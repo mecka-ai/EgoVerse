@@ -675,6 +675,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
     ):
         import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
