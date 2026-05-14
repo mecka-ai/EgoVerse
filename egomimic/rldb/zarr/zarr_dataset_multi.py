@@ -831,6 +831,12 @@ class LocalEpisodeResolver(EpisodeResolver):
         filtered_paths = self._get_local_filtered_paths(
             self.folder_path, filters, debug=self.debug
         )
+
+        if self.allowed_episode_ids is not None:
+            filtered_paths = [
+                (p, h) for p, h in filtered_paths if h in self.allowed_episode_ids
+            ]
+
         valid_folder_names = {folder_name for _, folder_name in filtered_paths}
         logger.info(f"Valid folder names: {valid_folder_names}")
         if not valid_folder_names:
