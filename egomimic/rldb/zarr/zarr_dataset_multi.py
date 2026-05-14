@@ -647,7 +647,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         folder_path: Path,
         key_map: dict | None = None,
         transform_list: list | None = None,
-        debug: int | bool | None = None,
         norm_stats: dict | None = None,
         allowed_episode_ids: list[str] | None = None,
     ):
@@ -730,6 +729,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         invokes `egomimic-training::scan_shard` in parallel. Each worker mounts
         the same zarr volume read-only and runs a thread-pooled .zattrs scan.
         """
+        import sys
         import time
 
         modal = _import_real_modal()
