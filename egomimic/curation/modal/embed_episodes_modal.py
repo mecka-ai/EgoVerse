@@ -56,6 +56,10 @@ OUTPUT_MOUNT = "/egoverse-training-outputs"
 
 os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 
+# Torch + torchvision are pulled in because importing anything from
+# egomimic.curation runs curation/__init__.py, which transitively imports
+# embedders.py (torch.nn) via DemInfCurator. The cache worker only calls
+# load_episode_from_path but still pays the import.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -64,6 +68,8 @@ image = (
             "zarr==3.1.5",
             "tqdm",
             "scipy",
+            "torch",
+            "torchvision",
             "omegaconf",
             "simplejpeg",
             "cloudpathlib",
