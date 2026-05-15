@@ -729,7 +729,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         invokes `egomimic-training::scan_shard` in parallel. Each worker mounts
         the same zarr volume read-only and runs a thread-pooled .zattrs scan.
         """
-        import sys
         import time
 
         modal = _import_real_modal()
