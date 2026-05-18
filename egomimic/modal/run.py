@@ -486,7 +486,7 @@ def run_hydra_train(
     gpu=None,
     cpu=4,
     memory=16384,
-    timeout=1800,
+    timeout=3600,
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
     volumes={CFG.volume_mount_path: zarr_volume},
 )
@@ -634,11 +634,20 @@ def run_curate(
 
     t0 = _time.time()
     episode_dicts: list = []
+    n_failed = 0
     for shard_result in _load_shard.starmap(
-        [(s, git_remote, git_commit) for s in shards]
+        [(s, git_remote, git_commit) for s in shards],
+        return_exceptions=True,
     ):
-        episode_dicts.extend(shard_result)
-    print(f"Loaded {len(episode_dicts)} episodes in {_time.time() - t0:.1f}s")
+        if isinstance(shard_result, Exception):
+            n_failed += 1
+            print(f"[shard] FAILED (skipping): {shard_result}")
+        else:
+            episode_dicts.extend(shard_result)
+    print(
+        f"Loaded {len(episode_dicts)} episodes in {_time.time() - t0:.1f}s "
+        f"({n_failed}/{len(shards)} shards failed)"
+    )
 
     # ── 4. Reconstruct Episode objects ────────────────────────────────────────
     from egomimic.curation.utils import Episode
