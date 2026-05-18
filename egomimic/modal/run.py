@@ -609,7 +609,7 @@ def run_curate(
         )
         try:
             pairs = LocalEpisodeResolver._get_local_filtered_paths(
-                search_path=folder_path,
+                search_path=Path(folder_path),
                 filters=DatasetFilter(filter_lambdas),
             )
             all_paths.extend(pairs)
