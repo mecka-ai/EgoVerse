@@ -72,6 +72,11 @@ image = (
         add_python="3.10",
     )
     .apt_install("git")
+    # Bake modal_setup.py into the image so curateModal.py / trainModal.py can
+    # import it at module-load time (before the repo is cloned via _prepare_repo).
+    # Path(__file__).parent resolves to /root/ in the container, so:
+    #   from modal_setup import (...)  works in both local and remote contexts.
+    .add_local_file(Path(__file__).resolve(), remote_path="/root/modal_setup.py")
     .pip_install(
         "lightning",
         "hydra-core",

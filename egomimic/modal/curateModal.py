@@ -25,11 +25,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import modal
 
-from egomimic.modal.modal_setup import (
+# modal_setup.py lives next to this file locally (egomimic/modal/) and is baked
+# into the image at /root/ so it is importable before the repo is cloned.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from modal_setup import (  # noqa: E402
     CFG,
     _local_wandb_key,
     _prepare_repo,
