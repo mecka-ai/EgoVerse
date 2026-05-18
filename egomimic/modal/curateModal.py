@@ -350,13 +350,19 @@ def run_curate(
         "per_task": per_task_stats,
     }
 
-    # ── 7. Save outputs ───────────────────────────────────────────────────────
+    # ── 7. Save outputs (scores sorted highest → lowest) ──────────────────────
+    def _sort_scores(d: dict) -> dict:
+        return dict(sorted(d.items(), key=lambda kv: kv[1] if _np.isfinite(kv[1]) else float("-inf"), reverse=True))
+
+    sorted_flat = _sort_scores(flat_scores)
+    sorted_by_task = {t: _sort_scores(s) for t, s in scores_by_task.items()}
+
     with open(output_dir / "scores.json", "w") as f:
-        json.dump(flat_scores, f, indent=2)
+        json.dump(sorted_flat, f, indent=2)
     with open(output_dir / "scores_by_task.json", "w") as f:
-        json.dump(scores_by_task, f, indent=2)
+        json.dump(sorted_by_task, f, indent=2)
     with open(output_dir / "kept_hashes.json", "w") as f:
-        json.dump(list(flat_scores.keys()), f, indent=2)
+        json.dump(list(sorted_flat.keys()), f, indent=2)
     with open(output_dir / "curation_stats.json", "w") as f:
         json.dump(stats, f, indent=2)
 
