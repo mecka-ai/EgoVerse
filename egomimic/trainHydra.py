@@ -26,6 +26,10 @@ from egomimic.utils.logging_utils import log_hyperparameters
 from egomimic.utils.pylogger import RankedLogger
 from egomimic.utils.utils import extras, task_wrapper
 
+# DemInf curation — imported lazily inside curate() to avoid heavy deps at
+# startup when running normal training.
+_CURATION_IMPORTS_DONE = False
+
 OmegaConf.register_new_resolver("eval", eval)
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -219,6 +223,70 @@ def _submit_to_modal(cfg: DictConfig) -> None:
     vol = modal_env.get("MODAL_ZARR_VOLUME", "egoverse-zarr-data")
     print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB  zarr_volume={vol}")
     print(f"Submitting to Modal via: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=str(repo_root), env=modal_env)
+    sys.exit(result.returncode)
+
+
+def _submit_curate_to_modal(cfg: DictConfig) -> None:
+    """Delegate to Modal to submit a DemInf curation job, then exit.
+
+    Routes to egomimic/modal/run.py::submit_curate.  By default this uses no
+    GPU (KSG is CPU-bound via scipy cKDTree) and 32 CPUs.  Override with:
+        +modal_gpu=A100      (only needed when StateEmbedder mode=image)
+        +modal_cpu=16
+        +modal_memory_gb=128
+    """
+    import subprocess
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+
+    _git_commit_and_push(repo_root)
+
+    modal_env = os.environ.copy()
+
+    _MODAL_KEYS = {
+        "modal_gpu",
+        "modal_cpu",
+        "modal_memory_gb",
+        "modal_memory_mb",
+        "modal_volume",
+    }
+    container_overrides = []
+    for override in HydraConfig.get().overrides.task:
+        key = override.lstrip("+").split("=")[0]
+        if key in _MODAL_KEYS:
+            val = override.split("=", 1)[1]
+            if key == "modal_gpu":
+                modal_env["MODAL_GPU"] = val
+            elif key == "modal_cpu":
+                modal_env["MODAL_CPU"] = val
+            elif key == "modal_memory_gb":
+                modal_env["MODAL_MEMORY_GB"] = val
+            elif key == "modal_memory_mb":
+                modal_env["MODAL_MEMORY_MB"] = val
+            elif key == "modal_volume":
+                modal_env["MODAL_ZARR_VOLUME"] = val
+        elif not key.startswith("trainer."):
+            # Strip trainer.* (e.g. trainer._modal=true) — not needed in container
+            container_overrides.append(override)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "modal",
+        "run",
+        "--detach",
+        "--env",
+        "robotics",
+        "egomimic/modal/run.py::submit_curate",
+        "--",
+        *container_overrides,
+    ]
+    cpu = modal_env.get("MODAL_CPU", "32")
+    gpu = modal_env.get("MODAL_GPU", "none (CPU-only)")
+    print(f"Modal curation resources: gpu={gpu}  cpu={cpu}")
+    print(f"Submitting curation to Modal via: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=str(repo_root), env=modal_env)
     sys.exit(result.returncode)
 
@@ -502,6 +570,133 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     return metric_dict, object_dict
 
 
+def _load_episodes_for_curation(data_cfg: DictConfig) -> list:
+    """
+    Load full episodes for DemInf curation from a training-style data config.
+
+    Reads ``data.train_datasets`` entries, extracts ``resolver.folder_path``
+    and ``filters.filter_lambdas``, and loads every matching episode from disk
+    using the curation utils loader (which prefers the ``actions_cartesian``
+    zarr key over per-timestep fallbacks).
+
+    Args:
+        data_cfg: The ``cfg.data`` DictConfig (e.g. from mecka_all_zarr.yaml).
+
+    Returns:
+        List of ``Episode`` objects ready for the DemInf pipeline.
+    """
+    from pathlib import Path
+
+    from egomimic.curation.utils import load_episode_from_path
+    from egomimic.rldb.filters import DatasetFilter
+    from egomimic.rldb.zarr.zarr_dataset_multi import LocalEpisodeResolver
+
+    episodes = []
+    train_datasets = OmegaConf.to_container(
+        data_cfg.train_datasets, resolve=True, throw_on_missing=False
+    )
+
+    for ds_name, ds_cfg in train_datasets.items():
+        resolver_cfg = (ds_cfg or {}).get("resolver", {}) or {}
+        folder_path_str = resolver_cfg.get("folder_path")
+        if not folder_path_str:
+            log.warning("Curation: %s has no resolver.folder_path — skipping", ds_name)
+            continue
+
+        folder_path = Path(folder_path_str)
+        if not folder_path.is_dir():
+            log.warning("Curation: %s: folder_path %s not found — skipping", ds_name, folder_path)
+            continue
+
+        filter_lambdas = list(
+            ((ds_cfg or {}).get("filters") or {}).get("filter_lambdas") or []
+        )
+        dataset_filter = DatasetFilter(filter_lambdas)
+
+        try:
+            filtered_paths = LocalEpisodeResolver._get_local_filtered_paths(
+                search_path=folder_path,
+                filters=dataset_filter,
+            )
+        except Exception as exc:
+            log.warning("Curation: %s: path enumeration failed: %s — skipping", ds_name, exc)
+            continue
+
+        pre_count = len(episodes)
+        for path_str, episode_hash in filtered_paths:
+            ep = load_episode_from_path(Path(path_str), episode_hash=episode_hash)
+            if ep is not None:
+                episodes.append(ep)
+
+        log.info(
+            "Curation: %s — loaded %d episodes from %s",
+            ds_name,
+            len(episodes) - pre_count,
+            folder_path,
+        )
+
+    return episodes
+
+
+def curate(cfg: DictConfig) -> None:
+    """
+    Run the DemInf curation pipeline.
+
+    Called by ``main()`` when ``cfg.mode == "curate"``.  Uses the same
+    data config format as training (``data.train_datasets`` resolver pattern)
+    so ``data: mecka_all_zarr`` works out of the box.
+
+    Args:
+        cfg: Full Hydra DictConfig composed from curate.yaml.
+    """
+    if cfg.get("seed"):
+        L.seed_everything(cfg.seed, workers=True)
+        set_global_seed(cfg.seed)
+
+    load_env()
+
+    # Start WandB run via the same logger config used for training
+    loggers = instantiate_loggers(cfg.get("logger"))
+    wandb_run = None
+    for lgr in loggers:
+        # WandbLogger.experiment initialises the run on first access
+        if hasattr(lgr, "experiment"):
+            try:
+                wandb_run = lgr.experiment
+            except Exception:
+                pass
+            break
+
+    log.info("Loading episodes from data config...")
+    episodes = _load_episodes_for_curation(cfg.data)
+    log.info("Total episodes loaded: %d", len(episodes))
+
+    if not episodes:
+        log.warning("No episodes loaded — check resolver.folder_path in data config")
+        return
+
+    log.info("Instantiating DemInf algo <%s>", cfg.model._target_)
+    algo = hydra.utils.instantiate(cfg.model)
+
+    from hydra.core.hydra_config import HydraConfig as _HC
+    output_dir = Path(_HC.get().runtime.output_dir)
+
+    result = algo.curate(episodes, output_dir=output_dir, wandb_run=wandb_run)
+
+    log.info(
+        "Curation complete — kept=%d  removed=%d  filter.yaml → %s",
+        len(result.kept_hashes),
+        len(result.all_removed_hashes),
+        output_dir / "filter.yaml",
+    )
+
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
+
+
 @hydra.main(
     version_base="1.3",
     config_path="./hydra_configs",
@@ -517,8 +712,25 @@ def main(cfg: DictConfig) -> Optional[float]:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
 
-    # If trainer._modal is set and we're not already inside a Modal container,
-    # submit the job to Modal using the raw Hydra CLI overrides and exit.
+    # Curation mode: dispatched to its own Modal function (CPU-heavy KSG).
+    if cfg.get("mode") == "curate":
+        if (
+            OmegaConf.select(cfg, "trainer._modal", default=False)
+            and os.environ.get("MODAL_IS_REMOTE") != "1"
+        ):
+            try:
+                _submit_curate_to_modal(cfg)
+            except ImportError:
+                raise RuntimeError(
+                    "trainer._modal=true requires the 'modal' package. "
+                    "Install it with: pip install modal"
+                )
+            return
+        print(OmegaConf.to_yaml(cfg))
+        curate(cfg)
+        return
+
+    # Training/eval: submit to Modal via run_hydra_train if requested.
     if OmegaConf.select(cfg, "trainer._modal", default=False):
         if os.environ.get("MODAL_IS_REMOTE") != "1":
             try:
@@ -528,11 +740,9 @@ def main(cfg: DictConfig) -> Optional[float]:
                     "trainer._modal=true requires the 'modal' package. "
                     "Install it with: pip install modal"
                 )
-            return  # _submit_to_modal calls sys.exit, but keep for clarity
+            return
 
     print(OmegaConf.to_yaml(cfg))
-
-    # cfg = OmegaConf.resolve(cfg)
 
     # train the model
     metric_dict, _ = train(cfg)

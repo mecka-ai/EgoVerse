@@ -438,6 +438,61 @@ def run_hydra_train(
 
 
 # ---------------------------------------------------------------------------
+# DemInf curation function — CPU-heavy (KSG via scipy cKDTree, workers=-1)
+# GPU only needed when StateEmbedder mode="image"; override with +modal_gpu=A100
+# ---------------------------------------------------------------------------
+
+_CURATE_GPU = os.environ.get("MODAL_GPU") or None  # no GPU by default
+_CURATE_CPU = float(os.environ.get("MODAL_CPU", "32"))
+_CURATE_MEMORY_MB = (
+    int(float(os.environ.get("MODAL_MEMORY_GB")) * 1024)
+    if os.environ.get("MODAL_MEMORY_GB")
+    else int(os.environ.get("MODAL_MEMORY_MB", "65536"))
+)
+
+
+@app.function(
+    gpu=_CURATE_GPU,
+    cpu=_CURATE_CPU,
+    memory=_CURATE_MEMORY_MB,
+    timeout=CFG.timeout_seconds,
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+    volumes={
+        CFG.volume_mount_path: zarr_volume,
+        CFG.output_mount_path: training_outputs_volume,
+    },
+)
+def run_curate(
+    hydra_args: tuple[str, ...],
+    git_remote: str,
+    git_commit: str,
+    wandb_api_key: str = "",
+) -> str:
+    """Clone repo and run DemInf curation via trainHydra.py --config-name=curate."""
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
+
+    cmd = [CFG.python_bin, CFG.train_script, "--config-name=curate", *hydra_args]
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("HYDRA_FULL_ERROR", "1")
+    if wandb_api_key:
+        env["WANDB_API_KEY"] = wandb_api_key
+    env["MODAL_IS_REMOTE"] = "1"
+
+    print(f"Running: {shlex.join(cmd)}")
+    process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
+
+    zarr_volume.commit()
+    training_outputs_volume.commit()
+
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Curation failed (exit {process.returncode}): {shlex.join(cmd)}"
+        )
+    return "curate_done"
+
+
+# ---------------------------------------------------------------------------
 # Container health-check function
 # ---------------------------------------------------------------------------
 
@@ -583,6 +638,43 @@ def submit(*hydra_args: str) -> None:
         "After completion, download artifacts:\n"
         "  modal volume get --env robotics egoverse-training-outputs <run-path> ./modal-outputs/"
     )
+
+
+@app.local_entrypoint()
+def submit_curate(*hydra_args: str) -> None:
+    """Fire-and-forget: spawn a Modal DemInf curation job and return immediately."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print(
+            "Warning: local repo has uncommitted changes. "
+            "Modal will run the last committed state only."
+        )
+    print(f"Submitting curation commit {git_commit[:12]} from {git_remote}")
+    handle = run_curate.spawn(
+        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
+    )
+    print(f"Submitted Modal curation job: {handle.object_id}")
+    print("Monitor at: https://modal.com/apps/egomimic-training")
+    print(
+        "After completion, download artifacts:\n"
+        "  modal volume get --env robotics egoverse-training-outputs <run-path> ./modal-outputs/"
+    )
+
+
+@app.local_entrypoint()
+def run_curate_cmd(*hydra_args: str) -> None:
+    """Blocking run: streams curation logs to stdout and waits for completion."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print(
+            "Warning: local repo has uncommitted changes. "
+            "Modal will run the last committed state only."
+        )
+    print(f"Running curation at commit {git_commit[:12]} from {git_remote}")
+    result = run_curate.remote(
+        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
+    )
+    print(f"Curation complete: {result}")
 
 
 @app.local_entrypoint()

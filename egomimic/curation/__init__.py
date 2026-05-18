@@ -10,10 +10,10 @@ Pipeline:
     3. Embed (state, action) pairs into a shared latent space
     4. Estimate pointwise MI using the KSG k-NN estimator
     5. Score each trajectory by its mean MI contribution
-    6. Export filtered episode hashes for downstream SQL filtering
+    6. Export filtered episode hashes for downstream training configs
 """
 
-from egomimic.curation.curator import CurationResult, DemInfCurator
+from egomimic.curation.curator import CurationResult
 from egomimic.curation.embedders import (
     ActionEmbedder,
     ImageStateEmbedder,
@@ -32,7 +32,6 @@ __all__ = [
     "ActionClipFilter",
     "ActionEmbedder",
     "CurationResult",
-    "DemInfCurator",
     "Episode",
     "ImageStateEmbedder",
     "MinLengthFilter",

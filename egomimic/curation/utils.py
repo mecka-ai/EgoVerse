@@ -35,23 +35,25 @@ EMBODIMENT_KEY_MAP: dict[str, dict[str, list[str]]] = {
     # Aria bimanual egocentric hand-tracking
     "aria_bimanual": {
         "obs_keys": ["right.obs_ee_pose", "left.obs_ee_pose", "obs_head_pose"],
-        "action_keys": ["right.obs_ee_pose", "left.obs_ee_pose"],
+        # actions_cartesian (T, chunk_size, 12) is preferred; per-timestep keys are fallback
+        "action_keys": ["actions_cartesian", "right.obs_ee_pose", "left.obs_ee_pose"],
         "image_keys": ["images.front_1"],
     },
     "aria_right_arm": {
         "obs_keys": ["right.obs_ee_pose", "obs_head_pose"],
-        "action_keys": ["right.obs_ee_pose"],
+        "action_keys": ["actions_cartesian", "right.obs_ee_pose"],
         "image_keys": ["images.front_1"],
     },
     "aria_left_arm": {
         "obs_keys": ["left.obs_ee_pose", "obs_head_pose"],
-        "action_keys": ["left.obs_ee_pose"],
+        "action_keys": ["actions_cartesian", "left.obs_ee_pose"],
         "image_keys": ["images.front_1"],
     },
     # Eva single right arm
     "eva_right_arm": {
         "obs_keys": ["right.obs_ee_pose", "right.gripper"],
-        "action_keys": ["right.cmd_ee_pose", "right.gripper"],
+        # actions_cartesian (T, chunk_size, 7) preferred; per-timestep keys are fallback
+        "action_keys": ["actions_cartesian", "right.cmd_ee_pose", "right.gripper"],
         "image_keys": ["images.front_1", "images.right_wrist"],
     },
     # Eva bimanual robot arm
@@ -62,7 +64,9 @@ EMBODIMENT_KEY_MAP: dict[str, dict[str, list[str]]] = {
             "left.obs_ee_pose",
             "left.gripper",
         ],
+        # actions_cartesian (T, chunk_size, 14) preferred; per-timestep keys are fallback
         "action_keys": [
+            "actions_cartesian",
             "right.cmd_ee_pose",
             "left.cmd_ee_pose",
             "right.gripper",
@@ -79,6 +83,7 @@ EMBODIMENT_KEY_MAP: dict[str, dict[str, list[str]]] = {
             "left.gripper",
         ],
         "action_keys": [
+            "actions_cartesian",
             "right.cmd_ee_pose",
             "left.cmd_ee_pose",
             "right.gripper",
@@ -98,6 +103,7 @@ EMBODIMENT_KEY_MAP: dict[str, dict[str, list[str]]] = {
             "obs_head_pose",
         ],
         "action_keys": [
+            "actions_cartesian",
             "right.obs_keypoints",
             "left.obs_keypoints",
         ],
@@ -120,7 +126,7 @@ class Episode:
 
     episode_hash: str
     observations: np.ndarray  # (T, obs_dim) proprioceptive or (T, C, H, W) images
-    actions: np.ndarray  # (T, action_dim) raw actions
+    actions: np.ndarray  # (T, action_dim) per-timestep OR (T, chunk_size, action_dim) chunks
     embodiment: str  # e.g. "aria_bimanual", "eva_bimanual"
     metadata: dict = field(default_factory=dict)
 
@@ -137,6 +143,12 @@ def _resolve_keys(
     """
     Return (obs_keys, action_keys) present in *store* for *embodiment*.
 
+    For action keys, ``actions_cartesian`` is listed first in the map and
+    used exclusively when present — it already encodes the full action chunk
+    ``(T, chunk_size, action_dim)`` and must not be mixed with per-timestep
+    fallback keys.  If ``actions_cartesian`` is absent the per-timestep keys
+    are used instead.
+
     Falls back to all float32 arrays when the embodiment is unknown.
     """
     key_spec = EMBODIMENT_KEY_MAP.get(embodiment)
@@ -144,7 +156,14 @@ def _resolve_keys(
 
     if key_spec is not None:
         obs_keys = [k for k in key_spec["obs_keys"] if k in available]
-        action_keys = [k for k in key_spec["action_keys"] if k in available]
+
+        # Use actions_cartesian alone when present; otherwise all fallback keys.
+        action_key_list = key_spec["action_keys"]
+        if action_key_list and action_key_list[0] in available:
+            action_keys = [action_key_list[0]]  # actions_cartesian only
+        else:
+            action_keys = [k for k in action_key_list[1:] if k in available]
+
         if obs_keys and action_keys:
             return obs_keys, action_keys
         logger.warning(
@@ -262,7 +281,13 @@ def load_episode_from_path(
         if a.ndim == 1:
             a = a[:, None]
         act_parts.append(a)
-    actions = np.concatenate(act_parts, axis=-1)  # (T, action_dim)
+
+    # actions_cartesian has shape (T, chunk_size, action_dim) — preserve as 3-D.
+    # Per-timestep fallback arrays are 2-D and concatenated along axis=-1.
+    if len(act_parts) == 1 and act_parts[0].ndim == 3:
+        actions = act_parts[0]  # (T, chunk_size, action_dim)
+    else:
+        actions = np.concatenate(act_parts, axis=-1)  # (T, action_dim)
     observations = observations[:T]
 
     return Episode(

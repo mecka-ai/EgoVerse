@@ -362,6 +362,12 @@ class ActionEmbedder:
     used — appropriate only when all embodiments share the same action space
     (e.g., retargeted robot data).
 
+    Input accepts either per-timestep actions ``(T, action_dim)`` or pre-stored
+    action chunks ``(T, chunk_size, action_dim)`` (the ``actions_cartesian`` zarr
+    key).  In both cases the last dimensions are flattened to ``(T, feat_dim)``
+    before normalisation, so the MI estimator scores how well the full upcoming
+    action sequence is predicted by the current state.
+
     Args:
         latent_dim: Output dimensionality (default 32).
         cross_embodiment_mode: "independent" or "shared".
@@ -397,14 +403,15 @@ class ActionEmbedder:
         self._fitted = True
 
     def _fit_shared(self, episodes: list[Episode]) -> None:
-        act_list = [ep.actions for ep in episodes]
+        # Flatten action chunks: (T, chunk_size, D) → (T, chunk_size*D), or (T, D) → (T, D)
+        act_list = [ep.actions.reshape(len(ep.actions), -1) for ep in episodes]
         self._mean, self._std = _fit_gaussian_stats(act_list)
-        action_dim = self._mean.shape[0]
-        self._proj = _build_random_projection(action_dim, self.latent_dim)
+        feat_dim = self._mean.shape[0]
+        self._proj = _build_random_projection(feat_dim, self.latent_dim)
         logger.info(
-            "ActionEmbedder (shared): action_dim=%d → latent_dim=%d (proj=%s)",
-            action_dim,
-            min(action_dim, self.latent_dim),
+            "ActionEmbedder (shared): feat_dim=%d → latent_dim=%d (proj=%s)",
+            feat_dim,
+            min(feat_dim, self.latent_dim),
             self._proj is not None,
         )
 
@@ -415,7 +422,9 @@ class ActionEmbedder:
 
         self._per_embodiment_stats = {}
         for embodiment, act_list in by_embodiment.items():
-            mean, std = _fit_gaussian_stats(act_list)
+            # Flatten action chunks: (T, chunk_size, D) → (T, chunk_size*D), or (T, D) → (T, D)
+            flat_list = [a.reshape(len(a), -1) for a in act_list]
+            mean, std = _fit_gaussian_stats(flat_list)
             proj = _build_random_projection(mean.shape[0], self.latent_dim)
             self._per_embodiment_stats[embodiment] = {
                 "mean": mean,
@@ -423,7 +432,7 @@ class ActionEmbedder:
                 "proj": proj,
             }
             logger.info(
-                "ActionEmbedder (independent) '%s': action_dim=%d → latent_dim=%d",
+                "ActionEmbedder (independent) '%s': feat_dim=%d → latent_dim=%d",
                 embodiment,
                 mean.shape[0],
                 min(mean.shape[0], self.latent_dim),
@@ -442,15 +451,24 @@ class ActionEmbedder:
         Embed a batch of actions.
 
         Args:
-            data: (N, action_dim) float32 array.
+            data: (T, action_dim) or (T, chunk_size, action_dim) float32 array.
+                When ``data`` is 3-D (action chunks from ``actions_cartesian``),
+                the chunk and action dimensions are flattened to
+                ``(T, chunk_size * action_dim)`` before normalisation.
             embodiment: Embodiment name used to select per-embodiment statistics
                 in independent mode.
 
         Returns:
-            (N, latent_dim) float32 numpy array.
+            (T, latent_dim) float32 numpy array.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before embed()")
+
+        # Flatten action chunks: (T, K, D) → (T, K*D), or (T, D) → (T, D)
+        data = data.reshape(len(data), -1)
+
+        if len(data) == 0:
+            return np.empty((0, self.latent_dim), dtype=np.float32)
 
         if (
             self.cross_embodiment_mode == "independent"
