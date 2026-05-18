@@ -3,7 +3,7 @@ defaults:
 
 # Modal is always single-node; set num_nodes: 1.
 # Set launch_params.gpus_per_node on the CLI to match the GPU count
-# requested in modal_config.py CFG.gpu (e.g. "A100:4" → gpus_per_node=4).
+# requested in modal_setup.py CFG.gpu (e.g. "A100:4" → gpus_per_node=4).
 strategy: ddp_find_unused_parameters_true
 
 accelerator: gpu

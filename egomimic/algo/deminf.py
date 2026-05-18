@@ -5,8 +5,7 @@ Integrates DemInf (Hejna et al. 2025) into the EgoVerse Hydra+Lightning
 training pipeline.  Configured via hydra_configs/model/deminf_*.yaml and
 launched through trainHydra.py with ``mode: curate``:
 
-    python egomimic/trainHydra.py --config-name=curate \\
-        name=my_run description=test data=mecka_all_zarr model=deminf_default
+    python egomimic/modal/curateModal.py::run_curate_cmd name=my_run description=test
 
 All sub-components (embedders, filters) are Hydra-instantiated from the model
 config automatically.  The TrajectoryScorer is assembled from the pre-built
@@ -23,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -264,47 +262,6 @@ class DemInfAlgo:
             json.dump(result.stats, f, indent=2)
 
         logger.info("Curation outputs written to %s", output_dir)
-
-    def _export_filter_yaml(self, result: CurationResult, path: Path) -> None:
-        """
-        Write a DatasetFilter-compatible YAML for direct use in training configs.
-
-        Inject the filter into a training run:
-            +data.train_datasets.<name>.filters.filter_lambdas=[<lambda>]
-        """
-        kept = result.kept_hashes
-        stats = result.stats or {}
-        mi_mean = stats.get("mi_mean")
-        mi_median = stats.get("mi_median")
-
-        kept_set_repr = repr(set(kept))
-        lambda_str = f"lambda row: row.get('episode_hash') in {kept_set_repr}"
-        mi_line = (
-            f"# MI mean/median: {mi_mean:.4f} / {mi_median:.4f}"
-            if mi_mean is not None and mi_median is not None and np.isfinite(mi_mean)
-            else "# MI stats: unavailable"
-        )
-        lines = [
-            "# DemInf curation filter",
-            f"# Generated: {datetime.now(tz=timezone.utc).isoformat()}",
-            f"# Git hash:  {_get_git_hash()}",
-            f"# Episodes:  {len(kept)} kept / {stats.get('total_input', 0)} total",
-            f"# Filter ratio: {self.filter_ratio:.0%}",
-            mi_line,
-            "#",
-            "# Usage — add to a training data config's filters section:",
-            "#   +data.train_datasets.<name>.filters.filter_lambdas=[<lambda>]",
-            "",
-            "_target_: egomimic.rldb.filters.DatasetFilter",
-            "filter_lambdas:",
-            f"  - {json.dumps(lambda_str)}",
-            "",
-            "kept_hashes:",
-        ]
-        for h in kept:
-            lines.append(f"  - {json.dumps(h)}")
-        lines.append("")
-        path.write_text("\n".join(lines))
 
     # ------------------------------------------------------------------
     # WandB logging

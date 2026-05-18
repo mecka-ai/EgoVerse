@@ -5,14 +5,14 @@
 #       name=<run_name> description=<description>
 #
 # Override data or model inline:
-#   data=mecka_all_zarr model=deminf_default model.filter_ratio=0.2
+#   data=deminf_mecka model=deminf_default
 #
 # Submit to Modal:
 #   trainer._modal=true +modal_gpu=A100
 
 defaults:
   - model: deminf_default
-  - data: mecka_all_zarr
+  - data: deminf_mecka
   - paths: default
   - logger: wandb
   - override hydra/launcher: submitit

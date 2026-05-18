@@ -211,7 +211,7 @@ def _submit_to_modal(cfg: DictConfig) -> None:
         "--detach",
         "--env",
         "robotics",
-        "egomimic/modal/run.py::submit",
+        "egomimic/modal/trainModal.py::submit",
         "--",
         *container_overrides,
     ]
@@ -230,7 +230,7 @@ def _submit_to_modal(cfg: DictConfig) -> None:
 def _submit_curate_to_modal(cfg: DictConfig) -> None:
     """Delegate to Modal to submit a DemInf curation job, then exit.
 
-    Routes to egomimic/modal/run.py::submit_curate.  By default this uses no
+    Routes to egomimic/modal/curateModal.py::submit_curate.  By default this uses no
     GPU (KSG is CPU-bound via scipy cKDTree) and 32 CPUs.  Override with:
         +modal_gpu=A100      (only needed when StateEmbedder mode=image)
         +modal_cpu=16
@@ -279,7 +279,7 @@ def _submit_curate_to_modal(cfg: DictConfig) -> None:
         "--detach",
         "--env",
         "robotics",
-        "egomimic/modal/run.py::submit_curate",
+        "egomimic/modal/curateModal.py::submit_curate",
         "--",
         *container_overrides,
     ]

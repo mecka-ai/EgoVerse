@@ -870,10 +870,21 @@ class LocalSQLEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         norm_stats: dict | None = None,
         exclude_hashes: list[str] | None = None,
+        eps_to_ignore: str | None = None,
+        eps_to_use: str | None = None,
     ):
         super().__init__(folder_path, key_map, transform_list, norm_stats=norm_stats)
         self.debug = debug
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
+        if eps_to_ignore:
+            with open(eps_to_ignore) as f:
+                self.exclude_hashes.update(json.load(f))
+            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
+        self.include_hashes: set[str] | None = None
+        if eps_to_use:
+            with open(eps_to_use) as f:
+                self.include_hashes = set(json.load(f))
+            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
 
     def resolve(
         self,
@@ -895,7 +906,12 @@ class LocalSQLEpisodeResolver(EpisodeResolver):
         if self.exclude_hashes:
             before = len(df)
             df = df[~df["episode_hash"].isin(self.exclude_hashes)]
-            logger.info("Excluded %d episodes via exclude_hashes", before - len(df))
+            logger.info("eps_to_ignore: excluded %d episodes", before - len(df))
+
+        if self.include_hashes is not None:
+            before = len(df)
+            df = df[df["episode_hash"].isin(self.include_hashes)]
+            logger.info("eps_to_use: restricted to %d / %d episodes", len(df), before)
 
         mask = df.apply(
             lambda row: filters.matches(_normalize_filter_row(row.to_dict())),

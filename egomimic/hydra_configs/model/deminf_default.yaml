@@ -1,11 +1,10 @@
 # DemInf curation model config — default settings.
 #
 # Launch a curation run:
-#   python egomimic/trainHydra.py --config-name=curate \
-#       name=my_run description=test data=mecka_all_zarr model=deminf_default
+#   python egomimic/modal/curateModal.py::run_curate_cmd name=my_run description=test
 #
 # Override individual knobs inline, e.g.:
-#   model.filter_ratio=0.2 model.scorer.k_range=[5,9]
+#   model.scorer.k_range=[5,9]
 
 _target_: egomimic.algo.deminf.DemInfAlgo
 
