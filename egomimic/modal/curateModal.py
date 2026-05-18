@@ -4,6 +4,8 @@ Architecture: one container per task — each loads only its task's episodes,
 applies preprocessing filters, and runs KSG scoring independently.  The
 orchestrator aggregates scores from all task containers into a single JSON.
 
+All configuration (data, model, preprocessing) comes from curate.yaml.
+
 Usage
 -----
 Fire-and-forget:
@@ -14,11 +16,10 @@ Blocking (streams logs):
     modal run --env robotics egomimic/modal/curateModal.py::run_curate_cmd -- \\
         name=my_run description=test
 
-Override data or model:
-    ... -- data=deminf_mecka model=deminf_default model.scorer.k_range=[5,9]
+Override individual config keys inline:
+    ... -- name=my_run description=test model.scorer.k_range=[5,9]
 
-KSG is CPU-bound; no GPU needed by default. For StateEmbedder mode=image:
-    ... -- +modal_gpu=A100
+KSG is CPU-bound; no GPU needed.
 """
 
 from __future__ import annotations
@@ -58,12 +59,13 @@ _CURATE_MEMORY_MB = (
 
 # ---------------------------------------------------------------------------
 # Per-task worker — one container per task group
+# 16 CPU / 32 GB; KSG and preprocessing both use 12 worker threads
 # ---------------------------------------------------------------------------
 
 
 @app.function(
     gpu=None,
-    cpu=8,
+    cpu=16,
     memory=32768,
     timeout=3600,
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
@@ -80,6 +82,7 @@ def _score_task(
     from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path as _Path
     import sys as _sys
+    from tqdm import tqdm
 
     _prepare_repo_light(git_remote=git_remote, git_commit=git_commit)
     _sys.path.insert(0, CFG.remote_repo_dir)
@@ -96,6 +99,7 @@ def _score_task(
 
     algo = _hydra.utils.instantiate(cfg.model)
 
+    # ── Load episodes (12 workers) ────────────────────────────────────────────
     def _load_one(pair):
         path_str, episode_hash = pair
         ep = load_episode_from_path(_Path(path_str), episode_hash=episode_hash)
@@ -103,9 +107,16 @@ def _score_task(
             ep.metadata["task_name"] = task_name
         return ep
 
-    n_threads = min(16, max(1, len(path_hash_pairs)))
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        results = list(pool.map(_load_one, path_hash_pairs))
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(
+            tqdm(
+                pool.map(_load_one, path_hash_pairs),
+                total=len(path_hash_pairs),
+                desc=f"[{task_name}] Loading",
+                unit="ep",
+                dynamic_ncols=True,
+            )
+        )
 
     episodes = [ep for ep in results if ep is not None]
     print(f"[{task_name}] loaded {len(episodes)}/{len(path_hash_pairs)} episodes")
@@ -113,13 +124,15 @@ def _score_task(
     if not episodes:
         return task_name, {}
 
-    filtered_episodes, _ = apply_filters(episodes, algo.preprocessing)
+    # ── Preprocessing (12 workers via apply_filters) ──────────────────────────
+    filtered_episodes, _ = apply_filters(episodes, algo.preprocessing, n_workers=12)
     print(f"[{task_name}] {len(filtered_episodes)}/{len(episodes)} after preprocessing")
 
     if len(filtered_episodes) < 2:
         print(f"[{task_name}] too few episodes for KSG — returning nan scores")
         return task_name, {ep.episode_hash: float("nan") for ep in filtered_episodes}
 
+    # ── KSG scoring (12 workers via scipy workers param) ─────────────────────
     algo._scorer.fit(filtered_episodes)
     scores = algo._scorer.get_scores()
     print(f"[{task_name}] scored {len(scores)} episodes")
@@ -146,7 +159,6 @@ def run_curate(
     hydra_args: tuple[str, ...],
     git_remote: str,
     git_commit: str,
-    wandb_api_key: str = "",
 ) -> str:
     """SQL task grouping + per-task container fan-out for DemInf curation."""
     import sys as _sys
@@ -157,12 +169,10 @@ def run_curate(
     _prepare_repo(git_remote=git_remote, git_commit=git_commit)
     _sys.path.insert(0, CFG.remote_repo_dir)
 
-    if wandb_api_key:
-        os.environ["WANDB_API_KEY"] = wandb_api_key
     os.environ["MODAL_IS_REMOTE"] = "1"
     os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
-    # ── 1. Load Hydra config ──────────────────────────────────────────────────
+    # ── 1. Load Hydra config (curate.yaml + overrides) ───────────────────────
     import hydra as _hydra
 
     with _hydra.initialize_config_dir(
@@ -187,7 +197,7 @@ def run_curate(
     from egomimic.rldb.zarr.zarr_dataset_multi import LocalEpisodeResolver
 
     train_datasets = OmegaConf.to_container(
-        cfg.data.train_datasets, resolve=True, throw_on_missing=False
+        cfg.data.train_datasets, resolve=False, throw_on_missing=False
     )
     all_paths: list = []
     for ds_name, ds_cfg in train_datasets.items():
@@ -198,24 +208,34 @@ def run_curate(
         filter_lambdas = list(
             (((ds_cfg or {}).get("filters") or {}).get("filter_lambdas")) or []
         )
+
         exclude_hashes: set[str] = set()
-        eps_to_ignore_path = resolver_cfg.get("eps_to_ignore")
-        if eps_to_ignore_path:
+        eps_to_ignore = resolver_cfg.get("eps_to_ignore")
+        if eps_to_ignore:
+            # Resolve relative paths against the cloned repo root
+            _p = _Path(eps_to_ignore)
+            if not _p.is_absolute():
+                _p = _Path(CFG.remote_repo_dir) / _p
             try:
-                with open(eps_to_ignore_path) as _f:
+                with open(_p) as _f:
                     exclude_hashes.update(json.load(_f))
                 print(f"[scan] {ds_name}: eps_to_ignore — {len(exclude_hashes)} hashes")
             except OSError as exc:
                 print(f"[scan] {ds_name}: eps_to_ignore not accessible ({exc}) — skipping")
+
         include_hashes: set[str] | None = None
-        eps_to_use_path = resolver_cfg.get("eps_to_use")
-        if eps_to_use_path:
+        eps_to_use = resolver_cfg.get("eps_to_use")
+        if eps_to_use:
+            _p = _Path(eps_to_use)
+            if not _p.is_absolute():
+                _p = _Path(CFG.remote_repo_dir) / _p
             try:
-                with open(eps_to_use_path) as _f:
+                with open(_p) as _f:
                     include_hashes = set(json.load(_f))
                 print(f"[scan] {ds_name}: eps_to_use — {len(include_hashes)} hashes")
             except OSError as exc:
                 print(f"[scan] {ds_name}: eps_to_use not accessible ({exc}) — skipping")
+
         debug = resolver_cfg.get("debug")
         try:
             pairs = LocalEpisodeResolver._get_local_filtered_paths(
@@ -266,33 +286,12 @@ def run_curate(
     summary = ", ".join(f"{t}:{len(p)}" for t, p in sorted(by_task.items())[:5])
     print(f"Task groups: {n_tasks} ({summary}{'...' if n_tasks > 5 else ''})")
 
-    # ── 4. WandB setup ────────────────────────────────────────────────────────
-    # hydra.compose() does not set HydraConfig, so logger configs that reference
-    # ${hydra:runtime.output_dir} or ${now:...} would fail. We init WandB directly.
-    wandb_run = None
-    try:
-        import wandb as _wandb
-        _wandb.init(
-            project="mecka-robotics",
-            entity="kevin_yam1_-mecka-ai",
-            name=f"{cfg.name}_{cfg.description}",
-            config={
-                "name": cfg.name,
-                "description": cfg.description,
-                "model": str(cfg.model._target_),
-            },
-        )
-        wandb_run = _wandb.run
-        print(f"[wandb] run initialised: {wandb_run.name}")
-    except Exception as exc:
-        print(f"[wandb] init skipped: {exc}")
-
-    # ── 5. Output dir ─────────────────────────────────────────────────────────
+    # ── 4. Output dir ─────────────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = _Path(CFG.output_mount_path) / cfg.name / f"{cfg.description}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 6. Fan-out per-task scoring ───────────────────────────────────────────
+    # ── 5. Fan-out per-task scoring ───────────────────────────────────────────
     task_args = [
         (task_name, pairs, git_remote, git_commit, hydra_args)
         for task_name, pairs in sorted(by_task.items())
@@ -318,7 +317,7 @@ def run_curate(
         f"({n_task_failures} failed)"
     )
 
-    # ── 7. Aggregate stats ────────────────────────────────────────────────────
+    # ── 6. Aggregate stats ────────────────────────────────────────────────────
     flat_scores: dict[str, float] = {}
     for t_scores in scores_by_task.values():
         flat_scores.update(t_scores)
@@ -351,7 +350,7 @@ def run_curate(
         "per_task": per_task_stats,
     }
 
-    # ── 8. Save outputs ───────────────────────────────────────────────────────
+    # ── 7. Save outputs ───────────────────────────────────────────────────────
     with open(output_dir / "scores.json", "w") as f:
         json.dump(flat_scores, f, indent=2)
     with open(output_dir / "scores_by_task.json", "w") as f:
@@ -365,31 +364,6 @@ def run_curate(
         f"Curation done — scored={len(flat_scores)}  "
         f"n_tasks={len(scores_by_task)}  output={output_dir}"
     )
-
-    # ── 9. WandB logging ─────────────────────────────────────────────────────
-    if wandb_run is not None:
-        try:
-            metrics: dict = {
-                "curation/total_input": total,
-                "curation/scored": len(flat_scores),
-                "curation/n_tasks": len(scores_by_task),
-                "curation/n_task_failures": n_task_failures,
-                "curation/mi_mean": stats["mi_mean"],
-                "curation/mi_std": stats["mi_std"],
-                "curation/mi_median": stats["mi_median"],
-            }
-            for t_name, ts in per_task_stats.items():
-                safe = t_name.replace(".", "_").replace("/", "_")[:64]
-                metrics[f"curation/task/{safe}/count"] = ts["count"]
-                metrics[f"curation/task/{safe}/mi_mean"] = ts["mi_mean"]
-                metrics[f"curation/task/{safe}/mi_median"] = ts["mi_median"]
-            wandb_run.log(metrics)
-        except Exception as exc:
-            print(f"WandB logging failed: {exc}")
-        try:
-            wandb_run.finish()
-        except Exception:
-            pass
 
     zarr_volume.commit()
     training_outputs_volume.commit()
@@ -409,9 +383,7 @@ def submit_curate(*hydra_args: str) -> None:
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
     print(f"Submitting curation at commit {git_commit[:12]} from {git_remote}")
-    handle = run_curate.spawn(
-        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
-    )
+    handle = run_curate.spawn(tuple(hydra_args), git_remote, git_commit)
     print(f"Submitted Modal curation job: {handle.object_id}")
     print("Monitor at: https://modal.com/apps/egomimic-training")
 
@@ -423,7 +395,5 @@ def run_curate_cmd(*hydra_args: str) -> None:
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
     print(f"Running curation at commit {git_commit[:12]} from {git_remote}")
-    result = run_curate.remote(
-        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
-    )
+    result = run_curate.remote(tuple(hydra_args), git_remote, git_commit)
     print(f"Curation complete: {result}")

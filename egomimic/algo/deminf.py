@@ -23,7 +23,6 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -60,7 +59,7 @@ class DemInfAlgo:
         self,
         state_embedder: StateEmbedder,
         action_embedder: ActionEmbedder,
-        scorer: Any,
+        scorer,
         filter_ratio: float = 0.3,
         preprocessing: list | None = None,
         cross_embodiment_mode: str = "independent",
@@ -91,7 +90,6 @@ class DemInfAlgo:
         self,
         episodes: list[Episode],
         output_dir: Path | str | None = None,
-        wandb_run: Any = None,
     ) -> CurationResult:
         """
         Run the full DemInf curation pipeline.
@@ -195,8 +193,6 @@ class DemInfAlgo:
             len(pre_removed),
         )
 
-        # Step 5: log + save
-        self._log_wandb(stats, per_task_stats, wandb_run)
         if output_dir:
             self._save(result, output_dir, scores_by_task=scores_by_task)
 
@@ -262,49 +258,6 @@ class DemInfAlgo:
             json.dump(result.stats, f, indent=2)
 
         logger.info("Curation outputs written to %s", output_dir)
-
-    # ------------------------------------------------------------------
-    # WandB logging
-    # ------------------------------------------------------------------
-
-    def _log_wandb(
-        self,
-        stats: dict,
-        per_task_stats: dict,
-        wandb_run: Any = None,
-    ) -> None:
-        """Log curation metrics to WandB if a run is active."""
-        try:
-            import wandb as _wandb
-
-            run = wandb_run or _wandb.run
-            if run is None:
-                return
-
-            metrics: dict[str, float] = {
-                "curation/total_input": stats.get("total_input", 0),
-                "curation/scored": stats.get("scored", 0),
-                "curation/pre_filter_removed": stats.get("pre_filter_removed", 0),
-                "curation/n_tasks": stats.get("n_tasks", 0),
-                "curation/mi_mean": stats.get("mi_mean", float("nan")),
-                "curation/mi_std": stats.get("mi_std", float("nan")),
-                "curation/mi_median": stats.get("mi_median", float("nan")),
-            }
-
-            for task_name, ts in per_task_stats.items():
-                safe = task_name.replace(".", "_").replace("/", "_")[:64]
-                metrics[f"curation/task/{safe}/count"] = ts.get("count", 0)
-                metrics[f"curation/task/{safe}/mi_mean"] = ts.get("mi_mean", float("nan"))
-                metrics[f"curation/task/{safe}/mi_median"] = ts.get("mi_median", float("nan"))
-
-            run.log(metrics)
-            logger.info("Logged curation metrics to WandB run '%s'", run.name)
-
-        except ImportError:
-            logger.debug("wandb not installed — skipping WandB logging")
-        except Exception as exc:
-            logger.warning("WandB logging failed: %s", exc)
-
 
 # ---------------------------------------------------------------------------
 # Utility

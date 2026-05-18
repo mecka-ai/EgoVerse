@@ -18,7 +18,7 @@ train_datasets:
         mode: cartesian
         pause_removal_epsilon: 0.005
       debug: 200
-      eps_to_ignore: /Users/anikethcheluva/Downloads/failures.json
+      eps_to_ignore: egomimic/hydra_configs/data/extra/failures.json
     mode: total
 
 train_dataloader_params:

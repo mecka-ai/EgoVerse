@@ -181,31 +181,43 @@ class MinLengthFilter:
 def apply_filters(
     episodes: list[Episode],
     filters: list[EpisodeFilter],
+    n_workers: int = 12,
 ) -> tuple[list[Episode], list[str]]:
     """
-    Apply a list of filters to a list of episodes.
+    Apply a list of filters to a list of episodes in parallel.
 
     Args:
         episodes: Input episodes.
         filters: Ordered list of filter callables.
+        n_workers: Thread-pool size (default 12).
 
     Returns:
         (kept_episodes, removed_hashes)
     """
-    kept: list[Episode] = []
-    removed: list[str] = []
+    from concurrent.futures import ThreadPoolExecutor
+    from tqdm import tqdm
 
-    for ep in episodes:
+    def _apply_chain(ep: Episode) -> Episode | None:
         result: Episode | None = ep
         for f in filters:
             if result is None:
                 break
             result = f(result)
+        return result
 
-        if result is None:
-            removed.append(ep.episode_hash)
-        else:
-            kept.append(result)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        results = list(
+            tqdm(
+                pool.map(_apply_chain, episodes),
+                total=len(episodes),
+                desc="Preprocessing",
+                unit="ep",
+                dynamic_ncols=True,
+            )
+        )
+
+    kept = [r for r in results if r is not None]
+    removed = [ep.episode_hash for ep, r in zip(episodes, results) if r is None]
 
     logger.info(
         "Filters: %d kept, %d removed (%.1f%%)",

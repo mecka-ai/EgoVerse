@@ -151,7 +151,11 @@ class TrajectoryScorer:
             global_offsets[i] = offset
             offset += len(ep.actions)
 
-        for embodiment, indexed_eps in by_embodiment.items():
+        from tqdm import tqdm
+
+        for embodiment, indexed_eps in tqdm(
+            by_embodiment.items(), desc="Embodiments", unit="emb", dynamic_ncols=True
+        ):
             eps_group = [ep for _, ep in indexed_eps]
             idxs_group = [idx for idx, _ in indexed_eps]
 
@@ -270,8 +274,10 @@ class TrajectoryScorer:
         s_all = np.empty((N_total, s_latent_dim), dtype=np.float32)
         a_all = np.empty((N_total, a_latent_dim), dtype=np.float32)
 
+        from tqdm import tqdm
+
         offset = 0
-        for ep in episodes:
+        for ep in tqdm(episodes, desc="Embedding episodes", unit="ep", dynamic_ncols=True):
             n = len(ep.actions)
             s_all[offset : offset + n] = self.state_embedder.embed(
                 ep.observations, embodiment=ep.embodiment
@@ -335,21 +341,25 @@ class TrajectoryScorer:
         # absent → index k-1 would be the k-th NN.  We always request k+1 and
         # use index k, which slightly over-estimates ε for out-of-reference points
         # (conservative → slightly lower MI estimates, which is acceptable).
-        dists, _ = tree_z.query(z_query, k=k_approx + 1, p=np.inf, workers=-1)
+        dists, _ = tree_z.query(z_query, k=k_approx + 1, p=np.inf, workers=12)
         eps = dists[:, k_approx]  # (N_total,)
         eps_strict = eps * (1.0 - 1e-10)
 
         # Batch marginal counting against reference trees
+        from tqdm import tqdm
+
         batch_sz = 10_000
         n_s = np.empty(N_total, dtype=np.float64)
         n_a = np.empty(N_total, dtype=np.float64)
-        for start in range(0, N_total, batch_sz):
+        for start in tqdm(
+            range(0, N_total, batch_sz), desc="Scoring batches", unit="batch", dynamic_ncols=True
+        ):
             end = min(start + batch_sz, N_total)
             cs = tree_s.query_ball_point(
-                s_query[start:end], eps_strict[start:end], p=np.inf, return_length=True
+                s_query[start:end], eps_strict[start:end], p=np.inf, return_length=True, workers=12
             )
             ca = tree_a.query_ball_point(
-                a_query[start:end], eps_strict[start:end], p=np.inf, return_length=True
+                a_query[start:end], eps_strict[start:end], p=np.inf, return_length=True, workers=12
             )
             # Subtract 1 for self if the query point happens to be in the reference.
             # Using max(0, c-1) as a conservative lower bound avoids negative counts.

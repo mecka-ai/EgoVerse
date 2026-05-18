@@ -13,8 +13,6 @@
 defaults:
   - model: deminf_default
   - data: deminf_mecka
-  - paths: default
-  - logger: wandb
   - override hydra/launcher: submitit
   - _self_
 

@@ -80,8 +80,7 @@ def ksg_mi(
     tree_y = cKDTree(y)
 
     # Find k-th NN distance in joint space (index k because index 0 = self)
-    # workers=-1 uses all available CPU threads
-    dists, _ = tree_z.query(z, k=k + 1, p=np.inf, workers=-1)
+    dists, _ = tree_z.query(z, k=k + 1, p=np.inf, workers=12)
     eps = dists[:, k]  # (N,) — distance to k-th NN, excluding self
 
     # Count neighbours in marginal spaces strictly within ε
@@ -105,15 +104,8 @@ def _count_neighbours(
     points: np.ndarray,
     radii: np.ndarray,
 ) -> np.ndarray:
-    """
-    For each point i, count neighbours within radii[i] (excluding self).
-
-    Uses return_length=True (SciPy ≥ 1.9) to return integer counts directly,
-    avoiding materialisation of the full per-point neighbour-index lists which
-    causes OOM for large N.
-    """
-    # return_length=True returns an int array of counts (includes self)
-    counts = tree.query_ball_point(points, radii, p=np.inf, return_length=True)
+    """For each point i, count neighbours within radii[i] (excluding self)."""
+    counts = tree.query_ball_point(points, radii, p=np.inf, return_length=True, workers=12)
     counts = np.asarray(counts, dtype=np.float64) - 1.0  # subtract self
     return np.maximum(counts, 0.0)
 
@@ -125,12 +117,15 @@ def _count_neighbours_batched(
     batch_size: int = 10_000,
 ) -> np.ndarray:
     """Batch version of _count_neighbours for very large N."""
+    from tqdm import tqdm
+
     N = len(points)
     counts = np.empty(N, dtype=np.float64)
-    for start in range(0, N, batch_size):
+    batches = list(range(0, N, batch_size))
+    for start in tqdm(batches, desc="KSG marginals", unit="batch", dynamic_ncols=True):
         end = min(start + batch_size, N)
         batch_counts = tree.query_ball_point(
-            points[start:end], radii[start:end], p=np.inf, return_length=True
+            points[start:end], radii[start:end], p=np.inf, return_length=True, workers=12
         )
         counts[start:end] = np.maximum(
             np.asarray(batch_counts, dtype=np.float64) - 1.0, 0.0
@@ -169,8 +164,13 @@ def ksg_mi_averaged(
     if not k_values:
         raise ValueError(f"Invalid k_range: {k_range}")
 
+    from tqdm import tqdm
+
     estimates = np.stack(
-        [ksg_mi(x, y, k=k, noise_scale=noise_scale) for k in k_values],
+        [
+            ksg_mi(x, y, k=k, noise_scale=noise_scale)
+            for k in tqdm(k_values, desc="KSG k-values", unit="k", dynamic_ncols=True)
+        ],
         axis=0,
     )  # (num_k, N)
 
