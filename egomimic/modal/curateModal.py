@@ -378,25 +378,13 @@ def run_curate(
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoints
+# Local entrypoint — use egomimic/modal/curate.sh to launch (always detached)
 # ---------------------------------------------------------------------------
 
 
 @app.local_entrypoint()
-def submit_curate(*hydra_args: str) -> None:
-    """Fire-and-forget: spawn a curation job and return immediately."""
-    git_remote, git_commit, is_dirty = _resolve_git_state()
-    if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
-    print(f"Submitting curation at commit {git_commit[:12]} from {git_remote}")
-    handle = run_curate.spawn(tuple(hydra_args), git_remote, git_commit)
-    print(f"Submitted Modal curation job: {handle.object_id}")
-    print("Monitor at: https://modal.com/apps/egomimic-training")
-
-
-@app.local_entrypoint()
 def run_curate_cmd(*hydra_args: str) -> None:
-    """Blocking run: streams curation logs to stdout and waits for completion."""
+    """Blocking streaming run — invoked by curate.sh via nohup (never call directly)."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
