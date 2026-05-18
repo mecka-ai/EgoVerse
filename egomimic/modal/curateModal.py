@@ -267,17 +267,25 @@ def run_curate(
     print(f"Task groups: {n_tasks} ({summary}{'...' if n_tasks > 5 else ''})")
 
     # ── 4. WandB setup ────────────────────────────────────────────────────────
-    from egomimic.utils.instantiators import instantiate_loggers
-
-    loggers = instantiate_loggers(cfg.get("logger"))
+    # hydra.compose() does not set HydraConfig, so logger configs that reference
+    # ${hydra:runtime.output_dir} or ${now:...} would fail. We init WandB directly.
     wandb_run = None
-    for lgr in loggers:
-        if hasattr(lgr, "experiment"):
-            try:
-                wandb_run = lgr.experiment
-            except Exception:
-                pass
-            break
+    try:
+        import wandb as _wandb
+        _wandb.init(
+            project="mecka-robotics",
+            entity="kevin_yam1_-mecka-ai",
+            name=f"{cfg.name}_{cfg.description}",
+            config={
+                "name": cfg.name,
+                "description": cfg.description,
+                "model": str(cfg.model._target_),
+            },
+        )
+        wandb_run = _wandb.run
+        print(f"[wandb] run initialised: {wandb_run.name}")
+    except Exception as exc:
+        print(f"[wandb] init skipped: {exc}")
 
     # ── 5. Output dir ─────────────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
