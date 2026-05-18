@@ -364,6 +364,47 @@ def _prepare_repo(git_remote: str, git_commit: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Lightweight repo setup for shard workers (no submodules needed for loading)
+# ---------------------------------------------------------------------------
+
+
+def _prepare_repo_light(git_remote: str, git_commit: str) -> None:
+    """Shallow clone without submodules — faster setup for curation shard workers."""
+    clone_url = _ssh_to_https(git_remote)
+    repo_dir = Path(CFG.remote_repo_dir)
+
+    if not (repo_dir / ".git").exists():
+        if repo_dir.exists():
+            subprocess.run(["git", "init", str(repo_dir)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "remote", "add", "origin", clone_url],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                [
+                    "git", "clone", "--depth=1", "--no-recurse-submodules",
+                    clone_url, str(repo_dir),
+                ],
+                check=True,
+            )
+
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "fetch", "--depth=1", "origin", git_commit],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo_dir), "checkout", "--detach", git_commit],
+        check=True,
+    )
+    subprocess.run(
+        [CFG.python_bin, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"],
+        cwd=str(repo_dir),
+        check=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Modal function
 # ---------------------------------------------------------------------------
 
@@ -438,11 +479,59 @@ def run_hydra_train(
 
 
 # ---------------------------------------------------------------------------
-# DemInf curation function — CPU-heavy (KSG via scipy cKDTree, workers=-1)
+# DemInf curation — shard worker (one per container, parallel loading)
+# ---------------------------------------------------------------------------
+
+@app.function(
+    gpu=None,
+    cpu=4,
+    memory=16384,
+    timeout=1800,
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+    volumes={CFG.volume_mount_path: zarr_volume},
+)
+def _load_shard(
+    path_hash_pairs: list,
+    git_remote: str,
+    git_commit: str,
+) -> list:
+    """Load a shard of episodes from zarr. Returns serialised episode dicts."""
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path as _Path
+    import sys as _sys
+
+    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit)
+    _sys.path.insert(0, CFG.remote_repo_dir)
+
+    from egomimic.curation.utils import load_episode_from_path
+
+    def _load_one(pair):
+        path_str, episode_hash = pair
+        ep = load_episode_from_path(_Path(path_str), episode_hash=episode_hash)
+        if ep is None:
+            return None
+        return {
+            "episode_hash": ep.episode_hash,
+            "observations": ep.observations,
+            "actions": ep.actions,
+            "embodiment": ep.embodiment,
+        }
+
+    n_threads = min(16, max(1, len(path_hash_pairs)))
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        results = list(pool.map(_load_one, path_hash_pairs))
+
+    kept = [r for r in results if r is not None]
+    print(f"[shard] loaded {len(kept)}/{len(path_hash_pairs)} episodes")
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# DemInf curation orchestrator — fan-out loading + serial KSG
 # GPU only needed when StateEmbedder mode="image"; override with +modal_gpu=A100
 # ---------------------------------------------------------------------------
 
-_CURATE_GPU = os.environ.get("MODAL_GPU") or None  # no GPU by default
+_CURATE_GPU = os.environ.get("MODAL_GPU") or None  # no GPU by default for KSG
 _CURATE_CPU = float(os.environ.get("MODAL_CPU", "32"))
 _CURATE_MEMORY_MB = (
     int(float(os.environ.get("MODAL_MEMORY_GB")) * 1024)
@@ -468,28 +557,143 @@ def run_curate(
     git_commit: str,
     wandb_api_key: str = "",
 ) -> str:
-    """Clone repo and run DemInf curation via trainHydra.py --config-name=curate."""
+    """Fan-out episode loading (300 containers) + serial KSG curation."""
+    import sys as _sys
+    import time as _time
+    import numpy as _np
+    from pathlib import Path as _Path
+
     _prepare_repo(git_remote=git_remote, git_commit=git_commit)
+    _sys.path.insert(0, CFG.remote_repo_dir)
 
-    cmd = [CFG.python_bin, CFG.train_script, "--config-name=curate", *hydra_args]
-    env = os.environ.copy()
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    env.setdefault("HYDRA_FULL_ERROR", "1")
     if wandb_api_key:
-        env["WANDB_API_KEY"] = wandb_api_key
-    env["MODAL_IS_REMOTE"] = "1"
+        os.environ["WANDB_API_KEY"] = wandb_api_key
+    os.environ["MODAL_IS_REMOTE"] = "1"
+    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
-    print(f"Running: {shlex.join(cmd)}")
-    process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
+    # ── 1. Load Hydra config ──────────────────────────────────────────────────
+    import hydra as _hydra
+    from hydra import compose
+
+    with _hydra.initialize_config_dir(
+        config_dir=f"{CFG.remote_repo_dir}/egomimic/hydra_configs",
+        version_base="1.3",
+    ):
+        cfg = compose("curate", overrides=list(hydra_args))
+
+    from egomimic.rldb.zarr.utils import set_global_seed
+    import lightning as _L
+
+    if cfg.get("seed"):
+        _L.seed_everything(cfg.seed, workers=True)
+        set_global_seed(cfg.seed)
+
+    from egomimic.utils.aws.aws_data_utils import load_env
+    load_env()
+
+    # ── 2. Scan for episode paths (uses existing Modal fan-out scan) ──────────
+    from omegaconf import OmegaConf
+    from egomimic.rldb.filters import DatasetFilter
+    from egomimic.rldb.zarr.zarr_dataset_multi import LocalEpisodeResolver
+
+    train_datasets = OmegaConf.to_container(
+        cfg.data.train_datasets, resolve=True, throw_on_missing=False
+    )
+    all_paths: list = []
+    for ds_name, ds_cfg in train_datasets.items():
+        folder_path = ((ds_cfg or {}).get("resolver") or {}).get("folder_path")
+        if not folder_path:
+            continue
+        filter_lambdas = list(
+            (((ds_cfg or {}).get("filters") or {}).get("filter_lambdas")) or []
+        )
+        try:
+            pairs = LocalEpisodeResolver._get_local_filtered_paths(
+                search_path=folder_path,
+                filters=DatasetFilter(filter_lambdas),
+            )
+            all_paths.extend(pairs)
+            print(f"[scan] {ds_name}: {len(pairs)} paths from {folder_path}")
+        except Exception as exc:
+            print(f"[scan] {ds_name}: failed — {exc}")
+
+    total = len(all_paths)
+    print(f"Total episode paths: {total}")
+    if total == 0:
+        print("No episodes found — check resolver.folder_path in data config")
+        return ""
+
+    # ── 3. Fan-out loading: up to 300 containers, ~660 episodes each ─────────
+    N_SHARDS = min(300, total)
+    shard_size = (total + N_SHARDS - 1) // N_SHARDS
+    shards = [all_paths[i : i + shard_size] for i in range(0, total, shard_size)]
+    print(
+        f"Fan-out loading: {len(shards)} containers × ~{shard_size} episodes "
+        f"(16 threads each)"
+    )
+
+    t0 = _time.time()
+    episode_dicts: list = []
+    for shard_result in _load_shard.starmap(
+        [(s, git_remote, git_commit) for s in shards]
+    ):
+        episode_dicts.extend(shard_result)
+    print(f"Loaded {len(episode_dicts)} episodes in {_time.time() - t0:.1f}s")
+
+    # ── 4. Reconstruct Episode objects ────────────────────────────────────────
+    from egomimic.curation.utils import Episode
+
+    episodes = [
+        Episode(
+            episode_hash=d["episode_hash"],
+            observations=_np.asarray(d["observations"], dtype=_np.float32),
+            actions=_np.asarray(d["actions"], dtype=_np.float32),
+            embodiment=d["embodiment"],
+        )
+        for d in episode_dicts
+    ]
+    del episode_dicts
+    print(f"Reconstructed {len(episodes)} Episode objects")
+
+    # ── 5. WandB ─────────────────────────────────────────────────────────────
+    from egomimic.utils.instantiators import instantiate_loggers
+
+    loggers = instantiate_loggers(cfg.get("logger"))
+    wandb_run = None
+    for lgr in loggers:
+        if hasattr(lgr, "experiment"):
+            try:
+                wandb_run = lgr.experiment
+            except Exception:
+                pass
+            break
+
+    # ── 6. Run curation pipeline ──────────────────────────────────────────────
+    timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = (
+        _Path(CFG.output_mount_path) / cfg.name / f"{cfg.description}_{timestamp}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Instantiating algo <{cfg.model._target_}>")
+    algo = _hydra.utils.instantiate(cfg.model)
+
+    result = algo.curate(episodes, output_dir=output_dir, wandb_run=wandb_run)
+    print(
+        f"Curation done — kept={len(result.kept_hashes)}  "
+        f"removed={len(result.all_removed_hashes)}  output={output_dir}"
+    )
 
     zarr_volume.commit()
     training_outputs_volume.commit()
 
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"Curation failed (exit {process.returncode}): {shlex.join(cmd)}"
-        )
-    return "curate_done"
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
+
+    return str(output_dir)
 
 
 # ---------------------------------------------------------------------------
