@@ -378,38 +378,29 @@ def run_curate(
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint (internal — called by __main__ via nohup)
-# ---------------------------------------------------------------------------
-
-
-@app.local_entrypoint()
-def run_curate_cmd(*hydra_args: str) -> None:
-    git_remote, git_commit, is_dirty = _resolve_git_state()
-    if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
-    print(f"Running curation at commit {git_commit[:12]} from {git_remote}")
-    result = run_curate.remote(tuple(hydra_args), git_remote, git_commit)
-    print(f"Curation complete: {result}")
-
-
-# ---------------------------------------------------------------------------
 # python curateModal.py name=my_run description=test [overrides...]
+# Deploys the app to Modal then spawns run_curate fire-and-forget.
+# The job runs entirely in Modal cloud — closing your laptop won't stop it.
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import subprocess
-    import time
 
-    hydra_args = sys.argv[1:]
-    log = f"/tmp/curate_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    cmd = [
-        "modal", "run", "--env", "robotics",
-        f"{Path(__file__).resolve()}::run_curate_cmd",
-        "--", *hydra_args,
-    ]
-    with open(log, "w") as fh:
-        proc = subprocess.Popen(cmd, stdout=fh, stderr=fh, start_new_session=True)
-    print(f"Curation launched (PID {proc.pid})")
-    print(f"Log:     {log}")
-    print(f"Monitor: https://modal.com/apps/mecka/robotics")
-    print(f"Tail:    tail -f {log}")
+    hydra_args = tuple(sys.argv[1:])
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+
+    # Deploy registers/updates the functions in Modal cloud.
+    # Fast when the image is cached (only slow on first run or after pip changes).
+    print("Deploying app to Modal...")
+    subprocess.run(
+        ["modal", "deploy", "--env", "robotics", str(Path(__file__).resolve())],
+        check=True,
+    )
+
+    # Spawn against the deployed function — fully detached, no local connection kept.
+    run_fn = modal.Function.from_name("egomimic-training", "run_curate", environment_name="robotics")
+    handle = run_fn.spawn(hydra_args, git_remote, git_commit)
+    print(f"Submitted curation at commit {git_commit[:12]}: {handle.object_id}")
+    print("Monitor: https://modal.com/apps/mecka/robotics")
