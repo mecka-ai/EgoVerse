@@ -17,8 +17,15 @@ _target_: egomimic.algo.deminf.DemInfAlgo
 #   all embodiments share the same retargeted action space).
 cross_embodiment_mode: independent
 
+# ── Grouping ─────────────────────────────────────────────────────────────────
+# "task": score each episode relative to others in the same task group
+#         (task_name from zarr metadata). Outputs scores_by_task.json.
+# "none": score all episodes globally (legacy behaviour).
+grouping: task
+
 # ── Selection ───────────────────────────────────────────────────────────────
-# Fraction of scored episodes to discard (lowest MI scores removed first).
+# filter_ratio is kept for future use — no filtering is applied during scoring.
+# Use a separate script to threshold scores_by_task.json.
 filter_ratio: 0.3
 
 device: cpu

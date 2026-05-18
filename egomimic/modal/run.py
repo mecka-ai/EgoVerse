@@ -515,6 +515,7 @@ def _load_shard(
             "observations": ep.observations,
             "actions": ep.actions,
             "embodiment": ep.embodiment,
+            "metadata": ep.metadata,
         }
 
     n_threads = min(16, max(1, len(path_hash_pairs)))
@@ -658,11 +659,29 @@ def run_curate(
             observations=_np.asarray(d["observations"], dtype=_np.float32),
             actions=_np.asarray(d["actions"], dtype=_np.float32),
             embodiment=d["embodiment"],
+            metadata=d.get("metadata", {}),
         )
         for d in episode_dicts
     ]
     del episode_dicts
     print(f"Reconstructed {len(episodes)} Episode objects")
+
+    # ── 4b. Enrich task names from SQL (authoritative source) ─────────────────
+    try:
+        from egomimic.utils.aws.aws_sql import batch_get_task_names, create_default_engine
+        engine = create_default_engine()
+        all_hashes = [ep.episode_hash for ep in episodes]
+        task_map = batch_get_task_names(engine, all_hashes)
+        enriched = 0
+        for ep in episodes:
+            task = task_map.get(ep.episode_hash)
+            if task:
+                ep.metadata["task_name"] = task
+                enriched += 1
+        print(f"[sql] enriched {enriched}/{len(episodes)} episodes with task names "
+              f"({len(set(task_map.values()))} distinct tasks)")
+    except Exception as exc:
+        print(f"[sql] task name lookup failed (falling back to zarr metadata): {exc}")
 
     # ── 5. WandB ─────────────────────────────────────────────────────────────
     from egomimic.utils.instantiators import instantiate_loggers

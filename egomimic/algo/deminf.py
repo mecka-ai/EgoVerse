@@ -66,6 +66,7 @@ class DemInfAlgo:
         filter_ratio: float = 0.3,
         preprocessing: list | None = None,
         cross_embodiment_mode: str = "independent",
+        grouping: str = "task",
         device: str = "cpu",
     ) -> None:
         self.state_embedder = state_embedder
@@ -73,6 +74,7 @@ class DemInfAlgo:
         self.filter_ratio = filter_ratio
         self.preprocessing = list(preprocessing) if preprocessing else []
         self.cross_embodiment_mode = cross_embodiment_mode
+        self.grouping = grouping
         self.device = device
 
         k_range = tuple(int(k) for k in scorer.get("k_range", [3, 7]))
@@ -117,7 +119,7 @@ class DemInfAlgo:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("DemInf curation: %d input episodes", len(episodes))
+        logger.info("DemInf curation: %d input episodes (grouping=%s)", len(episodes), self.grouping)
 
         # Step 1: preprocessing
         filtered_episodes, pre_removed = apply_filters(episodes, self.preprocessing)
@@ -137,96 +139,123 @@ class DemInfAlgo:
                 stats={"error": "all_episodes_filtered"},
             )
             if output_dir:
-                self._save(result, output_dir)
+                self._save(result, output_dir, scores_by_task={})
             return result
 
-        # Step 2 + 3: embed + score
-        self._scorer.fit(filtered_episodes)
-        scores = self._scorer.get_scores()
+        # Step 2 + 3: embed + score (per-task or global)
+        if self.grouping == "task":
+            scores, scores_by_task = self._score_per_task(filtered_episodes)
+        else:
+            self._scorer.fit(filtered_episodes)
+            scores = self._scorer.get_scores()
+            scores_by_task = {}
 
-        # Step 4: rank + threshold
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        n_total = len(ranked)
-        n_remove = int(np.floor(n_total * self.filter_ratio))
-        n_keep = n_total - n_remove
+        # No filtering — keep all scored episodes; filtering is a separate step.
+        kept_hashes = list(scores.keys())
+        all_score_vals = np.array([s for s in scores.values() if np.isfinite(s)])
 
-        kept_hashes = [h for h, _ in ranked[:n_keep]]
-        low_mi_hashes = [h for h, _ in ranked[n_keep:]]
-        threshold_score = ranked[n_keep - 1][1] if n_keep > 0 else float("nan")
-
-        all_scores = np.array([s for _, s in ranked if np.isfinite(s)])
-        ep_by_hash = {ep.episode_hash: ep for ep in filtered_episodes}
-        kept_set = set(kept_hashes)
-
-        embodiment_scores: dict[str, list[float]] = {}
-        embodiment_kept: dict[str, int] = {}
-        embodiment_total: dict[str, int] = {}
-        for h, s in scores.items():
-            emb = ep_by_hash[h].embodiment if h in ep_by_hash else "unknown"
-            embodiment_scores.setdefault(emb, []).append(s)
-            embodiment_total[emb] = embodiment_total.get(emb, 0) + 1
-            if h in kept_set:
-                embodiment_kept[emb] = embodiment_kept.get(emb, 0) + 1
-
-        per_embodiment_stats = {
-            emb: {
-                "count": len(vals),
-                "kept": embodiment_kept.get(emb, 0),
-                "total": embodiment_total.get(emb, 0),
-                "mean": float(np.nanmean(vals)),
-                "std": float(np.nanstd(vals)),
-                "median": float(np.nanmedian(vals)),
+        # Per-task stats
+        per_task_stats: dict[str, dict] = {}
+        for task_name, task_scores in scores_by_task.items():
+            vals = np.array([s for s in task_scores.values() if np.isfinite(s)])
+            per_task_stats[task_name] = {
+                "count": len(task_scores),
+                "mi_mean": float(np.nanmean(vals)) if len(vals) else float("nan"),
+                "mi_std": float(np.nanstd(vals)) if len(vals) else float("nan"),
+                "mi_median": float(np.nanmedian(vals)) if len(vals) else float("nan"),
+                "mi_min": float(np.nanmin(vals)) if len(vals) else float("nan"),
+                "mi_max": float(np.nanmax(vals)) if len(vals) else float("nan"),
             }
-            for emb, vals in embodiment_scores.items()
-        }
 
         stats = {
             "total_input": len(episodes),
             "pre_filter_removed": len(pre_removed),
-            "scored": n_total,
-            "kept": n_keep,
-            "low_mi_removed": n_remove,
-            "filter_ratio": self.filter_ratio,
-            "threshold_score": float(threshold_score),
-            "mi_mean": float(all_scores.mean()) if len(all_scores) else float("nan"),
-            "mi_std": float(all_scores.std()) if len(all_scores) else float("nan"),
-            "mi_median": float(np.median(all_scores)) if len(all_scores) else float("nan"),
-            "mi_min": float(all_scores.min()) if len(all_scores) else float("nan"),
-            "mi_max": float(all_scores.max()) if len(all_scores) else float("nan"),
-            "per_embodiment": per_embodiment_stats,
+            "scored": len(scores),
+            "n_tasks": len(scores_by_task),
+            "grouping": self.grouping,
             "cross_embodiment_mode": self.cross_embodiment_mode,
+            "mi_mean": float(all_score_vals.mean()) if len(all_score_vals) else float("nan"),
+            "mi_std": float(all_score_vals.std()) if len(all_score_vals) else float("nan"),
+            "mi_median": float(np.median(all_score_vals)) if len(all_score_vals) else float("nan"),
+            "mi_min": float(all_score_vals.min()) if len(all_score_vals) else float("nan"),
+            "mi_max": float(all_score_vals.max()) if len(all_score_vals) else float("nan"),
+            "per_task": per_task_stats,
         }
 
         result = CurationResult(
             kept_hashes=kept_hashes,
             removed_hashes=pre_removed,
-            low_mi_hashes=low_mi_hashes,
+            low_mi_hashes=[],
             scores=scores,
             stats=stats,
         )
 
         logger.info(
-            "Curation done — kept=%d  pre_filter_removed=%d  low_mi_removed=%d",
-            n_keep,
+            "Scoring done — %d episodes across %d tasks  pre_filter_removed=%d",
+            len(scores),
+            len(scores_by_task),
             len(pre_removed),
-            n_remove,
         )
 
         # Step 5: log + save
-        self._log_wandb(stats, per_embodiment_stats, wandb_run)
+        self._log_wandb(stats, per_task_stats, wandb_run)
         if output_dir:
-            self._save(result, output_dir)
+            self._save(result, output_dir, scores_by_task=scores_by_task)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Per-task scoring
+    # ------------------------------------------------------------------
+
+    def _score_per_task(
+        self, episodes: list[Episode]
+    ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+        """Score each episode relative to others in the same task group."""
+        from collections import defaultdict
+
+        by_task: dict[str, list[Episode]] = defaultdict(list)
+        for ep in episodes:
+            task = ep.metadata.get("task_name", "unknown")
+            by_task[task].append(ep)
+
+        logger.info("Scoring %d tasks independently …", len(by_task))
+
+        flat_scores: dict[str, float] = {}
+        scores_by_task: dict[str, dict[str, float]] = {}
+
+        for task_name, group in sorted(by_task.items()):
+            if len(group) < 2:
+                # KSG needs at least 2 points; assign nan
+                task_scores = {ep.episode_hash: float("nan") for ep in group}
+                logger.warning("Task '%s' has only %d episode(s) — skipping KSG", task_name, len(group))
+            else:
+                self._scorer.fit(group)
+                task_scores = self._scorer.get_scores()
+                logger.info("Task '%s': scored %d episodes", task_name, len(task_scores))
+
+            flat_scores.update(task_scores)
+            scores_by_task[task_name] = task_scores
+
+        return flat_scores, scores_by_task
 
     # ------------------------------------------------------------------
     # Output helpers
     # ------------------------------------------------------------------
 
-    def _save(self, result: CurationResult, output_dir: Path) -> None:
-        """Write scores.json, kept_hashes.json, curation_stats.json, filter.yaml."""
+    def _save(
+        self,
+        result: CurationResult,
+        output_dir: Path,
+        scores_by_task: dict | None = None,
+    ) -> None:
+        """Write scores.json, scores_by_task.json, kept_hashes.json, curation_stats.json."""
         with open(output_dir / "scores.json", "w") as f:
             json.dump(result.scores, f, indent=2)
+
+        if scores_by_task:
+            with open(output_dir / "scores_by_task.json", "w") as f:
+                json.dump(scores_by_task, f, indent=2)
 
         with open(output_dir / "kept_hashes.json", "w") as f:
             json.dump(result.kept_hashes, f, indent=2)
@@ -234,7 +263,6 @@ class DemInfAlgo:
         with open(output_dir / "curation_stats.json", "w") as f:
             json.dump(result.stats, f, indent=2)
 
-        self._export_filter_yaml(result, output_dir / "filter.yaml")
         logger.info("Curation outputs written to %s", output_dir)
 
     def _export_filter_yaml(self, result: CurationResult, path: Path) -> None:
@@ -285,7 +313,7 @@ class DemInfAlgo:
     def _log_wandb(
         self,
         stats: dict,
-        per_embodiment_stats: dict,
+        per_task_stats: dict,
         wandb_run: Any = None,
     ) -> None:
         """Log curation metrics to WandB if a run is active."""
@@ -298,27 +326,19 @@ class DemInfAlgo:
 
             metrics: dict[str, float] = {
                 "curation/total_input": stats.get("total_input", 0),
-                "curation/kept": stats.get("kept", 0),
+                "curation/scored": stats.get("scored", 0),
                 "curation/pre_filter_removed": stats.get("pre_filter_removed", 0),
-                "curation/low_mi_removed": stats.get("low_mi_removed", 0),
-                "curation/keep_rate": stats.get("kept", 0)
-                / max(stats.get("scored", 1), 1),
+                "curation/n_tasks": stats.get("n_tasks", 0),
                 "curation/mi_mean": stats.get("mi_mean", float("nan")),
                 "curation/mi_std": stats.get("mi_std", float("nan")),
                 "curation/mi_median": stats.get("mi_median", float("nan")),
-                "curation/threshold_score": stats.get("threshold_score", float("nan")),
             }
 
-            for emb, emb_stats in per_embodiment_stats.items():
-                safe = emb.replace(".", "_")
-                metrics[f"curation/{safe}/kept"] = emb_stats.get("kept", 0)
-                metrics[f"curation/{safe}/total"] = emb_stats.get("total", 0)
-                metrics[f"curation/{safe}/mi_mean"] = emb_stats.get(
-                    "mean", float("nan")
-                )
-                metrics[f"curation/{safe}/mi_median"] = emb_stats.get(
-                    "median", float("nan")
-                )
+            for task_name, ts in per_task_stats.items():
+                safe = task_name.replace(".", "_").replace("/", "_")[:64]
+                metrics[f"curation/task/{safe}/count"] = ts.get("count", 0)
+                metrics[f"curation/task/{safe}/mi_mean"] = ts.get("mi_mean", float("nan"))
+                metrics[f"curation/task/{safe}/mi_median"] = ts.get("mi_median", float("nan"))
 
             run.log(metrics)
             logger.info("Logged curation metrics to WandB run '%s'", run.name)
