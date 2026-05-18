@@ -378,16 +378,38 @@ def run_curate(
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoint — use egomimic/modal/curate.sh to launch (always detached)
+# Local entrypoint (internal — called by __main__ via nohup)
 # ---------------------------------------------------------------------------
 
 
 @app.local_entrypoint()
 def run_curate_cmd(*hydra_args: str) -> None:
-    """Blocking streaming run — invoked by curate.sh via nohup (never call directly)."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
     print(f"Running curation at commit {git_commit[:12]} from {git_remote}")
     result = run_curate.remote(tuple(hydra_args), git_remote, git_commit)
     print(f"Curation complete: {result}")
+
+
+# ---------------------------------------------------------------------------
+# python curateModal.py name=my_run description=test [overrides...]
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import subprocess
+    import time
+
+    hydra_args = sys.argv[1:]
+    log = f"/tmp/curate_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    cmd = [
+        "modal", "run", "--env", "robotics",
+        f"{Path(__file__).resolve()}::run_curate_cmd",
+        "--", *hydra_args,
+    ]
+    with open(log, "w") as fh:
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=fh, start_new_session=True)
+    print(f"Curation launched (PID {proc.pid})")
+    print(f"Log:     {log}")
+    print(f"Monitor: https://modal.com/apps/mecka/robotics")
+    print(f"Tail:    tail -f {log}")
