@@ -371,6 +371,7 @@ class S3EpisodeResolver(EpisodeResolver):
             logger.info("Episode table is empty.")
             return []
 
+        df = filters.filter_df(df)
         mask = df.apply(
             lambda row: filters.matches(_normalize_filter_row(row.to_dict())),
             axis=1,

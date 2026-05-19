@@ -18,6 +18,10 @@ train_datasets:
         mode: cartesian
         pause_removal_epsilon: 0.005
       eps_to_ignore: egomimic/hydra_configs/data/extra/failures.json
+      filters:
+        _target_: egomimic.rldb.filters.DatasetFilter
+        filter_lambdas:
+          - "lambda df: df[df['task'].map(df['task'].value_counts()) > 15]"
     mode: total
 
 train_dataloader_params:
