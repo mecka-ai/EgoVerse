@@ -41,4 +41,4 @@ reject_outliers: true
 # Absolute tolerance added to each side of the quantile bounds before rejecting a frame.
 # 0.01 suppresses spurious angle wrap-around violations near ±π without letting
 # through genuinely bad frames (which are typically 0.05–0.15 outside bounds).
-reject_outliers_slack: 0.0
+reject_outliers_slack: 0.02
