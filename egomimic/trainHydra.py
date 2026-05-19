@@ -325,7 +325,7 @@ def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> Non
     log.info("Dataset frame counts:\n" + table)
 
 
-def _propagate_data_schematic_to_datasets(data_schematic, datasets):
+def _propagate_data_schematic_to_datasets(data_schematic, datasets, bounds_slack: float = 0.0):
     """
     Set the shared data schematic on all top-level datasets.
     """
@@ -335,7 +335,7 @@ def _propagate_data_schematic_to_datasets(data_schematic, datasets):
             raise ValueError(
                 f"{dataset_name} is not a MultiDataset. All top level datasets in data config should be MultiDataset"
             )
-        dataset.set_data_schematic(data_schematic)
+        dataset.set_data_schematic(data_schematic, bounds_slack=bounds_slack)
 
 
 @task_wrapper
@@ -415,9 +415,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.reject_outliers:
         # Propagate the shared data schematic to top-level MultiDatasets for bounds checks.
         # Use datamodule.train_datasets (null entries already filtered by the wrapper).
+        bounds_slack = float(OmegaConf.select(cfg, "reject_outliers_slack", default=0.0))
         _propagate_data_schematic_to_datasets(
             data_schematic,
             datamodule.train_datasets,
+            bounds_slack=bounds_slack,
         )
     viz_func = cfg.visualization
     viz_func_dict = {}

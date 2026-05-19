@@ -38,3 +38,7 @@ norm_stats:
   save_cache_dir: ${hydra:runtime.output_dir}
   precomputed_norm_path: null
 reject_outliers: true
+# Absolute tolerance added to each side of the quantile bounds before rejecting a frame.
+# 0.01 suppresses spurious angle wrap-around violations near ±π without letting
+# through genuinely bad frames (which are typically 0.05–0.15 outside bounds).
+reject_outliers_slack: 0.0

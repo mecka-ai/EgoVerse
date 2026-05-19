@@ -1126,8 +1126,9 @@ class MultiDataset(torch.utils.data.Dataset):
                     )
                 return prefix
 
-            below = arr < q_low
-            above = arr > q_high
+            slack = getattr(self, "bounds_slack", 0.0)
+            below = arr < (q_low - slack)
+            above = arr > (q_high + slack)
             if torch.any(below) or torch.any(above):
                 n_below = below.sum().item()
                 n_above = above.sum().item()
@@ -1180,17 +1181,22 @@ class MultiDataset(torch.utils.data.Dataset):
 
         return data
 
-    def set_data_schematic(self, data_schematic) -> None:
+    def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
         """
         Set the data schematic used for top-level bounds checking.
 
         When child datasets are themselves MultiDatasets, recursively assign the
         same schematic so each wrapper can validate its own returned samples.
+
+        bounds_slack: absolute tolerance added to each side of the quantile bounds
+            before rejecting a frame. Use a small value (e.g. 0.01) to suppress
+            spurious rejections at circular-domain boundaries such as ±π.
         """
         self.data_schematic = data_schematic
+        self.bounds_slack = bounds_slack
         for ds in self.datasets.values():
             if isinstance(ds, MultiDataset):
-                ds.set_data_schematic(data_schematic)
+                ds.set_data_schematic(data_schematic, bounds_slack=bounds_slack)
         logger.info(
             f"Set data_schematic on MultiDataset with {len(self.datasets)} child datasets"
         )
