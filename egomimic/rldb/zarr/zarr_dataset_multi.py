@@ -1416,7 +1416,24 @@ class ZarrDataset(torch.utils.data.Dataset):
             else:
                 read_interval = (idx, None)
             read_dict = {zarr_key: read_interval}
-            raw_data = self.episode_reader.read(read_dict)
+            try:
+                raw_data = self.episode_reader.read(read_dict)
+            except (IndexError, KeyError) as e:
+                origin = _fallback_origin if _fallback_origin is not None else idx
+                next_idx, attempts = get_fallback_idx(
+                    idx=idx,
+                    candidates=range(self.total_frames),
+                    _attempts=_attempts,
+                    max_attempts=self.total_frames,
+                    exhausted_error=(
+                        f"Entire episode bad (no valid indices): ep={Path(self.episode_path).name}"
+                    ),
+                )
+                logger.warning(
+                    f"Zarr read failed ep={Path(self.episode_path).name} frame={idx} key={k} "
+                    f"({type(e).__name__}: {e}) | attempt {attempts}, trying random idx {next_idx}"
+                )
+                return self.__getitem__(next_idx, _fallback_origin=origin, _attempts=attempts)
             self._pad_sequences(raw_data, horizon)  # should be able to pad images
             data[k] = raw_data[zarr_key]
 
