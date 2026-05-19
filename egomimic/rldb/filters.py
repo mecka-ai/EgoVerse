@@ -29,12 +29,27 @@ class DatasetFilter:
     def is_empty(self) -> bool:
         return not self.filter_lambdas
 
+    def filter_df(self, df: Any) -> Any:
+        """Apply any DataFrame-level lambdas (those that accept and return a DataFrame)."""
+        for predicate in self.filters:
+            try:
+                result = predicate(df)
+                if hasattr(result, "iterrows"):  # it's a DataFrame
+                    df = result
+            except Exception:
+                pass  # per-row predicate — skip here, applied in matches()
+        return df
+
     def matches(self, row: Mapping[str, Any]) -> bool:
         row = dict(row)
         if row.get("is_deleted", False):
             return False
         for expr, predicate in zip(self.filter_lambdas, self.filters, strict=True):
-            result = predicate(row)
+            try:
+                result = predicate(row)
+            except (TypeError, KeyError, AttributeError):
+                # DataFrame-level predicate — already applied in filter_df(), skip
+                continue
             if not isinstance(result, bool):
                 raise TypeError(f"Filter must return bool: {expr}")
             if not result:
