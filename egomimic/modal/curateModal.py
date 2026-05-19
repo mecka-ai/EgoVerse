@@ -39,7 +39,7 @@ if _HERE not in sys.path:
 
 from modal_setup import (  # noqa: E402
     CFG,
-    _local_wandb_key,
+    _git_commit_and_push,
     _prepare_repo,
     _prepare_repo_light,
     _resolve_git_state,
@@ -378,29 +378,81 @@ def run_curate(
 
 
 # ---------------------------------------------------------------------------
-# python curateModal.py name=my_run description=test [overrides...]
-# Deploys the app to Modal then spawns run_curate fire-and-forget.
-# The job runs entirely in Modal cloud — closing your laptop won't stop it.
+# Local entrypoints
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import subprocess
 
-    hydra_args = tuple(sys.argv[1:])
+@app.local_entrypoint()
+def submit_curate(*hydra_args: str) -> None:
+    """Fire-and-forget: spawn a curation job from an already-pushed commit."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
-
-    # Deploy registers/updates the functions in Modal cloud.
-    # Fast when the image is cached (only slow on first run or after pip changes).
-    print("Deploying app to Modal...")
-    subprocess.run(
-        ["modal", "deploy", "--env", "robotics", str(Path(__file__).resolve())],
-        check=True,
-    )
-
-    # Spawn against the deployed function — fully detached, no local connection kept.
-    run_fn = modal.Function.from_name("egomimic-training", "run_curate", environment_name="robotics")
-    handle = run_fn.spawn(hydra_args, git_remote, git_commit)
-    print(f"Submitted curation at commit {git_commit[:12]}: {handle.object_id}")
+    print(f"Submitting curation at commit {git_commit[:12]} from {git_remote}")
+    handle = run_curate.spawn(tuple(hydra_args), git_remote, git_commit)
+    print(f"Submitted Modal curation job: {handle.object_id}")
     print("Monitor: https://modal.com/apps/mecka/robotics")
+
+
+@app.local_entrypoint()
+def run_curate_cmd(*hydra_args: str) -> None:
+    """Blocking run: streams logs and prints output path when complete."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+    print(f"Running curation at commit {git_commit[:12]} from {git_remote}")
+    output_path = run_curate.remote(tuple(hydra_args), git_remote, git_commit)
+    if output_path:
+        print(f"Curation complete. Output: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# python curateModal.py name=my_run description=test [overrides...]
+# Auto-commits, pushes, then re-invokes modal run curateModal.py::submit_curate
+# as a subprocess so CFG resource values are resolved after env vars are set.
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    """
+    Main curation submission entrypoint: python egomimic/modal/curateModal.py <hydra_args>
+
+    Parses +modal_gpu=, +modal_cpu=, +modal_memory_gb= from args, auto-commits
+    and pushes, then re-invokes `modal run curateModal.py::submit_curate`.
+
+    Examples:
+        python egomimic/modal/curateModal.py name=my_run description=test
+        python egomimic/modal/curateModal.py name=my_run description=test +modal_cpu=64
+    """
+    import subprocess
+
+    _MODAL_KEY_MAP = {
+        "modal_gpu": "MODAL_GPU",
+        "modal_cpu": "MODAL_CPU",
+        "modal_memory_gb": "MODAL_MEMORY_GB",
+        "modal_memory_mb": "MODAL_MEMORY_MB",
+    }
+
+    modal_env = os.environ.copy()
+    hydra_args = []
+    for arg in sys.argv[1:]:
+        key, sep, val = arg.lstrip("+").partition("=")
+        if sep and key in _MODAL_KEY_MAP:
+            modal_env[_MODAL_KEY_MAP[key]] = val
+        else:
+            hydra_args.append(arg)
+
+    cpu = modal_env.get("MODAL_CPU", "32")
+    gpu = modal_env.get("MODAL_GPU", "none (CPU-only)")
+    print(f"Modal curation resources: gpu={gpu}  cpu={cpu}")
+
+    _git_commit_and_push(Path(__file__).resolve().parent.parent.parent)
+
+    cmd = [
+        sys.executable, "-m", "modal", "run",
+        "--detach", "--env", "robotics",
+        str(Path(__file__).resolve()) + "::submit_curate",
+        "--", *hydra_args,
+    ]
+    print(f"Dispatching: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent.parent), env=modal_env)
+    sys.exit(result.returncode)

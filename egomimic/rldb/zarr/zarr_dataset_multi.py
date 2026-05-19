@@ -231,29 +231,6 @@ class EpisodeResolver:
 
         dataset_class = self._dataset_class or ZarrDataset
 
-        # Modal fan-out: when inside Modal with the volume mounted at the standard
-        # path, shard the per-episode .zattrs reads across many small containers.
-        # Each worker returns (path, hash, metadata) tuples; ZarrDataset is then
-        # constructed locally with precomputed_metadata, skipping the slow open.
-        # Disable with EGOMIMIC_DISABLE_MODAL_LOAD=1.
-        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
-            os.environ.get("MODAL_TASK_ID")
-        )
-        if (
-            inside_modal
-            and str(search_path) == "/mnt/zarr-data"
-            and os.environ.get("EGOMIMIC_DISABLE_MODAL_LOAD") != "1"
-        ):
-            try:
-                return self._modal_fanout_load(
-                    search_path, valid_folder_names, dataset_class
-                )
-            except Exception as e:
-                logger.warning(
-                    "Modal fan-out load failed (%s) — falling back to serial loop",
-                    e,
-                )
-
         all_paths = sorted(search_path.iterdir())
         datasets: dict[str, ZarrDataset] = {}
         skipped: list[str] = []
@@ -297,90 +274,6 @@ class EpisodeResolver:
         logger.info(
             f"Loaded {len(datasets)} datasets, skipped {len(skipped)} "
             f"(total scanned {total}) in {time.monotonic() - start_time:.1f}s"
-        )
-        return datasets
-
-    def _modal_fanout_load(
-        self,
-        search_path: Path,
-        valid_folder_names: set[str],
-        dataset_class,
-    ) -> dict:
-        """Fan out per-episode .zattrs reads across Modal containers via load_shard.
-
-        Worker returns picklable (path, hash, metadata) tuples; ZarrDataset is
-        constructed locally with precomputed_metadata so its eager zarr open is
-        skipped (deferred until first __getitem__).
-        """
-        import time
-
-        modal = _import_real_modal()
-
-        start_time = time.monotonic()
-        logger.info(f"Modal fan-out load: listing {search_path} (single readdir)...")
-        t0 = time.monotonic()
-        on_disk_names = []
-        for raw_name in os.listdir(search_path):
-            if raw_name.startswith("."):
-                continue
-            hash_name = raw_name[:-5] if raw_name.endswith(".zarr") else raw_name
-            if hash_name in valid_folder_names:
-                on_disk_names.append(raw_name)
-        total = len(on_disk_names)
-        logger.info(
-            f"Modal fan-out load: {total} target entries (of {len(valid_folder_names)} requested) "
-            f"in {time.monotonic() - t0:.1f}s"
-        )
-        if total == 0:
-            return {}
-
-        n_shards = min(int(os.environ.get("EGOMIMIC_LOAD_SHARDS", "100")), total)
-        shards = [on_disk_names[i::n_shards] for i in range(n_shards)]
-        shards = [s for s in shards if s]
-        total_shards = len(shards)
-
-        logger.info(
-            f"Modal fan-out load: {total} entries across {total_shards} shards "
-            f"(~{total // total_shards} per shard). Looking up load_shard function..."
-        )
-
-        fn = modal.Function.from_name(
-            "egomimic-scan", "load_shard", environment_name="robotics"
-        )
-        logger.info("Modal fan-out load: function lookup OK; launching .map()...")
-
-        datasets: dict = {}
-        skipped: list[str] = []
-        completed = 0
-        log_every = max(1, total_shards // 20)
-        for shard_result in fn.map(shards):
-            completed += 1
-            for path_str, episode_hash, metadata in shard_result:
-                if episode_hash not in valid_folder_names:
-                    continue
-                try:
-                    datasets[episode_hash] = dataset_class(
-                        Path(path_str),
-                        key_map=self.key_map,
-                        transform_list=self.transform_list,
-                        norm_stats=self.norm_stats,
-                        precomputed_metadata=metadata,
-                    )
-                except Exception as e:
-                    logger.error("Failed to construct dataset for %s: %s", path_str, e)
-                    skipped.append(episode_hash)
-            if completed % log_every == 0 or completed == total_shards:
-                elapsed = time.monotonic() - start_time
-                logger.info(
-                    f"Modal load: shard {completed}/{total_shards} done "
-                    f"| loaded={len(datasets)} skipped={len(skipped)} "
-                    f"| elapsed {elapsed:.0f}s"
-                )
-
-        logger.info(
-            f"Modal fan-out load complete: {len(datasets)} datasets "
-            f"(skipped {len(skipped)}) in {time.monotonic() - start_time:.1f}s "
-            f"({total_shards} shards)"
         )
         return datasets
 
@@ -640,6 +533,7 @@ class S3EpisodeResolver(EpisodeResolver):
 class LocalEpisodeResolver(EpisodeResolver):
     """
     Resolves episodes from local Zarr stores, filtering via local metadata.
+    No Modal-specific logic — for local or non-Modal use only.
     """
 
     def __init__(
@@ -648,6 +542,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         key_map: dict | None = None,
         transform_list: list | None = None,
         norm_stats: dict | None = None,
+        debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
     ):
         super().__init__(folder_path, key_map, transform_list, norm_stats=norm_stats)
@@ -715,73 +610,6 @@ class LocalEpisodeResolver(EpisodeResolver):
             logger.info("Debug mode: using first %d episodes", len(filtered))
 
         return filtered
-
-    @classmethod
-    def _modal_fanout_scan(
-        cls,
-        search_path: Path,
-        filters: DatasetFilter,
-        start_time: float,
-    ) -> list[tuple[str, str]]:
-        """Fan out the filter scan across Modal containers.
-
-        Lists candidate dir names locally (one fast syscall), shards them, and
-        invokes `egomimic-training::scan_shard` in parallel. Each worker mounts
-        the same zarr volume read-only and runs a thread-pooled .zattrs scan.
-        """
-        import time
-
-        modal = _import_real_modal()
-
-        # Single readdir syscall — no per-entry stat. Drop hidden files cheaply
-        # (string compare). Workers handle non-dir entries gracefully via
-        # exception-swallowing in _read_metadata, so we don't need is_dir() here.
-        logger.info(f"Modal fan-out scan: listing {search_path} (single readdir)...")
-        t0 = time.monotonic()
-        names = [n for n in os.listdir(search_path) if not n.startswith(".")]
-        total = len(names)
-        logger.info(
-            f"Modal fan-out scan: listed {total} entries in {time.monotonic() - t0:.1f}s"
-        )
-        if total == 0:
-            return []
-
-        n_shards = min(int(os.environ.get("EGOMIMIC_SCAN_SHARDS", "100")), total)
-        shards = [names[i::n_shards] for i in range(n_shards)]
-        shards = [s for s in shards if s]
-        total_shards = len(shards)
-
-        logger.info(
-            f"Modal fan-out scan: {total} entries across {total_shards} shards "
-            f"(~{total // total_shards} per shard). Looking up scan_shard function..."
-        )
-
-        fn = modal.Function.from_name(
-            "egomimic-scan", "scan_shard", environment_name="robotics"
-        )
-        logger.info("Modal fan-out scan: function lookup OK; launching .map()...")
-        filter_lambdas = list(filters.filter_lambdas)
-
-        matched: list[tuple[str, str]] = []
-        completed = 0
-        log_every = max(1, total_shards // 20)
-        for shard_result in fn.map(shards, [filter_lambdas] * total_shards):
-            completed += 1
-            matched.extend(shard_result)
-            if completed % log_every == 0 or completed == total_shards:
-                elapsed = time.monotonic() - start_time
-                logger.info(
-                    f"Modal scan: shard {completed}/{total_shards} done "
-                    f"| matched={len(matched)} | elapsed {elapsed:.0f}s"
-                )
-
-        logger.info(
-            f"Modal fan-out scan complete: {len(matched)} matches from {total} "
-            f"entries in {time.monotonic() - start_time:.1f}s "
-            f"({total_shards} shards)"
-        )
-        logger.info("Local filtered paths: %s", matched)
-        return matched
 
     def resolve(
         self,
@@ -852,14 +680,16 @@ class LocalEpisodeResolver(EpisodeResolver):
         return datasets
 
 
-class LocalSQLEpisodeResolver(EpisodeResolver):
+class ModalEpisodeResolver(EpisodeResolver):
     """
-    Resolves episodes by querying the SQL episode table and loading matching
-    zarr stores from a local volume directory.
+    Resolves episodes via SQL and loads from a locally-mounted Modal volume.
 
     Filtering happens on the SQL table (fast — no per-file zarr reads).
     Episodes present in the table but absent from the local volume are skipped
     with a warning, so a partially-synced volume still works.
+
+    This class is also the home for Modal-specific fan-out parallel container
+    methods (_modal_fanout_scan, _modal_fanout_load) used by other Modal code.
     """
 
     def __init__(
@@ -975,6 +805,161 @@ class LocalSQLEpisodeResolver(EpisodeResolver):
 
         logger.info("Loaded %d episodes from local volume", len(datasets))
         return datasets
+
+    # ------------------------------------------------------------------
+    # Modal fan-out helpers — parallel container code for Modal volume
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _modal_fanout_scan(
+        cls,
+        search_path: Path,
+        filters: DatasetFilter,
+        start_time: float,
+    ) -> list[tuple[str, str]]:
+        """Fan out a zarr metadata filter scan across Modal containers via scan_shard.
+
+        Lists candidate dir names locally (one fast readdir), shards them, and
+        invokes egomimic-scan::scan_shard in parallel.  Each worker mounts the
+        zarr volume read-only and runs a thread-pooled .zattrs scan.
+        """
+        import time
+
+        modal = _import_real_modal()
+
+        logger.info(f"Modal fan-out scan: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        names = [n for n in os.listdir(search_path) if not n.startswith(".")]
+        total = len(names)
+        logger.info(
+            f"Modal fan-out scan: listed {total} entries in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return []
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_SCAN_SHARDS", "100")), total)
+        shards = [names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out scan: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up scan_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "scan_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out scan: function lookup OK; launching .map()...")
+        filter_lambdas = list(filters.filter_lambdas)
+
+        matched: list[tuple[str, str]] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, [filter_lambdas] * total_shards):
+            completed += 1
+            matched.extend(shard_result)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal scan: shard {completed}/{total_shards} done "
+                    f"| matched={len(matched)} | elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out scan complete: {len(matched)} matches from {total} "
+            f"entries in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return matched
+
+    def _modal_fanout_load(
+        self,
+        search_path: Path,
+        valid_folder_names: set[str],
+        dataset_class,
+    ) -> dict:
+        """Fan out per-episode .zattrs reads across Modal containers via load_shard.
+
+        Worker returns picklable (path, hash, metadata) tuples; ZarrDataset is
+        constructed locally with precomputed_metadata so its zarr open is
+        deferred until first __getitem__.
+        """
+        import time
+
+        modal = _import_real_modal()
+
+        start_time = time.monotonic()
+        logger.info(f"Modal fan-out load: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        on_disk_names = []
+        for raw_name in os.listdir(search_path):
+            if raw_name.startswith("."):
+                continue
+            hash_name = raw_name[:-5] if raw_name.endswith(".zarr") else raw_name
+            if hash_name in valid_folder_names:
+                on_disk_names.append(raw_name)
+        total = len(on_disk_names)
+        logger.info(
+            f"Modal fan-out load: {total} target entries (of {len(valid_folder_names)} requested) "
+            f"in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return {}
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_LOAD_SHARDS", "100")), total)
+        shards = [on_disk_names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out load: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up load_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "load_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out load: function lookup OK; launching .map()...")
+
+        datasets: dict = {}
+        skipped: list[str] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards):
+            completed += 1
+            for path_str, episode_hash, metadata in shard_result:
+                if episode_hash not in valid_folder_names:
+                    continue
+                try:
+                    datasets[episode_hash] = dataset_class(
+                        Path(path_str),
+                        key_map=self.key_map,
+                        transform_list=self.transform_list,
+                        norm_stats=self.norm_stats,
+                        precomputed_metadata=metadata,
+                    )
+                except Exception as e:
+                    logger.error("Failed to construct dataset for %s: %s", path_str, e)
+                    skipped.append(episode_hash)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal load: shard {completed}/{total_shards} done "
+                    f"| loaded={len(datasets)} skipped={len(skipped)} "
+                    f"| elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out load complete: {len(datasets)} datasets "
+            f"(skipped {len(skipped)}) in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return datasets
+
+
+# Backward-compat alias — YAML configs that reference LocalSQLEpisodeResolver continue to work.
+LocalSQLEpisodeResolver = ModalEpisodeResolver
 
 
 class MultiDataset(torch.utils.data.Dataset):
@@ -1244,6 +1229,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         norm_stats: dict | None = None,
         _total_frames: int | None = None,
         _embodiment: str | None = None,
+        precomputed_metadata: dict | None = None,
     ):
         """
         Args:
@@ -1256,6 +1242,8 @@ class ZarrDataset(torch.utils.data.Dataset):
                 tracked key triggers the random index fallback.
             _total_frames: if provided (e.g. from SQL), skip zarr open at init and defer to first __getitem__.
             _embodiment: if provided alongside _total_frames, also skip zarr open at init.
+            precomputed_metadata: full .zattrs dict pre-loaded externally (e.g. from _modal_fanout_load).
+                When provided, skips zarr open at init and populates all metadata fields immediately.
         """
         self.episode_path = Episode_path
         self.metadata = None
@@ -1264,8 +1252,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._annotations = None
         self.episode_reader = None
 
-        if _total_frames is not None and _embodiment is not None:
-            # Fast path: metadata supplied externally — defer zarr open to first access
+        if precomputed_metadata is not None:
+            # Full metadata pre-loaded externally (e.g. from Modal fan-out load_shard)
+            self._init_from_metadata(precomputed_metadata)
+        elif _total_frames is not None and _embodiment is not None:
+            # Lightweight fast path from SQL — defer zarr open to first access
             self.total_frames = _total_frames
             self.embodiment = _embodiment
             self.keys_dict = {}

@@ -2,16 +2,12 @@
 
 Usage
 -----
-Via trainHydra.py (recommended):
-    python egomimic/trainHydra.py data=mecka_all_zarr trainer=ddp_modal \\
-        logger=wandb model=hpt_bc_flow_mecka name=<run> description=<desc> \\
-        [+modal_gpu=H100] [+modal_cpu=32] [+modal_memory_gb=128]
+Submit a training run (fire-and-forget):
+    python egomimic/modal/trainModal.py \\
+        data=mecka_all_zarr trainer=ddp_modal logger=wandb model=hpt_bc_flow_mecka \\
+        name=<run> description=<desc> [+modal_gpu=H100] [+modal_cpu=32] [+modal_memory_gb=128]
 
-Direct (fire-and-forget):
-    modal run --env robotics egomimic/modal/trainModal.py::submit -- \\
-        data=mecka_all_zarr trainer=ddp_modal logger=wandb model=hpt_bc_flow_mecka
-
-Direct (blocking — streams logs, downloads artifacts when done):
+Blocking run (streams logs, downloads artifacts when done):
     modal run --env robotics egomimic/modal/trainModal.py::run -- \\
         data=mecka_all_zarr trainer=ddp_modal logger=wandb model=hpt_bc_flow_mecka
 
@@ -41,6 +37,7 @@ if _HERE not in sys.path:
 from modal_setup import (  # noqa: E402
     CFG,
     REPO_ROOT,
+    _git_commit_and_push,
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
@@ -215,7 +212,7 @@ def verify() -> None:
 
 @app.local_entrypoint()
 def submit(*hydra_args: str) -> None:
-    """Fire-and-forget: spawn a training job and return immediately."""
+    """Fire-and-forget: spawn a training job from already-pushed commit."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
@@ -229,6 +226,74 @@ def submit(*hydra_args: str) -> None:
         "After completion, download artifacts:\n"
         "  modal volume get --env robotics egoverse-training-outputs <run-path> ./modal-outputs/"
     )
+
+
+if __name__ == "__main__":
+    """
+    Main submission entrypoint: python egomimic/modal/trainModal.py <hydra_args>
+
+    Parses +modal_gpu=, +modal_cpu=, +modal_memory_gb= from args, auto-commits
+    and pushes, then re-invokes `modal run trainModal.py::submit` as a subprocess
+    so CFG resource values are resolved after the env vars are set.
+
+    Examples:
+        python egomimic/modal/trainModal.py \\
+            data=mecka_all_zarr trainer=ddp_modal logger=wandb \\
+            model=hpt_bc_flow_mecka name=my_run description=test
+
+        python egomimic/modal/trainModal.py \\
+            data=mecka_all_zarr trainer=ddp_modal logger=wandb \\
+            model=hpt_bc_flow_mecka name=my_run description=test \\
+            +modal_gpu=H100 +modal_cpu=32 +modal_memory_gb=128
+    """
+    import subprocess
+
+    _MODAL_KEY_MAP = {
+        "modal_gpu": "MODAL_GPU",
+        "modal_cpu": "MODAL_CPU",
+        "modal_memory_gb": "MODAL_MEMORY_GB",
+        "modal_memory_mb": "MODAL_MEMORY_MB",
+        "modal_volume": "MODAL_ZARR_VOLUME",
+    }
+
+    modal_env = os.environ.copy()
+    container_overrides = []
+    gpu_count = 1
+
+    for arg in sys.argv[1:]:
+        key, sep, val = arg.lstrip("+").partition("=")
+        if sep and key in _MODAL_KEY_MAP:
+            modal_env[_MODAL_KEY_MAP[key]] = val
+            if key == "modal_gpu":
+                gpu_count = int(val.split(":")[1]) if ":" in val else 1
+        else:
+            container_overrides.append(arg)
+
+    # Keep DDP launcher in sync with requested GPU count
+    container_overrides = [
+        a for a in container_overrides
+        if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
+    ]
+    container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
+
+    gpu = modal_env.get("MODAL_GPU", "A100")
+    cpu = modal_env.get("MODAL_CPU", "12")
+    mem = modal_env.get("MODAL_MEMORY_GB") or str(
+        int(modal_env.get("MODAL_MEMORY_MB", "65536")) // 1024
+    )
+    print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB")
+
+    _git_commit_and_push(REPO_ROOT)
+
+    cmd = [
+        sys.executable, "-m", "modal", "run",
+        "--detach", "--env", "robotics",
+        str(Path(__file__).resolve()) + "::submit",
+        "--", *container_overrides,
+    ]
+    print(f"Dispatching: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env)
+    sys.exit(result.returncode)
 
 
 @app.local_entrypoint()

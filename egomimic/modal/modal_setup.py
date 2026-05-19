@@ -143,6 +143,27 @@ app = modal.App("egomimic-training", image=image)
 # ---------------------------------------------------------------------------
 
 
+def _git_commit_and_push(repo_root: Path) -> None:
+    """Auto-commit any local changes and push to remote before Modal submission."""
+    def _run(cmd):
+        return subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
+
+    if _run(["git", "status", "--porcelain"]).stdout.strip():
+        print("Auto-committing local changes before Modal submission...")
+        _run(["git", "add", "-A"])
+        result = _run(["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"])
+        if result.returncode != 0:
+            print(f"[git commit] {result.stderr.strip()}")
+
+    print("Pushing to remote...")
+    push = _run(["git", "push", "origin", "HEAD"])
+    if push.returncode != 0:
+        raise RuntimeError(
+            f"git push failed — cannot submit to Modal with unpushed changes:\n{push.stderr.strip()}"
+        )
+    print("Push complete.")
+
+
 def _local_wandb_key() -> str:
     """Read WANDB_API_KEY from the local environment or ~/.egoverse_env."""
     env_file = Path("~/.egoverse_env").expanduser()
