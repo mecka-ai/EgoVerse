@@ -200,6 +200,7 @@ def run_curate(
         cfg.data.train_datasets, resolve=False, throw_on_missing=False
     )
     all_paths: list = []
+    all_filter_lambdas: list[str] = []
     for ds_name, ds_cfg in train_datasets.items():
         resolver_cfg = (ds_cfg or {}).get("resolver") or {}
         folder_path = resolver_cfg.get("folder_path")
@@ -208,6 +209,7 @@ def run_curate(
         filter_lambdas = list(
             (((ds_cfg or {}).get("filters") or {}).get("filter_lambdas")) or []
         )
+        all_filter_lambdas.extend(filter_lambdas)
 
         exclude_hashes: set[str] = set()
         eps_to_ignore = resolver_cfg.get("eps_to_ignore")
@@ -281,6 +283,27 @@ def run_curate(
     for h in all_hashes:
         task = task_map.get(h, "unknown")
         by_task.setdefault(task, []).append((path_by_hash[h], h))
+
+    # Apply DataFrame-level filters (e.g. task-count filter) now that task names are known
+    if all_filter_lambdas:
+        import pandas as _pd
+        ep_df = _pd.DataFrame([
+            {"episode_hash": h, "task": task_map.get(h, "unknown")}
+            for h in all_hashes
+        ])
+        ep_df = DatasetFilter(all_filter_lambdas).filter_df(ep_df)
+        keep = set(ep_df["episode_hash"].tolist())
+        before_total = sum(len(p) for p in by_task.values())
+        by_task = {
+            task: [(p, h) for p, h in pairs if h in keep]
+            for task, pairs in by_task.items()
+        }
+        by_task = {task: pairs for task, pairs in by_task.items() if pairs}
+        after_total = sum(len(p) for p in by_task.values())
+        print(
+            f"[filter_df] {before_total} → {after_total} episodes after DataFrame-level filters "
+            f"({len(by_task)} tasks remaining)"
+        )
 
     n_tasks = len(by_task)
     summary = ", ".join(f"{t}:{len(p)}" for t, p in sorted(by_task.items())[:5])
