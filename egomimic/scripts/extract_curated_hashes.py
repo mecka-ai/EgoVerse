@@ -62,11 +62,18 @@ def extract(scores_by_task: dict, top_k: float) -> tuple[list[str], list[str]]:
         scored = [(h, s) for h, s in task_scores.items() if math.isfinite(s)]
         nan_eps = [h for h, s in task_scores.items() if not math.isfinite(s)]
 
-        # Scores are already sorted highest→lowest by curateModal.py
-        n_keep = max(1, math.ceil(len(scored) * top_k)) if scored else 0
-        top_hashes.extend(h for h, _ in scored[:n_keep])
         all_hashes.extend(h for h, _ in scored)
         all_hashes.extend(nan_eps)
+
+        if nan_eps:
+            # Task has unscored episodes — include everything (can't fairly rank)
+            top_hashes.extend(h for h, _ in scored)
+            top_hashes.extend(nan_eps)
+        else:
+            # All episodes scored — keep top k%
+            # Scores are already sorted highest→lowest by curateModal.py
+            n_keep = max(1, math.ceil(len(scored) * top_k)) if scored else 0
+            top_hashes.extend(h for h, _ in scored[:n_keep])
 
     return top_hashes, all_hashes
 
