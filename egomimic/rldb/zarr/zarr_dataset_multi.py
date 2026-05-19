@@ -744,6 +744,7 @@ class ModalEpisodeResolver(EpisodeResolver):
             df = df[df["episode_hash"].isin(self.include_hashes)]
             logger.info("eps_to_use: restricted to %d / %d episodes", len(df), before)
 
+        df = filters.filter_df(df)
         mask = df.apply(
             lambda row: filters.matches(_normalize_filter_row(row.to_dict())),
             axis=1,
