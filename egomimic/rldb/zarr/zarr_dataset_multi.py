@@ -991,6 +991,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
+        max_episodes: int | None = None,
     ):
         super().__init__(
             folder_path,
@@ -1000,6 +1001,7 @@ class ModalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
         )
         self.debug = debug
+        self.max_episodes = max_episodes
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
@@ -1044,6 +1046,10 @@ class ModalEpisodeResolver(EpisodeResolver):
             axis=1,
         )
         matched = df.loc[mask, ["episode_hash", "num_frames", "robot_name"]]
+        # Stable sort so any truncation (debug / max_episodes) yields the same
+        # pool across resolver instances (e.g. train vs valid datamodules)
+        # regardless of SQL row order.
+        matched = matched.sort_values("episode_hash").reset_index(drop=True)
         episode_hashes = matched["episode_hash"].tolist()
         logger.info("SQL filter matched %d episodes", len(episode_hashes))
 
@@ -1055,6 +1061,16 @@ class ModalEpisodeResolver(EpisodeResolver):
             matched = matched.iloc[:k]
             episode_hashes = matched["episode_hash"].tolist()
             logger.info("Debug mode: using first %d episodes", len(episode_hashes))
+
+        if self.max_episodes is not None and len(matched) > self.max_episodes:
+            before = len(matched)
+            matched = matched.iloc[: int(self.max_episodes)]
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info(
+                "max_episodes: truncated %d → %d episodes (hash-sorted)",
+                before,
+                len(matched),
+            )
 
         dataset_class = self._dataset_class or ZarrDataset
 
