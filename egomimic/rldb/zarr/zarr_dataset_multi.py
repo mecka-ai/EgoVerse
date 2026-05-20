@@ -864,6 +864,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
+        max_episodes: int | None = None,
         allowed_episode_ids: list[str] | None = None,
         max_episodes: int | None = None,
     ):
