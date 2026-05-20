@@ -7,8 +7,8 @@ Then `egomimic.rldb.zarr.zarr_dataset_multi._modal_fanout_scan` will look up
 `egomimic-scan::scan_shard` and fan out filter scans across many small
 CPU-only containers, each mounting the zarr volume read-only.
 
-Kept separate from `run.py` so the training app and the scan utility can be
-deployed independently — and so the scan workers use a minimal image (no
+Kept separate from `trainModal.py` so the training app and the scan utility can
+be deployed independently — and so the scan workers use a minimal image (no
 PyTorch / ML stack) for fast cold starts.
 
 Self-contained: no egomimic imports. The function mirrors
