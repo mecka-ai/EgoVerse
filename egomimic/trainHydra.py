@@ -1,15 +1,11 @@
 import copy
-import json
 import os
 import signal
-import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
 import lightning as L
 import torch
-from hydra.core.hydra_config import HydraConfig
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
@@ -28,199 +24,6 @@ from egomimic.utils.utils import extras, task_wrapper
 
 OmegaConf.register_new_resolver("eval", eval)
 log = RankedLogger(__name__, rank_zero_only=True)
-
-
-class ModalAutoRestartCallback(Callback):
-    """Saves a checkpoint and spawns a detached continuation job ~30 min before
-    the Modal container timeout, then stops the current run gracefully.
-
-    Requires these env vars (set by run.py):
-        MODAL_TIMEOUT_SECONDS   container timeout (e.g. 86400)
-        MODAL_START_TIME        unix timestamp when the container started
-        MODAL_HYDRA_ARGS        JSON-encoded list of the original hydra overrides
-        MODAL_GIT_REMOTE        remote URL used to clone the repo
-        MODAL_GIT_COMMIT        git SHA checked out in the container
-    """
-
-    _RESTART_MARGIN_SEC = 1800  # save + spawn 30 min before timeout
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._triggered = False
-        self._start = float(os.environ.get("MODAL_START_TIME", time.time()))
-        self._timeout = int(os.environ.get("MODAL_TIMEOUT_SECONDS", 86400))
-
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self._triggered:
-            return
-        remaining = self._timeout - (time.time() - self._start)
-        if remaining < self._RESTART_MARGIN_SEC:
-            self._triggered = True
-            self._auto_restart(trainer)
-
-    def _auto_restart(self, trainer: "Trainer") -> None:
-        ckpt_path = os.path.join(
-            trainer.default_root_dir, "checkpoints", "modal_auto_restart.ckpt"
-        )
-        trainer.save_checkpoint(ckpt_path)
-        log.info(f"[ModalAutoRestart] Checkpoint saved → {ckpt_path}")
-
-        # Grab the live WandB run ID so the continuation logs to the same run
-        wandb_run_id = None
-        for lgr in trainer.loggers:
-            if hasattr(lgr, "experiment") and hasattr(lgr.experiment, "id"):
-                wandb_run_id = lgr.experiment.id
-                break
-
-        # Build new hydra args: original args + updated ckpt_path + wandb_run_id
-        raw_args: list = json.loads(os.environ.get("MODAL_HYDRA_ARGS", "[]"))
-        new_args = [
-            a
-            for a in raw_args
-            if not a.startswith("ckpt_path=") and not a.startswith("wandb_run_id=")
-        ]
-        new_args.append(f"ckpt_path={ckpt_path}")
-        if wandb_run_id:
-            new_args.append(f"wandb_run_id={wandb_run_id}")
-
-        git_remote = os.environ.get("MODAL_GIT_REMOTE", "")
-        git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
-        wandb_api_key = os.environ.get("WANDB_API_KEY", "")
-
-        if trainer.is_global_zero:
-            try:
-                import modal as _modal
-
-                fn = _modal.Function.from_name(
-                    "egomimic-training",
-                    "run_hydra_train",
-                    environment_name="robotics",
-                )
-                handle = fn.spawn(
-                    tuple(new_args), git_remote, git_commit, wandb_api_key
-                )
-                log.info(f"[ModalAutoRestart] Spawned continuation: {handle.object_id}")
-            except Exception as exc:
-                log.error(f"[ModalAutoRestart] Failed to spawn continuation: {exc}")
-
-        trainer.should_stop = True
-        log.info(
-            "[ModalAutoRestart] Stopping current run — continuation job is running"
-        )
-
-
-def _git_commit_and_push(repo_root) -> None:
-    """Force-commit all active changes and push to remote before Modal submission."""
-    import subprocess
-
-    def _run(cmd, **kwargs):
-        return subprocess.run(
-            cmd, cwd=str(repo_root), capture_output=True, text=True, **kwargs
-        )
-
-    status = _run(["git", "status", "--porcelain"])
-    has_changes = bool(status.stdout.strip())
-
-    if has_changes:
-        print("Auto-committing local changes before Modal submission...")
-        _run(["git", "add", "-A"])
-        commit = _run(
-            ["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"]
-        )
-        if commit.returncode != 0:
-            print(f"[git commit] {commit.stderr.strip()}")
-
-    print("Pushing to remote...")
-    push = _run(["git", "push", "origin", "HEAD"])
-    if push.returncode != 0:
-        raise RuntimeError(
-            f"git push failed — cannot submit to Modal with unpushed changes:\n{push.stderr.strip()}"
-        )
-    print("Push complete.")
-
-
-def _submit_to_modal(cfg: DictConfig) -> None:
-    """Delegate to the modal CLI to submit a training job, then exit.
-
-    Uses subprocess so the modal package is imported in a clean process without
-    the egomimic/modal/ directory shadowing the installed modal package.
-
-    Supports these extra CLI overrides (stripped before forwarding to container):
-      +modal_gpu=H100          GPU type: A100, H100, A10G, A100:4 (4×A100), etc.
-      +modal_cpu=16            Number of CPU cores
-      +modal_memory_gb=128     RAM in GB  (or +modal_memory_mb=131072)
-    """
-    import subprocess
-    from pathlib import Path
-
-    repo_root = Path(__file__).resolve().parent.parent
-
-    _git_commit_and_push(repo_root)
-
-    # Env vars to forward to the modal subprocess (picked up by modal_config.py)
-    modal_env = os.environ.copy()
-
-    # Extract modal_* keys from Hydra overrides; pass the rest to the container
-    _MODAL_KEYS = {
-        "modal_gpu",
-        "modal_cpu",
-        "modal_memory_gb",
-        "modal_memory_mb",
-        "modal_volume",
-    }
-    container_overrides = []
-    gpu_count = 1
-    for override in HydraConfig.get().overrides.task:
-        # Strip leading +/++ sigils for key matching
-        key = override.lstrip("+").split("=")[0]
-        if key in _MODAL_KEYS:
-            val = override.split("=", 1)[1]
-            if key == "modal_gpu":
-                modal_env["MODAL_GPU"] = val
-                # Parse count from "A100:4" style specs
-                gpu_count = int(val.split(":")[1]) if ":" in val else 1
-            elif key == "modal_cpu":
-                modal_env["MODAL_CPU"] = val
-            elif key == "modal_memory_gb":
-                modal_env["MODAL_MEMORY_GB"] = val
-            elif key == "modal_memory_mb":
-                modal_env["MODAL_MEMORY_MB"] = val
-            elif key == "modal_volume":
-                modal_env["MODAL_ZARR_VOLUME"] = val
-        else:
-            container_overrides.append(override)
-
-    # Sync launch_params.gpus_per_node with the requested GPU count so DDP
-    # uses all available GPUs (devices: ${launch_params.gpus_per_node} in ddp_modal.yaml)
-    container_overrides = [
-        a
-        for a in container_overrides
-        if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
-    ]
-    container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "modal",
-        "run",
-        "--detach",
-        "--env",
-        "robotics",
-        "egomimic/modal/run.py::submit",
-        "--",
-        *container_overrides,
-    ]
-    gpu = modal_env.get("MODAL_GPU", "A100")
-    cpu = modal_env.get("MODAL_CPU", "12")
-    mem = modal_env.get("MODAL_MEMORY_GB") or str(
-        int(modal_env.get("MODAL_MEMORY_MB", "65536")) // 1024
-    )
-    vol = modal_env.get("MODAL_ZARR_VOLUME", "egoverse-zarr-data")
-    print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB  zarr_volume={vol}")
-    print(f"Submitting to Modal via: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=str(repo_root), env=modal_env)
-    sys.exit(result.returncode)
 
 
 def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
@@ -257,7 +60,7 @@ def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> Non
     log.info("Dataset frame counts:\n" + table)
 
 
-def _propagate_data_schematic_to_datasets(data_schematic, datasets):
+def _propagate_data_schematic_to_datasets(data_schematic, datasets, bounds_slack: float = 0.0):
     """
     Set the shared data schematic on all top-level datasets.
     """
@@ -267,7 +70,7 @@ def _propagate_data_schematic_to_datasets(data_schematic, datasets):
             raise ValueError(
                 f"{dataset_name} is not a MultiDataset. All top level datasets in data config should be MultiDataset"
             )
-        dataset.set_data_schematic(data_schematic)
+        dataset.set_data_schematic(data_schematic, bounds_slack=bounds_slack)
 
 
 @task_wrapper
@@ -347,9 +150,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if cfg.reject_outliers:
         # Propagate the shared data schematic to top-level MultiDatasets for bounds checks.
         # Use datamodule.train_datasets (null entries already filtered by the wrapper).
+        bounds_slack = float(OmegaConf.select(cfg, "reject_outliers_slack", default=0.0))
         _propagate_data_schematic_to_datasets(
             data_schematic,
             datamodule.train_datasets,
+            bounds_slack=bounds_slack,
         )
     viz_func = cfg.visualization
     viz_func_dict = {}
@@ -374,10 +179,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 
-    # Register Modal auto-restart callback when running inside a Modal container
-    if os.environ.get("MODAL_IS_REMOTE") == "1" and os.environ.get(
-        "MODAL_TIMEOUT_SECONDS"
-    ):
+    if os.environ.get("MODAL_IS_REMOTE") == "1" and os.environ.get("MODAL_TIMEOUT_SECONDS"):
+        from egomimic.modal.callbacks import ModalAutoRestartCallback
         callbacks.append(ModalAutoRestartCallback())
         log.info("[ModalAutoRestart] Callback registered")
 
@@ -517,22 +320,7 @@ def main(cfg: DictConfig) -> Optional[float]:
     # (e.g. ask for tags if none are provided in cfg, print cfg tree, etc.)
     extras(cfg)
 
-    # If trainer._modal is set and we're not already inside a Modal container,
-    # submit the job to Modal using the raw Hydra CLI overrides and exit.
-    if OmegaConf.select(cfg, "trainer._modal", default=False):
-        if os.environ.get("MODAL_IS_REMOTE") != "1":
-            try:
-                _submit_to_modal(cfg)
-            except ImportError:
-                raise RuntimeError(
-                    "trainer._modal=true requires the 'modal' package. "
-                    "Install it with: pip install modal"
-                )
-            return  # _submit_to_modal calls sys.exit, but keep for clarity
-
     print(OmegaConf.to_yaml(cfg))
-
-    # cfg = OmegaConf.resolve(cfg)
 
     # train the model
     metric_dict, _ = train(cfg)

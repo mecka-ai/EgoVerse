@@ -189,6 +189,24 @@ def episode_hash_to_table_row(engine, episode_hash):
     return TableRow(**row_data)
 
 
+def batch_get_task_names(engine, episode_hashes: list[str]) -> dict[str, str]:
+    """
+    Return {episode_hash: task} for all hashes found in app.episodes.
+
+    Uses a single ANY($1) query — safe for 100K+ hashes.
+    Missing hashes are simply absent from the returned dict.
+    """
+    if not episode_hashes:
+        return {}
+    episodes_tbl = _episodes_table(engine)
+    stmt = select(episodes_tbl.c.episode_hash, episodes_tbl.c.task).where(
+        episodes_tbl.c.episode_hash.in_(episode_hashes)
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(stmt).fetchall()
+    return {row[0]: row[1] for row in rows if row[1]}
+
+
 def delete_episodes(engine, episode_hashes: list[int]):
     episodes_tbl = _episodes_table(engine)
     with engine.begin() as conn:

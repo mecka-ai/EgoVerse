@@ -1,0 +1,38 @@
+# Top-level config for DemInf curation runs.
+#
+# Usage:
+#   python egomimic/trainHydra.py --config-name=curate \
+#       name=<run_name> description=<description>
+#
+# Override data or model inline:
+#   data=deminf_mecka model=deminf_default
+#
+# Submit to Modal:
+#   trainer._modal=true +modal_gpu=A100
+
+defaults:
+  - model: deminf_default
+  - data: deminf_mecka
+  - override hydra/launcher: submitit
+  - _self_
+
+mode: curate
+
+name: curate_test
+description: deminf_curation
+
+ckpt_path: null
+wandb_run_id: null
+
+# trainer._modal=true submits to Modal (CPU-heavy run_curate; KSG is CPU-bound).
+# The remaining trainer keys are unused — DemInfAlgo has no Lightning Trainer.
+trainer:
+  _modal: false
+
+hydra:
+  run:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+
+seed: 42

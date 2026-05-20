@@ -1,0 +1,30 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# DemInf curation data config — no train/valid split, all episodes scored.
+# Used exclusively by curate.yaml / run_curate_cmd.
+# To run on the full dataset: remove debug and eps_to_ignore overrides.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pause_removal_epsilon: 0.005
+      eps_to_ignore: egomimic/hydra_configs/data/extra/failures.json
+    filters:
+      _target_: egomimic.rldb.filters.DatasetFilter
+      filter_lambdas:
+        - "lambda df: df[df['task'].map(df['task'].value_counts()) > 15]"
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 30
