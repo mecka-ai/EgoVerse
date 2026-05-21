@@ -212,9 +212,18 @@ class ModelWrapper(LightningModule):
         """
         if self.evaluator is None:
             return
+        # When val_dataloader returns a *list* of CombinedLoaders (the
+        # train-split eval pass), Lightning's fetcher doesn't unwrap each
+        # inner CombinedLoader's (batch, batch_idx, sub_dataloader_idx)
+        # tuple, so `batch` arrives here as that 3-tuple rather than the
+        # raw dict. Unwrap defensively so process_batch_for_training (which
+        # expects a {embodiment: ...} dict) keeps working.
+        if isinstance(batch, tuple) and len(batch) == 3 and isinstance(batch[0], dict):
+            batch = batch[0]
         batch = self.model.process_batch_for_training(batch)
         print(
-            f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}",
+            f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}, "
+            f"dataloader_idx={dataloader_idx}",
             flush=True,
         )
         self.evaluator.on_validation_step(batch, batch_idx, dataloader_idx)
