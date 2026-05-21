@@ -166,9 +166,15 @@ def pause_precompute_shard(
 ) -> list[tuple[str, int, list[int]]]:
     """Compute per-episode pause keep_indices for a shard.
 
+    Mirrors ``egomimic.rldb.zarr.zarr_dataset_multi._build_pause_keep_mask`` —
+    keep them in sync. Self-contained on purpose: the worker image is
+    debian_slim + zarr + numpy with no egomimic install, so cold starts stay
+    in the few-hundred-MB range.
+
     Args:
         episodes: list of (episode_hash, episode_path_str).
-        epsilon: L2 threshold for the "frame is paused" test (m, per hand).
+        epsilon: L2 threshold for the "frame is paused" test (m, per hand /
+            per landmark).
 
     Returns:
         list of (episode_hash, raw_total_frames, keep_indices). For episodes
@@ -180,18 +186,32 @@ def pause_precompute_shard(
     import numpy as np
     import zarr
 
-    LEFT_KEY = "left.obs_ee_pose"
-    RIGHT_KEY = "right.obs_ee_pose"
+    LEFT_POSE = "left.obs_ee_pose"
+    RIGHT_POSE = "right.obs_ee_pose"
+    LEFT_KP = "left.obs_keypoints"
+    RIGHT_KP = "right.obs_keypoints"
 
     zarr_volume.reload()
 
-    def _mask(left_pose, right_pose):
+    def _kp_max_delta(kp):
+        T = kp.shape[0]
+        if T < 2 or kp.ndim != 2 or kp.shape[1] % 3 != 0 or kp.shape[1] == 0:
+            return np.zeros(max(T - 1, 0))
+        n_landmarks = kp.shape[1] // 3
+        diff = np.diff(kp.reshape(T, n_landmarks, 3), axis=0)
+        return np.linalg.norm(diff, axis=-1).max(axis=-1)
+
+    def _mask(left_pose, right_pose, left_kp=None, right_kp=None):
         T = len(left_pose)
         if T < 2:
             return np.ones(T, dtype=bool)
         left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
         right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
         is_paused = (left_d < epsilon) & (right_d < epsilon)
+        if left_kp is not None and len(left_kp) == T:
+            is_paused = is_paused & (_kp_max_delta(np.asarray(left_kp)) < epsilon)
+        if right_kp is not None and len(right_kp) == T:
+            is_paused = is_paused & (_kp_max_delta(np.asarray(right_kp)) < epsilon)
         keep = np.ones(T, dtype=bool)
         in_pause = False
         for t in range(1, T):
@@ -208,12 +228,23 @@ def pause_precompute_shard(
         episode_hash, path_str = item
         try:
             store = zarr.open_group(path_str, mode="r")
-            left = np.asarray(store[LEFT_KEY][:])
-            right = np.asarray(store[RIGHT_KEY][:])
+            left = np.asarray(store[LEFT_POSE][:])
+            right = np.asarray(store[RIGHT_POSE][:])
         except Exception:
             return (episode_hash, 0, [])
+        # Keypoints are optional — older episodes / non-MECKA embodiments may
+        # not have them; the detector degrades to ee_pose-only.
+        left_kp = right_kp = None
         try:
-            keep = _mask(left, right)
+            left_kp = np.asarray(store[LEFT_KP][:])
+        except (KeyError, Exception):
+            pass
+        try:
+            right_kp = np.asarray(store[RIGHT_KP][:])
+        except (KeyError, Exception):
+            pass
+        try:
+            keep = _mask(left, right, left_kp, right_kp)
             indices = np.flatnonzero(keep).astype(np.int64).tolist()
             return (episode_hash, int(left.shape[0]), indices)
         except Exception:
