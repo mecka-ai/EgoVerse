@@ -398,17 +398,19 @@ class EpisodeResolver:
     def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
         """Fan out per-episode precompute to pause_precompute_shard.
 
-        Worker is a function on the training app (egomimic-training), not a
-        separately-deployed app. We get a reference by importing it directly
-        from modal_setup after fixing the egomimic.modal-vs-SDK shadowing.
+        Worker lives on the training app (egomimic-training), not a separate
+        companion app. Lookup is by name so it resolves to the deployed
+        version of egomimic-training — direct in-process imports give an
+        un-hydrated function object from a trainHydra.py subprocess.
+
+        Workflow: ``modal deploy egomimic/modal/trainModal.py`` once (or
+        whenever modal_setup.py's worker or its image changes); subsequent
+        ``modal run --detach trainModal.py::submit`` calls reuse the
+        deployed worker for fan-out.
         """
         import time
 
-        # Ensure the real Modal SDK is in sys.modules before importing
-        # modal_setup, whose top-level `import modal` would otherwise resolve
-        # to the egomimic.modal subpackage inside a trainHydra.py subprocess.
-        _import_real_modal()
-        from egomimic.modal.modal_setup import pause_precompute_shard
+        modal_sdk = _import_real_modal()
 
         t0 = time.monotonic()
 
@@ -423,9 +425,13 @@ class EpisodeResolver:
 
         logger.info(
             "Pause precompute via Modal fan-out (same-app worker): "
-            "%d episodes across %d shards",
+            "%d episodes across %d shards — "
+            "looking up egomimic-training::pause_precompute_shard...",
             n,
             total_shards,
+        )
+        fn = modal_sdk.Function.from_name(
+            "egomimic-training", "pause_precompute_shard", environment_name="robotics"
         )
         epsilons = [self.pause_removal_epsilon] * total_shards
 
@@ -434,7 +440,7 @@ class EpisodeResolver:
         n_errs = 0
         completed = 0
         log_every = max(1, total_shards // 20)
-        for shard_result in pause_precompute_shard.map(shards, epsilons):
+        for shard_result in fn.map(shards, epsilons):
             completed += 1
             for episode_hash, raw_total, indices in shard_result:
                 ds = datasets.get(episode_hash)
