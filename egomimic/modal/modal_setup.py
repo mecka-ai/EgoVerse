@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -76,7 +75,9 @@ image = (
     # import it at module-load time (before the repo is cloned via _prepare_repo).
     # Path(__file__).parent resolves to /root/ in the container, so:
     #   from modal_setup import (...)  works in both local and remote contexts.
-    .add_local_file(Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True)
+    .add_local_file(
+        Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
+    )
     .pip_install(
         "lightning",
         "hydra-core",
@@ -139,19 +140,109 @@ app = modal.App("egomimic-training", image=image)
 
 
 # ---------------------------------------------------------------------------
+# Pause-precompute fan-out worker
+# ---------------------------------------------------------------------------
+# Lives on the training app so trainHydra.py (running inside run_hydra_train)
+# can .map() it without depending on a separately-deployed companion app.
+# The image is intentionally minimal — zarr + numpy only, no egomimic imports
+# — so cold starts are fast (each shard is a few seconds of I/O + numpy).
+
+pause_precompute_image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "zarr==3.1.5", "numpy"
+)
+
+
+@app.function(
+    image=pause_precompute_image,
+    cpu=2.0,
+    memory=4096,
+    timeout=900,
+    volumes={"/mnt/zarr-data": zarr_volume},
+    max_containers=100,
+)
+def pause_precompute_shard(
+    episodes: list[tuple[str, str]],
+    epsilon: float,
+) -> list[tuple[str, int, list[int]]]:
+    """Compute per-episode pause keep_indices for a shard.
+
+    Args:
+        episodes: list of (episode_hash, episode_path_str).
+        epsilon: L2 threshold for the "frame is paused" test (m, per hand).
+
+    Returns:
+        list of (episode_hash, raw_total_frames, keep_indices). For episodes
+        missing the obs_ee_pose keys or that fail to open, raw is 0 and
+        indices is empty — the caller treats this as "skip".
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import numpy as np
+    import zarr
+
+    LEFT_KEY = "left.obs_ee_pose"
+    RIGHT_KEY = "right.obs_ee_pose"
+
+    zarr_volume.reload()
+
+    def _mask(left_pose, right_pose):
+        T = len(left_pose)
+        if T < 2:
+            return np.ones(T, dtype=bool)
+        left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
+        right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
+        is_paused = (left_d < epsilon) & (right_d < epsilon)
+        keep = np.ones(T, dtype=bool)
+        in_pause = False
+        for t in range(1, T):
+            if is_paused[t - 1]:
+                if in_pause:
+                    keep[t] = False
+                else:
+                    in_pause = True
+            else:
+                in_pause = False
+        return keep
+
+    def _one(item):
+        episode_hash, path_str = item
+        try:
+            store = zarr.open_group(path_str, mode="r")
+            left = np.asarray(store[LEFT_KEY][:])
+            right = np.asarray(store[RIGHT_KEY][:])
+        except Exception:
+            return (episode_hash, 0, [])
+        try:
+            keep = _mask(left, right)
+            indices = np.flatnonzero(keep).astype(np.int64).tolist()
+            return (episode_hash, int(left.shape[0]), indices)
+        except Exception:
+            return (episode_hash, 0, [])
+
+    out: list[tuple[str, int, list[int]]] = []
+    with ThreadPoolExecutor(max_workers=64) as ex:
+        for r in ex.map(_one, episodes):
+            out.append(r)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Local helpers
 # ---------------------------------------------------------------------------
 
 
 def _git_commit_and_push(repo_root: Path) -> None:
     """Auto-commit any local changes and push to remote before Modal submission."""
+
     def _run(cmd):
         return subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
 
     if _run(["git", "status", "--porcelain"]).stdout.strip():
         print("Auto-committing local changes before Modal submission...")
         _run(["git", "add", "-A"])
-        result = _run(["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"])
+        result = _run(
+            ["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"]
+        )
         if result.returncode != 0:
             print(f"[git commit] {result.stderr.strip()}")
 
@@ -229,7 +320,7 @@ def _resolve_git_state() -> tuple[str, str, bool]:
 def _ssh_to_https(url: str) -> str:
     """Convert git@github.com:org/repo.git → https://github.com/org/repo.git"""
     if url.startswith("git@github.com:"):
-        path = url[len("git@github.com:"):]
+        path = url[len("git@github.com:") :]
         return f"https://github.com/{path}"
     return url
 
@@ -261,7 +352,15 @@ def _prepare_repo(git_remote: str, git_commit: str) -> None:
         ["git", "-C", CFG.remote_repo_dir, "checkout", git_commit], check=True
     )
     subprocess.run(
-        ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init", "--recursive"],
+        [
+            "git",
+            "-C",
+            CFG.remote_repo_dir,
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
         check=True,
     )
     subprocess.run(
@@ -285,7 +384,14 @@ def _prepare_repo_light(git_remote: str, git_commit: str) -> None:
             )
         else:
             subprocess.run(
-                ["git", "clone", "--depth=1", "--no-recurse-submodules", clone_url, str(repo_dir)],
+                [
+                    "git",
+                    "clone",
+                    "--depth=1",
+                    "--no-recurse-submodules",
+                    clone_url,
+                    str(repo_dir),
+                ],
                 check=True,
             )
 
