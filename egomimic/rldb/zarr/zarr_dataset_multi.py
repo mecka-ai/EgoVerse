@@ -330,6 +330,10 @@ class EpisodeResolver:
             thread pool.
           - Otherwise (local dev, or no pre-train fan-out happened), do the
             whole thing in-process.
+
+        The Modal fan-out itself lives in trainModal._precompute_pause_to_cache
+        — it has to run from a hydrated function context, which this
+        subprocess does not have.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
@@ -866,7 +870,6 @@ class ModalEpisodeResolver(EpisodeResolver):
         eps_to_use: str | None = None,
         max_episodes: int | None = None,
         allowed_episode_ids: list[str] | None = None,
-        max_episodes: int | None = None,
     ):
         super().__init__(
             folder_path,
@@ -896,11 +899,16 @@ class ModalEpisodeResolver(EpisodeResolver):
             )
             logger.info("allowed_episode_ids: restricted to %d episodes", len(self.include_hashes))
 
-    def resolve(
+    def _resolve_episode_meta(
         self,
         filters: DatasetFilter | None = None,
-        **kwargs,
-    ) -> dict[str, "ZarrDataset"]:
+    ) -> list[tuple[str, Path, int, str]]:
+        """Resolve episodes from SQL + filters → (hash, local_path, num_frames, robot_name).
+
+        No zarr opens, no ZarrDataset construction. Used by both resolve()
+        (which goes on to build datasets) and the pre-train precompute step
+        in trainModal.run_hydra_train (which only needs episode paths).
+        """
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -933,39 +941,31 @@ class ModalEpisodeResolver(EpisodeResolver):
         # pool across resolver instances (e.g. train vs valid datamodules)
         # regardless of SQL row order.
         matched = matched.sort_values("episode_hash").reset_index(drop=True)
-        episode_hashes = matched["episode_hash"].tolist()
-        logger.info("SQL filter matched %d episodes", len(episode_hashes))
+        logger.info("SQL filter matched %d episodes", len(matched))
 
-        if not episode_hashes:
+        if matched.empty:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            episode_hashes = matched["episode_hash"].tolist()
-            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
+            logger.info("Debug mode: using first %d episodes", len(matched))
 
         if self.max_episodes is not None and len(matched) > self.max_episodes:
             before = len(matched)
             matched = matched.iloc[: int(self.max_episodes)]
-            episode_hashes = matched["episode_hash"].tolist()
             logger.info(
                 "max_episodes: truncated %d → %d episodes (hash-sorted)",
                 before,
                 len(matched),
             )
 
-        dataset_class = self._dataset_class or ZarrDataset
-
-        # Build a lookup from episode_hash → (num_frames, robot_name) from SQL
-        meta_lookup = {
-            row["episode_hash"]: (int(row["num_frames"]), str(row["robot_name"]))
-            for _, row in matched.iterrows()
-        }
-
-        datasets: dict[str, ZarrDataset] = {}
+        out: list[tuple[str, Path, int, str]] = []
         n_missing = 0
-        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
+        for _, row in matched.iterrows():
+            episode_hash = row["episode_hash"]
+            num_frames = int(row["num_frames"])
+            robot_name = str(row["robot_name"])
             local_path = next(
                 (
                     p
@@ -981,6 +981,26 @@ class ModalEpisodeResolver(EpisodeResolver):
                 n_missing += 1
                 logger.warning("Episode not found locally, skipping: %s", episode_hash)
                 continue
+            out.append((episode_hash, local_path, num_frames, robot_name))
+
+        if n_missing:
+            logger.info("Skipped %d episodes not present in local volume", n_missing)
+        if not out:
+            raise ValueError(
+                "No episodes resolved — all SQL-matched episodes are missing from the local volume."
+            )
+        return out
+
+    def resolve(
+        self,
+        filters: DatasetFilter | None = None,
+        **kwargs,
+    ) -> dict[str, "ZarrDataset"]:
+        meta = self._resolve_episode_meta(filters)
+        dataset_class = self._dataset_class or ZarrDataset
+
+        datasets: dict[str, ZarrDataset] = {}
+        for episode_hash, local_path, num_frames, robot_name in meta:
             datasets[episode_hash] = dataset_class(
                 local_path,
                 key_map=self.key_map,
@@ -989,14 +1009,6 @@ class ModalEpisodeResolver(EpisodeResolver):
                 pause_removal_epsilon=self.pause_removal_epsilon,
                 _total_frames=num_frames,
                 _embodiment=robot_name,
-            )
-
-        if n_missing:
-            logger.info("Skipped %d episodes not present in local volume", n_missing)
-
-        if not datasets:
-            raise ValueError(
-                "No episodes loaded — all SQL-matched episodes are missing from the local volume."
             )
 
         logger.info("Loaded %d episodes from local volume", len(datasets))
