@@ -93,40 +93,7 @@ def _build_pause_keep_mask(
     return keep
 
 
-def _import_real_modal():
-    """Return the installed Modal SDK, working around egomimic.modal shadowing.
-
-    When trainHydra.py runs as `python /root/EgoVerse/egomimic/trainHydra.py`,
-    Python puts /root/EgoVerse/egomimic on sys.path[0], which makes a bare
-    `import modal` resolve to the egomimic.modal subpackage. This helper:
-      1. Returns the cached real SDK if one is already in sys.modules.
-      2. Otherwise strips egomimic from sys.path and re-imports.
-
-    Important: we do NOT pop `modal` from sys.modules once the real SDK is
-    cached there — re-importing produces a fresh top-level module that no
-    longer carries the lazily-attached submodules (modal._grpc_client, etc.),
-    breaking subsequent fn.map() calls.
-    """
-    import sys
-
-    existing = sys.modules.get("modal")
-    if existing is not None and hasattr(existing, "Function"):
-        return existing
-
-    _orig_path = list(sys.path)
-    sys.path = [p for p in sys.path if Path(p).name != "egomimic"]
-    sys.modules.pop("modal", None)
-    try:
-        import modal as _modal
-    finally:
-        sys.path = _orig_path
-
-    if not hasattr(_modal, "Function"):
-        raise RuntimeError(
-            "Imported `modal` has no `Function` attribute — "
-            "egomimic.modal subpackage is still shadowing the installed Modal SDK"
-        )
-    return _modal
+PAUSE_PRECOMPUTE_CACHE_ENV = "EGOMIMIC_PAUSE_PRECOMPUTE_CACHE"
 
 
 def split_dataset_names(dataset_names, valid_ratio=0.2, seed=SEED):
@@ -319,40 +286,74 @@ class EpisodeResolver:
     def _run_pause_precompute(self, datasets: dict) -> None:
         """Run per-episode pause precompute; no-op if epsilon is None.
 
-        Inside a Modal training container with the zarr volume mounted, fan out
-        to `egomimic.modal.modal_setup.pause_precompute_shard` (a function on
-        the training app — same app, no separately-deployed worker). Otherwise,
-        run in-process with a thread pool.
+        Two paths:
+          - If $EGOMIMIC_PAUSE_PRECOMPUTE_CACHE points at a JSON file produced
+            by trainModal.run_hydra_train (which fans out to the Modal worker
+            before launching this subprocess), load keep_indices from there.
+            Episodes missing from the cache fall through to the in-process
+            thread pool.
+          - Otherwise (local dev, or no pre-train fan-out happened), do the
+            whole thing in-process.
+
+        The Modal fan-out itself lives in trainModal._precompute_pause_to_cache
+        — it has to run from a hydrated function context, which this
+        subprocess does not have.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
 
-        if self._should_use_modal_pause_precompute(datasets):
-            try:
-                self._modal_fanout_pause_precompute(datasets)
-                return
-            except Exception as e:
-                logger.warning(
-                    "Modal pause precompute fan-out failed (%s) — "
-                    "falling back to in-process thread pool",
-                    e,
-                )
+        cache_path = os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
+        if cache_path and Path(cache_path).is_file():
+            remaining = self._apply_pause_precompute_cache(cache_path, datasets)
+            if remaining:
+                self._inprocess_pause_precompute(remaining)
+            return
 
         self._inprocess_pause_precompute(datasets)
 
-    @staticmethod
-    def _should_use_modal_pause_precompute(datasets: dict) -> bool:
-        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
-            os.environ.get("MODAL_TASK_ID")
+    def _apply_pause_precompute_cache(self, cache_path: str, datasets: dict) -> dict:
+        """Populate keep_indices from the cache JSON; return cache-miss subset.
+
+        Cache JSON shape: ``{episode_hash: {"raw_total": int, "keep_indices": [int]}}``.
+        Entries with raw_total == 0 (worker had an error reading the episode)
+        are treated as misses so the in-process fallback can retry.
+        """
+        import json
+        import time
+
+        t0 = time.monotonic()
+        with open(cache_path) as f:
+            cache = json.load(f)
+
+        n_hit = 0
+        n_total = 0
+        n_kept = 0
+        miss: dict = {}
+        for episode_hash, ds in datasets.items():
+            entry = cache.get(episode_hash)
+            if entry is None or int(entry.get("raw_total", 0)) == 0:
+                miss[episode_hash] = ds
+                continue
+            ds._raw_total_frames = int(entry["raw_total"])
+            ds.keep_indices = np.asarray(entry["keep_indices"], dtype=np.int64)
+            n_hit += 1
+            n_total += int(entry["raw_total"])
+            n_kept += len(entry["keep_indices"])
+
+        elapsed = time.monotonic() - t0
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        logger.info(
+            "Pause precompute via cache (%s): %d hits, %d misses | "
+            "kept %d/%d frames (%.1f%%) in %.2fs",
+            cache_path,
+            n_hit,
+            len(miss),
+            n_kept,
+            n_total,
+            pct,
+            elapsed,
         )
-        if not inside_modal:
-            return False
-        if os.environ.get("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE") == "1":
-            return False
-        return any(
-            str(getattr(ds, "episode_path", "")).startswith("/mnt/zarr-data")
-            for ds in datasets.values()
-        )
+        return miss
 
     def _inprocess_pause_precompute(self, datasets: dict) -> None:
         import time
@@ -394,93 +395,6 @@ class EpisodeResolver:
             sample = [r for r in results if r[3] is not None][:5]
             for name, _, _, err in sample:
                 logger.warning("Pause precompute failed for %s: %s", name, err)
-
-    def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
-        """Fan out per-episode precompute to pause_precompute_shard.
-
-        Worker lives on the training app (egomimic-training), not a separate
-        companion app. Lookup is by name so it resolves to the deployed
-        version of egomimic-training — direct in-process imports give an
-        un-hydrated function object from a trainHydra.py subprocess.
-
-        Workflow: ``modal deploy egomimic/modal/trainModal.py`` once (or
-        whenever modal_setup.py's worker or its image changes); subsequent
-        ``modal run --detach trainModal.py::submit`` calls reuse the
-        deployed worker for fan-out.
-        """
-        import time
-
-        modal_sdk = _import_real_modal()
-
-        t0 = time.monotonic()
-
-        work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
-        n = len(work)
-        n_shards = min(
-            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
-        )
-        shards = [work[i::n_shards] for i in range(n_shards)]
-        shards = [s for s in shards if s]
-        total_shards = len(shards)
-
-        logger.info(
-            "Pause precompute via Modal fan-out (same-app worker): "
-            "%d episodes across %d shards — "
-            "looking up egomimic-training::pause_precompute_shard...",
-            n,
-            total_shards,
-        )
-        fn = modal_sdk.Function.from_name(
-            "egomimic-training", "pause_precompute_shard", environment_name="robotics"
-        )
-        epsilons = [self.pause_removal_epsilon] * total_shards
-
-        n_total = 0
-        n_kept = 0
-        n_errs = 0
-        completed = 0
-        log_every = max(1, total_shards // 20)
-        for shard_result in fn.map(shards, epsilons):
-            completed += 1
-            for episode_hash, raw_total, indices in shard_result:
-                ds = datasets.get(episode_hash)
-                if ds is None:
-                    n_errs += 1
-                    continue
-                if raw_total == 0:
-                    n_errs += 1
-                    continue
-                ds._raw_total_frames = int(raw_total)
-                ds.keep_indices = np.asarray(indices, dtype=np.int64)
-                n_total += raw_total
-                n_kept += len(indices)
-            if completed % log_every == 0 or completed == total_shards:
-                elapsed = time.monotonic() - t0
-                logger.info(
-                    "Pause precompute via Modal: shard %d/%d done | kept=%d/%d "
-                    "errors=%d | elapsed %.0fs",
-                    completed,
-                    total_shards,
-                    n_kept,
-                    n_total,
-                    n_errs,
-                    elapsed,
-                )
-
-        elapsed = time.monotonic() - t0
-        pct = (100.0 * n_kept / n_total) if n_total else 100.0
-        logger.info(
-            "Pause precompute via Modal fan-out complete (epsilon=%s): kept %d/%d "
-            "frames (%.1f%%) across %d episodes in %.1fs (errors=%d, shards=%d)",
-            self.pause_removal_epsilon,
-            n_kept,
-            n_total,
-            pct,
-            n,
-            elapsed,
-            n_errs,
-            total_shards,
-        )
 
     @classmethod
     def _episode_already_present(cls, local_dir: Path, episode_hash: str) -> bool:
@@ -943,11 +857,16 @@ class ModalEpisodeResolver(EpisodeResolver):
                 "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
             )
 
-    def resolve(
+    def _resolve_episode_meta(
         self,
         filters: DatasetFilter | None = None,
-        **kwargs,
-    ) -> dict[str, "ZarrDataset"]:
+    ) -> list[tuple[str, Path, int, str]]:
+        """Resolve episodes from SQL + filters → (hash, local_path, num_frames, robot_name).
+
+        No zarr opens, no ZarrDataset construction. Used by both resolve()
+        (which goes on to build datasets) and the pre-train precompute step
+        in trainModal.run_hydra_train (which only needs episode paths).
+        """
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -976,29 +895,22 @@ class ModalEpisodeResolver(EpisodeResolver):
             axis=1,
         )
         matched = df.loc[mask, ["episode_hash", "num_frames", "robot_name"]]
-        episode_hashes = matched["episode_hash"].tolist()
-        logger.info("SQL filter matched %d episodes", len(episode_hashes))
+        logger.info("SQL filter matched %d episodes", len(matched))
 
-        if not episode_hashes:
+        if matched.empty:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            episode_hashes = matched["episode_hash"].tolist()
-            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
+            logger.info("Debug mode: using first %d episodes", len(matched))
 
-        dataset_class = self._dataset_class or ZarrDataset
-
-        # Build a lookup from episode_hash → (num_frames, robot_name) from SQL
-        meta_lookup = {
-            row["episode_hash"]: (int(row["num_frames"]), str(row["robot_name"]))
-            for _, row in matched.iterrows()
-        }
-
-        datasets: dict[str, ZarrDataset] = {}
+        out: list[tuple[str, Path, int, str]] = []
         n_missing = 0
-        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
+        for _, row in matched.iterrows():
+            episode_hash = row["episode_hash"]
+            num_frames = int(row["num_frames"])
+            robot_name = str(row["robot_name"])
             local_path = next(
                 (
                     p
@@ -1014,6 +926,26 @@ class ModalEpisodeResolver(EpisodeResolver):
                 n_missing += 1
                 logger.warning("Episode not found locally, skipping: %s", episode_hash)
                 continue
+            out.append((episode_hash, local_path, num_frames, robot_name))
+
+        if n_missing:
+            logger.info("Skipped %d episodes not present in local volume", n_missing)
+        if not out:
+            raise ValueError(
+                "No episodes resolved — all SQL-matched episodes are missing from the local volume."
+            )
+        return out
+
+    def resolve(
+        self,
+        filters: DatasetFilter | None = None,
+        **kwargs,
+    ) -> dict[str, "ZarrDataset"]:
+        meta = self._resolve_episode_meta(filters)
+        dataset_class = self._dataset_class or ZarrDataset
+
+        datasets: dict[str, ZarrDataset] = {}
+        for episode_hash, local_path, num_frames, robot_name in meta:
             datasets[episode_hash] = dataset_class(
                 local_path,
                 key_map=self.key_map,
@@ -1022,14 +954,6 @@ class ModalEpisodeResolver(EpisodeResolver):
                 pause_removal_epsilon=self.pause_removal_epsilon,
                 _total_frames=num_frames,
                 _embodiment=robot_name,
-            )
-
-        if n_missing:
-            logger.info("Skipped %d episodes not present in local volume", n_missing)
-
-        if not datasets:
-            raise ValueError(
-                "No episodes loaded — all SQL-matched episodes are missing from the local volume."
             )
 
         logger.info("Loaded %d episodes from local volume", len(datasets))
