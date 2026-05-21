@@ -129,6 +129,12 @@ def _precompute_pause_to_cache(hydra_args: tuple[str, ...]) -> str | None:
     import json as _json_local
     import time as _time_local
 
+    # _prepare_repo ran `pip install -e .` in a subprocess; the current process
+    # doesn't pick up that editable install via its already-loaded sys.path, so
+    # prepend the cloned repo so `import egomimic` resolves to the source tree.
+    if CFG.remote_repo_dir not in sys.path:
+        sys.path.insert(0, CFG.remote_repo_dir)
+
     try:
         from hydra import compose, initialize_config_dir
         from hydra.utils import instantiate
@@ -152,7 +158,11 @@ def _precompute_pause_to_cache(hydra_args: tuple[str, ...]) -> str | None:
         return None
 
     # Walk train_datasets + valid_datasets, build (resolver, filters) pairs
-    from egomimic.rldb.zarr.zarr_dataset_multi import ModalEpisodeResolver
+    try:
+        from egomimic.rldb.zarr.zarr_dataset_multi import ModalEpisodeResolver
+    except ModuleNotFoundError as e:
+        print(f"[pause-precompute] egomimic import failed ({e}); skipping fan-out")
+        return None
 
     work_by_eps: dict[float, dict[str, str]] = {}
     seen_blocks = 0
