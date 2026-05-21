@@ -71,6 +71,7 @@ class MultiDataModuleWrapper(LightningDataModule):
         proprio: bool = False,
         embodiment_label: bool = False,
         control_mode: dict[str, str] | None = None,
+        include_train_split_in_val: bool = False,
     ):
         """
         Args:
@@ -116,6 +117,7 @@ class MultiDataModuleWrapper(LightningDataModule):
         self.valid_datasets = {k: v for k, v in valid_datasets.items() if v is not None}
         self.train_dataloader_params = train_dataloader_params
         self.valid_dataloader_params = valid_dataloader_params
+        self.include_train_split_in_val = include_train_split_in_val
         if use_tokenizer:
             self.collate_fn = build_tokenized_collate(
                 max_length=collate_max_length,
@@ -150,6 +152,17 @@ class MultiDataModuleWrapper(LightningDataModule):
         return CombinedLoader(iterables, "max_size_cycle")
 
     def val_dataloader(self):
+        valid_loader = self._build_valid_split_loader()
+        if not self.include_train_split_in_val:
+            return valid_loader
+        # When the train split is included for evaluation, return a list of
+        # dataloaders so Lightning iterates each with a distinct
+        # ``dataloader_idx`` and the evaluator can route outputs by split.
+        # Idx 0 = valid (canonical eval), idx 1 = train (for comparison viz).
+        train_loader = self._build_train_split_val_loader()
+        return [valid_loader, train_loader]
+
+    def _build_valid_split_loader(self):
         iterables = dict()
         for dataset_name, dataset in self.valid_datasets.items():
             dataset_params = self.valid_dataloader_params.get(dataset_name)
@@ -166,6 +179,32 @@ class MultiDataModuleWrapper(LightningDataModule):
                 **dataset_params,
             )
 
+        return CombinedLoader(iterables, "max_size_cycle")
+
+    def _build_train_split_val_loader(self):
+        """Non-shuffled DataLoader(s) over the train datasets, used as a
+        secondary validation pass when ``include_train_split_in_val=True``.
+
+        Mirrors the train loader's batch_size/num_workers but forces
+        ``shuffle=False`` so the same samples appear each epoch — that makes
+        the resulting visualization videos directly comparable across epochs.
+        """
+        iterables = dict()
+        for dataset_name, dataset in self.train_datasets.items():
+            dataset_params = self.train_dataloader_params.get(dataset_name)
+            if dataset_params is None or len(dataset_params) == 0:
+                raise ValueError(
+                    f"No dataloader params found for dataset {dataset_name} "
+                    f"(needed for train-split val pass)."
+                )
+            dataset_params = dict(dataset_params)
+            dataset_params.pop("shuffle", None)
+            iterables[dataset_name] = DataLoader(
+                dataset,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                **dataset_params,
+            )
         return CombinedLoader(iterables, "max_size_cycle")
 
 
