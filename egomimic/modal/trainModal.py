@@ -480,4 +480,37 @@ if __name__ == "__main__":
     print(f"Modal app:       {modal_env['MODAL_APP_NAME']}")
     print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB")
 
-    launch_detached(Path(__file__).resolve(), "submit", container_overrides, modal_env)
+    _git_commit_and_push(REPO_ROOT)
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "modal",
+        "run",
+        "--detach",
+        "--env",
+        "robotics",
+        str(Path(__file__).resolve()) + "::submit",
+        "--",
+        *container_overrides,
+    ]
+    print(f"Dispatching: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env)
+    sys.exit(result.returncode)
+
+
+@app.local_entrypoint()
+def run(*hydra_args: str) -> None:
+    """Blocking run: streams logs and downloads artifacts when complete."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
+    print(f"Running commit {git_commit[:12]} from {git_remote}")
+    output_rel_path = run_hydra_train.remote(
+        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
+    )
+    print(f"Remote run completed. Output path in volume: {output_rel_path}")
+    if output_rel_path:
+        _download_run_artifacts(output_rel_path)
