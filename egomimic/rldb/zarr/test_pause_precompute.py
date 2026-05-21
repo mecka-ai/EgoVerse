@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ import zarr
 
 from egomimic.rldb.zarr.zarr_dataset_multi import (
     PAUSE_DETECT_KEYS,
+    EpisodeResolver,
     LocalEpisodeResolver,
     ZarrDataset,
     _build_pause_keep_mask,
@@ -233,3 +235,105 @@ def test_run_pause_precompute_runs_in_process(tmp_path):
     resolver._run_pause_precompute({"ep_inprocess": ds})
     assert ds.keep_indices is not None
     assert len(ds.keep_indices) < 20
+
+
+@pytest.fixture
+def _clean_modal_env(monkeypatch):
+    monkeypatch.delenv("MODAL_IS_REMOTE", raising=False)
+    monkeypatch.delenv("MODAL_TASK_ID", raising=False)
+    monkeypatch.delenv("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE", raising=False)
+
+
+def _stub_dataset(path: str):
+    return SimpleNamespace(episode_path=path)
+
+
+def test_dispatch_off_outside_modal(_clean_modal_env):
+    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
+    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
+
+
+def test_dispatch_on_inside_modal_with_volume_paths(_clean_modal_env, monkeypatch):
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    datasets = {
+        "a": _stub_dataset("/mnt/zarr-data/a.zarr"),
+        "b": _stub_dataset("/mnt/zarr-data/b.zarr"),
+    }
+    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is True
+
+
+def test_dispatch_on_when_modal_task_id_set(_clean_modal_env, monkeypatch):
+    monkeypatch.setenv("MODAL_TASK_ID", "ta-xxxxxxxx")
+    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
+    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is True
+
+
+def test_dispatch_off_when_disabled_env(_clean_modal_env, monkeypatch):
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    monkeypatch.setenv("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE", "1")
+    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
+    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
+
+
+def test_dispatch_off_when_paths_not_on_volume(_clean_modal_env, monkeypatch):
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    datasets = {"a": _stub_dataset("/tmp/elsewhere/a.zarr")}
+    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
+
+
+def test_run_pause_precompute_falls_back_when_modal_fanout_fails(
+    tmp_path, _clean_modal_env, monkeypatch
+):
+    """When dispatch picks Modal but the fan-out raises, fall back to in-process."""
+    ep = tmp_path / "ep_fallback.zarr"
+    _write_synthetic_mecka_episode(ep, n_frames=20, pause_spans=[(4, 10)])
+    key_map = {
+        "left.obs_ee_pose": {
+            "key_type": "proprio_keys",
+            "zarr_key": "left.obs_ee_pose",
+        },
+    }
+    ds = ZarrDataset(ep, key_map=key_map, pause_removal_epsilon=0.005)
+    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+
+    resolver = LocalEpisodeResolver(
+        folder_path=tmp_path,
+        key_map=key_map,
+        pause_removal_epsilon=0.005,
+    )
+
+    def _broken_modal_fanout(_self, _datasets):
+        raise RuntimeError("simulated fan-out failure")
+
+    monkeypatch.setattr(
+        EpisodeResolver,
+        "_modal_fanout_pause_precompute",
+        _broken_modal_fanout,
+    )
+
+    # Make dispatch think this is on the Modal volume by advertising the
+    # volume path via __str__ while __fspath__ keeps pointing at the tmp file.
+    class _PathProxy:
+        def __init__(self, real, advertised):
+            self._real = real
+            self._advertised = advertised
+
+        def __str__(self):
+            return self._advertised
+
+        def __fspath__(self):
+            return str(self._real)
+
+    ds.episode_path = _PathProxy(ep, "/mnt/zarr-data/ep_fallback.zarr")
+    resolver._run_pause_precompute({"ep_fallback": ds})
+    assert ds.keep_indices is not None
+    assert len(ds.keep_indices) < 20
+
+
+def test_modal_pause_precompute_shard_is_registered():
+    """Guard against accidental deletion of the same-app fan-out worker."""
+    pytest.importorskip("modal")
+    from egomimic.modal import modal_setup
+
+    assert hasattr(modal_setup, "pause_precompute_shard")
+    assert modal_setup.pause_precompute_shard.app is modal_setup.app

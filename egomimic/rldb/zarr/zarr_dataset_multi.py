@@ -93,6 +93,42 @@ def _build_pause_keep_mask(
     return keep
 
 
+def _import_real_modal():
+    """Return the installed Modal SDK, working around egomimic.modal shadowing.
+
+    When trainHydra.py runs as `python /root/EgoVerse/egomimic/trainHydra.py`,
+    Python puts /root/EgoVerse/egomimic on sys.path[0], which makes a bare
+    `import modal` resolve to the egomimic.modal subpackage. This helper:
+      1. Returns the cached real SDK if one is already in sys.modules.
+      2. Otherwise strips egomimic from sys.path and re-imports.
+
+    Important: we do NOT pop `modal` from sys.modules once the real SDK is
+    cached there — re-importing produces a fresh top-level module that no
+    longer carries the lazily-attached submodules (modal._grpc_client, etc.),
+    breaking subsequent fn.map() calls.
+    """
+    import sys
+
+    existing = sys.modules.get("modal")
+    if existing is not None and hasattr(existing, "Function"):
+        return existing
+
+    _orig_path = list(sys.path)
+    sys.path = [p for p in sys.path if Path(p).name != "egomimic"]
+    sys.modules.pop("modal", None)
+    try:
+        import modal as _modal
+    finally:
+        sys.path = _orig_path
+
+    if not hasattr(_modal, "Function"):
+        raise RuntimeError(
+            "Imported `modal` has no `Function` attribute — "
+            "egomimic.modal subpackage is still shadowing the installed Modal SDK"
+        )
+    return _modal
+
+
 def split_dataset_names(dataset_names, valid_ratio=0.2, seed=SEED):
     """
     Split a list of dataset names into train/valid sets.
@@ -281,14 +317,44 @@ class EpisodeResolver:
         return datasets
 
     def _run_pause_precompute(self, datasets: dict) -> None:
-        """Run per-episode pause precompute in-process; no-op if epsilon is None.
+        """Run per-episode pause precompute; no-op if epsilon is None.
 
-        Runs as part of the training process startup via an in-process thread
-        pool — no Modal fan-out, no deployed worker app.
+        Inside a Modal training container with the zarr volume mounted, fan out
+        to `egomimic.modal.modal_setup.pause_precompute_shard` (a function on
+        the training app — same app, no separately-deployed worker). Otherwise,
+        run in-process with a thread pool.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
 
+        if self._should_use_modal_pause_precompute(datasets):
+            try:
+                self._modal_fanout_pause_precompute(datasets)
+                return
+            except Exception as e:
+                logger.warning(
+                    "Modal pause precompute fan-out failed (%s) — "
+                    "falling back to in-process thread pool",
+                    e,
+                )
+
+        self._inprocess_pause_precompute(datasets)
+
+    @staticmethod
+    def _should_use_modal_pause_precompute(datasets: dict) -> bool:
+        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
+            os.environ.get("MODAL_TASK_ID")
+        )
+        if not inside_modal:
+            return False
+        if os.environ.get("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE") == "1":
+            return False
+        return any(
+            str(getattr(ds, "episode_path", "")).startswith("/mnt/zarr-data")
+            for ds in datasets.values()
+        )
+
+    def _inprocess_pause_precompute(self, datasets: dict) -> None:
         import time
         from concurrent.futures import ThreadPoolExecutor
 
@@ -328,6 +394,87 @@ class EpisodeResolver:
             sample = [r for r in results if r[3] is not None][:5]
             for name, _, _, err in sample:
                 logger.warning("Pause precompute failed for %s: %s", name, err)
+
+    def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
+        """Fan out per-episode precompute to pause_precompute_shard.
+
+        Worker is a function on the training app (egomimic-training), not a
+        separately-deployed app. We get a reference by importing it directly
+        from modal_setup after fixing the egomimic.modal-vs-SDK shadowing.
+        """
+        import time
+
+        # Ensure the real Modal SDK is in sys.modules before importing
+        # modal_setup, whose top-level `import modal` would otherwise resolve
+        # to the egomimic.modal subpackage inside a trainHydra.py subprocess.
+        _import_real_modal()
+        from egomimic.modal.modal_setup import pause_precompute_shard
+
+        t0 = time.monotonic()
+
+        work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
+        n = len(work)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
+        shards = [work[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            "Pause precompute via Modal fan-out (same-app worker): "
+            "%d episodes across %d shards",
+            n,
+            total_shards,
+        )
+        epsilons = [self.pause_removal_epsilon] * total_shards
+
+        n_total = 0
+        n_kept = 0
+        n_errs = 0
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in pause_precompute_shard.map(shards, epsilons):
+            completed += 1
+            for episode_hash, raw_total, indices in shard_result:
+                ds = datasets.get(episode_hash)
+                if ds is None:
+                    n_errs += 1
+                    continue
+                if raw_total == 0:
+                    n_errs += 1
+                    continue
+                ds._raw_total_frames = int(raw_total)
+                ds.keep_indices = np.asarray(indices, dtype=np.int64)
+                n_total += raw_total
+                n_kept += len(indices)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "Pause precompute via Modal: shard %d/%d done | kept=%d/%d "
+                    "errors=%d | elapsed %.0fs",
+                    completed,
+                    total_shards,
+                    n_kept,
+                    n_total,
+                    n_errs,
+                    elapsed,
+                )
+
+        elapsed = time.monotonic() - t0
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        logger.info(
+            "Pause precompute via Modal fan-out complete (epsilon=%s): kept %d/%d "
+            "frames (%.1f%%) across %d episodes in %.1fs (errors=%d, shards=%d)",
+            self.pause_removal_epsilon,
+            n_kept,
+            n_total,
+            pct,
+            n,
+            elapsed,
+            n_errs,
+            total_shards,
+        )
 
     @classmethod
     def _episode_already_present(cls, local_dir: Path, episode_hash: str) -> bool:
