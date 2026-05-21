@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import os
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,7 +11,7 @@ import zarr
 
 from egomimic.rldb.zarr.zarr_dataset_multi import (
     PAUSE_DETECT_KEYS,
-    EpisodeResolver,
+    PAUSE_PRECOMPUTE_CACHE_ENV,
     LocalEpisodeResolver,
     ZarrDataset,
     _build_pause_keep_mask,
@@ -218,52 +217,8 @@ def test_zarr_dataset_precompute_is_idempotent(tmp_path):
     assert ds.keep_indices is not None
 
 
-@pytest.fixture
-def _clean_modal_env(monkeypatch):
-    monkeypatch.delenv("MODAL_IS_REMOTE", raising=False)
-    monkeypatch.delenv("MODAL_TASK_ID", raising=False)
-    monkeypatch.delenv("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE", raising=False)
-
-
-def _stub_dataset(path: str):
-    return SimpleNamespace(episode_path=path)
-
-
-def test_dispatch_off_outside_modal(_clean_modal_env):
-    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
-    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
-
-
-def test_dispatch_on_inside_modal_with_volume_paths(_clean_modal_env, monkeypatch):
-    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
-    datasets = {
-        "a": _stub_dataset("/mnt/zarr-data/a.zarr"),
-        "b": _stub_dataset("/mnt/zarr-data/b.zarr"),
-    }
-    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is True
-
-
-def test_dispatch_on_when_modal_task_id_set(_clean_modal_env, monkeypatch):
-    monkeypatch.setenv("MODAL_TASK_ID", "ta-xxxxxxxx")
-    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
-    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is True
-
-
-def test_dispatch_off_when_disabled_env(_clean_modal_env, monkeypatch):
-    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
-    monkeypatch.setenv("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE", "1")
-    datasets = {"a": _stub_dataset("/mnt/zarr-data/a.zarr")}
-    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
-
-
-def test_dispatch_off_when_paths_not_on_volume(_clean_modal_env, monkeypatch):
-    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
-    datasets = {"a": _stub_dataset("/tmp/elsewhere/a.zarr")}
-    assert EpisodeResolver._should_use_modal_pause_precompute(datasets) is False
-
-
-def test_run_pause_precompute_uses_local_path_outside_modal(tmp_path, _clean_modal_env):
-    ep = tmp_path / "ep_dispatch.zarr"
+def test_run_pause_precompute_runs_in_process(tmp_path):
+    ep = tmp_path / "ep_inprocess.zarr"
     _write_synthetic_mecka_episode(ep, n_frames=20, pause_spans=[(4, 10)])
     key_map = {
         "left.obs_ee_pose": {
@@ -277,69 +232,103 @@ def test_run_pause_precompute_uses_local_path_outside_modal(tmp_path, _clean_mod
         key_map=key_map,
         pause_removal_epsilon=0.005,
     )
-    resolver._run_pause_precompute({"ep_dispatch": ds})
+    resolver._run_pause_precompute({"ep_inprocess": ds})
     assert ds.keep_indices is not None
     assert len(ds.keep_indices) < 20
 
 
-def test_run_pause_precompute_falls_back_when_modal_lookup_fails(
-    tmp_path, _clean_modal_env, monkeypatch
+def _make_dataset(tmp_path, *, name="ep", n_frames=20, pause_spans=None):
+    ep = tmp_path / f"{name}.zarr"
+    _write_synthetic_mecka_episode(
+        ep, n_frames=n_frames, pause_spans=pause_spans or [(4, 10)]
+    )
+    key_map = {
+        "left.obs_ee_pose": {
+            "key_type": "proprio_keys",
+            "zarr_key": "left.obs_ee_pose",
+        },
+    }
+    ds = ZarrDataset(ep, key_map=key_map, pause_removal_epsilon=0.005)
+    resolver = LocalEpisodeResolver(
+        folder_path=tmp_path,
+        key_map=key_map,
+        pause_removal_epsilon=0.005,
+    )
+    return resolver, ds
+
+
+def test_run_pause_precompute_consumes_cache_when_env_set(tmp_path, monkeypatch):
+    """Resolver populates keep_indices from the JSON cache when the env var points at it."""
+    resolver, ds = _make_dataset(tmp_path, name="ep_cache")
+
+    # Synthesize a cache: drop the first 5 frames.
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "ep_cache": {
+                    "raw_total": 20,
+                    "keep_indices": list(range(5, 20)),
+                }
+            }
+        )
+    )
+    monkeypatch.setenv(PAUSE_PRECOMPUTE_CACHE_ENV, str(cache_path))
+
+    resolver._run_pause_precompute({"ep_cache": ds})
+
+    assert ds._raw_total_frames == 20
+    assert ds.keep_indices is not None
+    assert ds.keep_indices.tolist() == list(range(5, 20))
+
+
+def test_run_pause_precompute_cache_miss_falls_back_in_process(tmp_path, monkeypatch):
+    """An episode missing from the cache still gets processed locally."""
+    resolver, ds = _make_dataset(tmp_path, name="ep_miss")
+
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        json.dumps({"some_other_hash": {"raw_total": 0, "keep_indices": []}})
+    )
+    monkeypatch.setenv(PAUSE_PRECOMPUTE_CACHE_ENV, str(cache_path))
+
+    resolver._run_pause_precompute({"ep_miss": ds})
+
+    assert ds.keep_indices is not None
+    assert len(ds.keep_indices) < 20  # in-process precompute trimmed pauses
+
+
+def test_run_pause_precompute_cache_with_raw_total_zero_falls_back(
+    tmp_path, monkeypatch
 ):
-    """When dispatch picks Modal but the function lookup raises, fall back to local."""
-    ep = tmp_path / "ep_fallback.zarr"
-    _write_synthetic_mecka_episode(ep, n_frames=20, pause_spans=[(4, 10)])
-    key_map = {
-        "left.obs_ee_pose": {
-            "key_type": "proprio_keys",
-            "zarr_key": "left.obs_ee_pose",
-        },
-    }
-    ds = ZarrDataset(ep, key_map=key_map, pause_removal_epsilon=0.005)
-    # Force the local dataset to look like it lives on the Modal volume so
-    # _should_use_modal_pause_precompute returns True.
-    ds.episode_path = Path("/mnt/zarr-data/ep_fallback.zarr")
-    monkeypatch.setenv("MODAL_IS_REMOTE", "1")
+    """raw_total==0 in the cache means the worker hit an error; fall back per-episode."""
+    resolver, ds = _make_dataset(tmp_path, name="ep_err")
 
-    resolver = LocalEpisodeResolver(
-        folder_path=tmp_path,
-        key_map=key_map,
-        pause_removal_epsilon=0.005,
-    )
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(json.dumps({"ep_err": {"raw_total": 0, "keep_indices": []}}))
+    monkeypatch.setenv(PAUSE_PRECOMPUTE_CACHE_ENV, str(cache_path))
 
-    def _broken_modal_fanout(_self, _datasets):
-        raise RuntimeError("simulated function lookup failure")
+    resolver._run_pause_precompute({"ep_err": ds})
 
-    monkeypatch.setattr(
-        EpisodeResolver,
-        "_modal_fanout_pause_precompute",
-        _broken_modal_fanout,
-    )
-    # Path on disk is real; restore for the local fallback read.
-    real_path = ep
-    ds.episode_path = real_path
-
-    # Tell dispatch to think this is on the Modal volume via the stub episode_path.
-    class _PathProxy:
-        def __init__(self, real, advertised):
-            self._real = real
-            self._advertised = advertised
-
-        def __str__(self):
-            return self._advertised
-
-        def __fspath__(self):
-            return str(self._real)
-
-    ds.episode_path = _PathProxy(real_path, "/mnt/zarr-data/ep_fallback.zarr")
-    resolver._run_pause_precompute({"ep_fallback": ds})
     assert ds.keep_indices is not None
     assert len(ds.keep_indices) < 20
 
 
-def test_modal_pause_precompute_shard_is_registered():
-    """Guards against accidental deletion of the deployed Modal worker."""
-    pytest.importorskip("modal")
-    from egomimic.modal import scan as scan_mod
+def test_run_pause_precompute_no_env_var_runs_in_process(tmp_path, monkeypatch):
+    """With no cache env var set, everything goes through the in-process path."""
+    monkeypatch.delenv(PAUSE_PRECOMPUTE_CACHE_ENV, raising=False)
+    resolver, ds = _make_dataset(tmp_path, name="ep_noenv")
 
-    assert hasattr(scan_mod, "pause_precompute_shard")
-    assert scan_mod.pause_precompute_shard.app is scan_mod.app
+    resolver._run_pause_precompute({"ep_noenv": ds})
+
+    assert ds.keep_indices is not None
+    assert len(ds.keep_indices) < 20
+
+
+def test_pause_precompute_shard_is_registered_on_training_app():
+    """Worker still lives on the training app for trainModal to call .map() against."""
+    pytest.importorskip("modal")
+    from egomimic.modal import modal_setup
+
+    assert hasattr(modal_setup, "pause_precompute_shard")
+    assert modal_setup.pause_precompute_shard.app is modal_setup.app

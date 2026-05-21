@@ -42,10 +42,10 @@ from modal_setup import (  # noqa: E402
     _prepare_repo,
     _resolve_git_state,
     app,
+    pause_precompute_shard,
     training_outputs_volume,
     zarr_volume,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,7 +62,13 @@ def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     fixed = []
     for arg in hydra_args:
         key, sep, val = arg.partition("=")
-        if sep and key in _PATH_KEYS and val and val != "null" and not val.startswith("/"):
+        if (
+            sep
+            and key in _PATH_KEYS
+            and val
+            and val != "null"
+            and not val.startswith("/")
+        ):
             val = f"{CFG.output_mount_path}/{val}"
             arg = f"{key}={val}"
         fixed.append(arg)
@@ -75,8 +81,13 @@ def _download_run_artifacts(output_rel_path: str) -> None:
     print(f"Downloading artifacts to {local_dest} ...")
     result = subprocess.run(
         [
-            sys.executable, "-m", "modal", "volume", "get",
-            "--env", "robotics",
+            sys.executable,
+            "-m",
+            "modal",
+            "volume",
+            "get",
+            "--env",
+            "robotics",
             "egoverse-training-outputs",
             output_rel_path,
             str(local_dest),
@@ -91,6 +102,158 @@ def _download_run_artifacts(output_rel_path: str) -> None:
             f"  modal volume get --env robotics egoverse-training-outputs "
             f'"{output_rel_path}" "{local_dest}"'
         )
+
+
+# ---------------------------------------------------------------------------
+# Pre-train pause precompute
+# ---------------------------------------------------------------------------
+#
+# run_hydra_train spawns trainHydra in a subprocess; that subprocess can't
+# .map() a Modal function (no hydration crosses the process boundary).
+# So we materialize the hydra config here, resolve which episodes the
+# resolvers will request, fan out pause_precompute_shard.map() from this
+# function (which IS hydrated), and write the keep_indices to a cache JSON
+# on disk. trainHydra's resolver reads the cache via
+# EGOMIMIC_PAUSE_PRECOMPUTE_CACHE env var.
+
+PAUSE_PRECOMPUTE_CACHE_PATH = "/tmp/pause_precompute_cache.json"
+
+
+def _precompute_pause_to_cache(hydra_args: tuple[str, ...]) -> str | None:
+    """Fan out pause precompute for every ModalEpisodeResolver in the data config.
+
+    Returns the cache-file path if anything was precomputed, else None.
+    Idempotent and best-effort — any failure logs and returns None so the
+    in-process fallback inside the trainHydra resolver still runs.
+    """
+    import json as _json_local
+    import time as _time_local
+
+    # _prepare_repo ran `pip install -e .` in a subprocess; the current process
+    # doesn't pick up that editable install via its already-loaded sys.path, so
+    # prepend the cloned repo so `import egomimic` resolves to the source tree.
+    if CFG.remote_repo_dir not in sys.path:
+        sys.path.insert(0, CFG.remote_repo_dir)
+
+    try:
+        from hydra import compose, initialize_config_dir
+        from hydra.utils import instantiate
+    except Exception as e:
+        print(f"[pause-precompute] hydra not available: {e}; skipping fan-out")
+        return None
+
+    config_dir = str(Path(CFG.remote_repo_dir) / "egomimic" / "hydra_configs")
+    if not Path(config_dir).is_dir():
+        print(f"[pause-precompute] config dir missing ({config_dir}); skipping")
+        return None
+
+    try:
+        with initialize_config_dir(config_dir=config_dir, version_base=None):
+            cfg = compose(
+                config_name="train_zarr_cartesian",
+                overrides=list(hydra_args),
+            )
+    except Exception as e:
+        print(f"[pause-precompute] hydra compose failed: {e}; skipping fan-out")
+        return None
+
+    # Walk train_datasets + valid_datasets, build (resolver, filters) pairs
+    try:
+        from egomimic.rldb.zarr.zarr_dataset_multi import ModalEpisodeResolver
+    except ModuleNotFoundError as e:
+        print(f"[pause-precompute] egomimic import failed ({e}); skipping fan-out")
+        return None
+
+    work_by_eps: dict[float, dict[str, str]] = {}
+    seen_blocks = 0
+    for block_name in ("train_datasets", "valid_datasets"):
+        block = cfg.data.get(block_name)
+        if block is None:
+            continue
+        for ds_name, ds_cfg in block.items():
+            resolver_cfg = ds_cfg.get("resolver")
+            if resolver_cfg is None:
+                continue
+            seen_blocks += 1
+            try:
+                resolver = instantiate(resolver_cfg)
+            except Exception as e:
+                print(
+                    f"[pause-precompute] failed to instantiate resolver "
+                    f"for {block_name}.{ds_name}: {e}"
+                )
+                continue
+            if not isinstance(resolver, ModalEpisodeResolver):
+                continue
+            eps = resolver.pause_removal_epsilon
+            if eps is None:
+                continue
+            filters_cfg = ds_cfg.get("filters")
+            filters = instantiate(filters_cfg) if filters_cfg is not None else None
+            try:
+                meta = resolver._resolve_episode_meta(filters)
+            except Exception as e:
+                print(
+                    f"[pause-precompute] _resolve_episode_meta failed for "
+                    f"{block_name}.{ds_name}: {e}"
+                )
+                continue
+            bucket = work_by_eps.setdefault(float(eps), {})
+            for episode_hash, local_path, _num_frames, _robot in meta:
+                # Dedup across train/valid: same hash + same eps = same work.
+                bucket[episode_hash] = str(local_path)
+
+    if not work_by_eps:
+        print(
+            f"[pause-precompute] no ModalEpisodeResolver with "
+            f"pause_removal_epsilon found across {seen_blocks} dataset block(s); "
+            "skipping fan-out (trainHydra will use in-process precompute if needed)"
+        )
+        return None
+
+    t0 = _time_local.monotonic()
+    cache: dict[str, dict] = {}
+    for eps, hash_to_path in work_by_eps.items():
+        episodes = list(hash_to_path.items())
+        n = len(episodes)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
+        shards = [episodes[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        epsilons = [eps] * len(shards)
+        print(
+            f"[pause-precompute] eps={eps}: {n} episodes across {len(shards)} shards "
+            f"(same-app worker, no deploy)"
+        )
+        completed = 0
+        for shard_result in pause_precompute_shard.map(shards, epsilons):
+            completed += 1
+            for episode_hash, raw_total, indices in shard_result:
+                cache[episode_hash] = {
+                    "raw_total": int(raw_total),
+                    "keep_indices": list(indices),
+                }
+            if completed % max(1, len(shards) // 10) == 0 or completed == len(shards):
+                elapsed = _time_local.monotonic() - t0
+                print(
+                    f"[pause-precompute] eps={eps}: shard {completed}/{len(shards)} "
+                    f"done | episodes={len(cache)} | elapsed {elapsed:.0f}s"
+                )
+
+    elapsed = _time_local.monotonic() - t0
+    n_kept = sum(len(v["keep_indices"]) for v in cache.values())
+    n_total = sum(v["raw_total"] for v in cache.values())
+    pct = (100.0 * n_kept / n_total) if n_total else 100.0
+    print(
+        f"[pause-precompute] complete: {len(cache)} episodes "
+        f"kept {n_kept}/{n_total} ({pct:.1f}%) in {elapsed:.1f}s"
+    )
+
+    Path(PAUSE_PRECOMPUTE_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(PAUSE_PRECOMPUTE_CACHE_PATH, "w") as f:
+        _json_local.dump(cache, f)
+    return PAUSE_PRECOMPUTE_CACHE_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +285,11 @@ def run_hydra_train(
     _prepare_repo(git_remote=git_remote, git_commit=git_commit)
 
     hydra_args = _resolve_volume_paths(hydra_args)
+
+    # Fan out pause precompute now while we're inside a hydrated function;
+    # the trainHydra subprocess can't reach a Modal worker without a deploy.
+    cache_path = _precompute_pause_to_cache(hydra_args)
+
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -135,6 +303,8 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
+    if cache_path:
+        env["EGOMIMIC_PAUSE_PRECOMPUTE_CACHE"] = cache_path
 
     print(f"Running: {shlex.join(cmd)}")
     process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
@@ -181,6 +351,7 @@ def _health_check() -> dict:
         results["volume"] = f"ERROR: {e}"
 
     import subprocess as _sp
+
     r = _sp.run(["s5cmd", "version"], capture_output=True, text=True)
     results["s5cmd"] = f"OK — {r.stdout.strip()}" if r.returncode == 0 else "MISSING"
 
@@ -215,7 +386,9 @@ def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
     print(f"Submitting commit {git_commit[:12]} from {git_remote}")
     handle = run_hydra_train.spawn(
         tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
@@ -271,7 +444,8 @@ if __name__ == "__main__":
 
     # Keep DDP launcher in sync with requested GPU count
     container_overrides = [
-        a for a in container_overrides
+        a
+        for a in container_overrides
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
@@ -286,10 +460,16 @@ if __name__ == "__main__":
     _git_commit_and_push(REPO_ROOT)
 
     cmd = [
-        sys.executable, "-m", "modal", "run",
-        "--detach", "--env", "robotics",
+        sys.executable,
+        "-m",
+        "modal",
+        "run",
+        "--detach",
+        "--env",
+        "robotics",
         str(Path(__file__).resolve()) + "::submit",
-        "--", *container_overrides,
+        "--",
+        *container_overrides,
     ]
     print(f"Dispatching: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env)
@@ -301,7 +481,9 @@ def run(*hydra_args: str) -> None:
     """Blocking run: streams logs and downloads artifacts when complete."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
     print(f"Running commit {git_commit[:12]} from {git_remote}")
     output_rel_path = run_hydra_train.remote(
         tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
