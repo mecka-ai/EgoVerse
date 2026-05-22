@@ -37,6 +37,7 @@ from modal_setup import (  # noqa: E402
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
+    app_name_from_hydra_args,
     launch_detached,
     pop_init_submodules,
     app,
@@ -277,11 +278,14 @@ if __name__ == "__main__":
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
 
+    modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(container_overrides)
+
     gpu = modal_env.get("MODAL_GPU", "A100")
     cpu = modal_env.get("MODAL_CPU", "12")
     mem = modal_env.get("MODAL_MEMORY_GB") or str(
         int(modal_env.get("MODAL_MEMORY_MB", "65536")) // 1024
     )
+    print(f"Modal app:       {modal_env['MODAL_APP_NAME']}")
     print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB")
 
     launch_detached(Path(__file__).resolve(), "submit", container_overrides, modal_env)
