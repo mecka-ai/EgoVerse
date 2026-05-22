@@ -93,7 +93,40 @@ def _build_pause_keep_mask(
     return keep
 
 
-PAUSE_PRECOMPUTE_CACHE_ENV = "EGOMIMIC_PAUSE_PRECOMPUTE_CACHE"
+def _import_real_modal():
+    """Return the installed Modal SDK, working around egomimic.modal shadowing.
+
+    When trainHydra.py runs as `python /root/EgoVerse/egomimic/trainHydra.py`,
+    Python puts /root/EgoVerse/egomimic on sys.path[0], which makes a bare
+    `import modal` resolve to the egomimic.modal subpackage. This helper:
+      1. Returns the cached real SDK if one is already in sys.modules.
+      2. Otherwise strips egomimic from sys.path and re-imports.
+
+    Important: we do NOT pop `modal` from sys.modules once the real SDK is
+    cached there — re-importing produces a fresh top-level module that no
+    longer carries the lazily-attached submodules (modal._grpc_client, etc.),
+    breaking subsequent fn.map() calls.
+    """
+    import sys
+
+    existing = sys.modules.get("modal")
+    if existing is not None and hasattr(existing, "Function"):
+        return existing
+
+    _orig_path = list(sys.path)
+    sys.path = [p for p in sys.path if Path(p).name != "egomimic"]
+    sys.modules.pop("modal", None)
+    try:
+        import modal as _modal
+    finally:
+        sys.path = _orig_path
+
+    if not hasattr(_modal, "Function"):
+        raise RuntimeError(
+            "Imported `modal` has no `Function` attribute — "
+            "egomimic.modal subpackage is still shadowing the installed Modal SDK"
+        )
+    return _modal
 
 
 def split_dataset_names(dataset_names, valid_ratio=0.2, seed=SEED):
@@ -980,16 +1013,11 @@ class ModalEpisodeResolver(EpisodeResolver):
                 self.include_hashes = set(json.load(f))
             logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
 
-    def _resolve_episode_meta(
+    def resolve(
         self,
         filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, Path, int, str]]:
-        """Resolve episodes from SQL + filters → (hash, local_path, num_frames, robot_name).
-
-        No zarr opens, no ZarrDataset construction. Used by both resolve()
-        (which goes on to build datasets) and the pre-train precompute step
-        in trainModal.run_hydra_train (which only needs episode paths).
-        """
+        **kwargs,
+    ) -> dict[str, "ZarrDataset"]:
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -1025,13 +1053,14 @@ class ModalEpisodeResolver(EpisodeResolver):
         episode_hashes = matched["episode_hash"].tolist()
         logger.info("SQL filter matched %d episodes", len(episode_hashes))
 
-        if matched.empty:
+        if not episode_hashes:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            logger.info("Debug mode: using first %d episodes", len(matched))
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
 
         if self.max_episodes is not None and len(matched) > self.max_episodes:
             before = len(matched)
@@ -1053,10 +1082,7 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         datasets: dict[str, ZarrDataset] = {}
         n_missing = 0
-        for _, row in matched.iterrows():
-            episode_hash = row["episode_hash"]
-            num_frames = int(row["num_frames"])
-            robot_name = str(row["robot_name"])
+        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
             local_path = next(
                 (
                     p
@@ -1072,26 +1098,6 @@ class ModalEpisodeResolver(EpisodeResolver):
                 n_missing += 1
                 logger.warning("Episode not found locally, skipping: %s", episode_hash)
                 continue
-            out.append((episode_hash, local_path, num_frames, robot_name))
-
-        if n_missing:
-            logger.info("Skipped %d episodes not present in local volume", n_missing)
-        if not out:
-            raise ValueError(
-                "No episodes resolved — all SQL-matched episodes are missing from the local volume."
-            )
-        return out
-
-    def resolve(
-        self,
-        filters: DatasetFilter | None = None,
-        **kwargs,
-    ) -> dict[str, "ZarrDataset"]:
-        meta = self._resolve_episode_meta(filters)
-        dataset_class = self._dataset_class or ZarrDataset
-
-        datasets: dict[str, ZarrDataset] = {}
-        for episode_hash, local_path, num_frames, robot_name in meta:
             datasets[episode_hash] = dataset_class(
                 local_path,
                 key_map=self.key_map,
