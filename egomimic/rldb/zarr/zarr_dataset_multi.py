@@ -480,7 +480,7 @@ class EpisodeResolver:
                 logger.warning("Pause precompute failed for %s: %s", name, err)
 
     def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
-        """Compute keep_indices in parallel across egomimic-scan::pause_precompute_shard workers."""
+        """Compute keep_indices in parallel across egomimic-training::pause_precompute_shard workers."""
         import time
 
         modal = _import_real_modal()
@@ -500,7 +500,7 @@ class EpisodeResolver:
             total_shards,
         )
         fn = modal.Function.from_name(
-            "egomimic-scan", "pause_precompute_shard", environment_name="robotics"
+            "egomimic-training", "pause_precompute_shard", environment_name="robotics"
         )
         epsilons = [self.pause_removal_epsilon] * total_shards
 
