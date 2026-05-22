@@ -18,7 +18,8 @@ train_datasets:
       _target_: egomimic.rldb.filters.DatasetFilter
       filter_lambdas:
         # - "lambda df: df[df.groupby('task')['task'].transform('count') > 15]"
-        - "lambda row: row['task'] in ['cutting_plastic', 'organizing_containers']"
+        # - "lambda row: row['task'] in ['cutting_plastic', 'organizing_containers']"
+        - "lambda row: row['task'] in ['cleaning_kitchenware', 'filling_and_capping_bottles', 'assembling_booklets', 'folding_socks', 'filling_snack_bags', 'sealing_packages', 'folding_gift_boxes', 'wrapping_forks', 'cleaning_drawers', 'wrapping_sandwiches', 'assembling_hair_clips', 'gift_wrapping', 'taping_boxes', 'washing_bowls' ]"
     mode: total
 
 # Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
