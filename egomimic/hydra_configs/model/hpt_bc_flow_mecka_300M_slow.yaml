@@ -117,7 +117,8 @@ optimizer:
   weight_decay: 0.0001
 
 scheduler:
-  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _target_: torch.optim.lr_scheduler.LinearLR
   _partial_: true
-  T_max: 200000
-  eta_min: 1e-6
+  start_factor: 0.01
+  end_factor: 1.0
+  total_iters: 1000
