@@ -57,6 +57,26 @@ logger = logging.getLogger(__name__)
 SEED = 42
 
 PAUSE_DETECT_KEYS: tuple[str, str] = ("left.obs_ee_pose", "right.obs_ee_pose")
+PAUSE_DETECT_KEYPOINT_KEYS: tuple[str, str] = (
+    "left.obs_keypoints",
+    "right.obs_keypoints",
+)
+
+
+def _keypoint_max_delta(kp: np.ndarray) -> np.ndarray:
+    """Per-frame max landmark delta for a flattened (T, K*3) keypoint array.
+
+    Reshapes to (T, K, 3), takes per-landmark L2 of the time-diff, and
+    returns max over landmarks → (T-1,). This catches finger flexion even
+    when the wrist (centroid) is stationary.
+    """
+    T = kp.shape[0]
+    if T < 2 or kp.ndim != 2 or kp.shape[1] % 3 != 0 or kp.shape[1] == 0:
+        return np.zeros(max(T - 1, 0))
+    n_landmarks = kp.shape[1] // 3
+    diff = np.diff(kp.reshape(T, n_landmarks, 3), axis=0)
+    per_landmark_norm = np.linalg.norm(diff, axis=-1)
+    return per_landmark_norm.max(axis=-1)
 
 
 def _build_pause_keep_mask(
@@ -64,13 +84,22 @@ def _build_pause_keep_mask(
     left_pose: np.ndarray,
     right_pose: np.ndarray,
     epsilon: float,
+    left_keypoints: np.ndarray | None = None,
+    right_keypoints: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return a boolean keep-mask over frames.
 
-    A frame at index t is a "pause step" iff both ||left[t]-left[t-1]|| < eps
-    and ||right[t]-right[t-1]|| < eps. The first frame of each pause run is
-    kept (transition into pause); subsequent in-pause frames are dropped
-    until motion resumes.
+    A frame at index t is a "pause step" iff EVERY available motion signal
+    moved less than ``epsilon`` between t-1 and t:
+      - left/right ee_pose L2 delta < eps (wrist movement), and
+      - if keypoints are provided, max-over-landmarks keypoint delta < eps
+        on the corresponding hand (catches finger flexion when the wrist
+        is stationary).
+
+    Missing keypoint arrays are simply skipped — the test reduces to
+    ee_pose-only. The first frame of each pause run is kept (transition
+    into pause); subsequent in-pause frames are dropped until motion
+    resumes.
     """
     T = len(left_pose)
     if T < 2:
@@ -79,6 +108,15 @@ def _build_pause_keep_mask(
     left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
     right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
     is_paused_step = (left_d < epsilon) & (right_d < epsilon)
+
+    if left_keypoints is not None and len(left_keypoints) == T:
+        is_paused_step = is_paused_step & (
+            _keypoint_max_delta(np.asarray(left_keypoints)) < epsilon
+        )
+    if right_keypoints is not None and len(right_keypoints) == T:
+        is_paused_step = is_paused_step & (
+            _keypoint_max_delta(np.asarray(right_keypoints)) < epsilon
+        )
 
     keep = np.ones(T, dtype=bool)
     in_pause = False
@@ -1378,10 +1416,25 @@ class ZarrDataset(torch.utils.data.Dataset):
             self.keep_indices = np.arange(self.total_frames, dtype=np.int64)
             return (self.total_frames, self.total_frames)
 
+        # Keypoints are optional — some embodiments / older episodes don't
+        # have them; in that case the detector falls back to ee_pose-only.
+        left_kp_key, right_kp_key = PAUSE_DETECT_KEYPOINT_KEYS
+        left_kp = right_kp = None
+        try:
+            left_kp = np.asarray(store[left_kp_key][:])
+        except KeyError:
+            pass
+        try:
+            right_kp = np.asarray(store[right_kp_key][:])
+        except KeyError:
+            pass
+
         keep = _build_pause_keep_mask(
             left_pose=left_pose,
             right_pose=right_pose,
             epsilon=self.pause_removal_epsilon,
+            left_keypoints=left_kp,
+            right_keypoints=right_kp,
         )
         self._raw_total_frames = int(self.total_frames)
         self.keep_indices = np.flatnonzero(keep).astype(np.int64)
@@ -1436,8 +1489,15 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
 
             if horizon is not None:
-                end_idx = self._chunk_end_idx(real_idx, horizon, key_type)
-                read_interval = (real_idx, end_idx)
+                if self.keep_indices is not None:
+                    # Fully-filtered chunk: take H consecutive *filtered* frames
+                    # by fancy-indexing keep_indices, so paused raw frames are
+                    # skipped inside the chunk too (not just at the anchor).
+                    end_filtered = min(idx + horizon, len(self.keep_indices))
+                    read_interval = self.keep_indices[idx:end_filtered]
+                else:
+                    end_idx = self._chunk_end_idx(real_idx, horizon, key_type)
+                    read_interval = (real_idx, end_idx)
             else:
                 read_interval = (real_idx, None)
             read_dict = {zarr_key: read_interval}
@@ -1614,32 +1674,41 @@ class ZarrEpisode:
         self.keys = self.metadata["features"]
 
     def read(
-        self, keys_with_ranges: dict[str, tuple[int, int | None]]
+        self,
+        keys_with_ranges: dict[str, tuple[int, int | None] | np.ndarray],
     ) -> dict[str, np.ndarray]:
         """
-        Read data for specified keys, each with their own index or range.
-        Args:
-            keys_with_ranges: Dictionary mapping keys to (start, end) tuples.
-                - start: Starting frame index
-                - end: Ending frame index (exclusive). If None, reads single frame at start.
-        Returns:
-            Dictionary mapping keys to numpy arrays
+        Read data for specified keys, each with their own range or index array.
+
+        Two indexer shapes are supported per key:
+
+        - ``(start, end)`` tuple: contiguous slice ``arr[start:end]``. ``end=None``
+          reads a single frame at ``start`` (and unwraps the trailing dim,
+          preserving VariableLengthBytes objects intact).
+        - ``np.ndarray`` of frame indices: fancy-index read ``arr[indices]``.
+          Used when the dataset has ``keep_indices`` set and the consumer
+          wants the action chunk to skip paused raw frames.
+
         Example:
             >>> episode.read({
-            ...     "obs/image": (0, 10),      # Read frames 0-10
-            ...     "actions": (5, 15),        # Read frames 5-15
-            ...     "rewards": (20, None),     # Read single frame at index 20
+            ...     "obs/image": (0, 10),                 # contiguous frames 0..9
+            ...     "actions":   np.array([0, 1, 8, 9]),  # fancy: skip 2..7
+            ...     "rewards":   (20, None),              # single frame 20
             ... })
         """
         result = {}
-        for key, (start, end) in keys_with_ranges.items():
+        for key, indexer in keys_with_ranges.items():
             arr = self._store[key]
-            if end is not None:
-                data = arr[start:end]
+            if isinstance(indexer, np.ndarray):
+                data = arr[indexer]
             else:
-                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                data = arr[start : start + 1][0]
+                start, end = indexer
+                if end is not None:
+                    data = arr[start:end]
+                else:
+                    # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
+                    # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
+                    data = arr[start : start + 1][0]
             result[key] = data
         return result
 
