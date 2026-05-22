@@ -43,6 +43,37 @@ class StateImageSettings:
 
 
 @dataclass(frozen=True)
+class ActionEmbedderSettings:
+    """
+    Action embedder type selection (``model.action_embedder``).
+
+    type: ``gaussian``   — Gaussian normalisation + random orthogonal projection (default).
+          ``checkpoint`` — Load a trained model from ``checkpoint_path`` and call
+                          ``encode_method`` to produce action latents.
+          ``oat``        — Load a trained OAT tokenizer checkpoint and use the encoder
+                          to produce continuous pre-quantization latents suitable for
+                          KSG mutual information estimation.
+
+    For ``type=oat``:
+      checkpoint_path:       Path to the OATTokenizerTrainer Lightning ``.ckpt``.
+      oat_action_chunk_size: Timesteps per action chunk (must match training config).
+      oat_action_dim:        Action dimensionality (must match training config).
+      oat_encoder_cfg:       Encoder block from the OAT model YAML (as a dict).
+      oat_decoder_cfg:       Decoder block (needed to instantiate OATTok).
+      oat_quantizer_cfg:     Quantizer block.
+    """
+
+    type: str = "gaussian"
+    checkpoint_path: str | None = None
+    encode_method: str = "encode"
+    oat_action_chunk_size: int = 100
+    oat_action_dim: int = 12
+    oat_encoder_cfg: dict | None = None
+    oat_decoder_cfg: dict | None = None
+    oat_quantizer_cfg: dict | None = None
+
+
+@dataclass(frozen=True)
 class EmbedderSettings:
     """Model embedder settings (``model.*``)."""
 
@@ -50,6 +81,9 @@ class EmbedderSettings:
     device: str = "cuda"
     norm_min_std: float = 1e-6
     state_image: StateImageSettings = field(default_factory=StateImageSettings)
+    action_embedder: ActionEmbedderSettings = field(
+        default_factory=ActionEmbedderSettings
+    )
 
 
 def select_seed(cfg: Any) -> int:
@@ -128,6 +162,44 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
     )
 
 
+def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
+    """Read ``model.action_embedder`` settings; defaults to gaussian if absent."""
+    block = OmegaConf.select(cfg, "model.action_embedder", default=None)
+    if block is None:
+        return ActionEmbedderSettings()
+    ae_type = str(block.get("type", "gaussian")).lower().strip()
+    ckpt = block.get("checkpoint_path", None)
+    encode_method = str(block.get("encode_method", "encode"))
+
+    # OAT-specific fields
+    oat_chunk = int(block.get("oat_action_chunk_size", 100))
+    oat_dim = int(block.get("oat_action_dim", 12))
+    oat_enc = block.get("oat_encoder_cfg", None)
+    oat_dec = block.get("oat_decoder_cfg", None)
+    oat_qtz = block.get("oat_quantizer_cfg", None)
+
+    # Convert OmegaConf sub-nodes to plain dicts for hydra.utils.instantiate
+    def _to_dict(x):
+        if x is None:
+            return None
+        try:
+            from omegaconf import OmegaConf as _OC
+            return _OC.to_container(x, resolve=True)
+        except Exception:
+            return x
+
+    return ActionEmbedderSettings(
+        type=ae_type,
+        checkpoint_path=str(ckpt) if ckpt is not None else None,
+        encode_method=encode_method,
+        oat_action_chunk_size=oat_chunk,
+        oat_action_dim=oat_dim,
+        oat_encoder_cfg=_to_dict(oat_enc),
+        oat_decoder_cfg=_to_dict(oat_dec),
+        oat_quantizer_cfg=_to_dict(oat_qtz),
+    )
+
+
 def select_embedder_settings(cfg: Any) -> EmbedderSettings:
     """Read embedder settings from ``model`` config."""
     return EmbedderSettings(
@@ -137,6 +209,7 @@ def select_embedder_settings(cfg: Any) -> EmbedderSettings:
             OmegaConf.select(cfg, "model.norm_min_std", default=1e-6)
         ),
         state_image=select_state_image_settings(cfg),
+        action_embedder=select_action_embedder_settings(cfg),
     )
 
 

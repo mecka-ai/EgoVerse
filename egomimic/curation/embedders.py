@@ -317,6 +317,188 @@ class StateEmbedder:
         return np.concatenate(outputs, axis=0)
 
 
+class OATActionEmbedder:
+    """Action embedder backed by a trained OAT tokenizer checkpoint.
+
+    Loads a Lightning ``.ckpt`` written by ``model=oat_tokenizer`` and uses the
+    OATTok encoder to produce **continuous** pre-quantization latents for each
+    action chunk.  These latents are suitable for KSG mutual information
+    estimation in the curation pipeline.
+
+    The encoder maps ``(B, S, action_dim)`` → ``(B, num_registers, latent_dim)``
+    (register tokens).  We mean-pool the register dimension to obtain a single
+    ``(B, latent_dim)`` embedding per chunk, then project down to ``latent_dim``
+    (= ``embed_latent_dim`` from the config) if needed via random projection.
+
+    Args:
+        checkpoint_path: Path to the OATTokenizerTrainer Lightning ``.ckpt``.
+        encoder_cfg: Hydra-structured dict describing the OATTok encoder
+            (same block used in the model YAML under ``action_tokenizer.encoder``).
+        decoder_cfg: Hydra-structured dict for the OATTok decoder (needed to
+            instantiate OATTok; weights are loaded but only the encoder is called).
+        quantizer_cfg: Hydra-structured dict for the OATTok FSQ quantizer.
+        device: Torch device for inference (default ``"cpu"``).
+        latent_dim: Output dimensionality after optional random projection.
+            Set to ``None`` to return the raw encoder embedding dimension.
+        action_chunk_size: Expected number of timesteps ``S`` per chunk.
+            Used to reshape flat ``(T * action_dim,)`` inputs.
+        action_dim: Action dimension ``D``.  Together with ``action_chunk_size``
+            this determines how flat arrays are reshaped into ``(B, S, D)`` chunks
+            before encoding.
+        batch_size: Max chunks per forward call.
+        seed: RNG seed for the optional random projection.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        encoder_cfg: dict,
+        decoder_cfg: dict,
+        quantizer_cfg: dict,
+        device: str | torch.device = "cpu",
+        latent_dim: int = 128,
+        action_chunk_size: int = 100,
+        action_dim: int = 12,
+        batch_size: int = 256,
+        seed: int = 42,
+    ) -> None:
+        self.checkpoint_path = checkpoint_path
+        self.encoder_cfg = encoder_cfg
+        self.decoder_cfg = decoder_cfg
+        self.quantizer_cfg = quantizer_cfg
+        self.device = torch.device(device)
+        self.latent_dim = latent_dim
+        self.action_chunk_size = action_chunk_size
+        self.action_dim = action_dim
+        self.batch_size = batch_size
+        self._seed = seed
+        self._encoder: nn.Module | None = None
+        self._proj: np.ndarray | None = None
+        self._fitted = False
+
+    # ------------------------------------------------------------------
+    # fit / set_precomputed_stats
+    # ------------------------------------------------------------------
+
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """No-op: OAT encoder handles normalisation internally via identity transform."""
+        logger.debug(
+            "OATActionEmbedder: ignoring external norm stats "
+            "(encoder uses identity normalizer seeded at OAT training time)"
+        )
+
+    def fit(self, episodes: list | None = None) -> None:
+        """Load the OAT tokenizer from checkpoint and extract the encoder.
+
+        Instantiates the full ``OATTok`` (encoder + quantizer + decoder) using the
+        provided configs, loads weights from ``checkpoint_path``, then holds only
+        the encoder for inference (avoids loading the decoder weights into GPU RAM
+        unnecessarily).
+        """
+        import hydra.utils
+        from omegaconf import OmegaConf
+
+        if not self.checkpoint_path:
+            raise ValueError("checkpoint_path is required for OATActionEmbedder")
+
+        logger.info("OATActionEmbedder: loading tokenizer from %s", self.checkpoint_path)
+
+        # Instantiate the full tokenizer to correctly load the state dict.
+        tok = hydra.utils.instantiate(
+            OmegaConf.create(
+                {
+                    "_target_": "oat.tokenizer.oat.tokenizer.OATTok",
+                    "encoder": self.encoder_cfg,
+                    "decoder": self.decoder_cfg,
+                    "quantizer": self.quantizer_cfg,
+                }
+            )
+        )
+
+        # Load the Lightning checkpoint — keys are prefixed with "nets.tokenizer."
+        state_dict_prefix = "nets.tokenizer."
+        sd = torch.load(
+            self.checkpoint_path, map_location="cpu", weights_only=False
+        )["state_dict"]
+        p = len(state_dict_prefix)
+        sub = {k[p:]: v for k, v in sd.items() if k.startswith(state_dict_prefix)}
+        tok.load_state_dict(sub, strict=True)
+
+        # Hold encoder only; freeze parameters.
+        self._encoder = tok.encoder.to(self.device).eval()
+        for param in self._encoder.parameters():
+            param.requires_grad_(False)
+
+        # Build optional random projection: encoder_latent_embed → latent_dim.
+        # encoder_latent_embed = num_registers * latent_dim_per_register
+        # We mean-pool over registers first to get (latent_dim_per_register,).
+        encoder_latent_per_register = self.encoder_cfg.get(
+            "latent_dim", getattr(self._encoder, "latent_dim", 5)
+        )
+        self._proj = _build_random_projection(
+            encoder_latent_per_register, self.latent_dim, seed=self._seed
+        )
+
+        self._fitted = True
+        logger.info(
+            "OATActionEmbedder: encoder ready on %s, "
+            "latent_per_register=%d → output_dim=%d",
+            self.device,
+            encoder_latent_per_register,
+            min(encoder_latent_per_register, self.latent_dim),
+        )
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
+        """Encode a batch of action chunks into latent representations.
+
+        Args:
+            data: ``(N, action_chunk_size * action_dim)`` or
+                  ``(N, action_chunk_size, action_dim)`` float32 array.
+                  Values should be pre-normalized to ``[-1, 1]`` (the same
+                  normalization applied during OAT training).
+
+        Returns:
+            ``(N, latent_dim)`` float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        if len(data) == 0:
+            return np.empty((0, self.latent_dim), dtype=np.float32)
+
+        # Reshape to (N, S, D) chunks
+        n = len(data)
+        chunks = data.reshape(n, self.action_chunk_size, self.action_dim).astype(
+            np.float32
+        )
+
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            for start in range(0, n, self.batch_size):
+                batch = torch.from_numpy(
+                    chunks[start : start + self.batch_size]
+                ).to(self.device)  # (B, S, D)
+
+                # OAT encoder: (B, S, D) → (B, num_registers, latent_dim_per_reg)
+                z = self._encoder(batch)  # continuous pre-quantization latents
+
+                # Mean-pool over register dimension → (B, latent_dim_per_reg)
+                z_pooled = z.mean(dim=1).float().cpu().numpy()
+
+                # Optional random projection to output latent_dim
+                if self._proj is not None:
+                    z_pooled = z_pooled @ self._proj
+                outputs.append(z_pooled)
+
+        elapsed = time.perf_counter() - t0
+        result = np.concatenate(outputs, axis=0)
+        logger.debug(
+            "[actions] OATActionEmbedder: %d chunks in %.3fs → latent_dim=%d",
+            n, elapsed, result.shape[1],
+        )
+        return result
+
+
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.
