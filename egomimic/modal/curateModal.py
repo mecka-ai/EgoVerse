@@ -58,6 +58,7 @@ from modal_setup import (  # noqa: E402
     _prepare_repo,
     _prepare_repo_light,
     _resolve_git_state,
+    app_name_from_hydra_args,
     launch_detached,
     pop_init_submodules,
     app,
@@ -659,8 +660,10 @@ def submit_curate(*hydra_args: str) -> None:
         init_submodules=init_submodules,
         hf_token=_local_hf_token(),
     )
+    _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
+    _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
     print(f"Submitted Modal curation job: {handle.object_id}")
-    print("Monitor: https://modal.com/apps/mecka/robotics")
+    print(f"Monitor: https://modal.com/apps/mecka/{_env}/apps/{_app}")
 
 
 # ---------------------------------------------------------------------------
@@ -677,12 +680,15 @@ if __name__ == "__main__":
         else:
             hydra_args.append(arg)
 
+    modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(hydra_args)
+
     task_compute = ModalCompute.from_mapping(
         modal_env,
         default_gpu="L40S",
         default_cpu=16.0,
         default_memory_mb=131072,
     )
+    print(f"Modal app:                                    {modal_env['MODAL_APP_NAME']}")
     print(f"Modal curation orchestrator (fixed):          {CURATE_ORCHESTRATOR.summary()}")
     print(f"Modal curation per-task CPU orchestrator:     {TASK_SCORE_COMPUTE.summary()}")
     print(f"Modal curation embed-shard GPU worker:        {task_compute.summary()}")

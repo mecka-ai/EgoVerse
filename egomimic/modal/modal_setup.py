@@ -7,6 +7,7 @@ at module level so it is safe to evaluate before the repo is cloned.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -17,6 +18,45 @@ import modal
 os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# ---------------------------------------------------------------------------
+# App naming
+# ---------------------------------------------------------------------------
+
+_MODAL_APP_DEFAULT = "egomimic-training"
+
+
+def app_name_from_hydra_args(hydra_args: list[str]) -> str:
+    """Derive a Modal App name as ``<name>-<description>`` from Hydra CLI args.
+
+    Sanitizes to Modal-valid characters (alphanumeric, ``-``, ``_``, ``.``),
+    max 64 chars. Falls back to ``egomimic-training`` if neither key is present.
+    """
+    def _san(s: object) -> str:
+        t = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(s or "").strip())
+        return t.strip("-_.") or ""
+
+    name = description = ""
+    for arg in hydra_args:
+        key, sep, val = arg.partition("=")
+        key = key.lstrip("+")
+        if sep and key == "name":
+            name = _san(val)
+        elif sep and key == "description":
+            description = _san(val)
+
+    if name and description:
+        label = f"{name}-{description}"
+    elif name:
+        label = name
+    elif description:
+        label = description
+    else:
+        return _MODAL_APP_DEFAULT
+
+    if len(label) > 64:
+        label = label[:64].rstrip("-_.")
+    return label or _MODAL_APP_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +246,10 @@ zarr_volume = modal.Volume.from_name("mecka_data_v2")
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
 )
-app = modal.App("egomimic-training", image=image)
+_modal_app_name = (
+    os.environ.get("MODAL_APP_NAME", _MODAL_APP_DEFAULT).strip() or _MODAL_APP_DEFAULT
+)
+app = modal.App(_modal_app_name, image=image)
 
 
 # ---------------------------------------------------------------------------
