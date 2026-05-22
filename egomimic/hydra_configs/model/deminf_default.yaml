@@ -9,6 +9,16 @@ keys:
 
 norm_min_std: 1.0e-6
 
+# Action embedder for Pass 2 (KSG MI input).
+# type=gaussian: Gaussian normalisation + random orthogonal projection (default, no checkpoint needed).
+# type=checkpoint: load a trained model (e.g. OAT tokeniser) from checkpoint_path.
+#   encode_method: method on the loaded model to call — must accept (T, action_dim) tensor,
+#                  return (T, latent_dim) tensor (default: "encode").
+action_embedder:
+  type: gaussian  # gaussian | checkpoint
+  checkpoint_path: null
+  encode_method: encode
+
 # Pass 2 state image embedder. Set backbone; dinov3 block is used only when backbone=dinov3.
 state_image:
   backbone: dinov3  # resnet18 | dinov3
