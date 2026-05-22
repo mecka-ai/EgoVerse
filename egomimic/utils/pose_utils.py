@@ -44,6 +44,98 @@ def _interpolate_linear(seq: np.ndarray, chunk_length: int) -> np.ndarray:
     return interp1d(old_time, seq, axis=0, kind="linear")(new_time)
 
 
+def _interpolate_linear_batch(seqs: np.ndarray, chunk_length: int) -> np.ndarray:
+    """
+    Batched linear interpolation: (B, T, D) → (B, chunk_length, D).
+
+    All B sequences share the same uniform time grid, so we reshape to
+    (T, B*D), call interp1d once, then reshape back.
+    """
+    B, T, D = seqs.shape
+    if T == 1:
+        return np.repeat(seqs, chunk_length, axis=1)
+    old_time = np.linspace(0, 1, T)
+    new_time = np.linspace(0, 1, chunk_length)
+    flat = seqs.transpose(1, 0, 2).reshape(T, B * D)  # (T, B*D)
+    result = interp1d(old_time, flat, axis=0, kind="linear")(new_time)  # (chunk_length, B*D)
+    return result.reshape(chunk_length, B, D).transpose(1, 0, 2)  # (B, chunk_length, D)
+
+
+def _interpolate_quat_wxyz_batch(seqs: np.ndarray, chunk_length: int) -> np.ndarray:
+    """
+    Batched quaternion-aware interpolation: (B, T, 7) → (B, chunk_length, 7).
+
+    All B sequences are interpolated simultaneously using numpy broadcasting.
+    Sign-continuity is enforced with a T-step loop vectorised over B — this
+    loop is over the *horizon* (≤30), not over episodes, so it is negligible.
+    Falls back to 1e9 sentinel if any input contains a sentinel value.
+    """
+    B, T, D = seqs.shape
+    if D != 7:
+        raise ValueError(f"_interpolate_quat_wxyz_batch expects last dim 7, got {D}")
+
+    if np.any(seqs >= 1e8):
+        return np.full((B, chunk_length, 7), 1e9, dtype=seqs.dtype)
+
+    old_time = np.linspace(0, 1, T)
+    new_time = np.linspace(0, 1, chunk_length)
+
+    xyz = seqs[:, :, :3].astype(np.float64)   # (B, T, 3)
+    quat_wxyz = seqs[:, :, 3:7].astype(np.float64)  # (B, T, 4)
+    quat_xyzw = quat_wxyz[:, :, [1, 2, 3, 0]]  # (B, T, 4)
+
+    norms = np.linalg.norm(quat_xyzw, axis=-1, keepdims=True)
+    if np.any(norms <= 0):
+        raise ValueError("Zero-norm quaternion found in _interpolate_quat_wxyz_batch input")
+    quat_xyzw = quat_xyzw / norms
+
+    # Sign-continuity: loop over T-1 horizon steps, vectorised over B.
+    q = quat_xyzw.copy()
+    for i in range(1, T):
+        dots = (q[:, i - 1, :] * q[:, i, :]).sum(-1)  # (B,)
+        flip = dots < 0                                  # (B,)
+        q[:, i, :] = np.where(flip[:, None], -q[:, i, :], q[:, i, :])
+
+    # Batched linear interpolation of xyz.
+    xyz_interp = _interpolate_linear_batch(xyz, chunk_length)  # (B, chunk_length, 3)
+
+    if T == 1:
+        quat_interp_wxyz = np.repeat(quat_wxyz, chunk_length, axis=1)  # (B, chunk_length, 4)
+    else:
+        # Lookup surrounding keyframe indices for each output time point.
+        idx = np.clip(np.searchsorted(old_time, new_time, side="right") - 1, 0, T - 2)
+        idx1 = idx + 1
+        t0 = old_time[idx]
+        t1 = old_time[idx1]
+        alpha = np.where(t1 > t0, (new_time - t0) / (t1 - t0), 0.5)  # (chunk_length,)
+
+        q0 = q[:, idx, :]   # (B, chunk_length, 4)
+        q1 = q[:, idx1, :]  # (B, chunk_length, 4)
+
+        dot = np.clip((q0 * q1).sum(-1, keepdims=True), -1.0, 1.0)  # (B, chunk_length, 1)
+        # After sign-continuity pass, consecutive dots are ≥ 0, but keep the
+        # sign-flip guard for SLERP between non-consecutive frames.
+        q1_adj = np.where(dot < 0, -q1, q1)
+        dot = np.clip((q0 * q1_adj).sum(-1, keepdims=True), -1.0, 1.0)
+
+        theta = np.arccos(dot)            # (B, chunk_length, 1)
+        sin_theta = np.sin(theta)
+
+        a = alpha[None, :, None]          # (1, chunk_length, 1) for broadcasting
+        w0 = np.where(sin_theta > 1e-6,
+                      np.sin((1.0 - a) * theta) / (sin_theta + 1e-10), 1.0 - a)
+        w1 = np.where(sin_theta > 1e-6,
+                      np.sin(a * theta) / (sin_theta + 1e-10), a)
+
+        quat_interp = w0 * q0 + w1 * q1_adj   # (B, chunk_length, 4)
+        norms_out = np.linalg.norm(quat_interp, axis=-1, keepdims=True)
+        quat_interp /= np.where(norms_out > 1e-10, norms_out, 1.0)
+        quat_interp_wxyz = quat_interp[:, :, [3, 0, 1, 2]]  # (B, chunk_length, 4) xyzw→wxyz
+
+    dtype = seqs.dtype if np.issubdtype(seqs.dtype, np.floating) else np.float64
+    return np.concatenate([xyz_interp, quat_interp_wxyz], axis=-1).astype(dtype, copy=False)
+
+
 def _interpolate_quat_wxyz(seq: np.ndarray, chunk_length: int) -> np.ndarray:
     """Quaternion-aware interpolation for a single (T, 7) sequence."""
     T, D = seq.shape

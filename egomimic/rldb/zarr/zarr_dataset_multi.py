@@ -36,8 +36,6 @@ import torch
 import zarr
 
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
-
-# from action_chunk_transforms import Transform
 from egomimic.rldb.filters import DatasetFilter
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.aws.aws_sql import (
@@ -332,10 +330,6 @@ class EpisodeResolver:
             thread pool.
           - Otherwise (local dev, or no pre-train fan-out happened), do the
             whole thing in-process.
-
-        The Modal fan-out itself lives in trainModal._precompute_pause_to_cache
-        — it has to run from a hydrated function context, which this
-        subprocess does not have.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
@@ -439,6 +433,7 @@ class EpisodeResolver:
         direct = local_dir / episode_hash
         if direct.is_dir():
             return True
+        return False
 
 
 class S3EpisodeResolver(EpisodeResolver):
@@ -736,6 +731,9 @@ class LocalEpisodeResolver(EpisodeResolver):
         filters: DatasetFilter | None = None,
         debug: int | bool | None = None,
     ):
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
             logger.warning("Local path does not exist: %s", search_path)
@@ -829,11 +827,6 @@ class LocalEpisodeResolver(EpisodeResolver):
             self.folder_path, filters, debug=self.debug
         )
 
-        if self.allowed_episode_ids is not None:
-            filtered_paths = [
-                (p, h) for p, h in filtered_paths if h in self.allowed_episode_ids
-            ]
-
         valid_folder_names = {folder_name for _, folder_name in filtered_paths}
         logger.info(f"Valid folder names: {valid_folder_names}")
         if not valid_folder_names:
@@ -856,6 +849,8 @@ class ModalEpisodeResolver(EpisodeResolver):
     Episodes present in the table but absent from the local volume are skipped
     with a warning, so a partially-synced volume still works.
 
+    This class is also the home for Modal-specific fan-out parallel container
+    methods (_modal_fanout_scan, _modal_fanout_load) used by other Modal code.
     """
 
     def __init__(
@@ -869,6 +864,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
+        allowed_episode_ids: list[str] | None = None,
         max_episodes: int | None = None,
     ):
         super().__init__(
@@ -884,29 +880,26 @@ class ModalEpisodeResolver(EpisodeResolver):
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
                 self.exclude_hashes.update(json.load(f))
-            logger.info(
-                "eps_to_ignore: %d hashes from %s",
-                len(self.exclude_hashes),
-                eps_to_ignore,
-            )
+            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
         self.include_hashes: set[str] | None = None
         if eps_to_use:
             with open(eps_to_use) as f:
                 self.include_hashes = set(json.load(f))
-            logger.info(
-                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
+            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
+        # allowed_episode_ids: restrict to exactly these hashes (used by curation per-task scoping)
+        if allowed_episode_ids is not None:
+            allowed_set = set(allowed_episode_ids)
+            self.include_hashes = (
+                allowed_set if self.include_hashes is None
+                else self.include_hashes & allowed_set
             )
+            logger.info("allowed_episode_ids: restricted to %d episodes", len(self.include_hashes))
 
-    def _resolve_episode_meta(
+    def resolve(
         self,
         filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, Path, int, str]]:
-        """Resolve episodes from SQL + filters → (hash, local_path, num_frames, robot_name).
-
-        No zarr opens, no ZarrDataset construction. Used by both resolve()
-        (which goes on to build datasets) and the pre-train precompute step
-        in trainModal.run_hydra_train (which only needs episode paths).
-        """
+        **kwargs,
+    ) -> dict[str, "ZarrDataset"]:
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -942,13 +935,14 @@ class ModalEpisodeResolver(EpisodeResolver):
         episode_hashes = matched["episode_hash"].tolist()
         logger.info("SQL filter matched %d episodes", len(episode_hashes))
 
-        if matched.empty:
+        if not episode_hashes:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            logger.info("Debug mode: using first %d episodes", len(matched))
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
 
         if self.max_episodes is not None and len(matched) > self.max_episodes:
             before = len(matched)
@@ -970,10 +964,7 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         datasets: dict[str, ZarrDataset] = {}
         n_missing = 0
-        for _, row in matched.iterrows():
-            episode_hash = row["episode_hash"]
-            num_frames = int(row["num_frames"])
-            robot_name = str(row["robot_name"])
+        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
             local_path = next(
                 (
                     p
@@ -989,26 +980,6 @@ class ModalEpisodeResolver(EpisodeResolver):
                 n_missing += 1
                 logger.warning("Episode not found locally, skipping: %s", episode_hash)
                 continue
-            out.append((episode_hash, local_path, num_frames, robot_name))
-
-        if n_missing:
-            logger.info("Skipped %d episodes not present in local volume", n_missing)
-        if not out:
-            raise ValueError(
-                "No episodes resolved — all SQL-matched episodes are missing from the local volume."
-            )
-        return out
-
-    def resolve(
-        self,
-        filters: DatasetFilter | None = None,
-        **kwargs,
-    ) -> dict[str, "ZarrDataset"]:
-        meta = self._resolve_episode_meta(filters)
-        dataset_class = self._dataset_class or ZarrDataset
-
-        datasets: dict[str, ZarrDataset] = {}
-        for episode_hash, local_path, num_frames, robot_name in meta:
             datasets[episode_hash] = dataset_class(
                 local_path,
                 key_map=self.key_map,
@@ -1019,9 +990,324 @@ class ModalEpisodeResolver(EpisodeResolver):
                 _embodiment=robot_name,
             )
 
+        if n_missing:
+            logger.info("Skipped %d episodes not present in local volume", n_missing)
+
+        if not datasets:
+            raise ValueError(
+                "No episodes loaded — all SQL-matched episodes are missing from the local volume."
+            )
+
         logger.info("Loaded %d episodes from local volume", len(datasets))
         self._run_pause_precompute(datasets)
         return datasets
+
+    # ------------------------------------------------------------------
+    # Modal SDK import helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _import_real_modal():
+        """Return the installed Modal SDK, working around egomimic.modal shadowing.
+
+        When trainHydra.py runs as `python /root/EgoVerse/egomimic/trainHydra.py`,
+        Python puts /root/EgoVerse/egomimic on sys.path[0], which makes a bare
+        `import modal` resolve to the egomimic.modal subpackage. This helper:
+          1. Returns the cached real SDK if one is already in sys.modules.
+          2. Otherwise strips egomimic from sys.path and re-imports.
+        """
+        import sys
+
+        existing = sys.modules.get("modal")
+        if existing is not None and hasattr(existing, "Function"):
+            return existing
+
+        _orig_path = list(sys.path)
+        sys.path = [p for p in sys.path if Path(p).name != "egomimic"]
+        sys.modules.pop("modal", None)
+        try:
+            import modal as _modal
+        finally:
+            sys.path = _orig_path
+
+        if not hasattr(_modal, "Function"):
+            raise RuntimeError(
+                "Imported `modal` has no `Function` attribute — "
+                "egomimic.modal subpackage is still shadowing the installed Modal SDK"
+            )
+        return _modal
+
+    # ------------------------------------------------------------------
+    # Modal fan-out helpers — parallel container code for Modal volume
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _modal_fanout_scan(
+        cls,
+        search_path: Path,
+        filters: DatasetFilter,
+        start_time: float,
+    ) -> list[tuple[str, str]]:
+        """Fan out a zarr metadata filter scan across Modal containers via scan_shard.
+
+        Lists candidate dir names locally (one fast readdir), shards them, and
+        invokes egomimic-scan::scan_shard in parallel.  Each worker mounts the
+        zarr volume read-only and runs a thread-pooled .zattrs scan.
+        """
+        import time
+
+        modal = cls._import_real_modal()
+
+        logger.info(f"Modal fan-out scan: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        names = [n for n in os.listdir(search_path) if not n.startswith(".")]
+        total = len(names)
+        logger.info(
+            f"Modal fan-out scan: listed {total} entries in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return []
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_SCAN_SHARDS", "100")), total)
+        shards = [names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out scan: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up scan_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "scan_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out scan: function lookup OK; launching .map()...")
+        filter_lambdas = list(filters.filter_lambdas)
+
+        matched: list[tuple[str, str]] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, [filter_lambdas] * total_shards):
+            completed += 1
+            matched.extend(shard_result)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal scan: shard {completed}/{total_shards} done "
+                    f"| matched={len(matched)} | elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out scan complete: {len(matched)} matches from {total} "
+            f"entries in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return matched
+
+    def _modal_fanout_load(
+        self,
+        search_path: Path,
+        valid_folder_names: set[str],
+        dataset_class,
+    ) -> dict:
+        """Fan out per-episode .zattrs reads across Modal containers via load_shard.
+
+        Worker returns picklable (path, hash, metadata) tuples; ZarrDataset is
+        constructed locally with precomputed_metadata so its zarr open is
+        deferred until first __getitem__.
+        """
+        import time
+
+        modal = self._import_real_modal()
+
+        start_time = time.monotonic()
+        logger.info(f"Modal fan-out load: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        on_disk_names = []
+        for raw_name in os.listdir(search_path):
+            if raw_name.startswith("."):
+                continue
+            hash_name = raw_name[:-5] if raw_name.endswith(".zarr") else raw_name
+            if hash_name in valid_folder_names:
+                on_disk_names.append(raw_name)
+        total = len(on_disk_names)
+        logger.info(
+            f"Modal fan-out load: {total} target entries (of {len(valid_folder_names)} requested) "
+            f"in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return {}
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_LOAD_SHARDS", "100")), total)
+        shards = [on_disk_names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out load: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up load_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "load_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out load: function lookup OK; launching .map()...")
+
+        datasets: dict = {}
+        skipped: list[str] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards):
+            completed += 1
+            for path_str, episode_hash, metadata in shard_result:
+                if episode_hash not in valid_folder_names:
+                    continue
+                try:
+                    datasets[episode_hash] = dataset_class(
+                        Path(path_str),
+                        key_map=self.key_map,
+                        transform_list=self.transform_list,
+                        norm_stats=self.norm_stats,
+                        precomputed_metadata=metadata,
+                    )
+                except Exception as e:
+                    logger.error("Failed to construct dataset for %s: %s", path_str, e)
+                    skipped.append(episode_hash)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal load: shard {completed}/{total_shards} done "
+                    f"| loaded={len(datasets)} skipped={len(skipped)} "
+                    f"| elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out load complete: {len(datasets)} datasets "
+            f"(skipped {len(skipped)}) in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return datasets
+
+    # ------------------------------------------------------------------
+    # Pause precompute — Modal fan-out override
+    # ------------------------------------------------------------------
+
+    def _run_pause_precompute(self, datasets: dict) -> None:
+        """Run per-episode pause precompute; no-op if epsilon is None.
+
+        Priority:
+          1. Pre-built cache JSON ($EGOMIMIC_PAUSE_PRECOMPUTE_CACHE) — fastest.
+          2. Modal fan-out (inside Modal container with volume mount).
+          3. In-process thread pool (local dev fallback).
+        """
+        if self.pause_removal_epsilon is None or not datasets:
+            return
+
+        cache_path = os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
+        if cache_path and Path(cache_path).is_file():
+            remaining = self._apply_pause_precompute_cache(cache_path, datasets)
+            if remaining:
+                self._inprocess_pause_precompute(remaining)
+            return
+
+        if self._should_use_modal_pause_precompute(datasets):
+            try:
+                self._modal_fanout_pause_precompute(datasets)
+                return
+            except Exception as e:
+                logger.warning(
+                    "Modal pause precompute failed (%s) — falling back to in-process thread pool",
+                    e,
+                )
+
+        self._inprocess_pause_precompute(datasets)
+
+    @staticmethod
+    def _should_use_modal_pause_precompute(datasets: dict) -> bool:
+        inside_modal = (
+            os.environ.get("MODAL_IS_REMOTE") == "1"
+            or bool(os.environ.get("MODAL_TASK_ID"))
+        )
+        if not inside_modal:
+            return False
+        if os.environ.get("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE") == "1":
+            return False
+        return any(
+            str(getattr(ds, "episode_path", "")).startswith("/mnt/zarr-data")
+            for ds in datasets.values()
+        )
+
+    def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
+        """Compute keep_indices in parallel across egomimic-scan::pause_precompute_shard workers."""
+        import time
+
+        modal = self._import_real_modal()
+        t0 = time.monotonic()
+
+        work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
+        n = len(work)
+        n_shards = min(int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n)
+        shards = [work[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            "Pause precompute via Modal fan-out: %d episodes across %d shards — "
+            "looking up pause_precompute_shard function...",
+            n,
+            total_shards,
+        )
+        fn = modal.Function.from_name(
+            "egomimic-scan", "pause_precompute_shard", environment_name="robotics"
+        )
+        epsilons = [self.pause_removal_epsilon] * total_shards
+
+        n_total = 0
+        n_kept = 0
+        n_errs = 0
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, epsilons):
+            completed += 1
+            for episode_hash, raw_total, indices in shard_result:
+                ds = datasets.get(episode_hash)
+                if ds is None:
+                    n_errs += 1
+                    continue
+                if raw_total == 0:
+                    n_errs += 1
+                    continue
+                ds._raw_total_frames = int(raw_total)
+                ds.keep_indices = np.asarray(indices, dtype=np.int64)
+                n_total += raw_total
+                n_kept += len(indices)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "Pause precompute via Modal: shard %d/%d done | kept=%d/%d "
+                    "errors=%d | elapsed %.0fs",
+                    completed,
+                    total_shards,
+                    n_kept,
+                    n_total,
+                    n_errs,
+                    elapsed,
+                )
+
+        elapsed = time.monotonic() - t0
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        logger.info(
+            "Pause precompute via Modal fan-out complete (epsilon=%s): kept %d/%d "
+            "frames (%.1f%%) across %d episodes in %.1fs (errors=%d, shards=%d)",
+            self.pause_removal_epsilon,
+            n_kept,
+            n_total,
+            pct,
+            n,
+            elapsed,
+            n_errs,
+            total_shards,
+        )
 
 
 # Backward-compat alias — YAML configs that reference LocalSQLEpisodeResolver continue to work.
@@ -1182,9 +1468,11 @@ class MultiDataset(torch.utils.data.Dataset):
             or self._n_samples_checked % self._violation_log_every == 0
         ):
             pct = 100 * self._n_violation_samples / max(self._n_samples_checked, 1)
-            print(
-                f"[BoundsCheck] {self._n_samples_checked} samples checked: "
-                f"{self._n_violation_samples} violations ({pct:.1f}%)"
+            logger.info(
+                "[BoundsCheck] %d samples checked: %d violations (%.1f%%)",
+                self._n_samples_checked,
+                self._n_violation_samples,
+                pct,
             )
 
         return prefix
@@ -1242,15 +1530,12 @@ class MultiDataset(torch.utils.data.Dataset):
 
         Args:
             resolver (EpisodeResolver): The resolver instance to use for loading datasets.
-            embodiment: The embodiment identifier to use for resolving datasets.
             **kwargs: Keyword args forwarded to resolver (e.g., filters,
                 sync_from_s3) and MultiDataset constructor (e.g., mode, percent,
                 key_map, valid_ratio).
         Returns:
             MultiDataset: The constructed multi-dataset.
         """
-        # TODO add key_map and transform pass to children
-
         sync_from_s3 = kwargs.pop("sync_from_s3", False)
         filters = kwargs.pop("filters", None)
 
@@ -1267,7 +1552,7 @@ class MultiDataset(torch.utils.data.Dataset):
 
 class ZarrDataset(torch.utils.data.Dataset):
     """
-    Base Zarr Dataset object, Just intializes as pass through to read from zarr episode
+    Base Zarr Dataset object — reads frames from a single zarr episode directory.
     """
 
     def __init__(
@@ -1297,7 +1582,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 through keep_indices. None leaves the episode unchanged.
             _total_frames: if provided (e.g. from SQL), skip zarr open at init and defer to first __getitem__.
             _embodiment: if provided alongside _total_frames, also skip zarr open at init.
-            precomputed_metadata: full .zattrs dict pre-loaded externally.
+            precomputed_metadata: full .zattrs dict pre-loaded externally (e.g. from _modal_fanout_load).
                 When provided, skips zarr open at init and populates all metadata fields immediately.
         """
         self.episode_path = Episode_path
@@ -1308,7 +1593,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.episode_reader = None
 
         if precomputed_metadata is not None:
-            # Full metadata pre-loaded externally
+            # Full metadata pre-loaded externally (e.g. from Modal fan-out load_shard)
             self._init_from_metadata(precomputed_metadata)
         elif _total_frames is not None and _embodiment is not None:
             # Lightweight fast path from SQL — defer zarr open to first access
@@ -1324,6 +1609,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.pause_removal_epsilon = pause_removal_epsilon
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
+        self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
         super().__init__()
 
     def _ensure_episode_reader(self):
@@ -1416,6 +1702,392 @@ class ZarrDataset(torch.utils.data.Dataset):
         if self.keep_indices is not None:
             return int(len(self.keep_indices))
         return self.total_frames
+
+    def actions_only_view(self) -> "ZarrDataset":
+        """
+        Shallow copy without camera/annotation keys (same transforms and pause mask).
+
+        Used by the curation batched transform path; images are bulk-read separately
+        in ``collect_curation_episode``.
+        """
+        import copy
+
+        view = copy.copy(self)
+        view.key_map = {
+            k: v
+            for k, v in self.key_map.items()
+            if v.get("key_type") not in ("camera_keys", "annotation_keys")
+        }
+        view._zarr_bulk_cache = None
+        return view
+
+    def preload_zarr_arrays(self) -> None:
+        """Load every zarr array in ``key_map`` once (``store[key][:]`` into RAM)."""
+        self._ensure_episode_reader()
+        store = self.episode_reader._store
+        cache: dict[str, np.ndarray] = {}
+        for spec in self.key_map.values():
+            zarr_key = spec.get("zarr_key")
+            if not zarr_key or zarr_key in cache:
+                continue
+            cache[zarr_key] = np.asarray(store[zarr_key][:])
+        self._zarr_bulk_cache = cache
+
+    def _read_key_slice(
+        self, zarr_key: str, start: int, end: int | None
+    ) -> np.ndarray:
+        if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
+            arr = self._zarr_bulk_cache[zarr_key]
+            if end is not None:
+                return arr[start:end]
+            return arr[start : start + 1][0]
+        read_dict = {zarr_key: (start, end)}
+        return self.episode_reader.read(read_dict)[zarr_key]
+
+    _CURATION_POSE_SENTINEL = 1e8
+    _CURATION_MIN_QUAT_NORM = 1e-6
+
+    def _logical_to_real_index(self, logical_idx: int) -> int:
+        if self.keep_indices is not None:
+            return int(self.keep_indices[logical_idx])
+        return int(logical_idx)
+
+    @staticmethod
+    def _pose_rows_valid(
+        pose: np.ndarray,
+        *,
+        min_quat_norm: float = 1e-6,
+        sentinel: float = 1e8,
+    ) -> np.ndarray:
+        """Per-row validity for ``(T, 7)`` xyz+wxyz pose arrays."""
+        pose = np.asarray(pose)
+        if pose.ndim != 2 or pose.shape[-1] != 7:
+            raise ValueError(f"Expected (T, 7) pose, got {pose.shape}")
+        xyz_ok = np.all(np.abs(pose[:, :3]) < sentinel, axis=1)
+        quat_norms = np.linalg.norm(pose[:, 3:7], axis=1)
+        return xyz_ok & (quat_norms > min_quat_norm)
+
+    def _action_chunk_horizon(self) -> int:
+        for spec in self.key_map.values():
+            horizon = spec.get("horizon")
+            if horizon is not None:
+                return int(horizon)
+        return 1
+
+    def _curation_valid_logical_indices(self) -> np.ndarray:
+        """Logical timestep indices with valid pose windows (skip zero-quat / cut rows)."""
+        n_logical = len(self)
+        if n_logical == 0:
+            return np.array([], dtype=np.int64)
+
+        horizon = self._action_chunk_horizon()
+        view = self.actions_only_view()
+        cache = view._zarr_bulk_cache or self._zarr_bulk_cache
+        if cache is None:
+            return np.array([], dtype=np.int64)
+
+        required = {
+            "obs_head_pose",
+            "left.obs_ee_pose",
+            "right.obs_ee_pose",
+        }
+        if not required.issubset(cache.keys()):
+            return np.array([], dtype=np.int64)
+
+        head = np.asarray(cache["obs_head_pose"])
+        left = np.asarray(cache["left.obs_ee_pose"])
+        right = np.asarray(cache["right.obs_ee_pose"])
+        head_ok = self._pose_rows_valid(
+            head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+        )
+        left_ok = self._pose_rows_valid(
+            left, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+        )
+        right_ok = self._pose_rows_valid(
+            right, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+        )
+
+        valid: list[int] = []
+        for logical_idx in range(n_logical):
+            real_idx = self._logical_to_real_index(logical_idx)
+            end_idx = min(real_idx + horizon, left.shape[0])
+            if real_idx >= end_idx:
+                continue
+            if not head_ok[real_idx]:
+                continue
+            if not left_ok[real_idx:end_idx].all() or not right_ok[real_idx:end_idx].all():
+                continue
+            if not left_ok[real_idx] or not right_ok[real_idx]:
+                continue
+            valid.append(logical_idx)
+
+        return np.asarray(valid, dtype=np.int64)
+
+    def _build_batched_transform_batch(
+        self, logical_indices: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """Stack per-timestep raw/transform inputs for ``apply_transform``-style batching.
+
+        Uses vectorised sliding-window indexing when the instance's ``_chunk_end_idx``
+        is the base implementation (simple ``min(start+H, total_frames)`` clamping).
+        Subclasses that override ``_chunk_end_idx`` (e.g. ``ZarrAnnotationCutoffDataset``)
+        fall back to the per-sample loop to preserve their clamping semantics.
+        """
+        view = self.actions_only_view()
+        view.keep_indices = self.keep_indices
+        if self._zarr_bulk_cache is not None:
+            needed = {
+                spec["zarr_key"]
+                for spec in view.key_map.values()
+                if spec.get("zarr_key")
+            }
+            view._zarr_bulk_cache = {
+                k: self._zarr_bulk_cache[k]
+                for k in needed
+                if k in self._zarr_bulk_cache
+            }
+
+        n = len(logical_indices)
+        # Vectorised path: safe only when _chunk_end_idx is the base implementation.
+        use_vec = type(self)._chunk_end_idx is ZarrDataset._chunk_end_idx
+        if use_vec and self._zarr_bulk_cache is not None:
+            real_indices = (
+                self.keep_indices[logical_indices]
+                if self.keep_indices is not None
+                else logical_indices.astype(np.int64)
+            )
+            batch: dict[str, np.ndarray] = {}
+            for key, spec in view.key_map.items():
+                zarr_key = spec["zarr_key"]
+                horizon = spec.get("horizon")
+                arr = np.asarray(view._zarr_bulk_cache[zarr_key])
+                if horizon is None:
+                    # Simple gather: (n, D)
+                    batch[key] = arr[real_indices]
+                else:
+                    H = int(horizon)
+                    # Pad the tail with the last frame so every window is length H.
+                    padding = np.repeat(arr[-1:], H - 1, axis=0)
+                    arr_padded = np.concatenate([arr, padding], axis=0)
+                    # Build (n, H) index matrix and gather in one shot.
+                    step_indices = real_indices[:, None] + np.arange(H, dtype=np.int64)
+                    batch[key] = arr_padded[step_indices]  # (n, H, D) or (n, H)
+            return batch
+
+        # Per-sample fallback (subclass overrides _chunk_end_idx, or no bulk cache).
+        batch = {}
+        for key, spec in view.key_map.items():
+            zarr_key = spec["zarr_key"]
+            horizon = spec.get("horizon")
+            key_type = spec.get("key_type")
+            rows: list[np.ndarray] = []
+            for logical_idx in logical_indices:
+                real_idx = self._logical_to_real_index(int(logical_idx))
+                if horizon is not None:
+                    end_idx = self._chunk_end_idx(real_idx, int(horizon), key_type)
+                    window = self._read_key_slice(zarr_key, real_idx, end_idx)
+                    window = self._pad_sequences({zarr_key: window}, int(horizon))[zarr_key]
+                    rows.append(np.asarray(window))
+                else:
+                    rows.append(
+                        np.asarray(self._read_key_slice(zarr_key, real_idx, None))
+                    )
+            batch[key] = np.stack(rows, axis=0) if n > 1 else np.expand_dims(rows[0], 0)
+        return batch
+
+    def _apply_transform_list_batched(
+        self, batch: dict[str, np.ndarray]
+    ) -> tuple[dict[str, np.ndarray] | None, np.ndarray]:
+        """
+        Run ``transform_list`` on a stacked batch; drop rows that still fail.
+
+        Returns ``(output_batch, ok_positions)`` where ``ok_positions`` index into
+        the leading batch dimension.
+
+        Fast path: if every transform has ``transform_batch``, run the whole batch
+        in one vectorized pass.  Falls back to the per-sample loop on any exception.
+        """
+        if not self.transform:
+            return batch, np.arange(next(iter(batch.values())).shape[0], dtype=np.int64)
+
+        batch_size = next(iter(batch.values())).shape[0]
+
+        if all(hasattr(t, "transform_batch") for t in self.transform):
+            try:
+                data = batch
+                for transform in self.transform:
+                    data = transform.transform_batch(data)
+                out = {k: np.asarray(v) for k, v in data.items() if isinstance(v, np.ndarray)}
+                return out, np.arange(batch_size, dtype=np.int64)
+            except Exception as exc:
+                logger.debug(
+                    "Vectorized transform_batch failed for ep=%s (%s: %s), falling back to per-sample",
+                    Path(self.episode_path).name,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        results: list[dict[str, np.ndarray]] = []
+        ok_positions: list[int] = []
+
+        for i in range(batch_size):
+            sample = {
+                k: v[i]
+                for k, v in batch.items()
+                if isinstance(v, np.ndarray) and v.shape[0] == batch_size
+            }
+            try:
+                data = sample
+                for transform in self.transform:
+                    data = transform.transform(data)
+                results.append(
+                    {
+                        k: np.asarray(v)
+                        for k, v in data.items()
+                        if isinstance(v, np.ndarray)
+                    }
+                )
+                ok_positions.append(i)
+            except Exception as exc:
+                logger.debug(
+                    "Skipping curation row ep=%s batch_pos=%d: %s: %s",
+                    Path(self.episode_path).name,
+                    i,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        if not results:
+            return None, np.array([], dtype=np.int64)
+
+        out: dict[str, np.ndarray] = {}
+        for key in results[0]:
+            out[key] = np.stack([r[key] for r in results], axis=0)
+        return out, np.asarray(ok_positions, dtype=np.int64)
+
+    def _camera_image_key(self) -> str:
+        for key, spec in self.key_map.items():
+            if spec.get("key_type") == "camera_keys":
+                return key
+        return next(iter(self.key_map))
+
+    def _collect_curation_batched(
+        self,
+        action_key: str,
+        image_key: str,
+        image_decode_workers: int,
+        *,
+        load_images: bool,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if load_images and image_key not in self.key_map:
+            return None, None
+
+        if self.pause_removal_epsilon is not None and self.keep_indices is None:
+            self.precompute_pause_filter()
+        self.preload_zarr_arrays()
+
+        n_logical = len(self)
+        if n_logical == 0:
+            return None, None
+
+        logical_valid = self._curation_valid_logical_indices()
+        n_skipped_pose = n_logical - len(logical_valid)
+        if n_skipped_pose > 0:
+            logger.info(
+                "curation ep=%s: skipped %d/%d timesteps (invalid/zero pose rows)",
+                Path(self.episode_path).name,
+                n_skipped_pose,
+                n_logical,
+            )
+        if len(logical_valid) == 0:
+            return None, None
+
+        batched_in = self._build_batched_transform_batch(logical_valid)
+        batched_out, ok_pos = self._apply_transform_list_batched(batched_in)
+        if batched_out is None or action_key not in batched_out:
+            return None, None
+
+        if len(ok_pos) < len(logical_valid):
+            logger.info(
+                "curation ep=%s: dropped %d/%d timesteps after transform failures",
+                Path(self.episode_path).name,
+                len(logical_valid) - len(ok_pos),
+                len(logical_valid),
+            )
+            logical_valid = logical_valid[ok_pos]
+
+        actions = np.asarray(batched_out[action_key], dtype=np.float32)
+        if actions.ndim < 2:
+            return None, None
+
+        if not load_images:
+            return actions, None
+
+        img_zarr_key = self.key_map[image_key]["zarr_key"]
+        if self._zarr_bulk_cache is None or img_zarr_key not in self._zarr_bulk_cache:
+            return None, None
+
+        jpeg_frames = self._zarr_bulk_cache[img_zarr_key]
+        if self.keep_indices is not None:
+            jpeg_frames = jpeg_frames[self.keep_indices]
+        jpeg_frames = jpeg_frames[logical_valid]
+
+        workers = max(0, int(image_decode_workers))
+        if workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                images = np.stack(
+                    list(pool.map(self._decode_jpeg_to_chw, jpeg_frames)),
+                    axis=0,
+                )
+        else:
+            images = np.stack(
+                [self._decode_jpeg_to_chw(b) for b in jpeg_frames],
+                axis=0,
+            )
+
+        if len(images) != len(actions):
+            raise RuntimeError(
+                f"action/image length mismatch ep={self.episode_path.name}: "
+                f"{len(actions)} vs {len(images)}"
+            )
+        return actions, images
+
+    @staticmethod
+    def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
+        """Decode one JPEG payload to float32 CHW in [0, 1]."""
+        if isinstance(jpeg_bytes, np.ndarray):
+            if jpeg_bytes.dtype == np.uint8 and jpeg_bytes.ndim >= 2:
+                return np.transpose(jpeg_bytes, (2, 0, 1)).astype(np.float32) / 255.0
+            jpeg_bytes = jpeg_bytes.item() if jpeg_bytes.ndim == 0 else jpeg_bytes[0]
+        decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
+        return np.transpose(decoded, (2, 0, 1)).astype(np.float32) / 255.0
+
+    def collect_curation_episode(
+        self,
+        action_key: str = "actions_cartesian",
+        image_key: str = "observations.images.front_img_1",
+        image_decode_workers: int = 8,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        DemInf Pass 2 per episode: bulk zarr read, batched transforms, aligned decode.
+
+        1. ``preload_zarr_arrays()`` — one ``[:]`` per zarr key.
+        2. Filter timesteps with invalid/zero quaternions (pose cut rows).
+        3. Stack valid rows → run ``transform_list`` in batch (no random fallback).
+        4. Decode JPEGs only for surviving logical indices.
+
+        Returns:
+            ``(actions, images)`` as ``(T, chunk, D)`` and ``(T, C, H, W)``, or
+            ``(None, None)`` if empty / keys missing.
+        """
+        return self._collect_curation_batched(
+            action_key=action_key,
+            image_key=image_key,
+            image_decode_workers=image_decode_workers,
+            load_images=True,
+        )
 
     def precompute_pause_filter(self) -> tuple[int, int]:
         """Build the per-episode pause keep-mask from raw obs_ee_pose deltas.
@@ -1525,9 +2197,17 @@ class ZarrDataset(torch.utils.data.Dataset):
                     read_interval = (real_idx, end_idx)
             else:
                 read_interval = (real_idx, None)
-            read_dict = {zarr_key: read_interval}
             try:
-                raw_data = self.episode_reader.read(read_dict)
+                if isinstance(read_interval, np.ndarray):
+                    # Fancy-index path (fully-filtered chunk)
+                    read_dict = {zarr_key: read_interval}
+                    raw_data = self.episode_reader.read(read_dict)
+                else:
+                    raw_data = {
+                        zarr_key: self._read_key_slice(
+                            zarr_key, read_interval[0], read_interval[1]
+                        )
+                    }
             except (IndexError, KeyError) as e:
                 origin = _fallback_origin if _fallback_origin is not None else idx
                 next_idx, attempts = get_fallback_idx(
@@ -1549,13 +2229,10 @@ class ZarrDataset(torch.utils.data.Dataset):
             self._pad_sequences(raw_data, horizon)  # should be able to pad images
             data[k] = raw_data[zarr_key]
 
-            # Decode JPEG-encoded image data and normalize to [0, 1]
-            # print(f"Print the image_keys: {self._image_keys}")
             if zarr_key in self._image_keys:
                 jpeg_bytes = data[k]
-                # Decode JPEG bytes to numpy array (H, W, 3)
                 try:
-                    decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
+                    data[k] = self._decode_jpeg_to_chw(jpeg_bytes)
                 except Exception:
                     origin = _fallback_origin if _fallback_origin is not None else idx
                     next_idx, attempts = get_fallback_idx(
@@ -1575,18 +2252,14 @@ class ZarrDataset(torch.utils.data.Dataset):
                         next_idx, _fallback_origin=origin, _attempts=attempts
                     )
                     return result
-                data[k] = np.transpose(decoded, (2, 0, 1)) / 255.0
             elif zarr_key in self._json_keys:
                 if isinstance(data[k], np.ndarray):
                     data[k] = [self._decode_json_entry(v) for v in data[k]]
                 else:
                     data[k] = self._decode_json_entry(data[k])
 
-        # Convert all numpy arrays in data to torch tensors
-
-        # TODO add the transform list code here
         if self.transform:
-            for transform in self.transform or []:
+            for transform in self.transform:
                 try:
                     data = transform.transform(data)
                 except Exception as e:
@@ -1699,41 +2372,32 @@ class ZarrEpisode:
         self.keys = self.metadata["features"]
 
     def read(
-        self,
-        keys_with_ranges: dict[str, tuple[int, int | None] | np.ndarray],
+        self, keys_with_ranges: dict[str, tuple[int, int | None]]
     ) -> dict[str, np.ndarray]:
         """
-        Read data for specified keys, each with their own range or index array.
-
-        Two indexer shapes are supported per key:
-
-        - ``(start, end)`` tuple: contiguous slice ``arr[start:end]``. ``end=None``
-          reads a single frame at ``start`` (and unwraps the trailing dim,
-          preserving VariableLengthBytes objects intact).
-        - ``np.ndarray`` of frame indices: fancy-index read ``arr[indices]``.
-          Used when the dataset has ``keep_indices`` set and the consumer
-          wants the action chunk to skip paused raw frames.
-
+        Read data for specified keys, each with their own index or range.
+        Args:
+            keys_with_ranges: Dictionary mapping keys to (start, end) tuples.
+                - start: Starting frame index
+                - end: Ending frame index (exclusive). If None, reads single frame at start.
+        Returns:
+            Dictionary mapping keys to numpy arrays
         Example:
             >>> episode.read({
-            ...     "obs/image": (0, 10),                 # contiguous frames 0..9
-            ...     "actions":   np.array([0, 1, 8, 9]),  # fancy: skip 2..7
-            ...     "rewards":   (20, None),              # single frame 20
+            ...     "obs/image": (0, 10),      # Read frames 0-10
+            ...     "actions": (5, 15),        # Read frames 5-15
+            ...     "rewards": (20, None),     # Read single frame at index 20
             ... })
         """
         result = {}
-        for key, indexer in keys_with_ranges.items():
+        for key, (start, end) in keys_with_ranges.items():
             arr = self._store[key]
-            if isinstance(indexer, np.ndarray):
-                data = arr[indexer]
+            if end is not None:
+                data = arr[start:end]
             else:
-                start, end = indexer
-                if end is not None:
-                    data = arr[start:end]
-                else:
-                    # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                    # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                    data = arr[start : start + 1][0]
+                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
+                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
+                data = arr[start : start + 1][0]
             result[key] = data
         return result
 
