@@ -7,7 +7,9 @@ at module level so it is safe to evaluate before the repo is cloned.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +18,45 @@ import modal
 os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# ---------------------------------------------------------------------------
+# App naming
+# ---------------------------------------------------------------------------
+
+_MODAL_APP_DEFAULT = "egomimic-training"
+
+
+def app_name_from_hydra_args(hydra_args: list[str]) -> str:
+    """Derive a Modal App name as ``<name>-<description>`` from Hydra CLI args.
+
+    Sanitizes to Modal-valid characters (alphanumeric, ``-``, ``_``, ``.``),
+    max 64 chars. Falls back to ``egomimic-training`` if neither key is present.
+    """
+    def _san(s: object) -> str:
+        t = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(s or "").strip())
+        return t.strip("-_.") or ""
+
+    name = description = ""
+    for arg in hydra_args:
+        key, sep, val = arg.partition("=")
+        key = key.lstrip("+")
+        if sep and key == "name":
+            name = _san(val)
+        elif sep and key == "description":
+            description = _san(val)
+
+    if name and description:
+        label = f"{name}-{description}"
+    elif name:
+        label = name
+    elif description:
+        label = description
+    else:
+        return _MODAL_APP_DEFAULT
+
+    if len(label) > 64:
+        label = label[:64].rstrip("-_.")
+    return label or _MODAL_APP_DEFAULT
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +103,77 @@ CFG = _Config()
 
 
 # ---------------------------------------------------------------------------
+# Modal compute (+modal_* launch overrides)
+# ---------------------------------------------------------------------------
+
+# Map Hydra-style CLI flags to env vars read at curateModal import time.
+MODAL_COMPUTE_ARG_MAP: dict[str, str] = {
+    "modal_gpu": "MODAL_GPU",
+    "modal_cpu": "MODAL_CPU",
+    "modal_memory_gb": "MODAL_MEMORY_GB",
+    "modal_memory_mb": "MODAL_MEMORY_MB",
+}
+
+
+@dataclass(frozen=True)
+class ModalCompute:
+    """GPU/CPU/RAM for a Modal ``@app.function`` container."""
+
+    gpu: str | None
+    cpu: float
+    memory_mb: int
+
+    @classmethod
+    def from_environ(
+        cls,
+        *,
+        default_gpu: str | None = "L40S",
+        default_cpu: float = 16.0,
+        default_memory_mb: int = 131072,
+    ) -> ModalCompute:
+        """Read ``MODAL_*`` env vars (set locally before ``modal run``)."""
+        return cls.from_mapping(
+            os.environ,
+            default_gpu=default_gpu,
+            default_cpu=default_cpu,
+            default_memory_mb=default_memory_mb,
+        )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        env: dict[str, str],
+        *,
+        default_gpu: str | None = "L40S",
+        default_cpu: float = 16.0,
+        default_memory_mb: int = 131072,
+    ) -> ModalCompute:
+        """Parse ``MODAL_GPU``, ``MODAL_CPU``, ``MODAL_MEMORY_GB`` / ``MODAL_MEMORY_MB``."""
+        raw_gpu = env.get("MODAL_GPU")
+        if raw_gpu is None:
+            gpu = default_gpu
+        elif str(raw_gpu).lower() in ("none", "null", "false", ""):
+            gpu = None
+        else:
+            gpu = str(raw_gpu)
+
+        cpu = float(env.get("MODAL_CPU", default_cpu))
+        if env.get("MODAL_MEMORY_GB"):
+            memory_mb = int(float(env["MODAL_MEMORY_GB"]) * 1024)
+        else:
+            memory_mb = int(env.get("MODAL_MEMORY_MB", default_memory_mb))
+        return cls(gpu=gpu, cpu=cpu, memory_mb=memory_mb)
+
+    def summary(self) -> str:
+        gpu_s = self.gpu if self.gpu else "none"
+        return f"gpu={gpu_s}  cpu={self.cpu}  memory={self.memory_mb / 1024:.0f}GB"
+
+
+# ``run_curate`` orchestrator: SQL + spawn only (fixed; ignore +modal_*).
+CURATE_ORCHESTRATOR = ModalCompute(gpu=None, cpu=4.0, memory_mb=8192)
+
+
+# ---------------------------------------------------------------------------
 # Container image
 # ---------------------------------------------------------------------------
 
@@ -75,9 +187,7 @@ image = (
     # import it at module-load time (before the repo is cloned via _prepare_repo).
     # Path(__file__).parent resolves to /root/ in the container, so:
     #   from modal_setup import (...)  works in both local and remote contexts.
-    .add_local_file(
-        Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
-    )
+    .add_local_file(Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True)
     .pip_install(
         "lightning",
         "hydra-core",
@@ -136,125 +246,10 @@ zarr_volume = modal.Volume.from_name("mecka_data_v2")
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
 )
-app = modal.App("egomimic-training", image=image)
-
-
-# ---------------------------------------------------------------------------
-# Pause-precompute fan-out worker
-# ---------------------------------------------------------------------------
-# Lives on the training app so trainHydra.py (running inside run_hydra_train)
-# can .map() it without depending on a separately-deployed companion app.
-# The image is intentionally minimal — zarr + numpy only, no egomimic imports
-# — so cold starts are fast (each shard is a few seconds of I/O + numpy).
-
-pause_precompute_image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "zarr==3.1.5", "numpy"
+_modal_app_name = (
+    os.environ.get("MODAL_APP_NAME", _MODAL_APP_DEFAULT).strip() or _MODAL_APP_DEFAULT
 )
-
-
-@app.function(
-    image=pause_precompute_image,
-    cpu=2.0,
-    memory=4096,
-    timeout=900,
-    volumes={"/mnt/zarr-data": zarr_volume},
-    max_containers=100,
-)
-def pause_precompute_shard(
-    episodes: list[tuple[str, str]],
-    epsilon: float,
-) -> list[tuple[str, int, list[int]]]:
-    """Compute per-episode pause keep_indices for a shard.
-
-    Mirrors ``egomimic.rldb.zarr.zarr_dataset_multi._build_pause_keep_mask`` —
-    keep them in sync. Self-contained on purpose: the worker image is
-    debian_slim + zarr + numpy with no egomimic install, so cold starts stay
-    in the few-hundred-MB range.
-
-    Args:
-        episodes: list of (episode_hash, episode_path_str).
-        epsilon: L2 threshold for the "frame is paused" test (m, per hand /
-            per landmark).
-
-    Returns:
-        list of (episode_hash, raw_total_frames, keep_indices). For episodes
-        missing the obs_ee_pose keys or that fail to open, raw is 0 and
-        indices is empty — the caller treats this as "skip".
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    import numpy as np
-    import zarr
-
-    LEFT_POSE = "left.obs_ee_pose"
-    RIGHT_POSE = "right.obs_ee_pose"
-    LEFT_KP = "left.obs_keypoints"
-    RIGHT_KP = "right.obs_keypoints"
-
-    zarr_volume.reload()
-
-    def _kp_max_delta(kp):
-        T = kp.shape[0]
-        if T < 2 or kp.ndim != 2 or kp.shape[1] % 3 != 0 or kp.shape[1] == 0:
-            return np.zeros(max(T - 1, 0))
-        n_landmarks = kp.shape[1] // 3
-        diff = np.diff(kp.reshape(T, n_landmarks, 3), axis=0)
-        return np.linalg.norm(diff, axis=-1).max(axis=-1)
-
-    def _mask(left_pose, right_pose, left_kp=None, right_kp=None):
-        T = len(left_pose)
-        if T < 2:
-            return np.ones(T, dtype=bool)
-        left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
-        right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
-        is_paused = (left_d < epsilon) & (right_d < epsilon)
-        if left_kp is not None and len(left_kp) == T:
-            is_paused = is_paused & (_kp_max_delta(np.asarray(left_kp)) < epsilon)
-        if right_kp is not None and len(right_kp) == T:
-            is_paused = is_paused & (_kp_max_delta(np.asarray(right_kp)) < epsilon)
-        keep = np.ones(T, dtype=bool)
-        in_pause = False
-        for t in range(1, T):
-            if is_paused[t - 1]:
-                if in_pause:
-                    keep[t] = False
-                else:
-                    in_pause = True
-            else:
-                in_pause = False
-        return keep
-
-    def _one(item):
-        episode_hash, path_str = item
-        try:
-            store = zarr.open_group(path_str, mode="r")
-            left = np.asarray(store[LEFT_POSE][:])
-            right = np.asarray(store[RIGHT_POSE][:])
-        except Exception:
-            return (episode_hash, 0, [])
-        # Keypoints are optional — older episodes / non-MECKA embodiments may
-        # not have them; the detector degrades to ee_pose-only.
-        left_kp = right_kp = None
-        try:
-            left_kp = np.asarray(store[LEFT_KP][:])
-        except (KeyError, Exception):
-            pass
-        try:
-            right_kp = np.asarray(store[RIGHT_KP][:])
-        except (KeyError, Exception):
-            pass
-        try:
-            keep = _mask(left, right, left_kp, right_kp)
-            indices = np.flatnonzero(keep).astype(np.int64).tolist()
-            return (episode_hash, int(left.shape[0]), indices)
-        except Exception:
-            return (episode_hash, 0, [])
-
-    out: list[tuple[str, int, list[int]]] = []
-    with ThreadPoolExecutor(max_workers=64) as ex:
-        for r in ex.map(_one, episodes):
-            out.append(r)
-    return out
+app = modal.App(_modal_app_name, image=image)
 
 
 # ---------------------------------------------------------------------------
@@ -262,18 +257,40 @@ def pause_precompute_shard(
 # ---------------------------------------------------------------------------
 
 
+def launch_detached(
+    script_path: Path,
+    entrypoint: str,
+    hydra_args: list[str],
+    modal_env: dict | None = None,
+    env: str = "robotics",
+) -> None:
+    """Push HEAD then fire a fully-detached Modal run.
+
+    The local process can exit or lose connectivity after this returns —
+    Modal keeps the spawned containers running to completion.
+    Always use this instead of modal run without --detach or .remote() calls.
+    """
+    _git_commit_and_push(Path(script_path).resolve().parent.parent.parent)
+    cmd = [
+        sys.executable, "-m", "modal", "run",
+        "--detach", "--env", env,
+        f"{script_path}::{entrypoint}",
+        "--", *hydra_args,
+    ]
+    print(f"Launching detached: {entrypoint} -- {' '.join(hydra_args)}")
+    result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env or os.environ.copy())
+    sys.exit(result.returncode)
+
+
 def _git_commit_and_push(repo_root: Path) -> None:
     """Auto-commit any local changes and push to remote before Modal submission."""
-
     def _run(cmd):
         return subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
 
     if _run(["git", "status", "--porcelain"]).stdout.strip():
         print("Auto-committing local changes before Modal submission...")
         _run(["git", "add", "-A"])
-        result = _run(
-            ["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"]
-        )
+        result = _run(["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"])
         if result.returncode != 0:
             print(f"[git commit] {result.stderr.strip()}")
 
@@ -284,6 +301,25 @@ def _git_commit_and_push(repo_root: Path) -> None:
             f"git push failed — cannot submit to Modal with unpushed changes:\n{push.stderr.strip()}"
         )
     print("Push complete.")
+
+
+def _local_hf_token() -> str:
+    """Read HuggingFace token from local auth cache (hf auth login) or ~/.egoverse_env."""
+    for token_path in [
+        Path("~/.cache/huggingface/token").expanduser(),
+        Path("~/.huggingface/token").expanduser(),
+    ]:
+        if token_path.exists():
+            token = token_path.read_text().strip()
+            if token:
+                return token
+    env_file = Path("~/.egoverse_env").expanduser()
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("HF_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    return ""
 
 
 def _local_wandb_key() -> str:
@@ -307,6 +343,21 @@ def _local_wandb_key() -> str:
 
 def _git_output(args: list[str]) -> str:
     return subprocess.check_output(args, cwd=REPO_ROOT, text=True).strip()
+
+
+def pop_init_submodules(
+    args: tuple[str, ...] | list[str],
+) -> tuple[tuple[str, ...], bool]:
+    """Strip ``init_submodules=…`` from launch args; return (remaining, init_submodules)."""
+    init_submodules = True
+    kept: list[str] = []
+    for arg in args:
+        key, sep, val = arg.lstrip("+").partition("=")
+        if sep and key == "init_submodules":
+            init_submodules = val.strip().lower() not in ("false", "0", "no", "off")
+        else:
+            kept.append(arg)
+    return tuple(kept), init_submodules
 
 
 def _resolve_git_state() -> tuple[str, str, bool]:
@@ -351,12 +402,17 @@ def _resolve_git_state() -> tuple[str, str, bool]:
 def _ssh_to_https(url: str) -> str:
     """Convert git@github.com:org/repo.git → https://github.com/org/repo.git"""
     if url.startswith("git@github.com:"):
-        path = url[len("git@github.com:") :]
+        path = url[len("git@github.com:"):]
         return f"https://github.com/{path}"
     return url
 
 
-def _prepare_repo(git_remote: str, git_commit: str) -> None:
+def _prepare_repo(
+    git_remote: str,
+    git_commit: str,
+    *,
+    init_submodules: bool = True,
+) -> None:
     """Clone (or update) the repo and check out the exact commit."""
     clone_url = _ssh_to_https(git_remote)
     repo_dir = Path(CFG.remote_repo_dir)
@@ -377,23 +433,33 @@ def _prepare_repo(git_remote: str, git_commit: str) -> None:
             check=True,
         )
     else:
-        subprocess.run(["git", "clone", clone_url, CFG.remote_repo_dir], check=True)
+        clone_cmd = ["git", "clone", clone_url, CFG.remote_repo_dir]
+        if not init_submodules:
+            clone_cmd = [
+                "git",
+                "clone",
+                "--no-recurse-submodules",
+                clone_url,
+                CFG.remote_repo_dir,
+            ]
+        subprocess.run(clone_cmd, check=True)
 
     subprocess.run(
         ["git", "-C", CFG.remote_repo_dir, "checkout", git_commit], check=True
     )
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            CFG.remote_repo_dir,
-            "submodule",
-            "update",
-            "--init",
-            "--recursive",
-        ],
-        check=True,
-    )
+    if init_submodules:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                CFG.remote_repo_dir,
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+            check=True,
+        )
     subprocess.run(
         [CFG.python_bin, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"],
         cwd=CFG.remote_repo_dir,
@@ -401,7 +467,12 @@ def _prepare_repo(git_remote: str, git_commit: str) -> None:
     )
 
 
-def _prepare_repo_light(git_remote: str, git_commit: str) -> None:
+def _prepare_repo_light(
+    git_remote: str,
+    git_commit: str,
+    *,
+    init_submodules: bool = False,
+) -> None:
     """Shallow clone without submodules — faster setup for curation shard workers."""
     clone_url = _ssh_to_https(git_remote)
     repo_dir = Path(CFG.remote_repo_dir)
@@ -415,14 +486,7 @@ def _prepare_repo_light(git_remote: str, git_commit: str) -> None:
             )
         else:
             subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "--depth=1",
-                    "--no-recurse-submodules",
-                    clone_url,
-                    str(repo_dir),
-                ],
+                ["git", "clone", "--depth=1", "--no-recurse-submodules", clone_url, str(repo_dir)],
                 check=True,
             )
 
@@ -433,6 +497,19 @@ def _prepare_repo_light(git_remote: str, git_commit: str) -> None:
     subprocess.run(
         ["git", "-C", str(repo_dir), "checkout", "--detach", git_commit], check=True
     )
+    if init_submodules:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+            check=True,
+        )
     subprocess.run(
         [CFG.python_bin, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"],
         cwd=str(repo_dir),

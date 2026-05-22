@@ -1,78 +1,32 @@
-# DemInf curation model config — default settings.
-#
-# Launch a curation run:
-#   python egomimic/modal/curateModal.py::run_curate_cmd name=my_run description=test
-#
-# Override individual knobs inline, e.g.:
-#   model.scorer.k_range=[5,9]
+# DemInf curation model settings (OmegaConf only — not Hydra-instantiated).
 
-_target_: egomimic.algo.deminf.DemInfAlgo
+latent_dim: 32
+device: cuda
 
-# ── Cross-embodiment ────────────────────────────────────────────────────────
-# "independent": KSG runs separately per embodiment group (recommended for
-#   heterogeneous datasets — avoids mixing 42-D hand keypoints with 14-D
-#   joint positions in the same NN search).
-# "shared": single KSG pass over all embodiments jointly (only sensible when
-#   all embodiments share the same retargeted action space).
-cross_embodiment_mode: independent
+keys:
+  action: actions_cartesian
+  image: observations.images.front_img_1
 
-# ── Grouping ─────────────────────────────────────────────────────────────────
-# "task": score each episode relative to others in the same task group
-#         (task_name from zarr metadata). Outputs scores_by_task.json.
-# "none": score all episodes globally (legacy behaviour).
-grouping: task
+norm_min_std: 1.0e-6
 
-# ── Selection ───────────────────────────────────────────────────────────────
-# filter_ratio is kept for future use — no filtering is applied during scoring.
-# Use a separate script to threshold scores_by_task.json.
-filter_ratio: 0.3
+# Pass 2 state image embedder. Set backbone; dinov3 block is used only when backbone=dinov3.
+state_image:
+  backbone: dinov3  # resnet18 | dinov3
+  dinov3:
+    model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    dtype: float16
 
-device: cpu
+# Required: path to norm_stats.json (same JSON as training offline_norm_stats).
+# Run the offline norm-stats script before curating; raises ValueError if absent.
+precomputed_norm_stats:
+  path: precomputed_norm_stats/mecka_all_zarr
+  embodiment_id: "9"
 
-# ── State embedder ───────────────────────────────────────────────────────────
-# mode: "proprioceptive" (default) or "image".
-# In proprioceptive mode, raw obs arrays are Gaussian-normalised then
-# projected to latent_dim via a random orthogonal matrix.
-# In image mode, a frozen ResNet-18 + fixed random linear head is used.
-state_embedder:
-  _target_: egomimic.curation.embedders.StateEmbedder
-  mode: proprioceptive
-  latent_dim: 32
-  cross_embodiment_mode: ${..cross_embodiment_mode}
-  device: ${..device}
-
-# ── Action embedder ──────────────────────────────────────────────────────────
-# Embeds per-timestep actions (T, D) OR pre-stored action chunks
-# (T, chunk_size, D) from the zarr key "actions_cartesian".
-# Both formats are flattened to (T, chunk_size*D) before normalisation
-# and random-orthogonal projection to latent_dim.
-action_embedder:
-  _target_: egomimic.curation.embedders.ActionEmbedder
-  latent_dim: 32
-  cross_embodiment_mode: ${..cross_embodiment_mode}
-
-# ── KSG scorer ───────────────────────────────────────────────────────────────
-# k_range: [k_min, k_max] — KSG is run for each k in this inclusive range
-# and averaged for robustness.  Wider ranges increase compute but reduce
-# variance in the MI estimate.
-scorer:
+# Pass 3: KSG on concatenated episode latents (CPU).
+ksg:
+  n_threads: 12
   k_range: [3, 7]
-
-# ── Preprocessing filters ────────────────────────────────────────────────────
-# Applied in order before embedding.  Each entry is Hydra-instantiated.
-#
-# PauseFilter   — collapses pause frames (||Δa|| < epsilon) to a single
-#                 representative frame; keeps context at pause boundaries.
-# ActionClipFilter — per-episode Gaussian normalisation + clipping, removing
-#                 teleop glitches that would dominate the embedding space.
-# MinLengthFilter  — discards episodes shorter than min_length timesteps after
-#                 the above two filters.
-preprocessing:
-  - _target_: egomimic.curation.filters.PauseFilter
-    epsilon: 0.01
-    embodiment_overrides:
-      mecka_bimanual: 0.005
-  - _target_: egomimic.curation.filters.ActionClipFilter
-    clip: 1.0
-  - _target_: egomimic.curation.filters.MinLengthFilter
-    min_length: 20
+  # Approximate subsampled KSG (disabled when null). Enable both, e.g. 100000.
+  chunked_threshold: null
+  chunked_max_points: null
+  batch_size: 10000

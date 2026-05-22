@@ -1,45 +1,50 @@
-"""
-State and action embedders for DemInf curation.
-
-Both embedders share a fit/embed interface:
-    embedder.fit(episodes)          — compute normalisation stats / train
-    embedder.embed(data) -> ndarray — map raw data to latent vectors
-
-Embedders must be fit on the *entire* dataset before any MI computation,
-because KSG is a global estimator operating on the joint distribution.
-
-Cross-embodiment support
-------------------------
-When ``cross_embodiment_mode="independent"`` (the default), each embodiment
-gets its own normalisation statistics and projection matrix.  The output
-dimensionality is always ``latent_dim`` regardless of the input dimension,
-so per-embodiment embeddings can be concatenated safely for downstream use,
-but MI is scored *within* each embodiment group to avoid comparing
-fundamentally different action modalities (e.g., hand keypoints vs. robot
-joint positions).
-
-When ``cross_embodiment_mode="shared"`` all episodes are embedded using a
-single global statistics set — only makes sense when embodiments have been
-retargeted to a common action/state space.
-"""
+"""State and action embedders for DemInf curation (fit / embed API)."""
 
 from __future__ import annotations
 
 import logging
-from typing import Literal
+import time
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from egomimic.curation.utils import Episode
-
 logger = logging.getLogger(__name__)
 
+_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3"})
+_DINOV3_DEFAULT_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
+
+def _parse_torch_dtype(name: str) -> "torch.dtype":
+    import torch
+
+    key = str(name).lower().replace(" ", "")
+    mapping = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if key not in mapping:
+        raise ValueError(
+            f"Unsupported dtype {name!r}; expected one of {sorted(mapping)}"
+        )
+    return mapping[key]
+
+
+def _chw_batch_to_rgb_images(chunk: np.ndarray) -> list[np.ndarray]:
+    """Convert (N, C, H, W) uint8 or float [0, 1] to N HWC RGB uint8 arrays."""
+    if chunk.dtype == np.uint8:
+        nhwc = np.transpose(chunk, (0, 2, 3, 1))
+    else:
+        nhwc = np.transpose(
+            (np.clip(chunk.astype(np.float32), 0.0, 1.0) * 255.0).astype(np.uint8),
+            (0, 2, 3, 1),
+        )
+    return [nhwc[i] for i in range(nhwc.shape[0])]
 
 
 def _fit_gaussian_stats(
@@ -47,35 +52,25 @@ def _fit_gaussian_stats(
     min_std: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute global mean and std from a list of (T, D) arrays."""
-    stacked = np.concatenate(arrays, axis=0)  # (N_total, D)
+    stacked = np.concatenate(arrays, axis=0)
     mean = stacked.mean(axis=0)
     std = np.maximum(stacked.std(axis=0), min_std)
     return mean, std
 
 
-def _build_random_projection(
-    in_dim: int,
-    out_dim: int,
-    seed: int = 42,
-) -> np.ndarray | None:
+def _build_random_projection(in_dim: int, out_dim: int, seed: int = 42) -> np.ndarray | None:
     """
     Build a random orthogonal projection matrix (in_dim → out_dim).
 
-    Returns None when in_dim <= out_dim (identity / no projection needed).
-    The matrix is computed via QR decomposition so columns are orthonormal,
-    preserving MI up to the Johnson-Lindenstrauss guarantee.
+    Returns None when in_dim ≤ out_dim (no projection needed).
+    Columns are orthonormal via QR decomposition, preserving MI up to
+    the Johnson-Lindenstrauss guarantee.
     """
     if in_dim <= out_dim:
         return None
     rng = np.random.default_rng(seed=seed)
-    G = rng.standard_normal((in_dim, out_dim))
-    Q, _ = np.linalg.qr(G)
+    Q, _ = np.linalg.qr(rng.standard_normal((in_dim, out_dim)))
     return Q[:, :out_dim].astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# StateEmbedder
-# ---------------------------------------------------------------------------
 
 
 class StateEmbedder:
@@ -86,102 +81,89 @@ class StateEmbedder:
         mode: "proprioceptive" or "image".
         latent_dim: Output dimensionality (default 32).
         device: Torch device for image mode.
-        cross_embodiment_mode: "independent" (separate stats per embodiment)
-            or "shared" (single global stats).  Only affects proprioceptive mode.
         image_batch_size: Batch size for GPU inference in image mode.
+        image_backbone: For image mode, ``resnet18`` or ``dinov3``.
+        dinov3_model_name: HuggingFace model id when ``image_backbone=dinov3``.
+        dinov3_dtype: Inference dtype for DINOv3 (e.g. ``float16``).
+        norm_min_std: Minimum std used in Gaussian normalisation to avoid divide-by-zero.
     """
 
     def __init__(
         self,
-        mode: Literal["proprioceptive", "image"] = "proprioceptive",
+        mode: str = "proprioceptive",
         latent_dim: int = 32,
         device: str | torch.device = "cpu",
-        cross_embodiment_mode: Literal["independent", "shared"] = "independent",
         image_batch_size: int = 256,
+        image_backbone: str = "resnet18",
+        dinov3_model_name: str = _DINOV3_DEFAULT_MODEL,
+        dinov3_dtype: str = "float16",
+        seed: int = 42,
+        norm_min_std: float = 1e-6,
     ) -> None:
         self.mode = mode
         self.latent_dim = latent_dim
         self.device = torch.device(device)
-        self.cross_embodiment_mode = cross_embodiment_mode
         self.image_batch_size = image_batch_size
+        self.image_backbone = image_backbone.lower().strip()
+        if self.image_backbone == "dino":
+            self.image_backbone = "dinov3"
+        self.dinov3_model_name = dinov3_model_name
+        self.dinov3_dtype = dinov3_dtype
+        self._seed = seed
+        self.norm_min_std = norm_min_std
         self._fitted = False
 
-        # Proprioceptive — shared stats (always populated, used as fallback)
         self._mean: np.ndarray | None = None
         self._std: np.ndarray | None = None
         self._proj: np.ndarray | None = None
-
-        # Per-embodiment stats (populated when mode="independent")
-        self._per_embodiment_stats: dict[str, dict] = {}
-
-        # Image
         self._backbone: nn.Module | None = None
         self._proj_layer: nn.Linear | None = None
+        self._processor: Any | None = None
+        self._num_patches: int = 0
 
-    # ------------------------------------------------------------------
-    # Fitting
-    # ------------------------------------------------------------------
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """
+        Provide precomputed normalisation stats from an external source (e.g. norm_stats.json).
 
-    def fit(self, episodes: list[Episode]) -> None:
+        When called before fit(), the embedder skips inline stats computation and
+        uses these values directly. The random projection is still built during fit().
+        """
+        self._mean = np.asarray(mean, dtype=np.float32)
+        self._std = np.asarray(std, dtype=np.float32)
+        self._precomputed = True
+        logger.info(
+            "StateEmbedder: using precomputed stats (obs_dim=%d)", self._mean.shape[0]
+        )
+
+    def fit(self, episodes: list | None = None) -> None:
         """Compute normalisation stats (and build projection) from all episodes."""
         if self.mode == "proprioceptive":
-            self._fit_proprioceptive(episodes)
+            if episodes and not getattr(self, "_precomputed", False):
+                obs_list = [ep.observations for ep in episodes]
+                self._mean, self._std = _fit_gaussian_stats(obs_list, min_std=self.norm_min_std)
+            self._proj = _build_random_projection(self._mean.shape[0], self.latent_dim, seed=self._seed)
+            logger.info(
+                "StateEmbedder (proprio): obs_dim=%d → latent_dim=%d",
+                self._mean.shape[0], min(self._mean.shape[0], self.latent_dim),
+            )
         else:
-            self._fit_image(episodes)
+            if self.image_backbone not in _STATE_IMAGE_BACKBONES:
+                raise ValueError(
+                    f"Unknown state image backbone {self.image_backbone!r}; "
+                    f"expected one of {sorted(_STATE_IMAGE_BACKBONES)}"
+                )
+            if self.image_backbone == "resnet18":
+                self._fit_resnet()
+            else:
+                self._fit_dinov3()
         self._fitted = True
 
-    def _fit_proprioceptive(self, episodes: list[Episode]) -> None:
-        if self.cross_embodiment_mode == "independent":
-            self._fit_proprioceptive_independent(episodes)
-        else:
-            self._fit_proprioceptive_shared(episodes)
-
-    def _fit_proprioceptive_shared(self, episodes: list[Episode]) -> None:
-        obs_list = [ep.observations for ep in episodes]
-        self._mean, self._std = _fit_gaussian_stats(obs_list)
-        obs_dim = self._mean.shape[0]
-        self._proj = _build_random_projection(obs_dim, self.latent_dim)
-        logger.info(
-            "StateEmbedder (proprio/shared): obs_dim=%d → latent_dim=%d",
-            obs_dim,
-            min(obs_dim, self.latent_dim),
-        )
-
-    def _fit_proprioceptive_independent(self, episodes: list[Episode]) -> None:
-        by_embodiment: dict[str, list[np.ndarray]] = {}
-        for ep in episodes:
-            by_embodiment.setdefault(ep.embodiment, []).append(ep.observations)
-
-        self._per_embodiment_stats = {}
-        for embodiment, obs_list in by_embodiment.items():
-            mean, std = _fit_gaussian_stats(obs_list)
-            proj = _build_random_projection(mean.shape[0], self.latent_dim)
-            self._per_embodiment_stats[embodiment] = {
-                "mean": mean,
-                "std": std,
-                "proj": proj,
-            }
-            logger.info(
-                "StateEmbedder (proprio/independent) '%s': obs_dim=%d → latent_dim=%d",
-                embodiment,
-                mean.shape[0],
-                min(mean.shape[0], self.latent_dim),
-            )
-
-        # Shared stats = first embodiment (fallback for unknown embodiments)
-        first = next(iter(self._per_embodiment_stats.values()))
-        self._mean, self._std, self._proj = (
-            first["mean"],
-            first["std"],
-            first["proj"],
-        )
-
-    def _fit_image(self, episodes: list[Episode]) -> None:  # noqa: ARG002
-        """Build frozen ResNet-18 + fixed random projection (Xavier init)."""
+    def _fit_resnet(self) -> None:
+        """Build frozen ResNet-18 + fixed Xavier-initialised projection (512 → latent_dim)."""
         try:
             from torchvision.models import ResNet18_Weights, resnet18
         except ImportError as exc:
-            raise ImportError("torchvision is required for image mode") from exc
+            raise ImportError("torchvision is required for resnet18 image backbone") from exc
 
         backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self._backbone = nn.Sequential(*list(backbone.children())[:-1])
@@ -189,10 +171,6 @@ class StateEmbedder:
             p.requires_grad_(False)
         self._backbone = self._backbone.to(self.device).eval()
 
-        # Fixed random projection 512 → latent_dim.
-        # We use a trainable Linear but initialise with Xavier and freeze it.
-        # A fixed random projection is sufficient for MI estimation — we only
-        # need a reasonable low-dimensional embedding, not a supervised mapping.
         self._proj_layer = nn.Linear(512, self.latent_dim, bias=True).to(self.device)
         nn.init.xavier_uniform_(self._proj_layer.weight)
         nn.init.zeros_(self._proj_layer.bias)
@@ -200,367 +178,225 @@ class StateEmbedder:
             p.requires_grad_(False)
 
         logger.info(
-            "StateEmbedder (image): ResNet-18 → %d (fixed random proj)", self.latent_dim
+            "StateEmbedder (image/resnet18): 512 → %d (fixed random proj)",
+            self.latent_dim,
         )
 
-    # ------------------------------------------------------------------
-    # Embedding
-    # ------------------------------------------------------------------
+    def _fit_dinov3(self) -> None:
+        """Build frozen DINOv3 + mean-pooled patch tokens → latent_dim projection."""
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+        except ImportError as exc:
+            raise ImportError(
+                "transformers is required for dinov3 image backbone"
+            ) from exc
 
-    def embed(self, data: np.ndarray, embodiment: str | None = None) -> np.ndarray:
+        dtype = _parse_torch_dtype(self.dinov3_dtype)
+        logger.info("Loading DINOv3 for curation: %s", self.dinov3_model_name)
+        self._processor = AutoImageProcessor.from_pretrained(self.dinov3_model_name)
+        self._backbone = AutoModel.from_pretrained(
+            self.dinov3_model_name, torch_dtype=dtype
+        )
+        self._backbone.to(self.device).eval()
+
+        cfg = self._backbone.config
+        side = int(cfg.image_size) // int(cfg.patch_size)
+        self._num_patches = side * side
+        hidden_dim = int(cfg.hidden_size)
+
+        self._proj_layer = nn.Linear(hidden_dim, self.latent_dim, bias=True).to(
+            self.device
+        )
+        nn.init.xavier_uniform_(self._proj_layer.weight)
+        nn.init.zeros_(self._proj_layer.bias)
+        for p in self._proj_layer.parameters():
+            p.requires_grad_(False)
+
+        logger.info(
+            "StateEmbedder (image/dinov3): %d patches, hidden=%d → %d",
+            self._num_patches,
+            hidden_dim,
+            self.latent_dim,
+        )
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
         """
         Embed a batch of observations.
 
         Args:
             data: (N, obs_dim) for proprioceptive or (N, C, H, W) for image.
-            embodiment: Embodiment name — used in independent mode to select
-                per-embodiment normalisation statistics.  Ignored in shared mode.
 
         Returns:
-            (N, latent_dim) float32 numpy array.
+            (N, latent_dim) float32 array.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before embed()")
-
         if self.mode == "proprioceptive":
-            return self._embed_proprioceptive(data, embodiment)
-        return self._embed_image(data)
+            normalised = (data.astype(np.float32) - self._mean) / self._std
+            return normalised @ self._proj if self._proj is not None else normalised
+        if self.image_backbone == "resnet18":
+            return self._embed_image_resnet(data)
+        return self._embed_image_dinov3(data)
 
-    def _embed_proprioceptive(
-        self, data: np.ndarray, embodiment: str | None
-    ) -> np.ndarray:
-        if (
-            self.cross_embodiment_mode == "independent"
-            and embodiment is not None
-            and embodiment in self._per_embodiment_stats
-        ):
-            stats = self._per_embodiment_stats[embodiment]
-            mean, std, proj = stats["mean"], stats["std"], stats["proj"]
-        else:
-            mean, std, proj = self._mean, self._std, self._proj
-
-        data = data.astype(np.float32)
-        normalised = (data - mean) / std
-        if proj is not None:
-            return normalised @ proj
-        return normalised
-
-    def _embed_image(self, data: np.ndarray) -> np.ndarray:
+    def _embed_image_resnet(self, data: np.ndarray) -> np.ndarray:
         """
-        Batched ResNet-18 inference with ImageNet preprocessing.
+        Batched ResNet-18 inference with ImageNet normalisation.
 
         Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1].
-        Applies center-crop after resize-to-224 to handle non-square Aria images.
+        Center-crops to 224×224 after resizing.
         """
         try:
             import torchvision.transforms.functional as TF
         except ImportError as exc:
-            raise ImportError("torchvision is required for image mode") from exc
+            raise ImportError("torchvision is required for resnet18 image backbone") from exc
 
-        all_outputs: list[np.ndarray] = []
-        N = data.shape[0]
-
-        for start in range(0, N, self.image_batch_size):
+        n_total = data.shape[0]
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, n_total, self.image_batch_size):
             chunk = data[start : start + self.image_batch_size]
-
-            # Convert to float32 [0, 1]
-            if chunk.dtype == np.uint8:
-                tensor = torch.from_numpy(chunk).float() / 255.0
-            else:
-                tensor = torch.from_numpy(chunk.astype(np.float32))
-
-            # Resize shortest side to 224, then centre-crop 224×224
-            # Using functional API to avoid the Compose/PIL overhead
+            tb = time.perf_counter()
+            tensor = torch.from_numpy(chunk).float() / 255.0 if chunk.dtype == np.uint8 else torch.from_numpy(chunk.astype(np.float32))
             tensor = TF.resize(tensor, [224], antialias=True)
             tensor = TF.center_crop(tensor, [224, 224])
-
-            # ImageNet normalisation
-            tensor = TF.normalize(
-                tensor,
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            )
-
-            tensor = tensor.to(self.device)
+            tensor = TF.normalize(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             with torch.no_grad():
-                feats = self._backbone(tensor)  # (B, 512, 1, 1)
-                feats = feats.flatten(1)  # (B, 512)
-                out = self._proj_layer(feats)  # (B, latent_dim)
+                feats = self._backbone(tensor.to(self.device)).flatten(1)
+                outputs.append(self._proj_layer(feats).cpu().numpy())
+            logger.debug(
+                "ResNet18 batch [%d:%d] %.3fs (%.0f imgs/s)",
+                start, start + len(chunk), time.perf_counter() - tb,
+                len(chunk) / (time.perf_counter() - tb) if (time.perf_counter() - tb) > 0 else 0,
+            )
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "[images] ResNet18 embed: %d images in %.2fs (%.0f imgs/s)",
+            n_total, elapsed, n_total / elapsed if elapsed > 0 else 0,
+        )
+        return np.concatenate(outputs, axis=0)
 
-            all_outputs.append(out.cpu().numpy())
-
-        return np.concatenate(all_outputs, axis=0)
-
-    def embed_batch(self, images: np.ndarray) -> np.ndarray:
+    def _embed_image_dinov3(self, data: np.ndarray) -> np.ndarray:
         """
-        Embed a batch of images efficiently (image mode only).
+        Batched DINOv3 inference (patch-token mean pool → latent_dim).
 
-        Args:
-            images: (N, C, H, W) numpy array in [0, 255] uint8 or [0,1] float32.
-
-        Returns:
-            (N, latent_dim) float32 numpy array.
+        Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1].
+        Uses the model's HuggingFace image processor for resize/normalise.
         """
-        if self.mode != "image":
-            raise RuntimeError("embed_batch() is only available in image mode")
-        return self._embed_image(images)
-
-    def embed_episodes(self, episodes: list[Episode]) -> tuple[np.ndarray, list[int]]:
-        """
-        Embed all timesteps from a list of episodes in one pass.
-
-        In independent mode, each episode's observations are normalised using
-        its embodiment's statistics, then results are concatenated globally.
-
-        Returns:
-            embeddings: (N_total, latent_dim)
-            lengths: list of per-episode timestep counts (for grouping back)
-        """
-        if self.mode == "image":
-            # Image mode: concatenate all frames, embed in batches
-            all_obs = [ep.observations for ep in episodes]
-            lengths = [len(o) for o in all_obs]
-            concatenated = np.concatenate(all_obs, axis=0)
-            embeddings = self.embed(concatenated)
-            return embeddings, lengths
-
-        # Proprioceptive: process per-episode so independent mode can route stats
-        all_emb: list[np.ndarray] = []
-        lengths: list[int] = []
-        for ep in episodes:
-            emb = self.embed(ep.observations, embodiment=ep.embodiment)
-            all_emb.append(emb)
-            lengths.append(len(ep.observations))
-        embeddings = np.concatenate(all_emb, axis=0)
-        return embeddings, lengths
-
-
-# ---------------------------------------------------------------------------
-# ActionEmbedder
-# ---------------------------------------------------------------------------
+        dtype = _parse_torch_dtype(self.dinov3_dtype)
+        n_total = data.shape[0]
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, n_total, self.image_batch_size):
+            chunk = data[start : start + self.image_batch_size]
+            tb = time.perf_counter()
+            images = _chw_batch_to_rgb_images(chunk)
+            t_decode = time.perf_counter()
+            inputs = self._processor(images=images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device, dtype=dtype)
+            t_preproc = time.perf_counter()
+            with torch.no_grad():
+                hidden = self._backbone(pixel_values=pixel_values).last_hidden_state
+                patches = hidden[:, -self._num_patches :]
+                pooled = patches.float().mean(dim=1)
+                proj_in = self._proj_layer.weight.dtype
+                outputs.append(
+                    self._proj_layer(pooled.to(proj_in)).cpu().numpy()
+                )
+            t_fwd = time.perf_counter()
+            logger.debug(
+                "DINOv3 batch [%d:%d] decode=%.3fs preproc=%.3fs forward=%.3fs total=%.3fs (%.0f imgs/s)",
+                start, start + len(chunk),
+                t_decode - tb, t_preproc - t_decode, t_fwd - t_preproc,
+                t_fwd - tb, len(chunk) / (t_fwd - tb) if (t_fwd - tb) > 0 else 0,
+            )
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "[images] DINOv3 embed: %d images in %.2fs (%.0f imgs/s, batch_size=%d)",
+            n_total, elapsed, n_total / elapsed if elapsed > 0 else 0, self.image_batch_size,
+        )
+        return np.concatenate(outputs, axis=0)
 
 
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.
 
-    A random orthogonal projection preserves MI (it is a bijective linear map
-    when action_dim ≤ latent_dim, and an MI-preserving dimensionality reduction
-    via Johnson-Lindenstrauss when action_dim > latent_dim).  This is preferred
-    over a random MLP because nonlinear random networks destroy linear
-    state-action correlations — the primary signal DemInf relies on.
+    A random orthogonal projection preserves MI (bijective when action_dim ≤
+    latent_dim; MI-preserving via Johnson-Lindenstrauss otherwise).
 
-    Cross-embodiment support
-    ~~~~~~~~~~~~~~~~~~~~~~~~
-    When ``cross_embodiment_mode="independent"`` (default), each embodiment
-    gets its own mean, std, and projection matrix.  This handles heterogeneous
-    action spaces (e.g., Aria 42-D hand keypoints vs. ALOHA 14-D joint
-    positions) without mixing statistics across fundamentally different
-    action modalities.
-
-    When ``cross_embodiment_mode="shared"`` a single global statistics set is
-    used — appropriate only when all embodiments share the same action space
-    (e.g., retargeted robot data).
-
-    Input accepts either per-timestep actions ``(T, action_dim)`` or pre-stored
-    action chunks ``(T, chunk_size, action_dim)`` (the ``actions_cartesian`` zarr
-    key).  In both cases the last dimensions are flattened to ``(T, feat_dim)``
-    before normalisation, so the MI estimator scores how well the full upcoming
-    action sequence is predicted by the current state.
+    Accepts per-timestep actions (T, action_dim) — the step-0 action vector
+    from the post-transform actions_cartesian chunk, in end-effector Cartesian
+    pose (head frame).
 
     Args:
         latent_dim: Output dimensionality (default 32).
-        cross_embodiment_mode: "independent" or "shared".
-        device: Unused for the projection itself; retained for API parity with
-            image embedders.
+        seed: RNG seed for the random orthogonal projection matrix.
+        norm_min_std: Minimum std used in Gaussian normalisation to avoid divide-by-zero.
     """
 
     def __init__(
         self,
         latent_dim: int = 32,
-        device: str | torch.device = "cpu",
-        cross_embodiment_mode: Literal["independent", "shared"] = "independent",
+        seed: int = 42,
+        norm_min_std: float = 1e-6,
     ) -> None:
         self.latent_dim = latent_dim
-        self.device = device
-        self.cross_embodiment_mode = cross_embodiment_mode
+        self.seed = seed
+        self.norm_min_std = norm_min_std
         self._fitted = False
-
-        # Shared / fallback stats
         self._mean: np.ndarray | None = None
         self._std: np.ndarray | None = None
         self._proj: np.ndarray | None = None
 
-        # Per-embodiment stats (populated in independent mode)
-        self._per_embodiment_stats: dict[str, dict] = {}
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """
+        Provide precomputed normalisation stats from an external source (e.g. norm_stats.json).
 
-    def fit(self, episodes: list[Episode]) -> None:
-        """Compute normalisation stats and random orthogonal projection."""
-        if self.cross_embodiment_mode == "independent":
-            self._fit_independent(episodes)
-        else:
-            self._fit_shared(episodes)
-        self._fitted = True
-
-    def _fit_shared(self, episodes: list[Episode]) -> None:
-        # Flatten action chunks: (T, chunk_size, D) → (T, chunk_size*D), or (T, D) → (T, D)
-        act_list = [ep.actions.reshape(len(ep.actions), -1) for ep in episodes]
-        self._mean, self._std = _fit_gaussian_stats(act_list)
-        feat_dim = self._mean.shape[0]
-        self._proj = _build_random_projection(feat_dim, self.latent_dim)
+        Stats should be flattened to 1-D to match the embedder's internal flat representation
+        (e.g. shape (chunk_size * action_dim,) for action chunks).
+        When called before fit(), inline stats computation is skipped.
+        """
+        self._mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+        self._std = np.asarray(std, dtype=np.float32).reshape(-1)
+        self._precomputed = True
         logger.info(
-            "ActionEmbedder (shared): feat_dim=%d → latent_dim=%d (proj=%s)",
-            feat_dim,
-            min(feat_dim, self.latent_dim),
-            self._proj is not None,
+            "ActionEmbedder: using precomputed stats (feat_dim=%d)", self._mean.shape[0]
         )
 
-    def _fit_independent(self, episodes: list[Episode]) -> None:
-        by_embodiment: dict[str, list[np.ndarray]] = {}
-        for ep in episodes:
-            by_embodiment.setdefault(ep.embodiment, []).append(ep.actions)
-
-        self._per_embodiment_stats = {}
-        for embodiment, act_list in by_embodiment.items():
-            # Flatten action chunks: (T, chunk_size, D) → (T, chunk_size*D), or (T, D) → (T, D)
-            flat_list = [a.reshape(len(a), -1) for a in act_list]
-            mean, std = _fit_gaussian_stats(flat_list)
-            proj = _build_random_projection(mean.shape[0], self.latent_dim)
-            self._per_embodiment_stats[embodiment] = {
-                "mean": mean,
-                "std": std,
-                "proj": proj,
-            }
-            logger.info(
-                "ActionEmbedder (independent) '%s': feat_dim=%d → latent_dim=%d",
-                embodiment,
-                mean.shape[0],
-                min(mean.shape[0], self.latent_dim),
-            )
-
-        # Shared fallback = first embodiment
-        first = next(iter(self._per_embodiment_stats.values()))
-        self._mean, self._std, self._proj = (
-            first["mean"],
-            first["std"],
-            first["proj"],
+    def fit(self, episodes: list | None = None) -> None:
+        """Compute normalisation stats and random orthogonal projection."""
+        if episodes and not getattr(self, "_precomputed", False):
+            act_list = [ep.actions.reshape(len(ep.actions), -1) for ep in episodes]
+            self._mean, self._std = _fit_gaussian_stats(act_list, min_std=self.norm_min_std)
+        feat_dim = self._mean.shape[0]
+        self._proj = _build_random_projection(feat_dim, self.latent_dim, seed=self.seed)
+        self._fitted = True
+        logger.info(
+            "ActionEmbedder: feat_dim=%d → latent_dim=%d (proj=%s)",
+            feat_dim, min(feat_dim, self.latent_dim), self._proj is not None,
         )
 
-    def embed(self, data: np.ndarray, embodiment: str | None = None) -> np.ndarray:
+    def embed(self, data: np.ndarray) -> np.ndarray:
         """
         Embed a batch of actions.
 
         Args:
-            data: (T, action_dim) or (T, chunk_size, action_dim) float32 array.
-                When ``data`` is 3-D (action chunks from ``actions_cartesian``),
-                the chunk and action dimensions are flattened to
-                ``(T, chunk_size * action_dim)`` before normalisation.
-            embodiment: Embodiment name used to select per-embodiment statistics
-                in independent mode.
+            data: (T, action_dim) float32 — per-timestep action vectors.
 
         Returns:
-            (T, latent_dim) float32 numpy array.
+            (T, latent_dim) float32 array.
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before embed()")
-
-        # Flatten action chunks: (T, K, D) → (T, K*D), or (T, D) → (T, D)
         data = data.reshape(len(data), -1)
-
         if len(data) == 0:
             return np.empty((0, self.latent_dim), dtype=np.float32)
-
-        if (
-            self.cross_embodiment_mode == "independent"
-            and embodiment is not None
-            and embodiment in self._per_embodiment_stats
-        ):
-            stats = self._per_embodiment_stats[embodiment]
-            mean, std, proj = stats["mean"], stats["std"], stats["proj"]
-        else:
-            if self.cross_embodiment_mode == "independent" and embodiment is not None:
-                logger.warning(
-                    "Unknown embodiment '%s' — falling back to global stats", embodiment
-                )
-            mean, std, proj = self._mean, self._std, self._proj
-
-        data = data.astype(np.float32)
-        normalised = (data - mean) / std
-        if proj is not None:
-            return normalised @ proj
-        return normalised
-
-    def embed_episodes(self, episodes: list[Episode]) -> tuple[np.ndarray, list[int]]:
-        """
-        Embed all timesteps from a list of episodes.
-
-        In independent mode, each episode is routed through its embodiment's
-        statistics before concatenation.
-
-        Returns:
-            embeddings: (N_total, latent_dim)
-            lengths: list of per-episode timestep counts
-        """
-        all_emb: list[np.ndarray] = []
-        lengths: list[int] = []
-        for ep in episodes:
-            emb = self.embed(ep.actions, embodiment=ep.embodiment)
-            all_emb.append(emb)
-            lengths.append(len(ep.actions))
-        return np.concatenate(all_emb, axis=0), lengths
-
-
-# ---------------------------------------------------------------------------
-# ImageStateEmbedder (convenience wrapper for pure image pipelines)
-# ---------------------------------------------------------------------------
-
-
-class ImageStateEmbedder:
-    """
-    Convenience wrapper: frozen ResNet-18 + fixed Xavier-initialised projection.
-
-    Equivalent to ``StateEmbedder(mode="image", ...)``, but exposed as a
-    dedicated class so it can be imported/configured explicitly.
-
-    The projection layer (512 → latent_dim) uses Xavier initialisation and is
-    *not* trained.  A fixed random projection is sufficient for the KSG
-    estimator — we only need a low-dimensional embedding that preserves
-    local geometry, not a supervised representation.
-
-    Args:
-        latent_dim: Output dimensionality.
-        device: Device for GPU inference.
-        batch_size: Number of frames per GPU batch.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int = 32,
-        device: str = "cuda",
-        batch_size: int = 256,
-    ) -> None:
-        self._embedder = StateEmbedder(
-            mode="image",
-            latent_dim=latent_dim,
-            device=device,
-            image_batch_size=batch_size,
+        t0 = time.perf_counter()
+        normalised = (data.astype(np.float32) - self._mean) / self._std
+        result = normalised @ self._proj if self._proj is not None else normalised
+        elapsed = time.perf_counter() - t0
+        logger.debug(
+            "[actions] ActionEmbedder: %d timesteps, feat_dim=%d → latent_dim=%d in %.3fs",
+            len(data), data.shape[1], result.shape[1], elapsed,
         )
-
-    def fit(self, episodes: list[Episode]) -> None:
-        self._embedder.fit(episodes)
-
-    @torch.no_grad()
-    def embed_batch(self, images: np.ndarray) -> np.ndarray:
-        """
-        Embed a batch of images.
-
-        Args:
-            images: (N, C, H, W) uint8 numpy array in [0, 255].
-
-        Returns:
-            (N, latent_dim) float32 numpy array.
-        """
-        return self._embedder.embed_batch(images)
-
-    def embed_episodes(self, episodes: list[Episode]) -> tuple[np.ndarray, list[int]]:
-        return self._embedder.embed_episodes(episodes)
+        return result

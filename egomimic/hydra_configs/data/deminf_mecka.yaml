@@ -1,8 +1,4 @@
-_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
-
-# DemInf curation data config — no train/valid split, all episodes scored.
-# Used exclusively by curate.yaml / run_curate_cmd.
-# To run on the full dataset: remove debug and eps_to_ignore overrides.
+# DemInf curation data — curate.yaml / curateModal.py only (not training DataLoader).
 
 train_datasets:
   mecka_bimanual:
@@ -10,21 +6,32 @@ train_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
       folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-        pause_removal_epsilon: 0.005
-      eps_to_ignore: egomimic/hydra_configs/data/extra/failures.json
+      eps_to_ignore: null
     filters:
       _target_: egomimic.rldb.filters.DatasetFilter
       filter_lambdas:
-        - "lambda df: df[df['task'].map(df['task'].value_counts()) > 15]"
+        # - "lambda df: df[df.groupby('task')['task'].transform('count') > 15]"
+        - "lambda row: row['task'] in ['cutting_plastic', 'organizing_containers']"
     mode: total
 
-train_dataloader_params:
+# Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
+# episode_workers: parallel episode loaders (CPU threads).
+# pass2_image_decode_workers: JPEG decode threads per episode.
+# frame_queue_maxsize: loaded episodes buffered between producers and GPU consumer.
+#   RAM budget: frame_queue_maxsize × ~180 MB/ep ≈ 5.4 GB at 30.
+#   Producers block when queue is full — GPU controls loading rate.
+# global_frame_batch_size: frames per GPU embed call.
+#   512 × (3×224×224) float32 ≈ 300 MB input — tune to fill VRAM.
+curation_loader:
   mecka_bimanual:
-    batch_size: 32
-    num_workers: 30
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 3072
