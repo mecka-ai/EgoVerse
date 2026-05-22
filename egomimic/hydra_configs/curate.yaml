@@ -1,38 +1,44 @@
-# Top-level config for DemInf curation runs.
+# DemInf curation on Modal — episode bulk read + embed per task worker.
 #
-# Usage:
-#   python egomimic/trainHydra.py --config-name=curate \
-#       name=<run_name> description=<description>
+#   python egomimic/modal/curateModal.py name=<run> description=<desc>
 #
-# Override data or model inline:
-#   data=deminf_mecka model=deminf_default
+# Pipeline (per task):
+#   Pass 2 — episodes sharded into chunks of ≤ max_episodes_per_shard, each
+#            shard embedded in a separate GPU container (parallel zarr load,
+#            batched JPEG decode, ResNet/DINOv3 state embed, action embed)
+#   Pass 3 — KSG MI on all shard latents combined (CPU orchestrator)
 #
-# Submit to Modal:
-#   trainer._modal=true +modal_gpu=A100
+# model.precomputed_norm_stats.path is REQUIRED (raise ValueError if absent).
+# Run the offline norm-stats script once and set it before curating.
+#
+# Global RNG seed (embedders, KSG, PyTorch): override with seed=<int>
+#
+# Per-task Modal worker compute (orchestrator is fixed lightweight CPU):
+#   +modal_gpu=L40S:1 +modal_cpu=32 +modal_memory_gb=128
+#
+# Common Hydra overrides:
+#   model.state_image.backbone=dinov3
+#   data.curation_loader.mecka_bimanual.episode_workers=1
+#   data.curation_loader.mecka_bimanual.frame_queue_maxsize=16
+#   data.curation_loader.mecka_bimanual.global_frame_batch_size=256
+#   model.ksg.chunked_threshold=100000 model.ksg.chunked_max_points=100000
+#   max_episodes_per_shard=200
 
 defaults:
   - model: deminf_default
   - data: deminf_mecka
-  - override hydra/launcher: submitit
   - _self_
-
-mode: curate
 
 name: curate_test
 description: deminf_curation
+seed: 42
 
-ckpt_path: null
-wandb_run_id: null
-
-# trainer._modal=true submits to Modal (CPU-heavy run_curate; KSG is CPU-bound).
-# The remaining trainer keys are unused — DemInfAlgo has no Lightning Trainer.
-trainer:
-  _modal: false
+# Max episodes per GPU shard (Pass 2). Tasks with more episodes are split
+# into multiple containers; KSG runs on all shards combined (Pass 3).
+max_episodes_per_shard: 100
 
 hydra:
   run:
     dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
   sweep:
     dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
-
-seed: 42

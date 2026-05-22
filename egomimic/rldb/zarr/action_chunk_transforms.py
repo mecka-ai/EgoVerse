@@ -23,7 +23,9 @@ from scipy.spatial.transform import Rotation as R
 from egomimic.utils.pose_utils import (
     _interpolate_euler,
     _interpolate_linear,
+    _interpolate_linear_batch,
     _interpolate_quat_wxyz,
+    _interpolate_quat_wxyz_batch,
     _interpolate_xyz,
     _matrix_to_xyz,
     _matrix_to_xyzwxyz,
@@ -101,6 +103,34 @@ class InterpolatePose(Transform):
                     f"'{self.action_key}'"
                 )
             batch[self.output_action_key] = _interpolate_xyz(
+                actions, self.new_chunk_length
+            )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: (B, H, D) → (B, new_chunk_length, D) after stride."""
+        actions = np.asarray(batch[self.action_key])  # (B, H, D)
+        actions = actions[:, :: self.stride, :]        # (B, H//stride, D)
+        if self.mode == "xyzwxyz":
+            if actions.shape[-1] != 7:
+                raise ValueError(
+                    f"InterpolatePose.transform_batch (xyzwxyz): expected last dim 7, "
+                    f"got {actions.shape} for key '{self.action_key}'"
+                )
+            batch[self.output_action_key] = _interpolate_quat_wxyz_batch(
+                actions, self.new_chunk_length
+            )
+        elif self.mode == "xyzypr":
+            if actions.shape[-1] != 6:
+                raise ValueError(
+                    f"InterpolatePose.transform_batch (xyzypr): expected last dim 6, "
+                    f"got {actions.shape} for key '{self.action_key}'"
+                )
+            batch[self.output_action_key] = _interpolate_linear_batch(
+                actions, self.new_chunk_length
+            )
+        else:
+            batch[self.output_action_key] = _interpolate_linear_batch(
                 actions, self.new_chunk_length
             )
         return batch
@@ -236,6 +266,74 @@ class ActionChunkCoordinateFrameTransform(Transform):
 
         return batch
 
+    def transform_batch(self, batch: dict) -> dict:
+        """
+        Vectorized SE3 transform over a full episode.
+
+        Inputs (B = timesteps):
+            target_world : (B, 7)          — head pose at each timestep
+            chunk_world  : (B, H, D) or (B, D)  — action chunk or single pose
+
+        Computes ``target_inv @ chunk`` analytically without projectaria_tools,
+        using R^{-1} = R^T for rotation matrices.
+        """
+        batch.update(self.extra_batch_key or {})
+        target_world = np.asarray(batch[self.target_world], dtype=np.float64)  # (B, D)
+        chunk_world  = np.asarray(batch[self.chunk_world],  dtype=np.float64)  # (B, H, D) or (B, D)
+        B = target_world.shape[0]
+
+        chunk_3d = chunk_world.ndim == 3
+        if chunk_3d:
+            H = chunk_world.shape[1]
+            chunk_2d = chunk_world.reshape(B * H, chunk_world.shape[-1])
+        else:
+            chunk_2d = chunk_world  # (B, D)
+
+        _to_mat = {
+            "xyzwxyz": _xyzwxyz_to_matrix,
+            "xyzypr":  _xyzypr_to_matrix,
+            "xyz":     _xyz_to_matrix,
+        }[self.mode]
+        _from_mat = {
+            "xyzwxyz": _matrix_to_xyzwxyz,
+            "xyzypr":  _matrix_to_xyzypr,
+            "xyz":     _matrix_to_xyz,
+        }[self.mode]
+        _tgt_to_mat = _xyzwxyz_to_matrix if target_world.shape[-1] == 7 else _xyzypr_to_matrix
+
+        # SE3 inverse: [[R, t], [0,1]]^{-1} = [[R^T, -R^T t], [0, 1]]
+        tgt_mats = _tgt_to_mat(target_world)  # (B, 4, 4)
+        R   = tgt_mats[:, :3, :3]             # (B, 3, 3)
+        t   = tgt_mats[:, :3, 3:]             # (B, 3, 1)
+        R_T = R.swapaxes(-1, -2)              # (B, 3, 3)
+        tgt_inv = np.zeros_like(tgt_mats)
+        tgt_inv[:, :3, :3] = R_T
+        tgt_inv[:, :3, 3:] = -(R_T @ t)
+        tgt_inv[:, 3, 3]   = 1.0
+
+        chunk_mats = _to_mat(chunk_2d)        # (B*H, 4, 4) or (B, 4, 4)
+
+        if chunk_3d:
+            chunk_mats = chunk_mats.reshape(B, H, 4, 4)
+            if self.inverse:
+                result_mats = (tgt_inv[:, None] @ chunk_mats).reshape(B * H, 4, 4)
+            else:
+                result_mats = (tgt_mats[:, None] @ chunk_mats).reshape(B * H, 4, 4)
+        else:
+            result_mats = (tgt_inv @ chunk_mats) if self.inverse else (tgt_mats @ chunk_mats)
+
+        result_flat = _from_mat(result_mats)  # (B*H, D) or (B, D)
+
+        if chunk_3d:
+            result = result_flat.reshape(B, H, result_flat.shape[-1])
+        else:
+            result = result_flat
+
+        src_dtype = np.asarray(batch[self.chunk_world]).dtype
+        out_dtype = src_dtype if np.issubdtype(src_dtype, np.floating) else np.float64
+        batch[self.transformed_key_name] = result.astype(out_dtype, copy=False)
+        return batch
+
 
 class QuaternionPoseToYPR(Transform):
     """Convert a single pose from xyz + quat(x,y,z,w) to xyz + ypr."""
@@ -355,6 +453,13 @@ class PoseCoordinateFrameTransform(Transform):
         )[0]
         return batch
 
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: target (B, 7), pose (B, D) → transformed pose (B, D)."""
+        sub = {self.target_world: batch[self.target_world], self.pose_world: batch[self.pose_world]}
+        result = self._chunk_transform.transform_batch(sub)
+        batch[self.transformed_key_name] = result[self.transformed_key_name]
+        return batch
+
 
 class DeleteKeys(Transform):
     def __init__(self, keys_to_delete):
@@ -364,6 +469,8 @@ class DeleteKeys(Transform):
         for key in self.keys_to_delete:
             batch.pop(key, None)
         return batch
+
+    transform_batch = transform
 
 
 class XYZWXYZ_to_XYZYPR(Transform):
@@ -383,6 +490,29 @@ class XYZWXYZ_to_XYZYPR(Transform):
                 raise ValueError(
                     f"XYZWXYZ_to_XYZYPR expects key '{key}' to have shape (7,) "
                     f"or (T, 7), got {value.shape}"
+                )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """
+        Vectorized: (B, 7) obs → (B, 6), (B, H, 7) chunks → (B, H, 6).
+
+        Reshape to (B*H, 7), convert, reshape back — no Python loop over B.
+        """
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 2 and value.shape[-1] == 7:
+                # (B, 7) single pose per timestep
+                batch[key] = _matrix_to_xyzypr(_xyzwxyz_to_matrix(value))  # (B, 6)
+            elif value.ndim == 3 and value.shape[-1] == 7:
+                # (B, H, 7) action chunk
+                B, H = value.shape[:2]
+                flat = _matrix_to_xyzypr(_xyzwxyz_to_matrix(value.reshape(B * H, 7)))
+                batch[key] = flat.reshape(B, H, 6)
+            else:
+                raise ValueError(
+                    f"XYZWXYZ_to_XYZYPR.transform_batch: key '{key}' shape {value.shape} "
+                    f"— expected (B, 7) or (B, H, 7)"
                 )
         return batch
 
@@ -510,6 +640,8 @@ class ConcatKeys(Transform):
                 batch.pop(k, None)
 
         return batch
+
+    transform_batch = transform
 
 
 class Reshape(Transform):

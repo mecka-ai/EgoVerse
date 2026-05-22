@@ -1,45 +1,47 @@
-"""
-DemInf data curation module for EgoVerse.
+"""DemInf data curation (mutual-information episode scoring)."""
 
-Implements mutual information-based trajectory scoring following
-Hejna et al. 2025 (Google DeepMind + Stanford).
-
-Pipeline:
-    1. Load episodes from local Zarr stores (or via EgoVerse config)
-    2. Apply preprocessing filters (pauses, clipping, min length)
-    3. Embed (state, action) pairs into a shared latent space
-    4. Estimate pointwise MI using the KSG k-NN estimator
-    5. Score each trajectory by its mean MI contribution
-    6. Export filtered episode hashes for downstream training configs
-"""
-
-from egomimic.curation.curator import CurationResult
-from egomimic.curation.embedders import (
-    ActionEmbedder,
-    ImageStateEmbedder,
-    StateEmbedder,
+from egomimic.curation.config import (
+    CurationLoaderSettings,
+    EmbedderSettings,
+    StateImageSettings,
+    apply_curation_seed,
+    load_action_norm_stats,
+    select_curation_loader,
+    select_embedder_settings,
+    select_seed,
+    select_state_image_settings,
+    select_tensor_keys,
 )
-from egomimic.curation.filters import ActionClipFilter, MinLengthFilter, PauseFilter
+from egomimic.curation.embedders import ActionEmbedder, StateEmbedder
+from egomimic.curation.episode_pipeline import (
+    build_embedders,
+    run_pass2_embed_episodes,
+)
 from egomimic.curation.ksg import ksg_mi, ksg_mi_averaged
-from egomimic.curation.scorer import TrajectoryScorer
-from egomimic.curation.utils import (
-    Episode,
-    load_episodes_from_config,
-    load_episodes_from_dir,
+from egomimic.curation.scoring import (
+    TrajectoryScorer,
+    aggregate_scores,
+    trajectory_scorer_from_cfg,
 )
 
 __all__ = [
-    "ActionClipFilter",
     "ActionEmbedder",
-    "CurationResult",
-    "Episode",
-    "ImageStateEmbedder",
-    "MinLengthFilter",
-    "PauseFilter",
+    "CurationLoaderSettings",
+    "EmbedderSettings",
+    "StateImageSettings",
+    "apply_curation_seed",
     "StateEmbedder",
     "TrajectoryScorer",
+    "aggregate_scores",
+    "build_embedders",
     "ksg_mi",
     "ksg_mi_averaged",
-    "load_episodes_from_config",
-    "load_episodes_from_dir",
+    "load_action_norm_stats",
+    "run_pass2_embed_episodes",
+    "select_curation_loader",
+    "select_embedder_settings",
+    "select_seed",
+    "select_state_image_settings",
+    "select_tensor_keys",
+    "trajectory_scorer_from_cfg",
 ]
