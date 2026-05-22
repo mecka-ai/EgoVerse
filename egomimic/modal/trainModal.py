@@ -42,10 +42,10 @@ from modal_setup import (  # noqa: E402
     launch_detached,
     pop_init_submodules,
     app,
-    pause_precompute_shard,
     training_outputs_volume,
     zarr_volume,
 )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,13 +62,7 @@ def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     fixed = []
     for arg in hydra_args:
         key, sep, val = arg.partition("=")
-        if (
-            sep
-            and key in _PATH_KEYS
-            and val
-            and val != "null"
-            and not val.startswith("/")
-        ):
+        if sep and key in _PATH_KEYS and val and val != "null" and not val.startswith("/"):
             val = f"{CFG.output_mount_path}/{val}"
             arg = f"{key}={val}"
         fixed.append(arg)
@@ -81,13 +75,8 @@ def _download_run_artifacts(output_rel_path: str) -> None:
     print(f"Downloading artifacts to {local_dest} ...")
     result = subprocess.run(
         [
-            sys.executable,
-            "-m",
-            "modal",
-            "volume",
-            "get",
-            "--env",
-            "robotics",
+            sys.executable, "-m", "modal", "volume", "get",
+            "--env", "robotics",
             "egoverse-training-outputs",
             output_rel_path,
             str(local_dest),
@@ -306,11 +295,6 @@ def run_hydra_train(
     )
 
     hydra_args = _resolve_volume_paths(hydra_args)
-
-    # Fan out pause precompute now while we're inside a hydrated function;
-    # the trainHydra subprocess can't reach a Modal worker without a deploy.
-    cache_path = _precompute_pause_to_cache(hydra_args)
-
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -324,8 +308,6 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
-    if cache_path:
-        env["EGOMIMIC_PAUSE_PRECOMPUTE_CACHE"] = cache_path
 
     print(f"Running: {shlex.join(cmd)}")
     process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
@@ -372,7 +354,6 @@ def _health_check() -> dict:
         results["volume"] = f"ERROR: {e}"
 
     import subprocess as _sp
-
     r = _sp.run(["s5cmd", "version"], capture_output=True, text=True)
     results["s5cmd"] = f"OK — {r.stdout.strip()}" if r.returncode == 0 else "MISSING"
 
@@ -408,9 +389,7 @@ def submit(*hydra_args: str) -> None:
     hydra_args, init_submodules = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print(
-            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
-        )
+        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
     print(f"Submitting commit {git_commit[:12]} from {git_remote}")
     if not init_submodules:
         print("Skipping git submodule init (init_submodules=false)")
@@ -464,8 +443,7 @@ if __name__ == "__main__":
             container_overrides.append(arg)
 
     container_overrides = [
-        a
-        for a in container_overrides
+        a for a in container_overrides
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
@@ -480,37 +458,4 @@ if __name__ == "__main__":
     print(f"Modal app:       {modal_env['MODAL_APP_NAME']}")
     print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB")
 
-    _git_commit_and_push(REPO_ROOT)
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "modal",
-        "run",
-        "--detach",
-        "--env",
-        "robotics",
-        str(Path(__file__).resolve()) + "::submit",
-        "--",
-        *container_overrides,
-    ]
-    print(f"Dispatching: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env)
-    sys.exit(result.returncode)
-
-
-@app.local_entrypoint()
-def run(*hydra_args: str) -> None:
-    """Blocking run: streams logs and downloads artifacts when complete."""
-    git_remote, git_commit, is_dirty = _resolve_git_state()
-    if is_dirty:
-        print(
-            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
-        )
-    print(f"Running commit {git_commit[:12]} from {git_remote}")
-    output_rel_path = run_hydra_train.remote(
-        tuple(hydra_args), git_remote, git_commit, _local_wandb_key()
-    )
-    print(f"Remote run completed. Output path in volume: {output_rel_path}")
-    if output_rel_path:
-        _download_run_artifacts(output_rel_path)
+    launch_detached(Path(__file__).resolve(), "submit", container_overrides, modal_env)

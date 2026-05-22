@@ -1,4 +1,5 @@
 # DemInf curation data — curate.yaml / curateModal.py only (not training DataLoader).
+# DemInf curation data — curate.yaml / curateModal.py only (not training DataLoader).
 
 train_datasets:
   mecka_bimanual:
@@ -7,6 +8,7 @@ train_datasets:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
       folder_path: /mnt/zarr-data
       pause_removal_epsilon: 0.005
+      pause_removal_epsilon: 0.005
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
@@ -14,12 +16,12 @@ train_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
       eps_to_ignore: null
+      eps_to_ignore: null
     filters:
       _target_: egomimic.rldb.filters.DatasetFilter
       filter_lambdas:
         # - "lambda df: df[df.groupby('task')['task'].transform('count') > 15]"
-        # - "lambda row: row['task'] in ['cutting_plastic', 'organizing_containers']"
-        - "lambda row: row['task'] in ['cleaning_kitchenware', 'filling_and_capping_bottles', 'assembling_booklets', 'folding_socks', 'filling_snack_bags', 'sealing_packages', 'folding_gift_boxes', 'wrapping_forks', 'cleaning_drawers', 'wrapping_sandwiches', 'assembling_hair_clips', 'gift_wrapping', 'taping_boxes', 'washing_bowls' ]"
+        - "lambda row: row['task'] in ['cutting_plastic', 'organizing_containers']"
     mode: total
 
 # Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
@@ -31,7 +33,20 @@ train_datasets:
 # global_frame_batch_size: frames per GPU embed call.
 #   512 × (3×224×224) float32 ≈ 300 MB input — tune to fill VRAM.
 curation_loader:
+# Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
+# episode_workers: parallel episode loaders (CPU threads).
+# pass2_image_decode_workers: JPEG decode threads per episode.
+# frame_queue_maxsize: loaded episodes buffered between producers and GPU consumer.
+#   RAM budget: frame_queue_maxsize × ~180 MB/ep ≈ 5.4 GB at 30.
+#   Producers block when queue is full — GPU controls loading rate.
+# global_frame_batch_size: frames per GPU embed call.
+#   512 × (3×224×224) float32 ≈ 300 MB input — tune to fill VRAM.
+curation_loader:
   mecka_bimanual:
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 3072
     episode_workers: 6
     pass2_image_decode_workers: 12
     frame_queue_maxsize: 12
