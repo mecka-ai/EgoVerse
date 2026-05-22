@@ -57,26 +57,6 @@ logger = logging.getLogger(__name__)
 SEED = 42
 
 PAUSE_DETECT_KEYS: tuple[str, str] = ("left.obs_ee_pose", "right.obs_ee_pose")
-PAUSE_DETECT_KEYPOINT_KEYS: tuple[str, str] = (
-    "left.obs_keypoints",
-    "right.obs_keypoints",
-)
-
-
-def _keypoint_max_delta(kp: np.ndarray) -> np.ndarray:
-    """Per-frame max landmark delta for a flattened (T, K*3) keypoint array.
-
-    Reshapes to (T, K, 3), takes per-landmark L2 of the time-diff, and
-    returns max over landmarks → (T-1,). This catches finger flexion even
-    when the wrist (centroid) is stationary.
-    """
-    T = kp.shape[0]
-    if T < 2 or kp.ndim != 2 or kp.shape[1] % 3 != 0 or kp.shape[1] == 0:
-        return np.zeros(max(T - 1, 0))
-    n_landmarks = kp.shape[1] // 3
-    diff = np.diff(kp.reshape(T, n_landmarks, 3), axis=0)
-    per_landmark_norm = np.linalg.norm(diff, axis=-1)
-    return per_landmark_norm.max(axis=-1)
 
 
 def _build_pause_keep_mask(
@@ -84,22 +64,13 @@ def _build_pause_keep_mask(
     left_pose: np.ndarray,
     right_pose: np.ndarray,
     epsilon: float,
-    left_keypoints: np.ndarray | None = None,
-    right_keypoints: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return a boolean keep-mask over frames.
 
-    A frame at index t is a "pause step" iff EVERY available motion signal
-    moved less than ``epsilon`` between t-1 and t:
-      - left/right ee_pose L2 delta < eps (wrist movement), and
-      - if keypoints are provided, max-over-landmarks keypoint delta < eps
-        on the corresponding hand (catches finger flexion when the wrist
-        is stationary).
-
-    Missing keypoint arrays are simply skipped — the test reduces to
-    ee_pose-only. The first frame of each pause run is kept (transition
-    into pause); subsequent in-pause frames are dropped until motion
-    resumes.
+    A frame at index t is a "pause step" iff both ||left[t]-left[t-1]|| < eps
+    and ||right[t]-right[t-1]|| < eps. The first frame of each pause run is
+    kept (transition into pause); subsequent in-pause frames are dropped
+    until motion resumes.
     """
     T = len(left_pose)
     if T < 2:
@@ -108,15 +79,6 @@ def _build_pause_keep_mask(
     left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
     right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
     is_paused_step = (left_d < epsilon) & (right_d < epsilon)
-
-    if left_keypoints is not None and len(left_keypoints) == T:
-        is_paused_step = is_paused_step & (
-            _keypoint_max_delta(np.asarray(left_keypoints)) < epsilon
-        )
-    if right_keypoints is not None and len(right_keypoints) == T:
-        is_paused_step = is_paused_step & (
-            _keypoint_max_delta(np.asarray(right_keypoints)) < epsilon
-        )
 
     keep = np.ones(T, dtype=bool)
     in_pause = False
@@ -131,7 +93,40 @@ def _build_pause_keep_mask(
     return keep
 
 
-PAUSE_PRECOMPUTE_CACHE_ENV = "EGOMIMIC_PAUSE_PRECOMPUTE_CACHE"
+def _import_real_modal():
+    """Return the installed Modal SDK, working around egomimic.modal shadowing.
+
+    When trainHydra.py runs as `python /root/EgoVerse/egomimic/trainHydra.py`,
+    Python puts /root/EgoVerse/egomimic on sys.path[0], which makes a bare
+    `import modal` resolve to the egomimic.modal subpackage. This helper:
+      1. Returns the cached real SDK if one is already in sys.modules.
+      2. Otherwise strips egomimic from sys.path and re-imports.
+
+    Important: we do NOT pop `modal` from sys.modules once the real SDK is
+    cached there — re-importing produces a fresh top-level module that no
+    longer carries the lazily-attached submodules (modal._grpc_client, etc.),
+    breaking subsequent fn.map() calls.
+    """
+    import sys
+
+    existing = sys.modules.get("modal")
+    if existing is not None and hasattr(existing, "Function"):
+        return existing
+
+    _orig_path = list(sys.path)
+    sys.path = [p for p in sys.path if Path(p).name != "egomimic"]
+    sys.modules.pop("modal", None)
+    try:
+        import modal as _modal
+    finally:
+        sys.path = _orig_path
+
+    if not hasattr(_modal, "Function"):
+        raise RuntimeError(
+            "Imported `modal` has no `Function` attribute — "
+            "egomimic.modal subpackage is still shadowing the installed Modal SDK"
+        )
+    return _modal
 
 
 def split_dataset_names(dataset_names, valid_ratio=0.2, seed=SEED):
@@ -321,79 +316,129 @@ class EpisodeResolver:
         )
         return datasets
 
+    def _modal_fanout_load(
+        self,
+        search_path: Path,
+        valid_folder_names: set[str],
+        dataset_class,
+    ) -> dict:
+        """Fan out per-episode .zattrs reads across Modal containers via load_shard.
+
+        Worker returns picklable (path, hash, metadata) tuples; ZarrDataset is
+        constructed locally with precomputed_metadata so its eager zarr open is
+        skipped (deferred until first __getitem__).
+        """
+        import time
+
+        modal = _import_real_modal()
+
+        start_time = time.monotonic()
+        logger.info(f"Modal fan-out load: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        on_disk_names = []
+        for raw_name in os.listdir(search_path):
+            if raw_name.startswith("."):
+                continue
+            hash_name = raw_name[:-5] if raw_name.endswith(".zarr") else raw_name
+            if hash_name in valid_folder_names:
+                on_disk_names.append(raw_name)
+        total = len(on_disk_names)
+        logger.info(
+            f"Modal fan-out load: {total} target entries (of {len(valid_folder_names)} requested) "
+            f"in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return {}
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_LOAD_SHARDS", "100")), total)
+        shards = [on_disk_names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out load: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up load_shard function..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "load_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out load: function lookup OK; launching .map()...")
+
+        datasets: dict = {}
+        skipped: list[str] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards):
+            completed += 1
+            for path_str, episode_hash, metadata in shard_result:
+                if episode_hash not in valid_folder_names:
+                    continue
+                try:
+                    datasets[episode_hash] = dataset_class(
+                        Path(path_str),
+                        key_map=self.key_map,
+                        transform_list=self.transform_list,
+                        norm_stats=self.norm_stats,
+                        pause_removal_epsilon=self.pause_removal_epsilon,
+                        precomputed_metadata=metadata,
+                    )
+                except Exception as e:
+                    logger.error("Failed to construct dataset for %s: %s", path_str, e)
+                    skipped.append(episode_hash)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal load: shard {completed}/{total_shards} done "
+                    f"| loaded={len(datasets)} skipped={len(skipped)} "
+                    f"| elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out load complete: {len(datasets)} datasets "
+            f"(skipped {len(skipped)}) in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return datasets
+
     def _run_pause_precompute(self, datasets: dict) -> None:
         """Run per-episode pause precompute; no-op if epsilon is None.
 
-        Two paths:
-          - If $EGOMIMIC_PAUSE_PRECOMPUTE_CACHE points at a JSON file produced
-            by trainModal.run_hydra_train (which fans out to the Modal worker
-            before launching this subprocess), load keep_indices from there.
-            Episodes missing from the cache fall through to the in-process
-            thread pool.
-          - Otherwise (local dev, or no pre-train fan-out happened), do the
-            whole thing in-process.
-
-        The Modal fan-out itself lives in trainModal._precompute_pause_to_cache
-        — it has to run from a hydrated function context, which this
-        subprocess does not have.
+        Dispatches to Modal fan-out when running inside a Modal container and
+        episode paths live on the volume mount; otherwise an in-process thread
+        pool.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
 
-        cache_path = os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
-        if cache_path and Path(cache_path).is_file():
-            remaining = self._apply_pause_precompute_cache(cache_path, datasets)
-            if remaining:
-                self._inprocess_pause_precompute(remaining)
-            return
+        if self._should_use_modal_pause_precompute(datasets):
+            try:
+                self._modal_fanout_pause_precompute(datasets)
+                return
+            except Exception as e:
+                logger.warning(
+                    "Modal pause precompute failed (%s) — falling back to local thread pool",
+                    e,
+                )
 
-        self._inprocess_pause_precompute(datasets)
+        self._local_pause_precompute(datasets)
 
-    def _apply_pause_precompute_cache(self, cache_path: str, datasets: dict) -> dict:
-        """Populate keep_indices from the cache JSON; return cache-miss subset.
-
-        Cache JSON shape: ``{episode_hash: {"raw_total": int, "keep_indices": [int]}}``.
-        Entries with raw_total == 0 (worker had an error reading the episode)
-        are treated as misses so the in-process fallback can retry.
-        """
-        import json
-        import time
-
-        t0 = time.monotonic()
-        with open(cache_path) as f:
-            cache = json.load(f)
-
-        n_hit = 0
-        n_total = 0
-        n_kept = 0
-        miss: dict = {}
-        for episode_hash, ds in datasets.items():
-            entry = cache.get(episode_hash)
-            if entry is None or int(entry.get("raw_total", 0)) == 0:
-                miss[episode_hash] = ds
-                continue
-            ds._raw_total_frames = int(entry["raw_total"])
-            ds.keep_indices = np.asarray(entry["keep_indices"], dtype=np.int64)
-            n_hit += 1
-            n_total += int(entry["raw_total"])
-            n_kept += len(entry["keep_indices"])
-
-        elapsed = time.monotonic() - t0
-        pct = (100.0 * n_kept / n_total) if n_total else 100.0
-        logger.info(
-            "Pause precompute via cache (%s): %d hits, %d misses | "
-            "kept %d/%d frames (%.1f%%) in %.2fs",
-            cache_path,
-            n_hit,
-            len(miss),
-            n_kept,
-            n_total,
-            pct,
-            elapsed,
+    @staticmethod
+    def _should_use_modal_pause_precompute(datasets: dict) -> bool:
+        inside_modal = (
+            os.environ.get("MODAL_IS_REMOTE") == "1"
+            or bool(os.environ.get("MODAL_TASK_ID"))
         )
-        return miss
+        if not inside_modal:
+            return False
+        if os.environ.get("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE") == "1":
+            return False
+        return any(
+            str(getattr(ds, "episode_path", "")).startswith("/mnt/zarr-data")
+            for ds in datasets.values()
+        )
 
-    def _inprocess_pause_precompute(self, datasets: dict) -> None:
+    def _local_pause_precompute(self, datasets: dict) -> None:
         import time
         from concurrent.futures import ThreadPoolExecutor
 
@@ -419,7 +464,7 @@ class EpisodeResolver:
         elapsed = time.monotonic() - t0
         pct = (100.0 * n_kept / n_total) if n_total else 100.0
         logger.info(
-            "Pause precompute via in-process thread pool (epsilon=%s): kept %d/%d frames "
+            "Pause precompute via local thread pool (epsilon=%s): kept %d/%d frames "
             "(%.1f%%) across %d episodes in %.1fs (errors=%d)",
             self.pause_removal_epsilon,
             n_kept,
@@ -433,6 +478,78 @@ class EpisodeResolver:
             sample = [r for r in results if r[3] is not None][:5]
             for name, _, _, err in sample:
                 logger.warning("Pause precompute failed for %s: %s", name, err)
+
+    def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
+        """Compute keep_indices in parallel across egomimic-scan::pause_precompute_shard workers."""
+        import time
+
+        modal = _import_real_modal()
+        t0 = time.monotonic()
+
+        work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
+        n = len(work)
+        n_shards = min(int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n)
+        shards = [work[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            "Pause precompute via Modal fan-out: %d episodes across %d shards — "
+            "looking up pause_precompute_shard function...",
+            n,
+            total_shards,
+        )
+        fn = modal.Function.from_name(
+            "egomimic-scan", "pause_precompute_shard", environment_name="robotics"
+        )
+        epsilons = [self.pause_removal_epsilon] * total_shards
+
+        n_total = 0
+        n_kept = 0
+        n_errs = 0
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, epsilons):
+            completed += 1
+            for episode_hash, raw_total, indices in shard_result:
+                ds = datasets.get(episode_hash)
+                if ds is None:
+                    n_errs += 1
+                    continue
+                if raw_total == 0:
+                    n_errs += 1
+                    continue
+                ds._raw_total_frames = int(raw_total)
+                ds.keep_indices = np.asarray(indices, dtype=np.int64)
+                n_total += raw_total
+                n_kept += len(indices)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "Pause precompute via Modal: shard %d/%d done | kept=%d/%d "
+                    "errors=%d | elapsed %.0fs",
+                    completed,
+                    total_shards,
+                    n_kept,
+                    n_total,
+                    n_errs,
+                    elapsed,
+                )
+
+        elapsed = time.monotonic() - t0
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        logger.info(
+            "Pause precompute via Modal fan-out complete (epsilon=%s): kept %d/%d "
+            "frames (%.1f%%) across %d episodes in %.1fs (errors=%d, shards=%d)",
+            self.pause_removal_epsilon,
+            n_kept,
+            n_total,
+            pct,
+            n,
+            elapsed,
+            n_errs,
+            total_shards,
+        )
 
     @classmethod
     def _episode_already_present(cls, local_dir: Path, episode_hash: str) -> bool:
@@ -736,6 +853,9 @@ class LocalEpisodeResolver(EpisodeResolver):
         filters: DatasetFilter | None = None,
         debug: int | bool | None = None,
     ):
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
             logger.warning("Local path does not exist: %s", search_path)
@@ -856,6 +976,8 @@ class ModalEpisodeResolver(EpisodeResolver):
     Episodes present in the table but absent from the local volume are skipped
     with a warning, so a partially-synced volume still works.
 
+    This class is also the home for Modal-specific fan-out parallel container
+    methods (_modal_fanout_scan, _modal_fanout_load) used by other Modal code.
     """
 
     def __init__(
@@ -869,6 +991,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
+        max_episodes: int | None = None,
     ):
         super().__init__(
             folder_path,
@@ -878,33 +1001,23 @@ class ModalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
         )
         self.debug = debug
+        self.max_episodes = max_episodes
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
                 self.exclude_hashes.update(json.load(f))
-            logger.info(
-                "eps_to_ignore: %d hashes from %s",
-                len(self.exclude_hashes),
-                eps_to_ignore,
-            )
+            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
         self.include_hashes: set[str] | None = None
         if eps_to_use:
             with open(eps_to_use) as f:
                 self.include_hashes = set(json.load(f))
-            logger.info(
-                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
-            )
+            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
 
-    def _resolve_episode_meta(
+    def resolve(
         self,
         filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, Path, int, str]]:
-        """Resolve episodes from SQL + filters → (hash, local_path, num_frames, robot_name).
-
-        No zarr opens, no ZarrDataset construction. Used by both resolve()
-        (which goes on to build datasets) and the pre-train precompute step
-        in trainModal.run_hydra_train (which only needs episode paths).
-        """
+        **kwargs,
+    ) -> dict[str, "ZarrDataset"]:
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -933,22 +1046,43 @@ class ModalEpisodeResolver(EpisodeResolver):
             axis=1,
         )
         matched = df.loc[mask, ["episode_hash", "num_frames", "robot_name"]]
-        logger.info("SQL filter matched %d episodes", len(matched))
+        # Stable sort so any truncation (debug / max_episodes) yields the same
+        # pool across resolver instances (e.g. train vs valid datamodules)
+        # regardless of SQL row order.
+        matched = matched.sort_values("episode_hash").reset_index(drop=True)
+        episode_hashes = matched["episode_hash"].tolist()
+        logger.info("SQL filter matched %d episodes", len(episode_hashes))
 
-        if matched.empty:
+        if not episode_hashes:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            logger.info("Debug mode: using first %d episodes", len(matched))
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
 
-        out: list[tuple[str, Path, int, str]] = []
+        if self.max_episodes is not None and len(matched) > self.max_episodes:
+            before = len(matched)
+            matched = matched.iloc[: int(self.max_episodes)]
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info(
+                "max_episodes: truncated %d → %d episodes (hash-sorted)",
+                before,
+                len(matched),
+            )
+
+        dataset_class = self._dataset_class or ZarrDataset
+
+        # Build a lookup from episode_hash → (num_frames, robot_name) from SQL
+        meta_lookup = {
+            row["episode_hash"]: (int(row["num_frames"]), str(row["robot_name"]))
+            for _, row in matched.iterrows()
+        }
+
+        datasets: dict[str, ZarrDataset] = {}
         n_missing = 0
-        for _, row in matched.iterrows():
-            episode_hash = row["episode_hash"]
-            num_frames = int(row["num_frames"])
-            robot_name = str(row["robot_name"])
+        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
             local_path = next(
                 (
                     p
@@ -964,26 +1098,6 @@ class ModalEpisodeResolver(EpisodeResolver):
                 n_missing += 1
                 logger.warning("Episode not found locally, skipping: %s", episode_hash)
                 continue
-            out.append((episode_hash, local_path, num_frames, robot_name))
-
-        if n_missing:
-            logger.info("Skipped %d episodes not present in local volume", n_missing)
-        if not out:
-            raise ValueError(
-                "No episodes resolved — all SQL-matched episodes are missing from the local volume."
-            )
-        return out
-
-    def resolve(
-        self,
-        filters: DatasetFilter | None = None,
-        **kwargs,
-    ) -> dict[str, "ZarrDataset"]:
-        meta = self._resolve_episode_meta(filters)
-        dataset_class = self._dataset_class or ZarrDataset
-
-        datasets: dict[str, ZarrDataset] = {}
-        for episode_hash, local_path, num_frames, robot_name in meta:
             datasets[episode_hash] = dataset_class(
                 local_path,
                 key_map=self.key_map,
@@ -994,8 +1108,167 @@ class ModalEpisodeResolver(EpisodeResolver):
                 _embodiment=robot_name,
             )
 
+        if n_missing:
+            logger.info("Skipped %d episodes not present in local volume", n_missing)
+
+        if not datasets:
+            raise ValueError(
+                "No episodes loaded — all SQL-matched episodes are missing from the local volume."
+            )
+
         logger.info("Loaded %d episodes from local volume", len(datasets))
         self._run_pause_precompute(datasets)
+        return datasets
+
+    # ------------------------------------------------------------------
+    # Modal fan-out helpers — parallel container code for Modal volume
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _modal_fanout_scan(
+        cls,
+        search_path: Path,
+        filters: DatasetFilter,
+        start_time: float,
+    ) -> list[tuple[str, str]]:
+        """Fan out a zarr metadata filter scan across Modal containers via scan_shard.
+
+        Lists candidate dir names locally (one fast readdir), shards them, and
+        invokes egomimic-scan::scan_shard in parallel.  Each worker mounts the
+        zarr volume read-only and runs a thread-pooled .zattrs scan.
+        """
+        import time
+
+        modal = _import_real_modal()
+
+        logger.info(f"Modal fan-out scan: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        names = [n for n in os.listdir(search_path) if not n.startswith(".")]
+        total = len(names)
+        logger.info(
+            f"Modal fan-out scan: listed {total} entries in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return []
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_SCAN_SHARDS", "100")), total)
+        shards = [names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out scan: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up scan_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "scan_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out scan: function lookup OK; launching .map()...")
+        filter_lambdas = list(filters.filter_lambdas)
+
+        matched: list[tuple[str, str]] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, [filter_lambdas] * total_shards):
+            completed += 1
+            matched.extend(shard_result)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal scan: shard {completed}/{total_shards} done "
+                    f"| matched={len(matched)} | elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out scan complete: {len(matched)} matches from {total} "
+            f"entries in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
+        return matched
+
+    def _modal_fanout_load(
+        self,
+        search_path: Path,
+        valid_folder_names: set[str],
+        dataset_class,
+    ) -> dict:
+        """Fan out per-episode .zattrs reads across Modal containers via load_shard.
+
+        Worker returns picklable (path, hash, metadata) tuples; ZarrDataset is
+        constructed locally with precomputed_metadata so its zarr open is
+        deferred until first __getitem__.
+        """
+        import time
+
+        modal = _import_real_modal()
+
+        start_time = time.monotonic()
+        logger.info(f"Modal fan-out load: listing {search_path} (single readdir)...")
+        t0 = time.monotonic()
+        on_disk_names = []
+        for raw_name in os.listdir(search_path):
+            if raw_name.startswith("."):
+                continue
+            hash_name = raw_name[:-5] if raw_name.endswith(".zarr") else raw_name
+            if hash_name in valid_folder_names:
+                on_disk_names.append(raw_name)
+        total = len(on_disk_names)
+        logger.info(
+            f"Modal fan-out load: {total} target entries (of {len(valid_folder_names)} requested) "
+            f"in {time.monotonic() - t0:.1f}s"
+        )
+        if total == 0:
+            return {}
+
+        n_shards = min(int(os.environ.get("EGOMIMIC_LOAD_SHARDS", "100")), total)
+        shards = [on_disk_names[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            f"Modal fan-out load: {total} entries across {total_shards} shards "
+            f"(~{total // total_shards} per shard). Looking up load_shard..."
+        )
+
+        fn = modal.Function.from_name(
+            "egomimic-scan", "load_shard", environment_name="robotics"
+        )
+        logger.info("Modal fan-out load: function lookup OK; launching .map()...")
+
+        datasets: dict = {}
+        skipped: list[str] = []
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards):
+            completed += 1
+            for path_str, episode_hash, metadata in shard_result:
+                if episode_hash not in valid_folder_names:
+                    continue
+                try:
+                    datasets[episode_hash] = dataset_class(
+                        Path(path_str),
+                        key_map=self.key_map,
+                        transform_list=self.transform_list,
+                        norm_stats=self.norm_stats,
+                        precomputed_metadata=metadata,
+                    )
+                except Exception as e:
+                    logger.error("Failed to construct dataset for %s: %s", path_str, e)
+                    skipped.append(episode_hash)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"Modal load: shard {completed}/{total_shards} done "
+                    f"| loaded={len(datasets)} skipped={len(skipped)} "
+                    f"| elapsed {elapsed:.0f}s"
+                )
+
+        logger.info(
+            f"Modal fan-out load complete: {len(datasets)} datasets "
+            f"(skipped {len(skipped)}) in {time.monotonic() - start_time:.1f}s "
+            f"({total_shards} shards)"
+        )
         return datasets
 
 
@@ -1272,7 +1545,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 through keep_indices. None leaves the episode unchanged.
             _total_frames: if provided (e.g. from SQL), skip zarr open at init and defer to first __getitem__.
             _embodiment: if provided alongside _total_frames, also skip zarr open at init.
-            precomputed_metadata: full .zattrs dict pre-loaded externally.
+            precomputed_metadata: full .zattrs dict pre-loaded externally (e.g. from _modal_fanout_load).
                 When provided, skips zarr open at init and populates all metadata fields immediately.
         """
         self.episode_path = Episode_path
@@ -1283,7 +1556,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.episode_reader = None
 
         if precomputed_metadata is not None:
-            # Full metadata pre-loaded externally
+            # Full metadata pre-loaded externally (e.g. from Modal fan-out load_shard)
             self._init_from_metadata(precomputed_metadata)
         elif _total_frames is not None and _embodiment is not None:
             # Lightweight fast path from SQL — defer zarr open to first access
@@ -1416,25 +1689,10 @@ class ZarrDataset(torch.utils.data.Dataset):
             self.keep_indices = np.arange(self.total_frames, dtype=np.int64)
             return (self.total_frames, self.total_frames)
 
-        # Keypoints are optional — some embodiments / older episodes don't
-        # have them; in that case the detector falls back to ee_pose-only.
-        left_kp_key, right_kp_key = PAUSE_DETECT_KEYPOINT_KEYS
-        left_kp = right_kp = None
-        try:
-            left_kp = np.asarray(store[left_kp_key][:])
-        except KeyError:
-            pass
-        try:
-            right_kp = np.asarray(store[right_kp_key][:])
-        except KeyError:
-            pass
-
         keep = _build_pause_keep_mask(
             left_pose=left_pose,
             right_pose=right_pose,
             epsilon=self.pause_removal_epsilon,
-            left_keypoints=left_kp,
-            right_keypoints=right_kp,
         )
         self._raw_total_frames = int(self.total_frames)
         self.keep_indices = np.flatnonzero(keep).astype(np.int64)
@@ -1489,15 +1747,8 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
 
             if horizon is not None:
-                if self.keep_indices is not None:
-                    # Fully-filtered chunk: take H consecutive *filtered* frames
-                    # by fancy-indexing keep_indices, so paused raw frames are
-                    # skipped inside the chunk too (not just at the anchor).
-                    end_filtered = min(idx + horizon, len(self.keep_indices))
-                    read_interval = self.keep_indices[idx:end_filtered]
-                else:
-                    end_idx = self._chunk_end_idx(real_idx, horizon, key_type)
-                    read_interval = (real_idx, end_idx)
+                end_idx = self._chunk_end_idx(real_idx, horizon, key_type)
+                read_interval = (real_idx, end_idx)
             else:
                 read_interval = (real_idx, None)
             read_dict = {zarr_key: read_interval}
@@ -1518,9 +1769,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                     f"Zarr read failed ep={Path(self.episode_path).name} frame={idx} key={k} "
                     f"({type(e).__name__}: {e}) | attempt {attempts}, trying random idx {next_idx}"
                 )
-                return self.__getitem__(
-                    next_idx, _fallback_origin=origin, _attempts=attempts
-                )
+                return self.__getitem__(next_idx, _fallback_origin=origin, _attempts=attempts)
             self._pad_sequences(raw_data, horizon)  # should be able to pad images
             data[k] = raw_data[zarr_key]
 
@@ -1674,41 +1923,32 @@ class ZarrEpisode:
         self.keys = self.metadata["features"]
 
     def read(
-        self,
-        keys_with_ranges: dict[str, tuple[int, int | None] | np.ndarray],
+        self, keys_with_ranges: dict[str, tuple[int, int | None]]
     ) -> dict[str, np.ndarray]:
         """
-        Read data for specified keys, each with their own range or index array.
-
-        Two indexer shapes are supported per key:
-
-        - ``(start, end)`` tuple: contiguous slice ``arr[start:end]``. ``end=None``
-          reads a single frame at ``start`` (and unwraps the trailing dim,
-          preserving VariableLengthBytes objects intact).
-        - ``np.ndarray`` of frame indices: fancy-index read ``arr[indices]``.
-          Used when the dataset has ``keep_indices`` set and the consumer
-          wants the action chunk to skip paused raw frames.
-
+        Read data for specified keys, each with their own index or range.
+        Args:
+            keys_with_ranges: Dictionary mapping keys to (start, end) tuples.
+                - start: Starting frame index
+                - end: Ending frame index (exclusive). If None, reads single frame at start.
+        Returns:
+            Dictionary mapping keys to numpy arrays
         Example:
             >>> episode.read({
-            ...     "obs/image": (0, 10),                 # contiguous frames 0..9
-            ...     "actions":   np.array([0, 1, 8, 9]),  # fancy: skip 2..7
-            ...     "rewards":   (20, None),              # single frame 20
+            ...     "obs/image": (0, 10),      # Read frames 0-10
+            ...     "actions": (5, 15),        # Read frames 5-15
+            ...     "rewards": (20, None),     # Read single frame at index 20
             ... })
         """
         result = {}
-        for key, indexer in keys_with_ranges.items():
+        for key, (start, end) in keys_with_ranges.items():
             arr = self._store[key]
-            if isinstance(indexer, np.ndarray):
-                data = arr[indexer]
+            if end is not None:
+                data = arr[start:end]
             else:
-                start, end = indexer
-                if end is not None:
-                    data = arr[start:end]
-                else:
-                    # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                    # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                    data = arr[start : start + 1][0]
+                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
+                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
+                data = arr[start : start + 1][0]
             result[key] = data
         return result
 
