@@ -31,7 +31,7 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 32
-    num_workers: 30
+    num_workers: 8
     persistent_workers: true
     prefetch_factor: 1
 
