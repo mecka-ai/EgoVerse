@@ -33,11 +33,11 @@ train_dataloader_params:
     batch_size: 32
     num_workers: 30
     persistent_workers: true
-    multiprocessing_context: forkserver
+    prefetch_factor: 1
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 32
-    num_workers: 30
+    num_workers: 4
     persistent_workers: true
-    multiprocessing_context: forkserver
+    prefetch_factor: 1
