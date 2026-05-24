@@ -31,13 +31,13 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 32
-    num_workers: 8
+    num_workers: 1
     persistent_workers: true
     prefetch_factor: 1
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 32
-    num_workers: 4
+    num_workers: 1
     persistent_workers: true
     prefetch_factor: 1
