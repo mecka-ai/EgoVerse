@@ -46,9 +46,13 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 64
-    num_workers: 10
+    num_workers: 16
+    pin_memory: true
+    multiprocessing_context: forkserver
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 64
-    num_workers: 10
+    num_workers: 16
+    pin_memory: true
+    multiprocessing_context: forkserver
