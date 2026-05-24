@@ -32,8 +32,12 @@ train_dataloader_params:
   mecka_bimanual:
     batch_size: 32
     num_workers: 30
+    persistent_workers: true
+    multiprocessing_context: forkserver
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 32
     num_workers: 30
+    persistent_workers: true
+    multiprocessing_context: forkserver
