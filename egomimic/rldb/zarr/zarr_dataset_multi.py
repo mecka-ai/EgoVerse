@@ -1361,15 +1361,29 @@ class MultiDataset(torch.utils.data.Dataset):
         self.datasets = {rid: ds for rid, ds in datasets.items() if rid in chosen}
         assert self.datasets, "No datasets left after applying mode split."
 
-        self.index_map = []
-        self._global_indices_by_dataset: dict[str, list[int]] = {
-            dataset_name: [] for dataset_name in self.datasets
+        # Build compact numpy index arrays instead of Python list-of-tuples.
+        # With 400M+ frames, Python tuples use ~50 GB; uint32 arrays use ~3.5 GB.
+        dataset_names_list = list(self.datasets.keys())
+        self._dataset_id_to_name: list[str] = dataset_names_list
+        self._dataset_name_to_id: dict[str, int] = {
+            name: i for i, name in enumerate(dataset_names_list)
         }
+
+        total_frames = sum(len(ds) for ds in self.datasets.values())
+        self._index_map_dataset_ids = np.empty(total_frames, dtype=np.uint32)
+        self._index_map_local_idx = np.empty(total_frames, dtype=np.uint32)
+        self._global_indices_by_dataset: dict[str, np.ndarray] = {}
+
+        pos = 0
         for dataset_name, dataset in self.datasets.items():
-            for local_idx in range(len(dataset)):
-                global_idx = len(self.index_map)
-                self.index_map.append((dataset_name, local_idx))
-                self._global_indices_by_dataset[dataset_name].append(global_idx)
+            n = len(dataset)
+            dataset_id = self._dataset_name_to_id[dataset_name]
+            self._index_map_dataset_ids[pos : pos + n] = dataset_id
+            self._index_map_local_idx[pos : pos + n] = np.arange(n, dtype=np.uint32)
+            self._global_indices_by_dataset[dataset_name] = np.arange(
+                pos, pos + n, dtype=np.uint32
+            )
+            pos += n
 
         self.data_schematic = None
         self._n_samples_checked = 0
@@ -1379,7 +1393,7 @@ class MultiDataset(torch.utils.data.Dataset):
         super().__init__()
 
     def __len__(self) -> int:
-        return len(self.index_map)
+        return len(self._index_map_dataset_ids)
 
     @staticmethod
     def _episode_name_for_dataset(dataset, dataset_name: str) -> str:
@@ -1481,7 +1495,8 @@ class MultiDataset(torch.utils.data.Dataset):
         """
         Multidataset handles outlier rejection so that you don't need to propagate the norm stats down to every sub dataset.
         """
-        dataset_name, local_idx = self.index_map[idx]
+        dataset_name = self._dataset_id_to_name[int(self._index_map_dataset_ids[idx])]
+        local_idx = int(self._index_map_local_idx[idx])
         dataset = self.datasets[dataset_name]
         data = dataset[local_idx]
 
