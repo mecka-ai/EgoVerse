@@ -64,11 +64,11 @@ def _propagate_data_schematic_to_datasets(data_schematic, datasets, bounds_slack
     """
     Set the shared data schematic on all top-level datasets.
     """
-    for dataset_name, dataset in datasets.items():
-        if not hasattr(dataset, "set_data_schematic"):
+    split_datasets = datasets
+    for dataset_name, dataset in split_datasets.items():
+        if not isinstance(dataset, MultiDataset):
             raise ValueError(
-                f"{dataset_name} does not implement set_data_schematic(). "
-                "Dataset must be a MultiDataset or TarShardIterableDataset."
+                f"{dataset_name} is not a MultiDataset. All top level datasets in data config should be MultiDataset"
             )
         dataset.set_data_schematic(data_schematic, bounds_slack=bounds_slack)
 
@@ -118,42 +118,27 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         cfg.data, train_datasets=train_datasets, valid_datasets=valid_datasets
     )
 
-    precomputed_norm_path = OmegaConf.select(cfg, "norm_stats.precomputed_norm_path", default=None)
-
     for dataset_name, dataset in datamodule.train_datasets.items():
         log.info(f"Inferring shapes for dataset <{dataset_name}>")
-        # IterableDataset doesn't support index access — peek at the first sample
-        if isinstance(dataset, torch.utils.data.IterableDataset):
-            first_sample = next(iter(dataset))
-        else:
-            first_sample = dataset[0]
-        data_schematic.infer_shapes_from_batch(first_sample)
+        data_schematic.infer_shapes_from_batch(dataset[0])
+        instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
+        keymap_cfg = instantiate_copy.resolver.key_map
+        km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
 
-        if precomputed_norm_path:
-            # norm_dataset is ignored when precomputed stats are loaded; reuse existing dataset
-            norm_dataset = dataset
-        else:
-            instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
-            # Support both resolver-based configs (MultiDataset) and direct dataset configs
-            if hasattr(instantiate_copy, "resolver"):
-                keymap_cfg = instantiate_copy.resolver.key_map
-                km = OmegaConf.to_container(keymap_cfg, resolve=False)
-                km["norm_mode"] = True
-                instantiate_copy.resolver.key_map = km
-            elif hasattr(instantiate_copy, "key_map"):
-                keymap_cfg = instantiate_copy.key_map
-                km = OmegaConf.to_container(keymap_cfg, resolve=False)
-                km["norm_mode"] = True
-                instantiate_copy.key_map = km
-            norm_dataset = hydra.utils.instantiate(instantiate_copy)
+        # this remove annotation and image keys from the keymap
+        km["norm_mode"] = True
 
+        instantiate_copy.resolver.key_map = km
+        norm_dataset = hydra.utils.instantiate(instantiate_copy)
         # infer_norm_from_dataset: load from precomputed JSON/dir if set, else compute (no disk write).
         data_schematic.infer_norm_from_dataset(
             norm_dataset,
             dataset_name,
             sample_frac=OmegaConf.select(cfg, "norm_stats.sample_frac", default=1.0),
             num_workers=OmegaConf.select(cfg, "norm_stats.num_workers", default=4),
-            precomputed_norm_path=precomputed_norm_path,
+            precomputed_norm_path=OmegaConf.select(
+                cfg, "norm_stats.precomputed_norm_path", default=None
+            ),
         )
         # Cache norm stats if save_cache_dir is set
         save_cache_dir = OmegaConf.select(

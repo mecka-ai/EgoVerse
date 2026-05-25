@@ -12,6 +12,12 @@ train_datasets:
     transform_list:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
       mode: cartesian
+    # Plain config block (no _target_) that trainHydra.py uses to build the norm_stats
+    # dataset via resolver.key_map. norm_mode=True is injected at runtime. Not instantiated.
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
 
 valid_datasets:
   mecka_bimanual:
@@ -25,6 +31,10 @@ valid_datasets:
     transform_list:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
       mode: cartesian
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
 
 train_dataloader_params:
   mecka_bimanual:
@@ -32,7 +42,7 @@ train_dataloader_params:
     num_workers: 8
     persistent_workers: true
     prefetch_factor: 2
-    # shuffle must be False — TarShardIterableDataset shuffles internally
+    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
     shuffle: false
 
 valid_dataloader_params:
