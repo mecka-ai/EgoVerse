@@ -112,7 +112,7 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
             "TarShardIterableDataset [%s]: %d shards in %s",
             mode, len(self._shards), shard_dir,
         )
-
+    
     # ------------------------------------------------------------------
     # Required by MultiDataset / trainHydra for DataSchematic wiring
     # ------------------------------------------------------------------
