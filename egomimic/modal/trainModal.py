@@ -56,40 +56,6 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
     return [CFG.python_bin, CFG.train_script, *hydra_args]
 
 
-# Data configs that use TarShardIterableDataset instead of MultiDataset.
-# trainHydra.py's reject_outliers path does isinstance(dataset, MultiDataset), which
-# fails for IterableDatasets, so we inject overrides automatically.
-_ITERABLE_DATA_CONFIGS = {"mecka_all_wds"}
-
-# Default Modal volume for wds data configs
-_WDS_DEFAULT_VOLUME = "mecka_data_wds_v2"
-
-# Default ephemeral disk for wds (MiB). 8 workers × 3.3 GB/shard = ~26 GB needed;
-# Modal minimum is 524288 MiB (512 GiB), so we request 600 GiB.
-_WDS_DEFAULT_EPHEMERAL_GIB = 600
-
-
-def _inject_modal_data_defaults(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
-    """Inject Hydra-level overrides needed when using tar-shard data configs.
-
-    For mecka_all_wds:
-    - reject_outliers=false: TarShardIterableDataset is not a MultiDataset; the
-      isinstance check in trainHydra._propagate_data_schematic_to_datasets fails.
-
-    Note: volume is auto-selected (mecka_data_wds_v2) when data=mecka_all_wds is used.
-    Override with +modal_volume=<name> or +modal_ephemeral_disk_gb=600 at the CLI.
-    """
-    args = list(hydra_args)
-    data_cfg = next(
-        (a.partition("=")[2] for a in args if a.startswith("data=") and "=" in a),
-        None,
-    )
-    if data_cfg in _ITERABLE_DATA_CONFIGS:
-        if not any(a.startswith("reject_outliers=") for a in args):
-            args.append("reject_outliers=false")
-    return tuple(args)
-
-
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
     _PATH_KEYS = {"ckpt_path", "norm_stats.precomputed_norm_path"}
@@ -186,7 +152,6 @@ def run_hydra_train(
         init_submodules=init_submodules,
     )
 
-    hydra_args = _inject_modal_data_defaults(hydra_args)
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
@@ -280,7 +245,6 @@ def verify() -> None:
 def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
     hydra_args, init_submodules = pop_init_submodules(hydra_args)
-    hydra_args = _inject_modal_data_defaults(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
@@ -327,14 +291,7 @@ if __name__ == "__main__":
     container_overrides = []
     gpu_count = 1
 
-    # Strip leading subcommand ('submit') and '--' separator if present
-    raw_args = sys.argv[1:]
-    if raw_args and raw_args[0] == "submit":
-        raw_args = raw_args[1:]
-    if raw_args and raw_args[0] == "--":
-        raw_args = raw_args[1:]
-
-    for arg in raw_args:
+    for arg in sys.argv[1:]:
         key, sep, val = arg.lstrip("+").partition("=")
         if sep and key in _MODAL_KEY_MAP:
             modal_env[_MODAL_KEY_MAP[key]] = val
@@ -348,15 +305,6 @@ if __name__ == "__main__":
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
-
-    # Auto-select volume based on data config when user hasn't overridden it
-    if "MODAL_VOLUME" not in modal_env or modal_env.get("MODAL_VOLUME") == os.environ.get("MODAL_VOLUME", ""):
-        data_cfg = next(
-            (a.partition("=")[2] for a in container_overrides if a.startswith("data=") and "=" in a),
-            None,
-        )
-        if data_cfg in _ITERABLE_DATA_CONFIGS and "MODAL_VOLUME" not in modal_env:
-            modal_env["MODAL_VOLUME"] = "mecka_data_wds_v2"
 
     modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(container_overrides)
 
