@@ -71,6 +71,7 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
         cache_dir: str = "/tmp/shard_cache",
         seed: int = 42,
         debug: int | None = None,
+        resolver=None,  # accepted but ignored; lets trainHydra.py access resolver.key_map via raw config
     ):
         super().__init__()
         self.shard_dir = Path(shard_dir)
@@ -125,6 +126,13 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
         # Approximate: 20 episodes/shard × ~2000 frames/episode
         # Used by Lightning for progress bars only; not required to be exact.
         return len(self._shards) * 20 * 2000
+
+    def __getitem__(self, idx: int):
+        # trainHydra.py calls dataset[0] once for shape inference.
+        # IterableDataset doesn't support random access, so we peek at the first
+        # available sample by extracting the first shard. The generator is discarded
+        # after one item; Python's GC triggers the finally-block cleanup.
+        return next(iter(self))
 
     # ------------------------------------------------------------------
     # Iteration

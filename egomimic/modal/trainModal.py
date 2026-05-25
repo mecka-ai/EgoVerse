@@ -56,6 +56,30 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
     return [CFG.python_bin, CFG.train_script, *hydra_args]
 
 
+# Data configs that use TarShardIterableDataset instead of MultiDataset.
+# trainHydra.py's reject_outliers path does isinstance(dataset, MultiDataset), which
+# fails for IterableDatasets, so we inject reject_outliers=false automatically.
+_ITERABLE_DATA_CONFIGS = {"mecka_all_wds"}
+
+
+def _inject_modal_data_defaults(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
+    """Inject Modal-specific Hydra overrides that compensate for trainHydra.py assumptions.
+
+    - reject_outliers=false: TarShardIterableDataset is not a MultiDataset; the
+      isinstance check in trainHydra._propagate_data_schematic_to_datasets would fail.
+    """
+    args = list(hydra_args)
+    data_cfg = next(
+        (a.partition("=")[2] for a in args if a.startswith("data=") and "=" in a),
+        None,
+    )
+    if data_cfg in _ITERABLE_DATA_CONFIGS:
+        has_reject = any(a.startswith("reject_outliers=") for a in args)
+        if not has_reject:
+            args.append("reject_outliers=false")
+    return tuple(args)
+
+
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
     _PATH_KEYS = {"ckpt_path", "norm_stats.precomputed_norm_path"}
@@ -148,6 +172,7 @@ def run_hydra_train(
         init_submodules=init_submodules,
     )
 
+    hydra_args = _inject_modal_data_defaults(hydra_args)
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
@@ -241,6 +266,7 @@ def verify() -> None:
 def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
     hydra_args, init_submodules = pop_init_submodules(hydra_args)
+    hydra_args = _inject_modal_data_defaults(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
