@@ -140,9 +140,20 @@ class MultiDataModuleWrapper(LightningDataModule):
                 raise ValueError(
                     f"No dataloader params found for dataset {dataset_name}. Please add {dataset_name} into your data config train_dataloader_params."
                 )
+            dataset_params = dict(dataset_params)
+            # IterableDataset handles its own shuffling; DataLoader shuffle must be False
+            is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+            shuffle = dataset_params.pop("shuffle", not is_iterable)
+            if is_iterable and shuffle:
+                logger.warning(
+                    "Dataset '%s' is an IterableDataset — ignoring shuffle=True. "
+                    "Shuffling is handled internally by the dataset.",
+                    dataset_name,
+                )
+                shuffle = False
             iterables[dataset_name] = DataLoader(
                 dataset,
-                shuffle=True,
+                shuffle=shuffle,
                 collate_fn=self.collate_fn,
                 **dataset_params,
             )

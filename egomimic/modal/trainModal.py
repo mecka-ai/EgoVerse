@@ -34,6 +34,7 @@ if _HERE not in sys.path:
 from modal_setup import (  # noqa: E402
     CFG,
     REPO_ROOT,
+    VOLUME_MAP,
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
@@ -97,16 +98,42 @@ def _download_run_artifacts(output_rel_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_volumes() -> dict:
+    """Build the volumes dict for the training function.
+
+    Respects +modal_volume=<name> override (e.g. mecka_data_zip).
+    Falls back to the default zarr volume (mecka_data_v2).
+    """
+    vol_name = os.environ.get("MODAL_VOLUME", "mecka_data_v2")
+    vol_obj, mount_path = VOLUME_MAP.get(vol_name, (zarr_volume, CFG.volume_mount_path))
+    return {
+        mount_path: vol_obj,
+        CFG.output_mount_path: training_outputs_volume,
+    }
+
+
+def _ephemeral_disk_mib() -> int | None:
+    """Return ephemeral disk size in MiB if +modal_ephemeral_disk_gb was set.
+
+    Modal's ephemeral_disk parameter is in MiB. Minimum allowed is 524288 MiB (512 GiB).
+    Use +modal_ephemeral_disk_gb=600 or more when extracting shards to /tmp at training.
+    """
+    gb = os.environ.get("MODAL_EPHEMERAL_DISK_GB")
+    return int(float(gb) * 1024) if gb else None
+
+
+_ephemeral = _ephemeral_disk_mib()
+_volumes = _build_volumes()
+
+
 @app.function(
     gpu=CFG.gpu,
     cpu=CFG.cpu,
     memory=CFG.memory_mb,
     timeout=CFG.timeout_seconds,
+    ephemeral_disk=_ephemeral,
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
-    volumes={
-        CFG.volume_mount_path: zarr_volume,
-        CFG.output_mount_path: training_outputs_volume,
-    },
+    volumes=_volumes,
 )
 def run_hydra_train(
     hydra_args: tuple[str, ...],
@@ -256,7 +283,8 @@ if __name__ == "__main__":
         "modal_cpu": "MODAL_CPU",
         "modal_memory_gb": "MODAL_MEMORY_GB",
         "modal_memory_mb": "MODAL_MEMORY_MB",
-        "modal_volume": "MODAL_ZARR_VOLUME",
+        "modal_volume": "MODAL_VOLUME",
+        "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",
     }
 
     modal_env = os.environ.copy()
