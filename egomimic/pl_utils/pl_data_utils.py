@@ -71,6 +71,7 @@ class MultiDataModuleWrapper(LightningDataModule):
         proprio: bool = False,
         embodiment_label: bool = False,
         control_mode: dict[str, str] | None = None,
+        include_train_split_in_val: bool = False,
     ):
         """
         Args:
@@ -107,6 +108,14 @@ class MultiDataModuleWrapper(LightningDataModule):
             is active, the prompt is rendered as
             ``"Task: {prompt}, <blocks>;\\nAction: "`` (pi0.5 anchor).
             Otherwise the raw ``prompt`` is tokenized as-is.
+
+            include_train_split_in_val: if True, ``val_dataloader`` returns a
+                list of two CombinedLoaders: [eval_split, train_split].
+                Lightning assigns idx 0 to the eval split and idx 1 to the
+                train_eval split, so the evaluator can route outputs by split.
+                The train-split loader is non-shuffled so the same samples
+                appear each epoch, making videos directly comparable across
+                runs. Defaults to False (original single-loader behavior).
         """
         super().__init__()
         # Drop `None` slots so downstream iteration sites don't need null guards.
@@ -116,6 +125,7 @@ class MultiDataModuleWrapper(LightningDataModule):
         self.valid_datasets = {k: v for k, v in valid_datasets.items() if v is not None}
         self.train_dataloader_params = train_dataloader_params
         self.valid_dataloader_params = valid_dataloader_params
+        self.include_train_split_in_val = include_train_split_in_val
         if use_tokenizer:
             self.collate_fn = build_tokenized_collate(
                 max_length=collate_max_length,
@@ -161,22 +171,48 @@ class MultiDataModuleWrapper(LightningDataModule):
         return CombinedLoader(iterables, "max_size_cycle")
 
     def val_dataloader(self):
-        iterables = dict()
+        eval_loader = self._build_eval_loader()
+        if not self.include_train_split_in_val:
+            return eval_loader
+        # Return [eval, train] so Lightning iterates each with a distinct
+        # dataloader_idx: 0 = eval (canonical), 1 = train (comparison viz).
+        return [eval_loader, self._build_train_split_loader()]
+
+    def _build_eval_loader(self) -> CombinedLoader:
+        iterables = {}
         for dataset_name, dataset in self.valid_datasets.items():
             dataset_params = self.valid_dataloader_params.get(dataset_name)
-            if dataset_params is None or len(dataset_params) == 0:
+            if not dataset_params:
                 raise ValueError(
-                    f"No dataloader params found for dataset {dataset_name}. Please add {dataset_name} into your data config valid_dataloader_params."
+                    f"No dataloader params found for dataset {dataset_name}. "
+                    f"Please add {dataset_name} into your data config valid_dataloader_params."
                 )
             dataset_params = dict(dataset_params)
             shuffle = dataset_params.pop("shuffle", False)
             iterables[dataset_name] = DataLoader(
-                dataset,
-                shuffle=shuffle,
-                collate_fn=self.collate_fn,
-                **dataset_params,
+                dataset, shuffle=shuffle, collate_fn=self.collate_fn, **dataset_params
             )
+        return CombinedLoader(iterables, "max_size_cycle")
 
+    def _build_train_split_loader(self) -> CombinedLoader:
+        """Non-shuffled loader over train datasets for comparison viz.
+
+        Mirrors train_dataloader params but forces shuffle=False so the same
+        samples appear each epoch, making videos comparable across runs.
+        """
+        iterables = {}
+        for dataset_name, dataset in self.train_datasets.items():
+            dataset_params = self.train_dataloader_params.get(dataset_name)
+            if not dataset_params:
+                raise ValueError(
+                    f"No dataloader params found for dataset {dataset_name} "
+                    f"(needed for train-split val pass)."
+                )
+            dataset_params = dict(dataset_params)
+            dataset_params.pop("shuffle", None)
+            iterables[dataset_name] = DataLoader(
+                dataset, shuffle=False, collate_fn=self.collate_fn, **dataset_params
+            )
         return CombinedLoader(iterables, "max_size_cycle")
 
 
