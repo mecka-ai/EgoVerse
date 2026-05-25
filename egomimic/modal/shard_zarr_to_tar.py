@@ -60,15 +60,14 @@ from modal_setup import app, zarr_volume, CFG, image
 # Output volume
 # ---------------------------------------------------------------------------
 
-wds_volume = modal.Volume.from_name("mecka_data_wds", create_if_missing=True)
+wds_volume = modal.Volume.from_name("mecka_data_wds_v2", create_if_missing=True)
 WDS_MOUNT = "/mnt/zarr-wds"
 INPUT_MOUNT = CFG.volume_mount_path  # /mnt/zarr-data
 
 EPISODES_PER_SHARD = 20
 
-# Each shard = 20 episodes × ~167 MB = ~3.3 GB
-# 500 MB ephemeral disk is plenty for one shard's worth of buffering in /tmp
-_EPHEMERAL_DISK_MB = 500_000  # 500 GB — enough headroom for a batch of shards
+# Each shard = 20 episodes × ~167 MB = ~3.3 GB written to /tmp then copied to volume.
+# No special ephemeral disk needed; default Modal filesystem handles ~4 GB comfortably.
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +82,6 @@ _EPHEMERAL_DISK_MB = 500_000  # 500 GB — enough headroom for a batch of shards
     },
     cpu=2,
     memory=8192,
-    ephemeral_disk=_EPHEMERAL_DISK_MB,
     timeout=3600,
 )
 def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
@@ -175,6 +173,23 @@ def write_shard_index(results: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Remote: list available episode directories
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    volumes={INPUT_MOUNT: zarr_volume},
+    cpu=1,
+    memory=4096,
+    timeout=120,
+)
+def list_episodes() -> list[str]:
+    """Return sorted list of episode directory paths from the input volume."""
+    input_root = Path(INPUT_MOUNT)
+    return sorted(str(p) for p in input_root.iterdir() if p.is_dir())
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint
 # ---------------------------------------------------------------------------
 
@@ -186,25 +201,24 @@ def main(dry_run: bool = False, max_shards: int = 0) -> None:
         dry_run:    Print plan without launching any jobs.
         max_shards: If >0, only convert this many shards (for testing).
     """
-    input_root = Path(INPUT_MOUNT)
-    all_episodes = sorted(p for p in input_root.iterdir() if p.is_dir())
+    print("Listing episodes from volume...")
+    all_episodes = list_episodes.remote()
     n_episodes = len(all_episodes)
 
     # Split into batches of EPISODES_PER_SHARD
     batches: list[list[str]] = []
     for i in range(0, n_episodes, EPISODES_PER_SHARD):
-        batch = [str(p) for p in all_episodes[i : i + EPISODES_PER_SHARD]]
+        batch = all_episodes[i : i + EPISODES_PER_SHARD]
         batches.append(batch)
 
-    n_shards = len(batches)
     if max_shards > 0:
         batches = batches[:max_shards]
-        n_shards = len(batches)
 
-    est_size_tb = n_episodes * 0.167 / 1000  # rough estimate based on benchmark
-    print(f"Episodes:      {n_episodes:,}")
-    print(f"Shards:        {n_shards:,}  ({EPISODES_PER_SHARD} episodes each)")
-    print(f"Est. output:   {est_size_tb:.1f} TB")
+    n_shards = len(batches)
+    est_size_gb = n_shards * EPISODES_PER_SHARD * 0.167
+    print(f"Episodes:      {n_episodes:,}  (using first {n_shards * EPISODES_PER_SHARD})")
+    print(f"Shards:        {n_shards}  ({EPISODES_PER_SHARD} episodes each)")
+    print(f"Est. output:   {est_size_gb:.0f} GB")
     print(f"Output volume: mecka_data_wds")
 
     if dry_run:
