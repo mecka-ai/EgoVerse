@@ -1,0 +1,47 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.tar_shard_resolver.TarShardResolver
+      shard_dir: /mnt/zarr-wds
+      cache_dir: /tmp/shard_cache
+      shards_per_worker: 2
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.tar_shard_resolver.TarShardResolver
+      shard_dir: /mnt/zarr-wds
+      cache_dir: /tmp/shard_cache
+      shards_per_worker: 1
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 8
+    persistent_workers: true
+    prefetch_factor: 2
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 1
