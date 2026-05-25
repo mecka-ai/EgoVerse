@@ -172,9 +172,20 @@ def _embed_task_shard(
     transform_list = _hydra.utils.instantiate(resolver_cfg.transform_list)
     pause_eps = OmegaConf.select(resolver_cfg, "pause_removal_epsilon")
 
-    # Load shard index and build episode map from tar shards
-    shard_index_path = Path(WDS_MOUNT_PATH) / "shard_index.json"
-    shard_index = json.loads(shard_index_path.read_text())
+    # Auto-discover per-task shard dir; fall back to global mixed shards.
+    # Per-task shards are created by shard_zarr_to_tar.py::shard_by_task and live at:
+    #   {WDS_MOUNT_PATH}/tasks/{task_name}_{sha6}/
+    import hashlib as _hl
+    task_hash = _hl.sha256(task_name.encode()).hexdigest()[:6]
+    task_shard_root = Path(WDS_MOUNT_PATH) / "tasks" / f"{task_name}_{task_hash}"
+    if (task_shard_root / "shard_index.json").exists():
+        shard_root = task_shard_root
+        print(f"{tag} Using per-task shards at tasks/{task_name}_{task_hash}/")
+    else:
+        shard_root = Path(WDS_MOUNT_PATH)
+        print(f"{tag} No per-task shards found — using global shard_index")
+
+    shard_index = json.loads((shard_root / "shard_index.json").read_text())
 
     tmp_dir = "/tmp/curation_tar_cache"
     from egomimic.rldb.zarr.tar_shard_dataset import load_episodes_from_tars
@@ -183,7 +194,7 @@ def _embed_task_shard(
     all_episodes = load_episodes_from_tars(
         shard_hashes,
         shard_index,
-        WDS_MOUNT_PATH,
+        str(shard_root),
         tmp_dir,
         key_map,
         transform_list,

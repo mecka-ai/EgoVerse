@@ -45,9 +45,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sys
 import tarfile
+import time
 from pathlib import Path
 
 _HERE = str(Path(__file__).resolve().parent)
@@ -55,7 +57,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import modal
-from modal_setup import app, zarr_volume, CFG, image
+from modal_setup import app, zarr_volume, CFG, image, _prepare_repo_light
 
 # ---------------------------------------------------------------------------
 # Output volume
@@ -97,19 +99,26 @@ def _shard_name(episode_dirs: list[str]) -> str:
     timeout=3600,
     max_containers=1000,
 )
-def convert_shard(episode_dirs: list[str]) -> dict:
+def convert_shard(episode_dirs: list[str], output_subdir: str = "") -> dict:
     """Bundle a list of zarr episode directories into a single content-addressed tar shard.
 
     The shard filename is a SHA-256 hash of the sorted episode names, so the same
     set of episodes always produces the same filename. Re-runs skip existing shards.
     The zarr directory tree is added verbatim — existing chunk compression is preserved.
+
+    output_subdir: relative path under WDS_MOUNT to write the shard (default: root).
     """
     import shutil
     import time
 
     shard_name = _shard_name(episode_dirs)
+    if output_subdir:
+        out_dir = Path(WDS_MOUNT) / output_subdir
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(WDS_MOUNT)
     tmp_path = Path("/tmp") / shard_name
-    out_path = Path(WDS_MOUNT) / shard_name
+    out_path = out_dir / shard_name
 
     if out_path.exists():
         print(f"[{shard_name}] already exists, skipping")
@@ -197,6 +206,178 @@ def list_episodes() -> list[str]:
     """Return sorted list of episode directory paths from the input volume."""
     input_root = Path(INPUT_MOUNT)
     return sorted(str(p) for p in input_root.iterdir() if p.is_dir())
+
+
+# ---------------------------------------------------------------------------
+# Remote: list episodes for specific tasks (SQL + zarr volume check)
+# ---------------------------------------------------------------------------
+
+
+def _task_shard_dir(task_name: str) -> str:
+    """Deterministic per-task subfolder: tasks/{task_name}_{sha6}."""
+    task_hash = hashlib.sha256(task_name.encode()).hexdigest()[:6]
+    return f"tasks/{task_name}_{task_hash}"
+
+
+@app.function(
+    image=image,
+    volumes={INPUT_MOUNT: zarr_volume},
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+    cpu=2,
+    memory=8192,
+    timeout=300,
+)
+def _list_task_episodes_remote(
+    task_names: list[str],
+    git_remote: str,
+    git_commit: str,
+) -> dict[str, list[str]]:
+    """SQL lookup + zarr volume existence check; returns {task_name: [ep_dir_path]}."""
+    import sys as _sys
+    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit)
+    _sys.path.insert(0, CFG.remote_repo_dir)
+
+    from egomimic.utils.aws.aws_data_utils import load_env
+    from egomimic.utils.aws.aws_sql import episode_table_to_df, create_default_engine
+    load_env()
+
+    engine = create_default_engine()
+    full_df = episode_table_to_df(engine)
+    if "is_deleted" in full_df.columns:
+        full_df = full_df[full_df["is_deleted"] != True]  # noqa: E712
+
+    task_set = set(task_names)
+    if "task" not in full_df.columns:
+        raise RuntimeError("SQL table has no 'task' column — check DB schema")
+
+    task_df = full_df[full_df["task"].isin(task_set)]
+    input_root = Path(INPUT_MOUNT)
+    by_task: dict[str, list[str]] = {}
+
+    for _, row in task_df.iterrows():
+        ep_hash = str(row["episode_hash"])
+        task = str(row["task"])
+        for candidate in [input_root / ep_hash, input_root / f"{ep_hash}.zarr"]:
+            if candidate.is_dir():
+                by_task.setdefault(task, []).append(str(candidate))
+                break
+
+    for task, dirs in sorted(by_task.items()):
+        print(f"  [{task}] {len(dirs)} episodes on zarr volume")
+    return by_task
+
+
+# ---------------------------------------------------------------------------
+# Remote: write per-task shard indexes and metadata
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=image,
+    volumes={WDS_MOUNT: wds_volume},
+    cpu=1,
+    memory=2048,
+    timeout=120,
+)
+def _write_task_indexes_remote(task_results: dict[str, list[dict]]) -> None:
+    """Write shard_index.json + metadata.json into each per-task shard dir."""
+    import time as _t
+
+    for task_name, results in task_results.items():
+        task_dir = Path(WDS_MOUNT) / _task_shard_dir(task_name)
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        index: dict[str, str] = {}
+        for r in results:
+            if r.get("skipped"):
+                continue
+            for ep_name in r.get("episodes", []):
+                ep_hash = ep_name[:-5] if ep_name.endswith(".zarr") else ep_name
+                index[ep_hash] = r["shard_name"]
+
+        (task_dir / "shard_index.json").write_text(json.dumps(index, indent=2))
+        meta = {
+            "task": task_name,
+            "n_episodes": len(index),
+            "n_shards": len([r for r in results if not r.get("skipped")]),
+            "created_at": _t.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        (task_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        print(f"  [{_task_shard_dir(task_name)}] {len(index)} episodes")
+
+    wds_volume.commit()
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoint: task-partitioned shard conversion
+# ---------------------------------------------------------------------------
+
+
+@app.local_entrypoint()
+def shard_by_task(tasks: str = "") -> None:
+    """Convert zarr episodes for specific tasks into per-task tar shards.
+
+    Each task gets a deterministic subfolder in the WDS volume:
+        tasks/{task_name}_{sha6}/shard-{content_hash}.tar
+        tasks/{task_name}_{sha6}/shard_index.json
+        tasks/{task_name}_{sha6}/metadata.json
+
+    Usage:
+        modal run --env robotics egomimic/modal/shard_zarr_to_tar.py::shard_by_task \\
+            -- --tasks cutting_plastic,organizing_containers
+    """
+    from modal_setup import _resolve_git_state
+
+    task_names = [t.strip() for t in tasks.split(",") if t.strip()]
+    if not task_names:
+        raise SystemExit("Specify tasks: --tasks task1,task2,...")
+
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: uncommitted local changes — Modal uses the last pushed commit.")
+
+    print(f"Querying zarr volume for tasks: {task_names}")
+    by_task: dict[str, list[str]] = _list_task_episodes_remote.remote(
+        task_names, git_remote, git_commit
+    )
+    if not by_task:
+        raise SystemExit("No episodes found on zarr volume for the specified tasks.")
+
+    # Build (episode_dirs, output_subdir) pairs for parallel convert_shard
+    episode_batches: list[list[str]] = []
+    output_subdirs: list[str] = []
+    batch_task_labels: list[str] = []
+
+    for task_name, ep_dirs in sorted(by_task.items()):
+        subdir = _task_shard_dir(task_name)
+        n_shards = math.ceil(len(ep_dirs) / EPISODES_PER_SHARD)
+        print(f"  {task_name}: {len(ep_dirs)} episodes → {n_shards} shards → {subdir}/")
+        for i in range(0, len(ep_dirs), EPISODES_PER_SHARD):
+            batch = ep_dirs[i : i + EPISODES_PER_SHARD]
+            episode_batches.append(batch)
+            output_subdirs.append(subdir)
+            batch_task_labels.append(task_name)
+
+    print(f"\nLaunching {len(episode_batches)} parallel shard conversions...")
+    results = list(convert_shard.map(episode_batches, output_subdirs, return_exceptions=True))
+
+    # Group results by task and write per-task indexes
+    task_results: dict[str, list[dict]] = {t: [] for t in by_task}
+    n_errors = 0
+    for i, r in enumerate(results):
+        if isinstance(r, dict):
+            task_results[batch_task_labels[i]].append(r)
+        else:
+            n_errors += 1
+            print(f"  Shard error ({batch_task_labels[i]}): {r}")
+
+    print(f"\nWriting per-task shard indexes ({n_errors} shard error(s))...")
+    _write_task_indexes_remote.remote(task_results)
+
+    print("\nTask shard conversion complete:")
+    for task_name in sorted(by_task.keys()):
+        ok = [r for r in task_results[task_name] if isinstance(r, dict) and not r.get("skipped")]
+        print(f"  {_task_shard_dir(task_name)}: {sum(r.get('n_episodes', 0) for r in ok)} episodes")
 
 
 # ---------------------------------------------------------------------------
