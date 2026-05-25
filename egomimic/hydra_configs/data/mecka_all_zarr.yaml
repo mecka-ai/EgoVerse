@@ -41,3 +41,4 @@ valid_dataloader_params:
     num_workers: 1
     persistent_workers: true
     prefetch_factor: 1
+ 
