@@ -148,11 +148,16 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
         # Each worker gets a strided slice of shards
         my_shards = self._shards[worker_id::n_workers]
 
-        # Shuffle shard order — use a different seed per epoch by mixing in
-        # a counter seeded from the global RNG state
-        epoch_seed = self.seed + worker_id + int(time.time() * 1000) % 10000
-        rng = random.Random(epoch_seed)
-        rng.shuffle(my_shards)
+        sequential = self.mode == "valid"
+
+        if not sequential:
+            # Shuffle shard order — use a different seed per epoch by mixing in
+            # a counter seeded from the global RNG state
+            epoch_seed = self.seed + worker_id + int(time.time() * 1000) % 10000
+            rng = random.Random(epoch_seed)
+            rng.shuffle(my_shards)
+        else:
+            rng = random.Random(self.seed)
 
         worker_cache = self.cache_dir / f"worker_{worker_id}"
         worker_cache.mkdir(parents=True, exist_ok=True)
@@ -163,8 +168,9 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
                 # Extract shard to local NVMe
                 ep_dirs = self._extract_shard(shard_path, shard_local)
 
-                # Shuffle episode order within shard
-                rng.shuffle(ep_dirs)
+                if not sequential:
+                    # Shuffle episode order within shard
+                    rng.shuffle(ep_dirs)
 
                 for ep_dir in ep_dirs:
                     ep_hash = ep_dir.name
@@ -191,9 +197,10 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
                     if n == 0:
                         continue
 
-                    # Shuffle frame indices within episode
+                    # Sequential frames for val; shuffled for train
                     indices = list(range(n))
-                    rng.shuffle(indices)
+                    if not sequential:
+                        rng.shuffle(indices)
                     for idx in indices:
                         try:
                             sample = ds[idx]
