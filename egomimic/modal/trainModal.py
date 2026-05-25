@@ -58,15 +58,26 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
 
 # Data configs that use TarShardIterableDataset instead of MultiDataset.
 # trainHydra.py's reject_outliers path does isinstance(dataset, MultiDataset), which
-# fails for IterableDatasets, so we inject reject_outliers=false automatically.
+# fails for IterableDatasets, so we inject overrides automatically.
 _ITERABLE_DATA_CONFIGS = {"mecka_all_wds"}
+
+# Default Modal volume for wds data configs
+_WDS_DEFAULT_VOLUME = "mecka_data_wds_v2"
+
+# Default ephemeral disk for wds (MiB). 8 workers × 3.3 GB/shard = ~26 GB needed;
+# Modal minimum is 524288 MiB (512 GiB), so we request 600 GiB.
+_WDS_DEFAULT_EPHEMERAL_GIB = 600
 
 
 def _inject_modal_data_defaults(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
-    """Inject Modal-specific Hydra overrides that compensate for trainHydra.py assumptions.
+    """Inject Hydra-level overrides needed when using tar-shard data configs.
 
+    For mecka_all_wds:
     - reject_outliers=false: TarShardIterableDataset is not a MultiDataset; the
-      isinstance check in trainHydra._propagate_data_schematic_to_datasets would fail.
+      isinstance check in trainHydra._propagate_data_schematic_to_datasets fails.
+
+    Note: volume and ephemeral disk are Modal-level (+modal_*) flags, not Hydra args.
+    Pass them at the CLI: +modal_volume=mecka_data_wds_v2 +modal_ephemeral_disk_gb=600
     """
     args = list(hydra_args)
     data_cfg = next(
@@ -74,8 +85,7 @@ def _inject_modal_data_defaults(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
         None,
     )
     if data_cfg in _ITERABLE_DATA_CONFIGS:
-        has_reject = any(a.startswith("reject_outliers=") for a in args)
-        if not has_reject:
+        if not any(a.startswith("reject_outliers=") for a in args):
             args.append("reject_outliers=false")
     return tuple(args)
 
@@ -136,13 +146,17 @@ def _build_volumes() -> dict:
     }
 
 
-def _ephemeral_disk_mb() -> int | None:
-    """Return ephemeral disk size in MB if +modal_ephemeral_disk_gb was set."""
+def _ephemeral_disk_mib() -> int | None:
+    """Return ephemeral disk size in MiB if +modal_ephemeral_disk_gb was set.
+
+    Modal's ephemeral_disk parameter is in MiB. Minimum allowed is 524288 MiB (512 GiB).
+    Use +modal_ephemeral_disk_gb=600 or more when extracting shards to /tmp at training.
+    """
     gb = os.environ.get("MODAL_EPHEMERAL_DISK_GB")
-    return int(float(gb) * 1000) if gb else None
+    return int(float(gb) * 1024) if gb else None
 
 
-_ephemeral = _ephemeral_disk_mb()
+_ephemeral = _ephemeral_disk_mib()
 _volumes = _build_volumes()
 
 
@@ -305,7 +319,8 @@ if __name__ == "__main__":
         "modal_cpu": "MODAL_CPU",
         "modal_memory_gb": "MODAL_MEMORY_GB",
         "modal_memory_mb": "MODAL_MEMORY_MB",
-        "modal_volume": "MODAL_ZARR_VOLUME",
+        "modal_volume": "MODAL_VOLUME",
+        "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",
     }
 
     modal_env = os.environ.copy()

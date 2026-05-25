@@ -245,15 +245,15 @@ image = (
 )
 
 zarr_volume = modal.Volume.from_name("mecka_data_v2")
-wds_volume = modal.Volume.from_name("mecka_data_wds", create_if_missing=True)
+wds_volume = modal.Volume.from_name("mecka_data_wds_v2", create_if_missing=True)
 zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True)
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
-    "mecka_data_v2":  (zarr_volume,  "/mnt/zarr-data"),
-    "mecka_data_wds": (wds_volume,   "/mnt/zarr-wds"),
-    "mecka_data_zip": (zip_volume,   "/mnt/zarr-zip"),
+    "mecka_data_v2":    (zarr_volume, "/mnt/zarr-data"),
+    "mecka_data_wds_v2": (wds_volume, "/mnt/zarr-wds"),
+    "mecka_data_zip":   (zip_volume,  "/mnt/zarr-zip"),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
