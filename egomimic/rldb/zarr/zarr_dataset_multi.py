@@ -739,24 +739,39 @@ class LocalEpisodeResolver(EpisodeResolver):
             logger.warning("Local path does not exist: %s", search_path)
             return []
 
+        def _is_episode(p: Path) -> bool:
+            return p.is_dir() or str(p).endswith(".zarr.zip")
+
+        def _episode_hash(p: Path) -> str:
+            name = p.name
+            if name.endswith(".zarr.zip"):
+                return name[:-9]
+            if name.endswith(".zarr"):
+                return name[:-5]
+            return name
+
+        def _open_store(p: Path):
+            if str(p).endswith(".zarr.zip"):
+                return zarr.open_group(store=zarr.ZipStore(str(p), mode="r"))
+            return zarr.open_group(str(p), mode="r")
+
         if filters.is_empty():
             filtered = []
             for p in search_path.iterdir():
-                if not p.is_dir():
+                if not _is_episode(p):
                     continue
-                episode_hash = p.name[:-5] if p.name.endswith(".zarr") else p.name
-                filtered.append((str(p), episode_hash))
+                filtered.append((str(p), _episode_hash(p)))
             logger.info("Local paths (no filter): %d episodes", len(filtered))
         else:
             filtered = []
             for p in search_path.iterdir():
-                if not p.is_dir():
+                if not _is_episode(p):
                     continue
 
-                episode_hash = p.name[:-5] if p.name.endswith(".zarr") else p.name
+                episode_hash = _episode_hash(p)
 
                 try:
-                    store = zarr.open_group(str(p), mode="r")
+                    store = _open_store(p)
                     metadata = dict(store.attrs)
                 except Exception as e:
                     logger.warning("Failed to read metadata for %s: %s", p, e)
@@ -2363,10 +2378,13 @@ class ZarrEpisode:
         """
         Initialize ZarrEpisode wrapper.
         Args:
-            path: Path to the .zarr episode directory
+            path: Path to the .zarr episode directory or .zarr.zip (ZipStore)
         """
         self._path = Path(path)
-        self._store = zarr.open_group(str(self._path), mode="r")
+        if str(self._path).endswith(".zarr.zip"):
+            self._store = zarr.open_group(store=zarr.ZipStore(str(self._path), mode="r"))
+        else:
+            self._store = zarr.open_group(str(self._path), mode="r")
         self.metadata = dict(self._store.attrs)
         self.keys = self.metadata["features"]
 
