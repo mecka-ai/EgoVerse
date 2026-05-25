@@ -359,7 +359,7 @@ def shard_by_task(tasks: str = "") -> None:
             batch_task_labels.append(task_name)
 
     print(f"\nLaunching {len(episode_batches)} parallel shard conversions...")
-    results = list(convert_shard.map(episode_batches, output_subdirs, return_exceptions=True))
+    results = list(convert_shard.map(episode_batches, output_subdirs, return_exceptions=True, wrap_returned_exceptions=False))
 
     # Group results by task and write per-task indexes
     task_results: dict[str, list[dict]] = {t: [] for t in by_task}
