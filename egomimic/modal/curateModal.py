@@ -54,6 +54,7 @@ from modal_setup import (  # noqa: E402
     CURATE_ORCHESTRATOR,
     MODAL_COMPUTE_ARG_MAP,
     ModalCompute,
+    WDS_MOUNT_PATH,
     _local_hf_token,
     _prepare_repo,
     _prepare_repo_light,
@@ -63,6 +64,7 @@ from modal_setup import (  # noqa: E402
     pop_init_submodules,
     app,
     training_outputs_volume,
+    wds_volume,
     zarr_volume,
 )
 
@@ -108,34 +110,6 @@ def _load_cfg(hydra_args: tuple[str, ...]):
         return _hydra.compose("curate", overrides=list(hydra_args))
 
 
-def _inject_episode_ids(cfg, hashes: list[str]):
-    """Deep-copy cfg and inject allowed_episode_ids into every resolver node."""
-    import copy
-    from omegaconf import open_dict
-
-    task_cfg = copy.deepcopy(cfg)
-    with open_dict(task_cfg):
-        for ds_name in task_cfg.data.train_datasets:
-            ds_node = task_cfg.data.train_datasets[ds_name]
-            if "resolver" in ds_node:
-                ds_node.resolver.allowed_episode_ids = list(hashes)
-    return task_cfg
-
-
-def _build_episode_map(task_cfg, hydra) -> dict:
-    """Instantiate MultiDatasets from task_cfg; return {hash: ZarrDataset}."""
-    episodes: dict = {}
-    for ds_name in task_cfg.data.train_datasets:
-        ds_node = task_cfg.data.train_datasets[ds_name]
-        try:
-            md = hydra.utils.instantiate(ds_node)
-            episodes.update(md.datasets)
-            print(f"  [{ds_name}] {len(md.datasets)} episodes loaded")
-        except Exception as exc:
-            print(f"  [{ds_name}] dataset build FAILED: {exc}")
-    return episodes
-
-
 # ---------------------------------------------------------------------------
 # Pass-1 GPU embed shard (one per shard of ≤ max_episodes_per_shard episodes)
 # ---------------------------------------------------------------------------
@@ -148,7 +122,7 @@ def _build_episode_map(task_cfg, hydra) -> dict:
     timeout=86400,
     secrets=_SHARED_SECRETS,
     volumes={
-        CFG.volume_mount_path: zarr_volume,
+        WDS_MOUNT_PATH: wds_volume,
         CFG.output_mount_path: training_outputs_volume,
     },
 )
@@ -166,19 +140,20 @@ def _embed_task_shard(
     """
     GPU embed worker for one shard of ≤ max_episodes_per_shard episodes.
 
-    Loads shard_hashes from the zarr volume, builds embedders from the
-    provided precomputed norm stats, and returns per-episode latents.
+    Reads episodes from tar shards on the WDS volume (fast sequential NVMe I/O),
+    builds embedders from the provided precomputed norm stats, and returns latents.
 
     Returns
     -------
     (shard_idx, state_latents, action_latents, hashes, ep_lengths)
     where state_latents / action_latents are lists of per-episode (T, D) arrays.
     """
+    import shutil
     import numpy as _np
     import torch
-    from tqdm import tqdm
-
+    from omegaconf import OmegaConf
     import time as _time
+
     t_shard_start = _time.perf_counter()
 
     _boot_container(git_remote, git_commit, hf_token)
@@ -190,13 +165,35 @@ def _embed_task_shard(
     tag = f"[{task_name}][shard {shard_idx}]"
     print(f"{tag} {len(shard_hashes)} episodes — embedding")
 
+    # Instantiate key_map and transform_list from the data config
+    ds_name = next(iter(cfg.data.train_datasets))
+    resolver_cfg = cfg.data.train_datasets[ds_name].resolver
+    key_map = _hydra.utils.instantiate(resolver_cfg.key_map)
+    transform_list = _hydra.utils.instantiate(resolver_cfg.transform_list)
+    pause_eps = OmegaConf.select(resolver_cfg, "pause_removal_epsilon")
+
+    # Load shard index and build episode map from tar shards
+    shard_index_path = Path(WDS_MOUNT_PATH) / "shard_index.json"
+    shard_index = json.loads(shard_index_path.read_text())
+
+    tmp_dir = "/tmp/curation_tar_cache"
+    from egomimic.rldb.zarr.tar_shard_dataset import load_episodes_from_tars
+
     t_map = _time.perf_counter()
-    task_cfg = _inject_episode_ids(cfg, shard_hashes)
-    all_episodes = _build_episode_map(task_cfg, _hydra)
+    all_episodes = load_episodes_from_tars(
+        shard_hashes,
+        shard_index,
+        WDS_MOUNT_PATH,
+        tmp_dir,
+        key_map,
+        transform_list,
+        pause_removal_epsilon=pause_eps,
+    )
     print(f"{tag} Episode map built: {len(all_episodes)} episodes in {_time.perf_counter() - t_map:.2f}s")
 
     if not all_episodes:
         print(f"{tag} No episodes loaded — returning empty shard")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         return shard_idx, [], [], [], []
 
     from egomimic.curation.config import (
@@ -212,7 +209,6 @@ def _embed_task_shard(
     embed_cfg = select_embedder_settings(cfg)
     device = torch.device(embed_cfg.device if torch.cuda.is_available() else "cpu")
     action_key, image_key = select_tensor_keys(cfg)
-    ds_name = next(iter(task_cfg.data.train_datasets))
     loader_cfg = select_curation_loader(cfg, ds_name)
 
     t_embed_build = _time.perf_counter()
@@ -231,16 +227,20 @@ def _embed_task_shard(
     )
 
     t_pass2 = _time.perf_counter()
-    state_latents, action_latents, hashes, ep_lengths = run_pass2_embed_episodes(
-        all_episodes,
-        set(all_episodes.keys()),
-        action_key,
-        image_key,
-        loader_cfg,
-        action_embedder,
-        state_embedder,
-        progress=f"{tag} embed",
-    )
+    try:
+        state_latents, action_latents, hashes, ep_lengths = run_pass2_embed_episodes(
+            all_episodes,
+            set(all_episodes.keys()),
+            action_key,
+            image_key,
+            loader_cfg,
+            action_embedder,
+            state_embedder,
+            progress=f"{tag} embed",
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     n_frames = sum(ep_lengths)
     print(
         f"{tag} Pass2 done in {_time.perf_counter() - t_pass2:.2f}s — "
