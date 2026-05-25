@@ -463,6 +463,36 @@ class S3EpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
         )
 
+    def discover_episode_paths(
+        self,
+        filters: DatasetFilter | None = None,
+    ) -> list[tuple[str, str]]:
+        """Return ``[(episode_hash, local_zarr_path), ...]`` without syncing or building datasets.
+
+        Mirrors the helper on Local/Modal resolvers but does NOT trigger an
+        S3 sync — the Nebius/SLURM pause-precompute workflow assumes data has
+        already been staged onto the shared filesystem. SQL-matched episodes
+        that aren't present under ``self.folder_path`` are silently skipped.
+        """
+        filtered_paths = self._get_filtered_paths(filters, debug=self.debug)
+        out: list[tuple[str, str]] = []
+        for _processed_path, episode_hash in filtered_paths:
+            local_path = next(
+                (
+                    p
+                    for p in (
+                        self.folder_path / episode_hash,
+                        self.folder_path / f"{episode_hash}.zarr",
+                    )
+                    if p.is_dir()
+                ),
+                None,
+            )
+            if local_path is None:
+                continue
+            out.append((episode_hash, str(local_path)))
+        return out
+
     def resolve(
         self,
         filters: DatasetFilter | None = None,
