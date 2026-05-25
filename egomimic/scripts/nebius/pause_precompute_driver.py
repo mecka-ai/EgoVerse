@@ -74,8 +74,6 @@ def _discover_work(cfg) -> dict[float, dict[str, str]]:
     """
     from hydra.utils import instantiate
 
-    from egomimic.rldb.zarr.zarr_dataset_multi import ModalEpisodeResolver
-
     work_by_eps: dict[float, dict[str, str]] = {}
     seen_blocks = 0
     for block_name in ("train_datasets", "valid_datasets"):
@@ -96,9 +94,12 @@ def _discover_work(cfg) -> dict[float, dict[str, str]]:
                     file=sys.stderr,
                 )
                 continue
-            if not isinstance(resolver, ModalEpisodeResolver):
+            # Duck-type on the helper rather than isinstance-checking a
+            # specific subclass — both LocalEpisodeResolver and
+            # ModalEpisodeResolver implement discover_episode_paths.
+            if not hasattr(resolver, "discover_episode_paths"):
                 continue
-            eps = resolver.pause_removal_epsilon
+            eps = getattr(resolver, "pause_removal_epsilon", None)
             if eps is None:
                 continue
 

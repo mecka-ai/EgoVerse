@@ -771,6 +771,44 @@ class LocalEpisodeResolver(EpisodeResolver):
 
         return filtered
 
+    def discover_episode_paths(
+        self,
+        filters: DatasetFilter | None = None,
+    ) -> list[tuple[str, str]]:
+        """Return ``[(episode_hash, local_zarr_path), ...]`` without building datasets.
+
+        Mirrors ``ModalEpisodeResolver.discover_episode_paths``: shares the
+        directory-scan + metadata-filter pipeline used by ``resolve()`` but
+        stops short of ZarrDataset construction and in-process pause
+        precompute. The Nebius/SLURM pause-precompute driver uses this to
+        enumerate work for sbatch fan-out cheaply on the login node.
+        """
+        if self.allowed_episode_ids is not None:
+            out: list[tuple[str, str]] = []
+            for episode_hash in self.allowed_episode_ids:
+                local_path = next(
+                    (
+                        p
+                        for p in (
+                            self.folder_path / f"{episode_hash}.zarr",
+                            self.folder_path / episode_hash,
+                        )
+                        if p.is_dir()
+                    ),
+                    None,
+                )
+                if local_path is None:
+                    continue
+                out.append((episode_hash, str(local_path)))
+            return out
+
+        filtered_paths = self._get_local_filtered_paths(
+            self.folder_path, filters, debug=self.debug
+        )
+        # _get_local_filtered_paths returns (path_str, episode_hash) tuples;
+        # flip to match the (hash, path) order used by the driver.
+        return [(episode_hash, path_str) for path_str, episode_hash in filtered_paths]
+
     def resolve(
         self,
         sync_from_s3=False,
