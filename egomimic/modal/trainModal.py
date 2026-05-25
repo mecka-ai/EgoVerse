@@ -76,8 +76,8 @@ def _inject_modal_data_defaults(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     - reject_outliers=false: TarShardIterableDataset is not a MultiDataset; the
       isinstance check in trainHydra._propagate_data_schematic_to_datasets fails.
 
-    Note: volume and ephemeral disk are Modal-level (+modal_*) flags, not Hydra args.
-    Pass them at the CLI: +modal_volume=mecka_data_wds_v2 +modal_ephemeral_disk_gb=600
+    Note: volume is auto-selected (mecka_data_wds_v2) when data=mecka_all_wds is used.
+    Override with +modal_volume=<name> or +modal_ephemeral_disk_gb=600 at the CLI.
     """
     args = list(hydra_args)
     data_cfg = next(
@@ -348,6 +348,15 @@ if __name__ == "__main__":
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
+
+    # Auto-select volume based on data config when user hasn't overridden it
+    if "MODAL_VOLUME" not in modal_env or modal_env.get("MODAL_VOLUME") == os.environ.get("MODAL_VOLUME", ""):
+        data_cfg = next(
+            (a.partition("=")[2] for a in container_overrides if a.startswith("data=") and "=" in a),
+            None,
+        )
+        if data_cfg in _ITERABLE_DATA_CONFIGS and "MODAL_VOLUME" not in modal_env:
+            modal_env["MODAL_VOLUME"] = "mecka_data_wds_v2"
 
     modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(container_overrides)
 
