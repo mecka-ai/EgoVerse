@@ -43,6 +43,7 @@ At training time, workers:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -70,6 +71,17 @@ EPISODES_PER_SHARD = 20
 # No special ephemeral disk needed; default Modal filesystem handles ~4 GB comfortably.
 
 
+def _shard_name(episode_dirs: list[str]) -> str:
+    """Compute a content-addressed shard filename from the episode hashes it contains.
+
+    Hashing the sorted episode names means the same set of episodes always produces
+    the same filename, making re-runs fully idempotent.
+    """
+    ep_names = sorted(Path(d).name for d in episode_dirs)
+    digest = hashlib.sha256("\n".join(ep_names).encode()).hexdigest()[:16]
+    return f"shard-{digest}.tar"
+
+
 # ---------------------------------------------------------------------------
 # Remote: convert one batch of episode dirs → one tar shard
 # ---------------------------------------------------------------------------
@@ -85,23 +97,23 @@ EPISODES_PER_SHARD = 20
     timeout=3600,
     max_containers=1000,
 )
-def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
-    """Bundle a list of zarr episode directories into a single tar shard.
+def convert_shard(episode_dirs: list[str]) -> dict:
+    """Bundle a list of zarr episode directories into a single content-addressed tar shard.
 
-    The zarr directory tree is added verbatim — existing chunk compression is
-    preserved and no data is re-encoded. The shard is written to /tmp first
-    (local NVMe), then copied to the output volume.
+    The shard filename is a SHA-256 hash of the sorted episode names, so the same
+    set of episodes always produces the same filename. Re-runs skip existing shards.
+    The zarr directory tree is added verbatim — existing chunk compression is preserved.
     """
     import shutil
     import time
 
-    shard_name = f"shard-{shard_id:06d}.tar"
+    shard_name = _shard_name(episode_dirs)
     tmp_path = Path("/tmp") / shard_name
     out_path = Path(WDS_MOUNT) / shard_name
 
     if out_path.exists():
-        print(f"[shard {shard_id:06d}] already exists, skipping")
-        return {"shard_id": shard_id, "n_episodes": 0, "skipped": True}
+        print(f"[{shard_name}] already exists, skipping")
+        return {"shard_name": shard_name, "n_episodes": 0, "skipped": True}
 
     n_ok = 0
     n_err = 0
@@ -121,7 +133,7 @@ def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
                 episodes_in_shard.append(ep_path.name)
                 n_ok += 1
             except Exception as e:
-                print(f"[shard {shard_id:06d}] ERROR on {ep_path.name}: {e}")
+                print(f"[{shard_name}] ERROR on {ep_path.name}: {e}")
                 n_err += 1
 
     elapsed = time.perf_counter() - t0
@@ -132,12 +144,9 @@ def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
     tmp_path.unlink()
     wds_volume.commit()
 
-    print(
-        f"[shard {shard_id:06d}] {n_ok} episodes, "
-        f"{size_mb:.0f} MB, {elapsed:.0f}s — copied to volume"
-    )
+    print(f"[{shard_name}] {n_ok} episodes, {size_mb:.0f} MB, {elapsed:.0f}s — copied to volume")
     return {
-        "shard_id": shard_id,
+        "shard_name": shard_name,
         "n_episodes": n_ok,
         "n_errors": n_err,
         "size_mb": size_mb,
@@ -158,14 +167,14 @@ def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
     timeout=300,
 )
 def write_shard_index(results: list[dict]) -> None:
-    """Write shard_index.json mapping episode_hash -> shard_id to the volume."""
+    """Write shard_index.json mapping episode_hash -> shard_name to the volume."""
     index = {}
     for r in results:
         if r.get("skipped"):
             continue
         for ep_name in r.get("episodes", []):
             ep_hash = ep_name[:-5] if ep_name.endswith(".zarr") else ep_name
-            index[ep_hash] = r["shard_id"]
+            index[ep_hash] = r["shard_name"]
 
     out = Path(WDS_MOUNT) / "shard_index.json"
     out.write_text(json.dumps(index, indent=2))
@@ -227,22 +236,22 @@ def main(dry_run: bool = False, max_shards: int = 0) -> None:
         return
 
     print(f"\nLaunching {n_shards} parallel Modal functions...")
-    shard_ids = list(range(n_shards))
-    results = list(convert_shard.map(batches, shard_ids, return_exceptions=True))
+    results = list(convert_shard.map(batches, return_exceptions=True))
 
-    # Filter out exceptions for reporting
     ok = [r for r in results if isinstance(r, dict) and not r.get("skipped")]
+    skipped = [r for r in results if isinstance(r, dict) and r.get("skipped")]
     errs = [r for r in results if isinstance(r, Exception)]
 
     total_episodes = sum(r["n_episodes"] for r in ok)
     total_mb = sum(r.get("size_mb", 0) for r in ok)
 
     print(f"\nConversion complete:")
-    print(f"  Shards written: {len(ok)}")
-    print(f"  Episodes:       {total_episodes:,}")
-    print(f"  Total size:     {total_mb/1000:.1f} GB")
+    print(f"  Shards written:  {len(ok)}")
+    print(f"  Shards skipped:  {len(skipped)} (already existed)")
+    print(f"  Episodes:        {total_episodes:,}")
+    print(f"  Total size:      {total_mb/1000:.1f} GB")
     if errs:
-        print(f"  Errors:         {len(errs)} shards failed")
+        print(f"  Errors:          {len(errs)} shards failed")
 
     # Write shard index
     print("\nWriting shard index...")
