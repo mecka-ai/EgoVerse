@@ -83,6 +83,7 @@ EPISODES_PER_SHARD = 20
     cpu=2,
     memory=8192,
     timeout=3600,
+    max_containers=1000,
 )
 def convert_shard(episode_dirs: list[str], shard_id: int) -> dict:
     """Bundle a list of zarr episode directories into a single tar shard.
