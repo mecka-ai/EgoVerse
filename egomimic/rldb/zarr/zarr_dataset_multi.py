@@ -2390,19 +2390,14 @@ class ZarrEpisode:
             ... })
         """
         result = {}
-        for key, idx_or_range in keys_with_ranges.items():
+        for key, (start, end) in keys_with_ranges.items():
             arr = self._store[key]
-            if isinstance(idx_or_range, np.ndarray):
-                # Fancy-index path: pause-filtered frame indices
-                data = arr[idx_or_range]
+            if end is not None:
+                data = arr[start:end]
             else:
-                start, end = idx_or_range
-                if end is not None:
-                    data = arr[start:end]
-                else:
-                    # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                    # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                    data = arr[start : start + 1][0]
+                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
+                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
+                data = arr[start : start + 1][0]
             result[key] = data
         return result
 
