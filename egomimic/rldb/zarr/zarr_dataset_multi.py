@@ -739,39 +739,24 @@ class LocalEpisodeResolver(EpisodeResolver):
             logger.warning("Local path does not exist: %s", search_path)
             return []
 
-        def _is_episode(p: Path) -> bool:
-            return p.is_dir() or str(p).endswith(".zarr.zip")
-
-        def _episode_hash(p: Path) -> str:
-            name = p.name
-            if name.endswith(".zarr.zip"):
-                return name[:-9]
-            if name.endswith(".zarr"):
-                return name[:-5]
-            return name
-
-        def _open_store(p: Path):
-            if str(p).endswith(".zarr.zip"):
-                return zarr.open_group(store=zarr.ZipStore(str(p), mode="r"))
-            return zarr.open_group(str(p), mode="r")
-
         if filters.is_empty():
             filtered = []
             for p in search_path.iterdir():
-                if not _is_episode(p):
+                if not p.is_dir():
                     continue
-                filtered.append((str(p), _episode_hash(p)))
+                episode_hash = p.name[:-5] if p.name.endswith(".zarr") else p.name
+                filtered.append((str(p), episode_hash))
             logger.info("Local paths (no filter): %d episodes", len(filtered))
         else:
             filtered = []
             for p in search_path.iterdir():
-                if not _is_episode(p):
+                if not p.is_dir():
                     continue
 
-                episode_hash = _episode_hash(p)
+                episode_hash = p.name[:-5] if p.name.endswith(".zarr") else p.name
 
                 try:
-                    store = _open_store(p)
+                    store = zarr.open_group(str(p), mode="r")
                     metadata = dict(store.attrs)
                 except Exception as e:
                     logger.warning("Failed to read metadata for %s: %s", p, e)
@@ -1376,29 +1361,15 @@ class MultiDataset(torch.utils.data.Dataset):
         self.datasets = {rid: ds for rid, ds in datasets.items() if rid in chosen}
         assert self.datasets, "No datasets left after applying mode split."
 
-        # Build compact numpy index arrays instead of Python list-of-tuples.
-        # With 400M+ frames, Python tuples use ~50 GB; uint32 arrays use ~3.5 GB.
-        dataset_names_list = list(self.datasets.keys())
-        self._dataset_id_to_name: list[str] = dataset_names_list
-        self._dataset_name_to_id: dict[str, int] = {
-            name: i for i, name in enumerate(dataset_names_list)
+        self.index_map = []
+        self._global_indices_by_dataset: dict[str, list[int]] = {
+            dataset_name: [] for dataset_name in self.datasets
         }
-
-        total_frames = sum(len(ds) for ds in self.datasets.values())
-        self._index_map_dataset_ids = np.empty(total_frames, dtype=np.uint32)
-        self._index_map_local_idx = np.empty(total_frames, dtype=np.uint32)
-        self._global_indices_by_dataset: dict[str, np.ndarray] = {}
-
-        pos = 0
         for dataset_name, dataset in self.datasets.items():
-            n = len(dataset)
-            dataset_id = self._dataset_name_to_id[dataset_name]
-            self._index_map_dataset_ids[pos : pos + n] = dataset_id
-            self._index_map_local_idx[pos : pos + n] = np.arange(n, dtype=np.uint32)
-            self._global_indices_by_dataset[dataset_name] = np.arange(
-                pos, pos + n, dtype=np.uint32
-            )
-            pos += n
+            for local_idx in range(len(dataset)):
+                global_idx = len(self.index_map)
+                self.index_map.append((dataset_name, local_idx))
+                self._global_indices_by_dataset[dataset_name].append(global_idx)
 
         self.data_schematic = None
         self._n_samples_checked = 0
@@ -1408,7 +1379,7 @@ class MultiDataset(torch.utils.data.Dataset):
         super().__init__()
 
     def __len__(self) -> int:
-        return len(self._index_map_dataset_ids)
+        return len(self.index_map)
 
     @staticmethod
     def _episode_name_for_dataset(dataset, dataset_name: str) -> str:
@@ -1510,8 +1481,7 @@ class MultiDataset(torch.utils.data.Dataset):
         """
         Multidataset handles outlier rejection so that you don't need to propagate the norm stats down to every sub dataset.
         """
-        dataset_name = self._dataset_id_to_name[int(self._index_map_dataset_ids[idx])]
-        local_idx = int(self._index_map_local_idx[idx])
+        dataset_name, local_idx = self.index_map[idx]
         dataset = self.datasets[dataset_name]
         data = dataset[local_idx]
 
@@ -2394,13 +2364,10 @@ class ZarrEpisode:
         """
         Initialize ZarrEpisode wrapper.
         Args:
-            path: Path to the .zarr episode directory or .zarr.zip (ZipStore)
+            path: Path to the .zarr episode directory
         """
         self._path = Path(path)
-        if str(self._path).endswith(".zarr.zip"):
-            self._store = zarr.open_group(store=zarr.ZipStore(str(self._path), mode="r"))
-        else:
-            self._store = zarr.open_group(str(self._path), mode="r")
+        self._store = zarr.open_group(str(self._path), mode="r")
         self.metadata = dict(self._store.attrs)
         self.keys = self.metadata["features"]
 
