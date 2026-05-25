@@ -327,7 +327,14 @@ if __name__ == "__main__":
     container_overrides = []
     gpu_count = 1
 
-    for arg in sys.argv[1:]:
+    # Strip leading subcommand ('submit') and '--' separator if present
+    raw_args = sys.argv[1:]
+    if raw_args and raw_args[0] == "submit":
+        raw_args = raw_args[1:]
+    if raw_args and raw_args[0] == "--":
+        raw_args = raw_args[1:]
+
+    for arg in raw_args:
         key, sep, val = arg.lstrip("+").partition("=")
         if sep and key in _MODAL_KEY_MAP:
             modal_env[_MODAL_KEY_MAP[key]] = val
