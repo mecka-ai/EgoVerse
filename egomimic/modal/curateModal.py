@@ -4,7 +4,13 @@ Architecture
 ------------
 run_curate (orchestrator, CPU)
   • SQL task lookup partitions episode hashes by task.
+  • Ensures per-task tar shards exist on WDS volume (auto-provisions missing ones).
   • Fans out one _score_task_split container per task.
+
+Shard provisioning (inside run_curate, only for tasks missing shards)
+  • convert_shard (from shard_zarr_to_tar): bundles zarr dirs → tar on WDS volume.
+  • _write_task_indexes_remote: writes shard_index.json + metadata.json per task.
+  • Idempotent: existing per-task shard dirs are skipped.
 
 _score_task_split (CPU worker, one per task)
   • Reads precomputed action norm stats (required — raises if missing).
@@ -14,9 +20,9 @@ _score_task_split (CPU worker, one per task)
   • Pass 2 (KSG): mutual-information scoring on combined latents.
 
 _embed_task_shard (GPU worker, one per shard of ≤ max_episodes_per_shard episodes)
-  • Receives pre-computed action_mean/std from _score_task_split.
-  • Injects allowed_episode_ids = shard_hashes into every resolver.
-  • Pass 1 (embed): parallel bulk load + GPU embed → returns (state, action) latents.
+  • Reads from per-task tar shards on WDS volume (fast sequential NVMe I/O).
+  • Falls back to global shard_index if no per-task dir exists.
+  • Pass 1 (embed): extract tar → GPU embed → returns (state, action) latents.
 
 Norm stats are always precomputed offline (model.precomputed_norm_stats in
 deminf_default.yaml). Sharding is controlled by max_episodes_per_shard in
@@ -66,6 +72,12 @@ from modal_setup import (  # noqa: E402
     training_outputs_volume,
     wds_volume,
     zarr_volume,
+)
+from shard_zarr_to_tar import (  # noqa: E402
+    EPISODES_PER_SHARD,
+    _task_shard_dir,
+    _write_task_indexes_remote,
+    convert_shard,
 )
 
 # GPU embed-shard workers — override at launch via +modal_gpu / +modal_cpu / +modal_memory_gb.
@@ -449,6 +461,7 @@ def _score_task_split(
     secrets=_SHARED_SECRETS,
     volumes={
         CFG.volume_mount_path: zarr_volume,
+        WDS_MOUNT_PATH: wds_volume,
         CFG.output_mount_path: training_outputs_volume,
     },
 )
@@ -537,14 +550,76 @@ def run_curate(
         print("No episodes found — check data config resolver settings")
         return ""
 
-    # ── 3. Output dir ─────────────────────────────────────────────────────────
+    # ── 3. Ensure per-task tar shards exist on WDS volume ────────────────────
+    tasks_needing_shards = [
+        task_name for task_name in by_task
+        if not (
+            Path(WDS_MOUNT_PATH) / _task_shard_dir(task_name) / "shard_index.json"
+        ).exists()
+    ]
+
+    if tasks_needing_shards:
+        print(
+            f"Provisioning tar shards for {len(tasks_needing_shards)}/{len(by_task)} "
+            f"task(s): {', '.join(sorted(tasks_needing_shards))}"
+        )
+        zarr_root = Path(CFG.volume_mount_path)
+        episode_batches: list[list[str]] = []
+        output_subdirs: list[str] = []
+        batch_task_labels: list[str] = []
+
+        for task_name in sorted(tasks_needing_shards):
+            subdir = _task_shard_dir(task_name)
+            ep_dirs: list[str] = []
+            for ep_hash in by_task[task_name]:
+                for cand in (zarr_root / ep_hash, zarr_root / f"{ep_hash}.zarr"):
+                    if cand.is_dir():
+                        ep_dirs.append(str(cand))
+                        break
+            if not ep_dirs:
+                print(f"  [{task_name}] no zarr dirs found on volume — skipping shard provisioning")
+                continue
+            n_batches = -(-len(ep_dirs) // EPISODES_PER_SHARD)
+            print(f"  [{task_name}] {len(ep_dirs)} episodes → {n_batches} shard(s) → {subdir}/")
+            for i in range(0, len(ep_dirs), EPISODES_PER_SHARD):
+                episode_batches.append(ep_dirs[i : i + EPISODES_PER_SHARD])
+                output_subdirs.append(subdir)
+                batch_task_labels.append(task_name)
+
+        if episode_batches:
+            print(f"Launching {len(episode_batches)} parallel shard conversion(s) ...")
+            shard_results = list(
+                convert_shard.map(
+                    episode_batches,
+                    output_subdirs,
+                    return_exceptions=True,
+                    wrap_returned_exceptions=False,
+                )
+            )
+
+            task_shard_results: dict[str, list[dict]] = {t: [] for t in tasks_needing_shards}
+            n_shard_errors = 0
+            for i, r in enumerate(shard_results):
+                if isinstance(r, dict):
+                    task_shard_results[batch_task_labels[i]].append(r)
+                else:
+                    n_shard_errors += 1
+                    print(f"  Shard error ({batch_task_labels[i]}): {r}")
+
+            print(f"Shard conversion done ({n_shard_errors} error(s)) — writing per-task indexes ...")
+            _write_task_indexes_remote.remote(task_shard_results)
+            print("Shard provisioning complete.")
+    else:
+        print(f"All {len(by_task)} task(s) already have tar shards — skipping provisioning.")
+
+    # ── 4. Output dir ─────────────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = (
         Path(CFG.output_mount_path) / cfg.name / f"{cfg.description}_{timestamp}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 4. Fan-out per-task scoring containers ────────────────────────────────
+    # ── 5. Fan-out per-task scoring containers ────────────────────────────────
     print(f"Spawning {len(by_task)} per-task CPU orchestrators …")
     t0 = _time.time()
 
@@ -562,7 +637,7 @@ def run_curate(
         )
         for task_name, episode_hashes in sorted(by_task.items())
     ]
-    print(f"All {len(handles)} task containers spawned — collecting results …")
+    print(f"All {len(handles)} task container(s) spawned — collecting results …")
 
     scores_by_task: dict[str, dict[str, float]] = {}
     n_failures = 0
@@ -582,7 +657,7 @@ def run_curate(
         f"({n_failures} failed)"
     )
 
-    # ── 5. Aggregate + save outputs ───────────────────────────────────────────
+    # ── 6. Aggregate + save outputs ───────────────────────────────────────────
     flat_scores: dict[str, float] = {}
     for t_scores in scores_by_task.values():
         flat_scores.update(t_scores)
