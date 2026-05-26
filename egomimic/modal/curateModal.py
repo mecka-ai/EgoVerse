@@ -469,7 +469,7 @@ def run_curate(
     hydra_args: tuple[str, ...],
     git_remote: str,
     git_commit: str,
-    init_submodules: bool = True,
+    init_submodules: bool = False,
     hf_token: str = "",
 ) -> str:
     """Orchestrator: SQL task grouping + per-task container fan-out."""

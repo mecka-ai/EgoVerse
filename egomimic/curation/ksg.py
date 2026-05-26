@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -140,8 +141,9 @@ def ksg_mi_averaged(
     """
     Average per-sample MI estimates over a range of k values.
 
-    Averaging over a small k range reduces variance without significant
-    compute overhead.
+    Optimised: builds trees once and does a single joint NN query for k_max+1
+    neighbours.  Each k value extracts its epsilon from the cached distance
+    matrix.  n_x and n_y marginal counts run in parallel (ThreadPoolExecutor(2)).
 
     Args:
         x: (N, dx) state embeddings.
@@ -160,25 +162,69 @@ def ksg_mi_averaged(
     if not k_values:
         raise ValueError(f"Invalid k_range: {k_range}")
 
-    logger.info("KSG averaged MI: k_range=%s (%d values)", k_range, len(k_values))
-    t0 = time.perf_counter()
-    estimates = np.stack(
-        [
-            ksg_mi(
-                x,
-                y,
-                k=k,
-                noise_scale=noise_scale,
-                n_workers=n_workers,
-                batch_threshold=batch_threshold,
-                batch_size=batch_size,
-                seed=seed,
-            )
-            for k in tqdm(k_values, desc="KSG k-values", unit="k", dynamic_ncols=True)
-        ],
-        axis=0,
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    if y.ndim == 1:
+        y = y[:, None]
+
+    N = len(x)
+    if N <= k_max:
+        raise ValueError(f"k_max={k_max} must be < N={N}")
+
+    logger.info(
+        "KSG averaged MI: N=%d, k_range=%s (%d values), dx=%d, dy=%d",
+        N, k_range, len(k_values), x.shape[1], y.shape[1],
     )
-    result = estimates.mean(axis=0)
+    t0 = time.perf_counter()
+
+    rng = np.random.default_rng(seed=seed)
+    x = x + rng.standard_normal(x.shape) * noise_scale
+    y = y + rng.standard_normal(y.shape) * noise_scale
+
+    t_tree = time.perf_counter()
+    z = np.hstack([x, y])
+    tree_z = cKDTree(z)
+    tree_x = cKDTree(x)
+    tree_y = cKDTree(y)
+    logger.info("KSG tree build (shared): %.2fs", time.perf_counter() - t_tree)
+
+    # Single joint NN query — fetch k_max+1 distances, reuse across all k values.
+    t_nn = time.perf_counter()
+    dists, _ = tree_z.query(z, k=k_max + 1, p=np.inf, workers=n_workers)
+    logger.info("KSG joint NN query (k_max=%d): %.2fs", k_max, time.perf_counter() - t_nn)
+
+    def _marginals(eps_strict: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Compute n_x and n_y in parallel, each using half the workers."""
+        half = max(1, n_workers // 2)
+        if N <= batch_threshold:
+            def _cx():
+                return _count_neighbours(tree_x, x, eps_strict, n_workers=half)
+            def _cy():
+                return _count_neighbours(tree_y, y, eps_strict, n_workers=half)
+        else:
+            def _cx():
+                return _count_neighbours_batched(tree_x, x, eps_strict, batch_size=batch_size, n_workers=half)
+            def _cy():
+                return _count_neighbours_batched(tree_y, y, eps_strict, batch_size=batch_size, n_workers=half)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fx = pool.submit(_cx)
+            fy = pool.submit(_cy)
+            return fx.result(), fy.result()
+
+    estimates = []
+    for k in tqdm(k_values, desc="KSG k-values", unit="k", dynamic_ncols=True):
+        eps = dists[:, k]
+        eps_strict = eps * (1.0 - 1e-10)
+        t_m = time.perf_counter()
+        n_x, n_y = _marginals(eps_strict)
+        logger.info("KSG k=%d marginals: %.2fs", k, time.perf_counter() - t_m)
+        mi = digamma(k) - digamma(n_x + 1) - digamma(n_y + 1) + digamma(N)
+        logger.info("KSG k=%d: mi_mean=%.4f mi_std=%.4f", k, float(mi.mean()), float(mi.std()))
+        estimates.append(mi.astype(np.float64))
+
+    result = np.stack(estimates, axis=0).mean(axis=0)
     logger.info(
         "KSG averaged MI done: %.2fs total, mi_mean=%.4f mi_std=%.4f",
         time.perf_counter() - t0, float(result.mean()), float(result.std()),

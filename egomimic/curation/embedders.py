@@ -193,7 +193,7 @@ class StateEmbedder:
 
         dtype = _parse_torch_dtype(self.dinov3_dtype)
         logger.info("Loading DINOv3 for curation: %s", self.dinov3_model_name)
-        self._processor = AutoImageProcessor.from_pretrained(self.dinov3_model_name)
+        proc = AutoImageProcessor.from_pretrained(self.dinov3_model_name)
         self._backbone = AutoModel.from_pretrained(
             self.dinov3_model_name, torch_dtype=dtype
         )
@@ -212,11 +212,33 @@ class StateEmbedder:
         for p in self._proj_layer.parameters():
             p.requires_grad_(False)
 
+        # Extract preprocessing params from the HF processor so the hot path
+        # can skip PIL entirely and run resize/normalize on the GPU.
+        _mean = list(getattr(proc, "image_mean", None) or [0.485, 0.456, 0.406])
+        _std  = list(getattr(proc, "image_std",  None) or [0.229, 0.224, 0.225])
+        _crop = getattr(proc, "crop_size", None) or {}
+        if isinstance(_crop, dict):
+            crop_h = int(_crop.get("height", cfg.image_size))
+            crop_w = int(_crop.get("width",  cfg.image_size))
+        else:
+            crop_h = crop_w = int(_crop)
+        _sz = getattr(proc, "size", None) or {}
+        if isinstance(_sz, dict):
+            resize_to = int(_sz.get("shortest_edge", _sz.get("height", crop_h)))
+        else:
+            resize_to = int(_sz) if _sz else crop_h
+
+        self._dino_mean_t  = torch.tensor(_mean, dtype=dtype, device=self.device).view(1, 3, 1, 1)
+        self._dino_std_t   = torch.tensor(_std,  dtype=dtype, device=self.device).view(1, 3, 1, 1)
+        self._dino_crop_hw = (crop_h, crop_w)
+        self._dino_resize_to = resize_to
+        self._processor = None  # no longer needed at inference time
+
         logger.info(
-            "StateEmbedder (image/dinov3): %d patches, hidden=%d → %d",
-            self._num_patches,
-            hidden_dim,
-            self.latent_dim,
+            "StateEmbedder (image/dinov3): %d patches, hidden=%d → %d, "
+            "resize=%d crop=%dx%d (GPU fast path)",
+            self._num_patches, hidden_dim, self.latent_dim,
+            resize_to, crop_h, crop_w,
         )
 
     def embed(self, data: np.ndarray) -> np.ndarray:
@@ -280,35 +302,64 @@ class StateEmbedder:
         Batched DINOv3 inference (patch-token mean pool → latent_dim).
 
         Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1].
-        Uses the model's HuggingFace image processor for resize/normalise.
+        Uses direct GPU tensor ops (resize + normalize) instead of the HF
+        PIL-based processor, which avoids per-frame Python object allocation.
         """
+        import torch.nn.functional as F
+
         dtype = _parse_torch_dtype(self.dinov3_dtype)
         n_total = data.shape[0]
         outputs: list[np.ndarray] = []
+        crop_h, crop_w = self._dino_crop_hw
+        resize_to = self._dino_resize_to
         t0 = time.perf_counter()
+
         for start in range(0, n_total, self.image_batch_size):
             chunk = data[start : start + self.image_batch_size]
             tb = time.perf_counter()
-            images = _chw_batch_to_rgb_images(chunk)
-            t_decode = time.perf_counter()
-            inputs = self._processor(images=images, return_tensors="pt")
-            pixel_values = inputs["pixel_values"].to(self.device, dtype=dtype)
+
+            # Single numpy→GPU copy for the whole batch (NCHW uint8 → float).
+            if chunk.dtype == np.uint8:
+                tensor = torch.from_numpy(chunk).to(self.device, dtype=dtype, non_blocking=True)
+                tensor = tensor.div_(255.0)
+            else:
+                tensor = torch.from_numpy(chunk.astype(np.float32)).to(self.device, dtype=dtype, non_blocking=True)
+                tensor = tensor.clamp_(0.0, 1.0)
+
+            # GPU resize → center-crop (matches HF processor shortest-edge logic).
+            h, w = tensor.shape[-2], tensor.shape[-1]
+            if h != crop_h or w != crop_w:
+                if resize_to != crop_h:
+                    # Resize shortest edge to resize_to, then center-crop.
+                    if h <= w:
+                        new_h, new_w = resize_to, max(crop_w, int(w * resize_to / h))
+                    else:
+                        new_h, new_w = max(crop_h, int(h * resize_to / w)), resize_to
+                    tensor = F.interpolate(tensor, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                    top  = (tensor.shape[-2] - crop_h) // 2
+                    left = (tensor.shape[-1] - crop_w) // 2
+                    tensor = tensor[:, :, top : top + crop_h, left : left + crop_w]
+                else:
+                    tensor = F.interpolate(tensor, size=(crop_h, crop_w), mode="bilinear", align_corners=False)
+
+            # Normalize with pre-cached GPU tensors.
+            tensor = (tensor - self._dino_mean_t) / self._dino_std_t
+
             t_preproc = time.perf_counter()
             with torch.no_grad():
-                hidden = self._backbone(pixel_values=pixel_values).last_hidden_state
+                hidden = self._backbone(pixel_values=tensor).last_hidden_state
                 patches = hidden[:, -self._num_patches :]
                 pooled = patches.float().mean(dim=1)
                 proj_in = self._proj_layer.weight.dtype
-                outputs.append(
-                    self._proj_layer(pooled.to(proj_in)).cpu().numpy()
-                )
+                outputs.append(self._proj_layer(pooled.to(proj_in)).cpu().numpy())
             t_fwd = time.perf_counter()
             logger.debug(
-                "DINOv3 batch [%d:%d] decode=%.3fs preproc=%.3fs forward=%.3fs total=%.3fs (%.0f imgs/s)",
+                "DINOv3 batch [%d:%d] preproc=%.3fs forward=%.3fs total=%.3fs (%.0f imgs/s)",
                 start, start + len(chunk),
-                t_decode - tb, t_preproc - t_decode, t_fwd - t_preproc,
+                t_preproc - tb, t_fwd - t_preproc,
                 t_fwd - tb, len(chunk) / (t_fwd - tb) if (t_fwd - tb) > 0 else 0,
             )
+
         elapsed = time.perf_counter() - t0
         logger.info(
             "[images] DINOv3 embed: %d images in %.2fs (%.0f imgs/s, batch_size=%d)",
