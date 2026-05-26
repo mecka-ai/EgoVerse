@@ -37,8 +37,11 @@ Usage
     python egomimic/modal/pause_precompute_modal.py \\
         name=pause_run description=mecka_50k \\
         pause_config_name=train_zarr_cartesian \\
-        data=mecka_50k_20k \\
-        [pause_shards=500]
+        data=mecka_50k_20k
+
+Optional: pass ``pause_shards=N`` (default 500) on its own — do NOT wrap
+in brackets; bash forwards them as literal characters and Hydra rejects
+them as an unparseable override.
 
 After completion the cache path is printed; wire it into your training
 data config::
@@ -346,7 +349,19 @@ def run_pause_precompute(
     )
 
     # ── Partition: round-robin per epsilon → list[(shard_id, eps, [(h, p)])] ──
-    shards = _partition_into_shards(work_by_eps, n_shards)
+    # Round-robin (episodes[i::eps_shards]) spreads similar storage layouts
+    # across shards — keeps tail latency tight. Mirrors the Nebius driver's
+    # _write_manifest algorithm.
+    shards: list[tuple[int, float, list[tuple[str, str]]]] = []
+    for eps, hash_to_path in work_by_eps.items():
+        episodes = list(hash_to_path.items())
+        if not episodes:
+            continue
+        eps_shards = min(n_shards, len(episodes))
+        for i in range(eps_shards):
+            shard_eps = episodes[i::eps_shards]
+            if shard_eps:
+                shards.append((len(shards), float(eps), shard_eps))
 
     total_shards = len(shards)
     print(
@@ -409,54 +424,6 @@ def run_pause_precompute(
 # ---------------------------------------------------------------------------
 
 
-def _partition_into_shards(
-    work_by_eps: dict[float, dict[str, str]],
-    n_shards: int,
-) -> list[tuple[int, float, list[tuple[str, str]]]]:
-    """Round-robin per-epsilon partitioning into shards.
-
-    Matches the Nebius driver's ``_write_manifest`` algorithm: each epsilon
-    group is independently split into ``min(n_shards, |episodes|)`` shards
-    via ``episodes[i::eps_shards]``, so episodes from similar storage
-    locations get spread across shards (avoids hotspots in tail latency).
-
-    Returns ``[(shard_id, epsilon, [(hash, path), ...]), ...]`` with
-    contiguous global shard IDs across epsilons. Pure function — no Modal
-    or filesystem deps — so it's unit-testable.
-    """
-    shards: list[tuple[int, float, list[tuple[str, str]]]] = []
-    for eps, hash_to_path in work_by_eps.items():
-        episodes = list(hash_to_path.items())
-        if not episodes:
-            continue
-        eps_shards = min(n_shards, len(episodes))
-        for i in range(eps_shards):
-            shard_eps = episodes[i::eps_shards]
-            if not shard_eps:
-                continue
-            shards.append((len(shards), float(eps), [(h, p) for h, p in shard_eps]))
-    return shards
-
-
-def _pop_pause_arg(
-    args: list[str], key: str, default: str | None = None
-) -> tuple[list[str], str | None]:
-    """Strip ``key=val`` from args; return ``(remaining, value)``.
-
-    Accepts both ``key=val`` and ``+key=val``.
-    """
-    kept: list[str] = []
-    value = default
-    for arg in args:
-        bare = arg.lstrip("+")
-        k, sep, v = bare.partition("=")
-        if sep and k == key:
-            value = v
-        else:
-            kept.append(arg)
-    return kept, value
-
-
 @app.local_entrypoint()
 def submit_pause_precompute(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a pause-precompute job from an already-pushed commit.
@@ -468,9 +435,26 @@ def submit_pause_precompute(*hydra_args: str) -> None:
       - ``init_submodules=<bool>`` — clone with --recurse-submodules.
       - ``name=<str>`` / ``description=<str>`` — used to label the output subdir.
     """
-    args = list(hydra_args)
-    args, config_name = _pop_pause_arg(args, "pause_config_name")
-    args, shards_str = _pop_pause_arg(args, "pause_shards", default=str(DEFAULT_SHARDS))
+    # Strip pause_config_name / pause_shards (used here) and collect name/
+    # description (for the output subdir). Everything else stays in `args`
+    # to forward to Hydra compose inside the orchestrator.
+    config_name: str | None = None
+    shards_str: str = str(DEFAULT_SHARDS)
+    name = description = ""
+    args: list[str] = []
+    for arg in hydra_args:
+        bare = arg.lstrip("+")
+        k, sep, v = bare.partition("=")
+        if sep and k == "pause_config_name":
+            config_name = v
+        elif sep and k == "pause_shards":
+            shards_str = v
+        else:
+            if sep and k == "name":
+                name = v
+            elif sep and k == "description":
+                description = v
+            args.append(arg)
     args, init_submodules = pop_init_submodules(args)
 
     if not config_name:
@@ -480,21 +464,9 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         )
     n_shards = int(shards_str)
 
-    # Build a stable, human-readable output subdir from name/description/timestamp.
     import time as _time
-
-    def _arg_val(args_: list[str], key: str) -> str:
-        for arg in args_:
-            bare = arg.lstrip("+")
-            k, sep, v = bare.partition("=")
-            if sep and k == key:
-                return v
-        return ""
-
-    name = _arg_val(args, "name") or "pause"
-    desc = _arg_val(args, "description") or config_name
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
-    out_subdir = f"{name}_{desc}_{timestamp}"
+    out_subdir = f"{name or 'pause'}_{description or config_name}_{timestamp}"
 
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
@@ -526,7 +498,7 @@ def submit_pause_precompute(*hydra_args: str) -> None:
 # ---------------------------------------------------------------------------
 # python egomimic/modal/pause_precompute_modal.py \
 #     name=… description=… pause_config_name=train_zarr_cartesian \
-#     data=mecka_50k_20k [pause_shards=500]
+#     data=mecka_50k_20k   (optional: pause_shards=N, default 500)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":

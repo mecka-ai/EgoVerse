@@ -202,6 +202,53 @@ def test_zarr_dataset_getitem_uses_keep_indices(tmp_path):
     )
 
 
+def test_zarr_dataset_action_chunk_contains_only_kept_frames(tmp_path):
+    """Action chunks must fancy-index ``keep_indices`` so paused frames are
+    dropped from inside the chunk, not just from the anchor.
+
+    Setup: 30-frame episode with a 7-frame pause span. Build a key_map with a
+    horizon=5 ``action_keys`` entry pointing at ``right.obs_ee_pose``. The
+    pose's x-coord is monotone on non-pause frames and flat across pause
+    spans, so it uniquely tags which raw frames the chunk read. We confirm
+    that the chunk returned at ``ds[0]`` matches the values at
+    ``raw[keep_indices[0:5]]`` — i.e. the chunk skips paused raw frames in
+    the middle — and is NOT equal to the contiguous ``raw[0:5]`` read.
+    """
+    ep = tmp_path / "ep_chunk.zarr"
+    n_frames = 30
+    pause_spans = [(2, 9)]  # 7-frame pause span overlapping the first chunk
+    _write_synthetic_mecka_episode(ep, n_frames=n_frames, pause_spans=pause_spans)
+
+    horizon = 5
+    key_map = {
+        "right.action_ee_pose": {
+            "key_type": "action_keys",
+            "zarr_key": "right.obs_ee_pose",
+            "horizon": horizon,
+        },
+    }
+    ds = ZarrDataset(ep, key_map=key_map, pause_removal_epsilon=0.005)
+    ds.precompute_pause_filter()
+    keep = ds.keep_indices
+    assert keep is not None and len(keep) >= horizon, (
+        f"expected enough kept frames for a {horizon}-frame chunk, "
+        f"got len(keep)={None if keep is None else len(keep)}"
+    )
+
+    raw_right = ds.episode_reader._store["right.obs_ee_pose"][:]
+    expected_kept = raw_right[keep[:horizon]]
+    naive_contiguous = raw_right[:horizon]
+    # Pre-condition: the pause span causes the two reads to actually differ —
+    # otherwise this test is vacuous.
+    assert not np.array_equal(expected_kept, naive_contiguous), (
+        "test setup is vacuous: pause span did not perturb the first chunk"
+    )
+
+    chunk = ds[0]["right.action_ee_pose"].numpy()
+    assert chunk.shape[0] == horizon
+    np.testing.assert_allclose(chunk, expected_kept)
+
+
 def test_zarr_dataset_precompute_is_idempotent(tmp_path):
     ep = tmp_path / "ep_idem.zarr"
     _write_synthetic_mecka_episode(ep, n_frames=15, pause_spans=[(5, 10)])

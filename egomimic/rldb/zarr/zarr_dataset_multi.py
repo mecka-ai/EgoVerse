@@ -2417,32 +2417,45 @@ class ZarrEpisode:
         self.keys = self.metadata["features"]
 
     def read(
-        self, keys_with_ranges: dict[str, tuple[int, int | None]]
+        self,
+        keys_with_ranges: dict[str, tuple[int, int | None] | np.ndarray],
     ) -> dict[str, np.ndarray]:
         """
         Read data for specified keys, each with their own index or range.
         Args:
-            keys_with_ranges: Dictionary mapping keys to (start, end) tuples.
-                - start: Starting frame index
-                - end: Ending frame index (exclusive). If None, reads single frame at start.
+            keys_with_ranges: Dictionary mapping keys to either:
+                - (start, end) tuple — contiguous slice; end=None reads a single
+                  frame at start.
+                - numpy array of frame indices — fancy-index read. Used by the
+                  pause-filtered chunk path in ZarrDataset.__getitem__, where
+                  consecutive *kept* frames don't correspond to a contiguous
+                  raw slice.
         Returns:
             Dictionary mapping keys to numpy arrays
         Example:
             >>> episode.read({
-            ...     "obs/image": (0, 10),      # Read frames 0-10
-            ...     "actions": (5, 15),        # Read frames 5-15
-            ...     "rewards": (20, None),     # Read single frame at index 20
+            ...     "obs/image": (0, 10),         # Read frames 0-10
+            ...     "actions":   (5, 15),         # Read frames 5-15
+            ...     "rewards":   (20, None),      # Read single frame at index 20
+            ...     "filtered":  np.array([0, 3, 5]),  # Fancy-index those frames
             ... })
         """
         result = {}
-        for key, (start, end) in keys_with_ranges.items():
+        for key, idx_or_range in keys_with_ranges.items():
             arr = self._store[key]
-            if end is not None:
-                data = arr[start:end]
+            if isinstance(idx_or_range, np.ndarray):
+                # Fancy-index path: pause-filtered frame indices. Read the
+                # discontiguous set of kept frames so the resulting chunk
+                # contains only frames the pause filter marked as kept.
+                data = arr[idx_or_range]
             else:
-                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                data = arr[start : start + 1][0]
+                start, end = idx_or_range
+                if end is not None:
+                    data = arr[start:end]
+                else:
+                    # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
+                    # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
+                    data = arr[start : start + 1][0]
             result[key] = data
         return result
 

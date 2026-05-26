@@ -1,16 +1,11 @@
 """Unit tests for the Modal pause-precompute fan-out script.
 
-Three layers of coverage:
-
-1. ``_pop_pause_arg`` — CLI arg-stripping (key=val, +key=val, defaults).
-2. ``_partition_into_shards`` — pure round-robin partition algorithm
-   (matches the Nebius driver's manifest layout).
-3. Worker round-trip via ``_pause_precompute_shard.local(...)``  — writes a
-   synthetic zarr group with ``{left,right}.obs_ee_pose`` (+ optionally
-   ``{left,right}.obs_keypoints``) and confirms the worker's keep-mask
-   matches ``_build_pause_keep_mask`` from zarr_dataset_multi (the
-   single source of truth used by the in-process precompute path and by
-   the Nebius worker).
+Worker round-trip via ``_pause_precompute_shard.local(...)`` — writes a
+synthetic zarr group with ``{left,right}.obs_ee_pose`` (+ optionally
+``{left,right}.obs_keypoints``) and confirms the worker's keep-mask
+matches ``_build_pause_keep_mask`` from zarr_dataset_multi (the single
+source of truth used by the in-process precompute path and by the Nebius
+worker).
 """
 
 from __future__ import annotations
@@ -21,132 +16,12 @@ import numpy as np
 import pytest
 import zarr
 
-from egomimic.modal.pause_precompute_modal import (
-    _partition_into_shards,
-    _pause_precompute_shard,
-    _pop_pause_arg,
-)
+from egomimic.modal.pause_precompute_modal import _pause_precompute_shard
 from egomimic.rldb.zarr.zarr_dataset_multi import (
     PAUSE_DETECT_KEYPOINT_KEYS,
     PAUSE_DETECT_KEYS,
     _build_pause_keep_mask,
 )
-
-# ---------------------------------------------------------------------------
-# _pop_pause_arg
-# ---------------------------------------------------------------------------
-
-
-def test_pop_pause_arg_basic():
-    args = ["data=foo", "pause_shards=42", "model=bar"]
-    remaining, val = _pop_pause_arg(args, "pause_shards")
-    assert val == "42"
-    assert remaining == ["data=foo", "model=bar"]
-
-
-def test_pop_pause_arg_plus_prefix():
-    """+key=val (Hydra "add" syntax) must also be matched."""
-    args = ["+pause_shards=10", "data=foo"]
-    remaining, val = _pop_pause_arg(args, "pause_shards")
-    assert val == "10"
-    assert remaining == ["data=foo"]
-
-
-def test_pop_pause_arg_default_when_missing():
-    args = ["data=foo"]
-    remaining, val = _pop_pause_arg(args, "pause_shards", default="500")
-    assert val == "500"
-    assert remaining == ["data=foo"]
-
-
-def test_pop_pause_arg_returns_none_when_missing_no_default():
-    args = ["data=foo"]
-    remaining, val = _pop_pause_arg(args, "pause_shards")
-    assert val is None
-    assert remaining == ["data=foo"]
-
-
-def test_pop_pause_arg_takes_last_occurrence():
-    """Repeated keys: behavior is to keep the LAST value (Hydra-like override)."""
-    args = ["pause_shards=10", "pause_shards=99"]
-    remaining, val = _pop_pause_arg(args, "pause_shards")
-    assert val == "99"
-    assert remaining == []
-
-
-# ---------------------------------------------------------------------------
-# _partition_into_shards
-# ---------------------------------------------------------------------------
-
-
-def test_partition_single_epsilon_balanced():
-    work = {0.005: {f"hash{i}": f"/p/{i}" for i in range(10)}}
-    shards = _partition_into_shards(work, n_shards=3)
-    assert len(shards) == 3
-    # Global ids contiguous starting at 0.
-    assert [s[0] for s in shards] == [0, 1, 2]
-    # All same epsilon.
-    assert all(s[1] == 0.005 for s in shards)
-    # Round-robin balance: lengths differ by at most 1.
-    lens = sorted(len(s[2]) for s in shards)
-    assert lens == [3, 3, 4]
-    # Every input episode appears exactly once.
-    all_hashes = [h for _, _, eps in shards for h, _ in eps]
-    assert sorted(all_hashes) == sorted(work[0.005].keys())
-
-
-def test_partition_more_shards_than_episodes_caps_to_episode_count():
-    work = {0.005: {f"hash{i}": f"/p/{i}" for i in range(3)}}
-    shards = _partition_into_shards(work, n_shards=100)
-    # Can't have more shards than episodes.
-    assert len(shards) == 3
-    assert all(len(s[2]) == 1 for s in shards)
-
-
-def test_partition_multi_epsilon_contiguous_ids_and_grouping():
-    work = {
-        0.005: {f"a{i}": f"/p/a{i}" for i in range(4)},
-        0.010: {f"b{i}": f"/p/b{i}" for i in range(2)},
-    }
-    shards = _partition_into_shards(work, n_shards=2)
-    assert len(shards) == 4  # 2 per epsilon, since both groups have ≥2 episodes
-    assert [s[0] for s in shards] == [0, 1, 2, 3]
-    eps_per_shard = [s[1] for s in shards]
-    # First two shards belong to first epsilon, next two to second.
-    assert eps_per_shard.count(0.005) == 2
-    assert eps_per_shard.count(0.010) == 2
-    # No cross-contamination of hashes across epsilon groups.
-    eps_05_hashes = [
-        h for sid, eps, episodes in shards if eps == 0.005 for h, _ in episodes
-    ]
-    eps_10_hashes = [
-        h for sid, eps, episodes in shards if eps == 0.010 for h, _ in episodes
-    ]
-    assert all(h.startswith("a") for h in eps_05_hashes)
-    assert all(h.startswith("b") for h in eps_10_hashes)
-
-
-def test_partition_empty_input():
-    assert _partition_into_shards({}, n_shards=10) == []
-    # Epsilon group with no episodes is skipped (no zero-sized shards emitted).
-    assert _partition_into_shards({0.005: {}}, n_shards=10) == []
-
-
-def test_partition_preserves_path_pairing():
-    """A hash's path must travel with it into whichever shard receives it."""
-    work = {0.005: {f"h{i}": f"/data/zarr-{i}" for i in range(7)}}
-    shards = _partition_into_shards(work, n_shards=3)
-    seen: dict[str, str] = {}
-    for _sid, _eps, episodes in shards:
-        for h, p in episodes:
-            assert h not in seen, f"{h} appeared in multiple shards"
-            seen[h] = p
-    assert seen == work[0.005]
-
-
-# ---------------------------------------------------------------------------
-# Worker behavior — synthetic zarr round-trip via .local()
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
