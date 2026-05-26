@@ -1,0 +1,3 @@
+_target_: egomimic.eval.train_viz_eval_video.TrainVizEvalVideo
+base:
+  _target_: egomimic.eval.eval_hpt.HPTEvalVideo

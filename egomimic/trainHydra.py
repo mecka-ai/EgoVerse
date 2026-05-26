@@ -13,7 +13,6 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from tabulate import tabulate
 
 from egomimic.eval.eval import Eval
-from egomimic.eval.eval_video import EvalVideo, TrainVizEvalVideo
 from egomimic.pl_utils.pl_model import ModelWrapper
 from egomimic.rldb.zarr.utils import DataSchematic, set_global_seed
 from egomimic.rldb.zarr.zarr_dataset_multi import MultiDataset
@@ -294,15 +293,13 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             eval_obj.trainer = trainer
             eval_obj.model = model.model
             model.evaluator = eval_obj
-            if getattr(datamodule, "train_viz_datasets", None):
-                base_train_viz: EvalVideo = hydra.utils.instantiate(cfg.evaluator)
-                train_viz_eval = TrainVizEvalVideo(base=base_train_viz)
+            if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+                train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
                 train_viz_eval.trainer = trainer
                 train_viz_eval.model = model.model
                 model.train_viz_evaluator = train_viz_eval
                 log.info(
-                    "train_viz_datasets present — wired TrainVizEvalVideo "
-                    "(writes to videos_train_viz/, metrics prefixed train_viz/)"
+                    "train_viz_evaluator configured — wired to dataloader_idx=1"
                 )
         log.info("Starting training!")
         trainer.fit(
@@ -315,9 +312,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         eval_obj.trainer = trainer
         eval_obj.model = model.model
         model.evaluator = eval_obj
-        if getattr(datamodule, "train_viz_datasets", None):
-            base_train_viz: EvalVideo = hydra.utils.instantiate(cfg.evaluator)
-            train_viz_eval = TrainVizEvalVideo(base=base_train_viz)
+        if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+            train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
             train_viz_eval.trainer = trainer
             train_viz_eval.model = model.model
             model.train_viz_evaluator = train_viz_eval
