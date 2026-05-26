@@ -324,14 +324,10 @@ class EpisodeResolver:
     def _run_pause_precompute(self, datasets: dict) -> None:
         """Run per-episode pause precompute; no-op if epsilon is None.
 
-        Priority:
-          1. ``self.pause_precompute_cache`` — set via the data config's top-level
-             ``pause_precompute_cache`` field (injected into the resolver by
-             trainHydra before instantiation).
-          2. ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE`` env var — legacy / Modal path.
-          3. In-process thread pool — local dev fallback.
-
-        Episodes missing from the cache fall through to the in-process thread pool.
+        Requires a precomputed cache JSON supplied via either the data config's
+        ``pause_precompute_cache`` field or the ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE``
+        env var.  Raises ``RuntimeError`` if no cache is found or if any
+        episodes are missing from the cache.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
@@ -340,17 +336,30 @@ class EpisodeResolver:
         if cache_path and Path(cache_path).is_file():
             remaining = self._apply_pause_precompute_cache(cache_path, datasets)
             if remaining:
-                self._inprocess_pause_precompute(remaining)
+                raise RuntimeError(
+                    f"pause_removal_epsilon is set but {len(remaining)} episode(s) are missing "
+                    f"from the precomputed cache ({cache_path}). "
+                    "Run the pause-precompute job (e.g. pause_precompute_driver.py) to populate "
+                    "the cache before training. Missing episodes: "
+                    + ", ".join(list(remaining.keys())[:10])
+                    + ("…" if len(remaining) > 10 else "")
+                )
             return
 
-        self._inprocess_pause_precompute(datasets)
+        raise RuntimeError(
+            "pause_removal_epsilon is set but no precomputed pause cache was found. "
+            f"Set pause_precompute_cache in your data config or export "
+            f"{PAUSE_PRECOMPUTE_CACHE_ENV}=<path/to/cache.json> and run the "
+            "pause-precompute job (e.g. pause_precompute_driver.py) first."
+        )
 
     def _apply_pause_precompute_cache(self, cache_path: str, datasets: dict) -> dict:
         """Populate keep_indices from the cache JSON; return cache-miss subset.
 
         Cache JSON shape: ``{episode_hash: {"raw_total": int, "keep_indices": [int]}}``.
         Entries with raw_total == 0 (worker had an error reading the episode)
-        are treated as misses so the in-process fallback can retry.
+        are treated as misses.  The caller is responsible for raising an error
+        if the returned miss dict is non-empty.
         """
         import json
         import time
@@ -388,47 +397,6 @@ class EpisodeResolver:
             elapsed,
         )
         return miss
-
-    def _inprocess_pause_precompute(self, datasets: dict) -> None:
-        import time
-        from concurrent.futures import ThreadPoolExecutor
-
-        max_workers = min(32, max(2, len(datasets)))
-        t0 = time.monotonic()
-        results: list[tuple[str, int, int, str | None]] = []
-
-        def _one(item):
-            name, ds = item
-            try:
-                n_raw, n_kept = ds.precompute_pause_filter()
-                return (name, n_raw, n_kept, None)
-            except Exception as e:
-                return (name, 0, 0, f"{type(e).__name__}: {e}")
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for r in ex.map(_one, datasets.items()):
-                results.append(r)
-
-        n_total = sum(r[1] for r in results)
-        n_kept = sum(r[2] for r in results)
-        n_errs = sum(1 for r in results if r[3] is not None)
-        elapsed = time.monotonic() - t0
-        pct = (100.0 * n_kept / n_total) if n_total else 100.0
-        logger.info(
-            "Pause precompute via in-process thread pool (epsilon=%s): kept %d/%d frames "
-            "(%.1f%%) across %d episodes in %.1fs (errors=%d)",
-            self.pause_removal_epsilon,
-            n_kept,
-            n_total,
-            pct,
-            len(datasets),
-            elapsed,
-            n_errs,
-        )
-        if n_errs:
-            sample = [r for r in results if r[3] is not None][:5]
-            for name, _, _, err in sample:
-                logger.warning("Pause precompute failed for %s: %s", name, err)
 
     @classmethod
     def _episode_already_present(cls, local_dir: Path, episode_hash: str) -> bool:
@@ -1252,7 +1220,10 @@ class ModalEpisodeResolver(EpisodeResolver):
           1. ``self.pause_precompute_cache`` (data config field) — fastest.
           2. ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE`` env var — legacy / Modal path.
           3. Modal fan-out (inside Modal container with volume mount).
-          4. In-process thread pool (local dev fallback).
+
+        Raises ``RuntimeError`` if no cache is found, if cache entries are
+        missing, or if Modal fan-out fails.  The in-process thread pool
+        fallback has been removed.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
@@ -1261,20 +1232,26 @@ class ModalEpisodeResolver(EpisodeResolver):
         if cache_path and Path(cache_path).is_file():
             remaining = self._apply_pause_precompute_cache(cache_path, datasets)
             if remaining:
-                self._inprocess_pause_precompute(remaining)
+                raise RuntimeError(
+                    f"pause_removal_epsilon is set but {len(remaining)} episode(s) are missing "
+                    f"from the precomputed cache ({cache_path}). "
+                    "Run the pause-precompute job (e.g. pause_precompute_driver.py) to populate "
+                    "the cache before training. Missing episodes: "
+                    + ", ".join(list(remaining.keys())[:10])
+                    + ("…" if len(remaining) > 10 else "")
+                )
             return
 
         if self._should_use_modal_pause_precompute(datasets):
-            try:
-                self._modal_fanout_pause_precompute(datasets)
-                return
-            except Exception as e:
-                logger.warning(
-                    "Modal pause precompute failed (%s) — falling back to in-process thread pool",
-                    e,
-                )
+            self._modal_fanout_pause_precompute(datasets)
+            return
 
-        self._inprocess_pause_precompute(datasets)
+        raise RuntimeError(
+            "pause_removal_epsilon is set but no precomputed pause cache was found. "
+            f"Set pause_precompute_cache in your data config or export "
+            f"{PAUSE_PRECOMPUTE_CACHE_ENV}=<path/to/cache.json> and run the "
+            "pause-precompute job (e.g. pause_precompute_driver.py) first."
+        )
 
     @staticmethod
     def _should_use_modal_pause_precompute(datasets: dict) -> bool:
