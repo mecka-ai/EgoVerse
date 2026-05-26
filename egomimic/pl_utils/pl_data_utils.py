@@ -71,6 +71,8 @@ class MultiDataModuleWrapper(LightningDataModule):
         proprio: bool = False,
         embodiment_label: bool = False,
         control_mode: dict[str, str] | None = None,
+        train_viz_datasets: dict | None = None,
+        train_viz_dataloader_params: dict | None = None,
     ):
         """
         Args:
@@ -107,6 +109,20 @@ class MultiDataModuleWrapper(LightningDataModule):
             is active, the prompt is rendered as
             ``"Task: {prompt}, <blocks>;\\nAction: "`` (pi0.5 anchor).
             Otherwise the raw ``prompt`` is tokenized as-is.
+
+            train_viz_datasets: optional dict of MultiDatasets used solely for
+                train-time visualization. When non-empty, ``val_dataloader``
+                returns ``[eval_loader, train_viz_loader]`` so Lightning runs
+                a second validation pass at ``dataloader_idx=1`` that the
+                model wrapper routes to ``train_viz_evaluator``. Datasets
+                follow the same scheme as ``train_datasets``/``valid_datasets``
+                and accept the same ``DatasetFilter`` filters; typically the
+                YAML reuses (and optionally extends) the train filter set.
+                Defaults to ``{}`` (single-loader, backward compatible).
+            train_viz_dataloader_params: per-dataset DataLoader kwargs for
+                the train_viz loader. Required when ``train_viz_datasets``
+                is non-empty. ``shuffle`` is always forced to False so the
+                same samples appear each epoch.
         """
         super().__init__()
         # Drop `None` slots so downstream iteration sites don't need null guards.
@@ -116,6 +132,10 @@ class MultiDataModuleWrapper(LightningDataModule):
         self.valid_datasets = {k: v for k, v in valid_datasets.items() if v is not None}
         self.train_dataloader_params = train_dataloader_params
         self.valid_dataloader_params = valid_dataloader_params
+        self.train_viz_datasets = {
+            k: v for k, v in (train_viz_datasets or {}).items() if v is not None
+        }
+        self.train_viz_dataloader_params = train_viz_dataloader_params or {}
         if use_tokenizer:
             self.collate_fn = build_tokenized_collate(
                 max_length=collate_max_length,
@@ -161,22 +181,49 @@ class MultiDataModuleWrapper(LightningDataModule):
         return CombinedLoader(iterables, "max_size_cycle")
 
     def val_dataloader(self):
-        iterables = dict()
+        eval_loader = self._build_eval_loader()
+        if not self.train_viz_datasets:
+            return eval_loader
+        # Return [eval, train_viz] so Lightning iterates each with a distinct
+        # dataloader_idx: 0 = eval (canonical), 1 = train_viz (comparison viz).
+        return [eval_loader, self._build_train_viz_loader()]
+
+    def _build_eval_loader(self) -> CombinedLoader:
+        iterables = {}
         for dataset_name, dataset in self.valid_datasets.items():
             dataset_params = self.valid_dataloader_params.get(dataset_name)
-            if dataset_params is None or len(dataset_params) == 0:
+            if not dataset_params:
                 raise ValueError(
-                    f"No dataloader params found for dataset {dataset_name}. Please add {dataset_name} into your data config valid_dataloader_params."
+                    f"No dataloader params found for dataset {dataset_name}. "
+                    f"Please add {dataset_name} into your data config valid_dataloader_params."
                 )
             dataset_params = dict(dataset_params)
             shuffle = dataset_params.pop("shuffle", False)
             iterables[dataset_name] = DataLoader(
-                dataset,
-                shuffle=shuffle,
-                collate_fn=self.collate_fn,
-                **dataset_params,
+                dataset, shuffle=shuffle, collate_fn=self.collate_fn, **dataset_params
             )
+        return CombinedLoader(iterables, "max_size_cycle")
 
+    def _build_train_viz_loader(self) -> CombinedLoader:
+        """Non-shuffled loader over train_viz datasets.
+
+        Uses train_viz_dataloader_params; shuffle is forced off so the same
+        samples appear each epoch, making videos comparable across runs.
+        """
+        iterables = {}
+        for dataset_name, dataset in self.train_viz_datasets.items():
+            dataset_params = self.train_viz_dataloader_params.get(dataset_name)
+            if not dataset_params:
+                raise ValueError(
+                    f"No dataloader params found for train_viz dataset "
+                    f"{dataset_name}. Please add {dataset_name} into your data "
+                    f"config train_viz_dataloader_params."
+                )
+            dataset_params = dict(dataset_params)
+            dataset_params.pop("shuffle", None)
+            iterables[dataset_name] = DataLoader(
+                dataset, shuffle=False, collate_fn=self.collate_fn, **dataset_params
+            )
         return CombinedLoader(iterables, "max_size_cycle")
 
 

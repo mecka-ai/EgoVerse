@@ -37,7 +37,11 @@ def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
     return OmegaConf.create({"model": model_cfg})
 
 
-def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> None:
+def _log_dataset_frame_counts(
+    train_datasets: dict,
+    valid_datasets: dict,
+    train_viz_datasets: dict | None = None,
+) -> None:
     rows = []
     for name, ds in train_datasets.items():
         rows.append(("train", name, len(ds)))
@@ -50,6 +54,16 @@ def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> Non
     if valid_datasets:
         rows.append(
             ("TOTAL", "(valid)", sum(len(ds) for ds in valid_datasets.values()))
+        )
+    if train_viz_datasets:
+        for name, ds in train_viz_datasets.items():
+            rows.append(("train_viz", name, len(ds)))
+        rows.append(
+            (
+                "TOTAL",
+                "(train_viz)",
+                sum(len(ds) for ds in train_viz_datasets.values()),
+            )
         )
     table = tabulate(
         rows,
@@ -110,12 +124,24 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             cfg.data.valid_datasets[dataset_name]
         )
 
+    train_viz_datasets = {}
+    train_viz_cfg = OmegaConf.select(cfg, "data.train_viz_datasets", default=None)
+    if train_viz_cfg:
+        for dataset_name in train_viz_cfg:
+            entry = train_viz_cfg[dataset_name]
+            if entry is None:
+                continue
+            train_viz_datasets[dataset_name] = hydra.utils.instantiate(entry)
+
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     assert (
         "MultiDataModuleWrapper" in cfg.data._target_
     ), "cfg.data._target_ must be 'MultiDataModuleWrapper'"
     datamodule: LightningDataModule = hydra.utils.instantiate(
-        cfg.data, train_datasets=train_datasets, valid_datasets=valid_datasets
+        cfg.data,
+        train_datasets=train_datasets,
+        valid_datasets=valid_datasets,
+        train_viz_datasets=train_viz_datasets,
     )
 
     for dataset_name, dataset in datamodule.train_datasets.items():
@@ -174,7 +200,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         scheduler_interval=cfg.model.get("scheduler_interval", "step"),
     )
 
-    _log_dataset_frame_counts(datamodule.train_datasets, datamodule.valid_datasets)
+    _log_dataset_frame_counts(
+        datamodule.train_datasets,
+        datamodule.valid_datasets,
+        getattr(datamodule, "train_viz_datasets", None),
+    )
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -263,6 +293,14 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             eval_obj.trainer = trainer
             eval_obj.model = model.model
             model.evaluator = eval_obj
+            if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+                train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
+                train_viz_eval.trainer = trainer
+                train_viz_eval.model = model.model
+                model.train_viz_evaluator = train_viz_eval
+                log.info(
+                    "train_viz_evaluator configured — wired to dataloader_idx=1"
+                )
         log.info("Starting training!")
         trainer.fit(
             model=model,
@@ -274,6 +312,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         eval_obj.trainer = trainer
         eval_obj.model = model.model
         model.evaluator = eval_obj
+        if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+            train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
+            train_viz_eval.trainer = trainer
+            train_viz_eval.model = model.model
+            model.train_viz_evaluator = train_viz_eval
         # Load checkpoint weights manually so we can reset the epoch counter
         ckpt_path = cfg.get("ckpt_path")
         if ckpt_path:
