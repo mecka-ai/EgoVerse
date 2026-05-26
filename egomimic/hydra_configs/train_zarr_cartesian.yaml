@@ -9,6 +9,13 @@ defaults:
   - callbacks: checkpoints
   - data_schematic: default
   - evaluator: eval_hpt
+  # Optional second evaluator for the train_viz val pass (dataloader_idx=1).
+  # Defaults to null (disabled). Enable via CLI:
+  #   evaluator@train_viz_evaluator=train_viz_hpt
+  # which loads hydra_configs/evaluator/train_viz_hpt.yaml into
+  # cfg.train_viz_evaluator. Pair with a data config that defines
+  # `train_viz_datasets`.
+  - evaluator@train_viz_evaluator: train_viz_hpt
   - override hydra/launcher: submitit
   - _self_
 
@@ -17,10 +24,6 @@ description: test
 ckpt_path: null
 wandb_run_id: null  # set to resume an existing W&B run (auto-set on Modal auto-restart)
 mode: train
-# Optional second evaluator for the train_viz val pass (dataloader_idx=1).
-# Set via CLI, e.g. `+train_viz_evaluator=train_viz_hpt`, when the data config
-# also defines `train_viz_datasets`. Null disables it (single-loader behavior).
-train_viz_evaluator: null
 
 hydra:
   run:

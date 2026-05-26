@@ -4,11 +4,15 @@
 # and uses `mode: total` so the resolved set is used as-is (the 80/20 hash
 # split in `mode: train` empties the bucket with so few episodes).
 #
-# To exercise the second val loader, also enable the train_viz evaluator:
+# To exercise the second val loader, also enable the train_viz evaluator.
+# The slot is declared in train_zarr_cartesian.yaml as
+#   - evaluator@train_viz_evaluator: null
+# so the CLI override uses the group@package form (loads from
+# hydra_configs/evaluator/<name>.yaml into cfg.train_viz_evaluator):
 #   python egomimic/modal/trainModal.py \
 #     data=mecka_all_zarr_smoke trainer=debug_modal logger=wandb \
 #     model=hpt_bc_flow_mecka name=train_viz_smoke description=smoke \
-#     +train_viz_evaluator=train_viz_hpt
+#     evaluator@train_viz_evaluator=train_viz_hpt
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
