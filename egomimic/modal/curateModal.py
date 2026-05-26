@@ -200,7 +200,7 @@ def _embed_task_shard(
     shard_index = json.loads((shard_root / "shard_index.json").read_text())
 
     tmp_dir = "/tmp/curation_tar_cache"
-    from egomimic.rldb.zarr.tar_shard_dataset import load_episodes_from_tars
+    from egomimic.curation.tar_loader import load_episodes_from_tars
 
     t_map = _time.perf_counter()
     all_episodes = load_episodes_from_tars(
