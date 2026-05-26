@@ -87,25 +87,23 @@ DEFAULT_SHARDS = int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "500"))
 
 _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 
-# Slim image for the shard workers — no repo clone, fast cold start. The
-# keep-mask algorithm below is duplicated from
-# egomimic.rldb.zarr.zarr_dataset_multi._build_pause_keep_mask; keep them
-# in sync.  The Nebius worker, by contrast, imports from zarr_dataset_multi
-# directly because Slurm has cheap "full egomimic" via the cluster venv —
-# Modal would require a repo clone per container, which kills cold-start
-# at 500-way fan-out.
-pause_worker_image = modal.Image.debian_slim(python_version="3.11").pip_install(
-    "zarr==3.1.5", "numpy"
-)
-
 
 # ---------------------------------------------------------------------------
-# Shard worker (slim image)
+# Shard worker
 # ---------------------------------------------------------------------------
+#
+# Inherits the main app image. Earlier this used a slim debian_slim+zarr+numpy
+# image to chase faster cold starts, but ``modal_setup.py`` is only baked into
+# the main image (via ``.add_local_file`` in modal_setup.py), and the worker
+# container deserializes ``pause_precompute_modal.py`` at module load — which
+# runs ``from modal_setup import ...`` and fails on a slim image without that
+# file. The main image already carries zarr+numpy, and at 500-way fan-out the
+# extra image pull is a few cents on a one-time precompute. Keep the duplicated
+# keep-mask logic below in sync with ``_build_pause_keep_mask`` in
+# ``egomimic.rldb.zarr.zarr_dataset_multi``.
 
 
 @app.function(
-    image=pause_worker_image,
     cpu=PAUSE_WORKER.cpu,
     memory=PAUSE_WORKER.memory_mb,
     timeout=1800,
