@@ -97,6 +97,18 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
     data_schematic: DataSchematic = hydra.utils.instantiate(cfg.data_schematic)
 
+    # If the data config declares a pause_precompute_cache path, inject it into
+    # every resolver before instantiation so _run_pause_precompute uses the
+    # pre-built JSON rather than the env var or in-process computation.
+    _pause_cache = OmegaConf.select(cfg, "data.pause_precompute_cache", default=None)
+    if _pause_cache:
+        for _block_name in ("train_datasets", "valid_datasets"):
+            _block = OmegaConf.select(cfg.data, _block_name) or {}
+            for _ds_name, _ds_cfg in _block.items():
+                if _ds_cfg is not None and OmegaConf.select(_ds_cfg, "resolver") is not None:
+                    with open_dict(_ds_cfg):
+                        _ds_cfg.resolver.pause_precompute_cache = str(_pause_cache)
+
     # Modify dataset configs to include `data_schematic` dynamically at runtime
     train_datasets = {}
     for dataset_name in cfg.data.train_datasets:

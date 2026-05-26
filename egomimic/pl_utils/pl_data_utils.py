@@ -71,6 +71,7 @@ class MultiDataModuleWrapper(LightningDataModule):
         proprio: bool = False,
         embodiment_label: bool = False,
         control_mode: dict[str, str] | None = None,
+        pause_precompute_cache: str | None = None,  # injected into resolvers by trainHydra; accepted here to satisfy Hydra kwarg passing
     ):
         """
         Args:

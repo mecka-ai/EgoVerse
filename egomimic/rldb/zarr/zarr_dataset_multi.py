@@ -250,12 +250,14 @@ class EpisodeResolver:
         transform_list: list | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        pause_precompute_cache: str | None = None,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
         self.transform_list = transform_list
         self.norm_stats = norm_stats
         self.pause_removal_epsilon = pause_removal_epsilon
+        self.pause_precompute_cache = pause_precompute_cache
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
         """
@@ -322,19 +324,19 @@ class EpisodeResolver:
     def _run_pause_precompute(self, datasets: dict) -> None:
         """Run per-episode pause precompute; no-op if epsilon is None.
 
-        Two paths:
-          - If $EGOMIMIC_PAUSE_PRECOMPUTE_CACHE points at a JSON file produced
-            by trainModal.run_hydra_train (which fans out to the Modal worker
-            before launching this subprocess), load keep_indices from there.
-            Episodes missing from the cache fall through to the in-process
-            thread pool.
-          - Otherwise (local dev, or no pre-train fan-out happened), do the
-            whole thing in-process.
+        Priority:
+          1. ``self.pause_precompute_cache`` — set via the data config's top-level
+             ``pause_precompute_cache`` field (injected into the resolver by
+             trainHydra before instantiation).
+          2. ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE`` env var — legacy / Modal path.
+          3. In-process thread pool — local dev fallback.
+
+        Episodes missing from the cache fall through to the in-process thread pool.
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
 
-        cache_path = os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
+        cache_path = self.pause_precompute_cache or os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
         if cache_path and Path(cache_path).is_file():
             remaining = self._apply_pause_precompute_cache(cache_path, datasets)
             if remaining:
@@ -435,6 +437,41 @@ class EpisodeResolver:
             return True
         return False
 
+    def _local_path_for(self, episode_hash: str) -> Path | None:
+        """First existing on-disk path for an episode hash (probes both ``hash`` and ``hash.zarr``)."""
+        for p in (
+            self.folder_path / episode_hash,
+            self.folder_path / f"{episode_hash}.zarr",
+        ):
+            if p.is_dir():
+                return p
+        return None
+
+    def _match_episode_hashes(self, filters: DatasetFilter | None) -> list[str]:
+        """Subclass hook: return episode hashes matching ``filters`` (no local-presence check)."""
+        raise NotImplementedError
+
+    def discover_episode_paths(
+        self,
+        filters: DatasetFilter | None = None,
+    ) -> list[tuple[str, str]]:
+        """Return ``[(episode_hash, local_zarr_path), ...]`` for filter matches present on disk.
+
+        Shares the filter pipeline used by ``resolve()`` but stops short of
+        ZarrDataset construction and in-process pause precompute. The
+        Nebius/SLURM pause-precompute driver uses this to enumerate work for
+        sbatch fan-out cheaply on the login node. Each subclass defines
+        ``_match_episode_hashes`` for its specific filter source (SQL or local
+        zarr metadata); the local-presence probe is shared here.
+        """
+        out: list[tuple[str, str]] = []
+        for episode_hash in self._match_episode_hashes(filters):
+            local_path = self._local_path_for(episode_hash)
+            if local_path is None:
+                continue
+            out.append((episode_hash, str(local_path)))
+        return out
+
 
 class S3EpisodeResolver(EpisodeResolver):
     """
@@ -446,52 +483,27 @@ class S3EpisodeResolver(EpisodeResolver):
         folder_path: Path,
         bucket_name: str = "rldb",
         main_prefix: str = "processed_v3",
-        key_map: dict | None = None,
-        transform_list: list | None = None,
         debug: int | bool | None = None,
-        norm_stats: dict | None = None,
-        pause_removal_epsilon: float | None = None,
+        **kwargs,
     ):
         self.bucket_name = bucket_name
         self.main_prefix = main_prefix
         self.debug = debug
-        super().__init__(
-            folder_path,
-            key_map=key_map,
-            transform_list=transform_list,
-            norm_stats=norm_stats,
-            pause_removal_epsilon=pause_removal_epsilon,
-        )
+        super().__init__(folder_path, **kwargs)
 
-    def discover_episode_paths(
-        self,
-        filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, str]]:
-        """Return ``[(episode_hash, local_zarr_path), ...]`` without syncing or building datasets.
+    def _match_episode_hashes(self, filters: DatasetFilter | None) -> list[str]:
+        """SQL-filter matches; does NOT trigger an S3 sync.
 
-        Mirrors the helper on Local/Modal resolvers but does NOT trigger an
-        S3 sync — the Nebius/SLURM pause-precompute workflow assumes data has
-        already been staged onto the shared filesystem. SQL-matched episodes
-        that aren't present under ``self.folder_path`` are silently skipped.
+        The Nebius/SLURM pause-precompute workflow assumes data has already
+        been staged onto the shared filesystem, so the base
+        ``discover_episode_paths`` silently skips SQL hits absent from disk.
         """
-        filtered_paths = self._get_filtered_paths(filters, debug=self.debug)
-        out: list[tuple[str, str]] = []
-        for _processed_path, episode_hash in filtered_paths:
-            local_path = next(
-                (
-                    p
-                    for p in (
-                        self.folder_path / episode_hash,
-                        self.folder_path / f"{episode_hash}.zarr",
-                    )
-                    if p.is_dir()
-                ),
-                None,
+        return [
+            episode_hash
+            for _processed_path, episode_hash in self._get_filtered_paths(
+                filters, debug=self.debug
             )
-            if local_path is None:
-                continue
-            out.append((episode_hash, str(local_path)))
-        return out
+        ]
 
     def resolve(
         self,
@@ -725,20 +737,11 @@ class LocalEpisodeResolver(EpisodeResolver):
     def __init__(
         self,
         folder_path: Path,
-        key_map: dict | None = None,
-        transform_list: list | None = None,
-        norm_stats: dict | None = None,
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
-        pause_removal_epsilon: float | None = None,
+        **kwargs,
     ):
-        super().__init__(
-            folder_path,
-            key_map,
-            transform_list,
-            norm_stats=norm_stats,
-            pause_removal_epsilon=pause_removal_epsilon,
-        )
+        super().__init__(folder_path, **kwargs)
         self.debug = debug
         self.allowed_episode_ids = (
             set(allowed_episode_ids) if allowed_episode_ids else None
@@ -801,43 +804,14 @@ class LocalEpisodeResolver(EpisodeResolver):
 
         return filtered
 
-    def discover_episode_paths(
-        self,
-        filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, str]]:
-        """Return ``[(episode_hash, local_zarr_path), ...]`` without building datasets.
-
-        Mirrors ``ModalEpisodeResolver.discover_episode_paths``: shares the
-        directory-scan + metadata-filter pipeline used by ``resolve()`` but
-        stops short of ZarrDataset construction and in-process pause
-        precompute. The Nebius/SLURM pause-precompute driver uses this to
-        enumerate work for sbatch fan-out cheaply on the login node.
-        """
+    def _match_episode_hashes(self, filters: DatasetFilter | None) -> list[str]:
+        """Local-zarr metadata-filter matches; honors ``allowed_episode_ids`` short-circuit."""
         if self.allowed_episode_ids is not None:
-            out: list[tuple[str, str]] = []
-            for episode_hash in self.allowed_episode_ids:
-                local_path = next(
-                    (
-                        p
-                        for p in (
-                            self.folder_path / f"{episode_hash}.zarr",
-                            self.folder_path / episode_hash,
-                        )
-                        if p.is_dir()
-                    ),
-                    None,
-                )
-                if local_path is None:
-                    continue
-                out.append((episode_hash, str(local_path)))
-            return out
-
+            return list(self.allowed_episode_ids)
         filtered_paths = self._get_local_filtered_paths(
             self.folder_path, filters, debug=self.debug
         )
-        # _get_local_filtered_paths returns (path_str, episode_hash) tuples;
-        # flip to match the (hash, path) order used by the driver.
-        return [(episode_hash, path_str) for path_str, episode_hash in filtered_paths]
+        return [episode_hash for _path_str, episode_hash in filtered_paths]
 
     def resolve(
         self,
@@ -921,23 +895,14 @@ class ModalEpisodeResolver(EpisodeResolver):
     def __init__(
         self,
         folder_path: Path,
-        key_map: dict | None = None,
-        transform_list: list | None = None,
         debug: int | bool | None = None,
-        norm_stats: dict | None = None,
         exclude_hashes: list[str] | None = None,
-        pause_removal_epsilon: float | None = None,
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
         allowed_episode_ids: list[str] | None = None,
+        **kwargs,
     ):
-        super().__init__(
-            folder_path,
-            key_map,
-            transform_list,
-            norm_stats=norm_stats,
-            pause_removal_epsilon=pause_removal_epsilon,
-        )
+        super().__init__(folder_path, **kwargs)
         self.debug = debug
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
         if eps_to_ignore:
@@ -968,18 +933,8 @@ class ModalEpisodeResolver(EpisodeResolver):
                 len(self.include_hashes),
             )
 
-    def discover_episode_paths(
-        self,
-        filters: DatasetFilter | None = None,
-    ) -> list[tuple[str, str]]:
-        """Return ``[(episode_hash, local_zarr_path), ...]`` without building datasets.
-
-        Shares the SQL → filter → local-presence pipeline with ``resolve()`` but
-        skips ZarrDataset construction and in-process pause precompute. The
-        Nebius/SLURM pause-precompute driver uses this to enumerate work for
-        sbatch fan-out without paying the construction cost or accidentally
-        triggering the in-process filter loop.
-        """
+    def _match_episode_hashes(self, filters: DatasetFilter | None) -> list[str]:
+        """SQL filter + exclude/include sets; skips deleted episodes."""
         filters = _ensure_dataset_filter(filters)
 
         engine = create_default_engine()
@@ -989,7 +944,6 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         if "is_deleted" in df.columns:
             df = df[df["is_deleted"] != True]  # noqa: E712
-
         if self.exclude_hashes:
             df = df[~df["episode_hash"].isin(self.exclude_hashes)]
         if self.include_hashes is not None:
@@ -1006,23 +960,7 @@ class ModalEpisodeResolver(EpisodeResolver):
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
 
-        out: list[tuple[str, str]] = []
-        for episode_hash in matched["episode_hash"].tolist():
-            local_path = next(
-                (
-                    p
-                    for p in (
-                        self.folder_path / episode_hash,
-                        self.folder_path / f"{episode_hash}.zarr",
-                    )
-                    if p.is_dir()
-                ),
-                None,
-            )
-            if local_path is None:
-                continue
-            out.append((episode_hash, str(local_path)))
-        return out
+        return matched["episode_hash"].tolist()
 
     def resolve(
         self,
@@ -1311,14 +1249,15 @@ class ModalEpisodeResolver(EpisodeResolver):
         """Run per-episode pause precompute; no-op if epsilon is None.
 
         Priority:
-          1. Pre-built cache JSON ($EGOMIMIC_PAUSE_PRECOMPUTE_CACHE) — fastest.
-          2. Modal fan-out (inside Modal container with volume mount).
-          3. In-process thread pool (local dev fallback).
+          1. ``self.pause_precompute_cache`` (data config field) — fastest.
+          2. ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE`` env var — legacy / Modal path.
+          3. Modal fan-out (inside Modal container with volume mount).
+          4. In-process thread pool (local dev fallback).
         """
         if self.pause_removal_epsilon is None or not datasets:
             return
 
-        cache_path = os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
+        cache_path = self.pause_precompute_cache or os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
         if cache_path and Path(cache_path).is_file():
             remaining = self._apply_pause_precompute_cache(cache_path, datasets)
             if remaining:
