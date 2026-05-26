@@ -15,7 +15,6 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-        pause_removal_epsilon: 0.005
       eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_all.json
     mode: train
 
@@ -31,7 +30,6 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-        pause_removal_epsilon: 0.005
       eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_all.json
     mode: valid
 

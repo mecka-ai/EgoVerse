@@ -27,7 +27,6 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      pause_removal_epsilon: 0.005
     filters:
       _target_: egomimic.rldb.filters.DatasetFilter
       filter_lambdas:
@@ -46,7 +45,6 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      pause_removal_epsilon: 0.005
     filters:
       _target_: egomimic.rldb.filters.DatasetFilter
       filter_lambdas:

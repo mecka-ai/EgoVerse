@@ -11,16 +11,19 @@ Pipeline
 run_pause_precompute (orchestrator, CPU — main training image)
   1. Hydra-compose the training config from the supplied overrides.
   2. Walk ``data.train_datasets`` + ``data.valid_datasets``, picking out
-     every resolver with ``pause_removal_epsilon`` set.
+     every resolver that exposes ``discover_episode_paths``. The epsilon
+     used for pause classification is supplied as a CLI parameter
+     (``pause_epsilon=<float>``) — not read off the resolver config.
   3. Call ``discover_episode_paths(filters)`` on each to enumerate
      ``[(episode_hash, local_path)]`` under ``/mnt/zarr-data`` — no
      ZarrDataset construction, no in-process precompute.
-  4. Group by epsilon, partition round-robin into N shards (default 500,
-     overridable via ``pause_shards=N``).
+  4. Partition the merged episode list round-robin into N shards
+     (default 500, overridable via ``pause_shards=N``).
   5. Fan out ``_pause_precompute_shard.map(...)`` across up to 500 CPU
-     containers.
+     containers using the supplied epsilon.
   6. Aggregate the returned dicts and write
-     ``/mnt/zarr-data/pause_cache/<run>/cache.json`` on the zarr volume.
+     ``/mnt/zarr-data/pause_cache/<run>_eps<epsilon>/cache.json`` on the
+     zarr volume.
 
 _pause_precompute_shard (CPU worker, slim image, up to 500 concurrent)
   • Opens each zarr; builds the keep-mask with the SAME algorithm as
@@ -37,16 +40,17 @@ Usage
     python egomimic/modal/pause_precompute_modal.py \\
         name=pause_run description=mecka_50k \\
         pause_config_name=train_zarr_cartesian \\
+        pause_epsilon=0.005 \\
         data=mecka_50k_20k
 
-Optional: pass ``pause_shards=N`` (default 500) on its own — do NOT wrap
-in brackets; bash forwards them as literal characters and Hydra rejects
-them as an unparseable override.
+``pause_epsilon=<float>`` is required. Optional: pass ``pause_shards=N``
+(default 500) on its own — do NOT wrap in brackets; bash forwards them
+as literal characters and Hydra rejects them as an unparseable override.
 
 After completion the cache path is printed; wire it into your training
 data config::
 
-    pause_precompute_cache: /mnt/zarr-data/pause_cache/<run>/cache.json
+    pause_precompute_cache: /mnt/zarr-data/pause_cache/<run>_eps<eps>/cache.json
 """
 
 from __future__ import annotations
@@ -246,6 +250,7 @@ def run_pause_precompute(
     git_commit: str,
     config_name: str,
     out_subdir: str,
+    epsilon: float,
     n_shards: int = DEFAULT_SHARDS,
     init_submodules: bool = True,
     hf_token: str = "",
@@ -278,8 +283,11 @@ def run_pause_precompute(
     ):
         cfg = compose(config_name=config_name, overrides=list(hydra_args))
 
-    # ── Walk resolvers and enumerate (hash, path) by epsilon ──────────────────
-    work_by_eps: dict[float, dict[str, str]] = {}
+    # ── Walk resolvers and enumerate (hash, path) ────────────────────────────
+    # Epsilon is supplied by the caller (CLI parameter), not read off the
+    # resolver config — that's a property of the data, not of the precompute
+    # job. We collapse every resolver's episodes into a single dedup'd map.
+    episodes_by_hash: dict[str, str] = {}
     seen_blocks = 0
     data_cfg = cfg.get("data") if cfg is not None else None
     if data_cfg is None:
@@ -307,9 +315,6 @@ def run_pause_precompute(
                 continue
             if not hasattr(resolver, "discover_episode_paths"):
                 continue
-            eps = getattr(resolver, "pause_removal_epsilon", None)
-            if eps is None:
-                continue
 
             filters_cfg = ds_cfg.get("filters")
             filters = instantiate(filters_cfg) if filters_cfg is not None else None
@@ -324,42 +329,35 @@ def run_pause_precompute(
                 )
                 continue
 
-            bucket = work_by_eps.setdefault(float(eps), {})
             for episode_hash, local_path in pairs:
-                bucket[episode_hash] = local_path
+                episodes_by_hash[episode_hash] = local_path
             print(
                 f"[pause-precompute] {block_name}.{ds_name}: "
-                f"epsilon={eps}, {len(pairs)} episodes resolved"
+                f"{len(pairs)} episodes resolved"
             )
 
-    if not work_by_eps:
+    if not episodes_by_hash:
         raise RuntimeError(
-            f"pause-precompute: no resolvers with pause_removal_epsilon found "
-            f"across {seen_blocks} dataset block(s). Set pause_removal_epsilon "
-            "on at least one resolver in your data config and re-submit."
+            f"pause-precompute: no resolvers with discover_episode_paths found "
+            f"across {seen_blocks} dataset block(s)."
         )
 
-    total_eps = sum(len(v) for v in work_by_eps.values())
     print(
-        f"[pause-precompute] {total_eps} episodes across {len(work_by_eps)} "
-        "epsilon group(s): "
-        + ", ".join(f"eps={e}({len(v)})" for e, v in work_by_eps.items())
+        f"[pause-precompute] {len(episodes_by_hash)} unique episodes "
+        f"(epsilon={epsilon})"
     )
 
-    # ── Partition: round-robin per epsilon → list[(shard_id, eps, [(h, p)])] ──
+    # ── Partition: round-robin → list[(shard_id, eps, [(h, p)])] ─────────────
     # Round-robin (episodes[i::eps_shards]) spreads similar storage layouts
     # across shards — keeps tail latency tight. Mirrors the Nebius driver's
     # _write_manifest algorithm.
     shards: list[tuple[int, float, list[tuple[str, str]]]] = []
-    for eps, hash_to_path in work_by_eps.items():
-        episodes = list(hash_to_path.items())
-        if not episodes:
-            continue
-        eps_shards = min(n_shards, len(episodes))
-        for i in range(eps_shards):
-            shard_eps = episodes[i::eps_shards]
-            if shard_eps:
-                shards.append((len(shards), float(eps), shard_eps))
+    episodes = list(episodes_by_hash.items())
+    eps_shards = min(n_shards, len(episodes))
+    for i in range(eps_shards):
+        shard_eps = episodes[i::eps_shards]
+        if shard_eps:
+            shards.append((len(shards), float(epsilon), shard_eps))
 
     total_shards = len(shards)
     print(
@@ -429,14 +427,17 @@ def submit_pause_precompute(*hydra_args: str) -> None:
     Recognized non-hydra args (stripped before composition):
       - ``pause_config_name=<name>`` — Hydra training config (required, e.g.
         ``train_zarr_cartesian`` or ``train_zarr_cartesian_pi``).
+      - ``pause_epsilon=<float>`` — pause-classification epsilon (required).
+        Appended to the output subdir as ``_eps<value>``.
       - ``pause_shards=<int>`` — number of shards (default 500).
       - ``init_submodules=<bool>`` — clone with --recurse-submodules.
       - ``name=<str>`` / ``description=<str>`` — used to label the output subdir.
     """
-    # Strip pause_config_name / pause_shards (used here) and collect name/
-    # description (for the output subdir). Everything else stays in `args`
-    # to forward to Hydra compose inside the orchestrator.
+    # Strip pause_config_name / pause_epsilon / pause_shards (used here) and
+    # collect name/description (for the output subdir). Everything else stays
+    # in `args` to forward to Hydra compose inside the orchestrator.
     config_name: str | None = None
+    epsilon_str: str | None = None
     shards_str: str = str(DEFAULT_SHARDS)
     name = description = ""
     args: list[str] = []
@@ -445,6 +446,8 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         k, sep, v = bare.partition("=")
         if sep and k == "pause_config_name":
             config_name = v
+        elif sep and k == "pause_epsilon":
+            epsilon_str = v
         elif sep and k == "pause_shards":
             shards_str = v
         else:
@@ -460,11 +463,24 @@ def submit_pause_precompute(*hydra_args: str) -> None:
             "pause-precompute: pause_config_name=<hydra-config-name> is required "
             "(e.g. pause_config_name=train_zarr_cartesian)"
         )
+    if epsilon_str is None:
+        raise SystemExit(
+            "pause-precompute: pause_epsilon=<float> is required "
+            "(e.g. pause_epsilon=0.005)"
+        )
+    try:
+        epsilon = float(epsilon_str)
+    except ValueError:
+        raise SystemExit(
+            f"pause-precompute: pause_epsilon must be a float, got {epsilon_str!r}"
+        )
     n_shards = int(shards_str)
 
     import time as _time
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
-    out_subdir = f"{name or 'pause'}_{description or config_name}_{timestamp}"
+    out_subdir = (
+        f"{name or 'pause'}_{description or config_name}_eps{epsilon_str}_{timestamp}"
+    )
 
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
@@ -474,7 +490,8 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         )
     print(
         f"Submitting pause-precompute at commit {git_commit[:12]} from {git_remote}\n"
-        f"  config_name={config_name}  shards={n_shards}  out_subdir={out_subdir}"
+        f"  config_name={config_name}  epsilon={epsilon}  shards={n_shards}\n"
+        f"  out_subdir={out_subdir}"
     )
 
     handle = run_pause_precompute.spawn(
@@ -483,6 +500,7 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         git_commit,
         config_name,
         out_subdir,
+        epsilon,
         n_shards=n_shards,
         init_submodules=init_submodules,
         hf_token=_local_hf_token(),
@@ -496,6 +514,7 @@ def submit_pause_precompute(*hydra_args: str) -> None:
 # ---------------------------------------------------------------------------
 # python egomimic/modal/pause_precompute_modal.py \
 #     name=… description=… pause_config_name=train_zarr_cartesian \
+#     pause_epsilon=0.005 \
 #     data=mecka_50k_20k   (optional: pause_shards=N, default 500)
 # ---------------------------------------------------------------------------
 
