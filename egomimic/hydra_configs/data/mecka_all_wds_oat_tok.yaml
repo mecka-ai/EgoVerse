@@ -1,15 +1,14 @@
 # Data config for OAT tokenizer training over the full WDS (tar-shard) dataset.
 # Mirrors mecka_all_wds but uses larger batches — the OAT tokenizer has no image
-# encoder so forward passes are cheap, even though images are still in the batch.
+# encoder so forward passes are cheap, even though images are still delivered
+# by the WDS shards.
 #
-# Pair with model=oat_tokenizer and evaluator=null:
-#
+# Launch command:
 #   python egomimic/modal/trainModal.py \
 #       model=oat_tokenizer \
 #       data=mecka_all_wds_oat_tok \
 #       evaluator=null \
 #       trainer=ddp_modal \
-#       reject_outliers=false \
 #       +modal_volume=mecka_data_wds_v2 \
 #       name=oat_tok description=mecka_bimanual_wds
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
@@ -20,14 +19,14 @@ train_datasets:
     shard_dir: /mnt/zarr-wds
     mode: train
     cache_dir: /tmp/shard_cache
-    prefetch_shards: 2
-    max_workers: 30
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
     transform_list:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
       mode: cartesian
+    # Plain config block (no _target_) that trainHydra.py uses to build the norm_stats
+    # dataset via resolver.key_map. norm_mode=True is injected at runtime. Not instantiated.
     resolver:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
@@ -39,8 +38,6 @@ valid_datasets:
     shard_dir: /mnt/zarr-wds
     mode: valid
     cache_dir: /tmp/shard_cache
-    prefetch_shards: 1
-    max_workers: 2
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -54,12 +51,13 @@ valid_datasets:
 
 train_dataloader_params:
   mecka_bimanual:
-    # Larger batch than HPT configs — OAT tokenizer has no image encoder so the
-    # forward pass is cheap even though WDS shards still deliver image tensors.
+    # Larger batch than HPT configs — no image encoder, so GPU forward pass is cheap
+    # even though WDS shards still deliver image tensors.
     batch_size: 256
-    num_workers: 30
+    num_workers: 8
     persistent_workers: true
     prefetch_factor: 2
+    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
     shuffle: false
 
 valid_dataloader_params:
