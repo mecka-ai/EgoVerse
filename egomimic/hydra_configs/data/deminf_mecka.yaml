@@ -6,6 +6,7 @@ train_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
       folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian

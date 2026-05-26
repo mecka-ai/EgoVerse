@@ -249,12 +249,14 @@ class EpisodeResolver:
         key_map: dict | None = None,
         transform_list: list | None = None,
         norm_stats: dict | None = None,
+        pause_removal_epsilon: float | None = None,
         pause_precompute_cache: str | None = None,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
         self.transform_list = transform_list
         self.norm_stats = norm_stats
+        self.pause_removal_epsilon = pause_removal_epsilon
         self.pause_precompute_cache = pause_precompute_cache
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
@@ -296,6 +298,7 @@ class EpisodeResolver:
                     key_map=self.key_map,
                     transform_list=self.transform_list,
                     norm_stats=self.norm_stats,
+                    pause_removal_epsilon=self.pause_removal_epsilon,
                 )
                 datasets[name] = ds_obj
             except Exception as e:
@@ -319,35 +322,36 @@ class EpisodeResolver:
         return datasets
 
     def _run_pause_precompute(self, datasets: dict) -> None:
-        """Apply precomputed pause-keep indices to ``datasets`` if a cache is provided.
+        """Run per-episode pause precompute; no-op if epsilon is None.
 
-        No-op when no cache is configured (via ``pause_precompute_cache`` in the
-        data config or ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE``). Raises
-        ``RuntimeError`` if a cache path is set but the file is missing, or if
-        any episode lacks a cache entry.
+        Requires a precomputed cache JSON supplied via either the data config's
+        ``pause_precompute_cache`` field or the ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE``
+        env var.  Raises ``RuntimeError`` if no cache is found or if any
+        episodes are missing from the cache.
         """
-        if not datasets:
+        if self.pause_removal_epsilon is None or not datasets:
             return
 
         cache_path = self.pause_precompute_cache or os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
-        if not cache_path:
+        if cache_path and Path(cache_path).is_file():
+            remaining = self._apply_pause_precompute_cache(cache_path, datasets)
+            if remaining:
+                raise RuntimeError(
+                    f"pause_removal_epsilon is set but {len(remaining)} episode(s) are missing "
+                    f"from the precomputed cache ({cache_path}). "
+                    "Run the pause-precompute job (e.g. pause_precompute_driver.py) to populate "
+                    "the cache before training. Missing episodes: "
+                    + ", ".join(list(remaining.keys())[:10])
+                    + ("…" if len(remaining) > 10 else "")
+                )
             return
-        if not Path(cache_path).is_file():
-            raise RuntimeError(
-                f"pause_precompute_cache points to a missing file: {cache_path}. "
-                "Run the pause-precompute job (e.g. egomimic/modal/pause_precompute_modal.py) "
-                "before training."
-            )
 
-        remaining = self._apply_pause_precompute_cache(cache_path, datasets)
-        if remaining:
-            raise RuntimeError(
-                f"{len(remaining)} episode(s) are missing from the precomputed pause cache "
-                f"({cache_path}). Re-run the pause-precompute job to cover the new episodes. "
-                "Missing: "
-                + ", ".join(list(remaining.keys())[:10])
-                + ("…" if len(remaining) > 10 else "")
-            )
+        raise RuntimeError(
+            "pause_removal_epsilon is set but no precomputed pause cache was found. "
+            f"Set pause_precompute_cache in your data config or export "
+            f"{PAUSE_PRECOMPUTE_CACHE_ENV}=<path/to/cache.json> and run the "
+            "pause-precompute job (e.g. pause_precompute_driver.py) first."
+        )
 
     def _apply_pause_precompute_cache(self, cache_path: str, datasets: dict) -> dict:
         """Populate keep_indices from the cache JSON; return cache-miss subset.
@@ -808,6 +812,7 @@ class LocalEpisodeResolver(EpisodeResolver):
                                 key_map=self.key_map,
                                 transform_list=self.transform_list,
                                 norm_stats=self.norm_stats,
+                                pause_removal_epsilon=self.pause_removal_epsilon,
                             )
                         except Exception as e:
                             logger.error(
@@ -1001,6 +1006,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                 key_map=self.key_map,
                 transform_list=self.transform_list,
                 norm_stats=self.norm_stats,
+                pause_removal_epsilon=self.pause_removal_epsilon,
                 _total_frames=num_frames,
                 _embodiment=robot_name,
             )
@@ -1202,6 +1208,139 @@ class ModalEpisodeResolver(EpisodeResolver):
             f"({total_shards} shards)"
         )
         return datasets
+
+    # ------------------------------------------------------------------
+    # Pause precompute — Modal fan-out override
+    # ------------------------------------------------------------------
+
+    def _run_pause_precompute(self, datasets: dict) -> None:
+        """Run per-episode pause precompute; no-op if epsilon is None.
+
+        Priority:
+          1. ``self.pause_precompute_cache`` (data config field) — fastest.
+          2. ``$EGOMIMIC_PAUSE_PRECOMPUTE_CACHE`` env var — legacy / Modal path.
+          3. Modal fan-out (inside Modal container with volume mount).
+
+        Raises ``RuntimeError`` if no cache is found, if cache entries are
+        missing, or if Modal fan-out fails.  The in-process thread pool
+        fallback has been removed.
+        """
+        if self.pause_removal_epsilon is None or not datasets:
+            return
+
+        cache_path = self.pause_precompute_cache or os.environ.get(PAUSE_PRECOMPUTE_CACHE_ENV)
+        if cache_path and Path(cache_path).is_file():
+            remaining = self._apply_pause_precompute_cache(cache_path, datasets)
+            if remaining:
+                raise RuntimeError(
+                    f"pause_removal_epsilon is set but {len(remaining)} episode(s) are missing "
+                    f"from the precomputed cache ({cache_path}). "
+                    "Run the pause-precompute job (e.g. pause_precompute_driver.py) to populate "
+                    "the cache before training. Missing episodes: "
+                    + ", ".join(list(remaining.keys())[:10])
+                    + ("…" if len(remaining) > 10 else "")
+                )
+            return
+
+        if self._should_use_modal_pause_precompute(datasets):
+            self._modal_fanout_pause_precompute(datasets)
+            return
+
+        raise RuntimeError(
+            "pause_removal_epsilon is set but no precomputed pause cache was found. "
+            f"Set pause_precompute_cache in your data config or export "
+            f"{PAUSE_PRECOMPUTE_CACHE_ENV}=<path/to/cache.json> and run the "
+            "pause-precompute job (e.g. pause_precompute_driver.py) first."
+        )
+
+    @staticmethod
+    def _should_use_modal_pause_precompute(datasets: dict) -> bool:
+        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
+            os.environ.get("MODAL_TASK_ID")
+        )
+        if not inside_modal:
+            return False
+        if os.environ.get("EGOMIMIC_DISABLE_MODAL_PAUSE_PRECOMPUTE") == "1":
+            return False
+        return any(
+            str(getattr(ds, "episode_path", "")).startswith("/mnt/zarr-data")
+            for ds in datasets.values()
+        )
+
+    def _modal_fanout_pause_precompute(self, datasets: dict) -> None:
+        """Compute keep_indices in parallel across egomimic-scan::pause_precompute_shard workers."""
+        import time
+
+        modal = self._import_real_modal()
+        t0 = time.monotonic()
+
+        work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
+        n = len(work)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
+        shards = [work[i::n_shards] for i in range(n_shards)]
+        shards = [s for s in shards if s]
+        total_shards = len(shards)
+
+        logger.info(
+            "Pause precompute via Modal fan-out: %d episodes across %d shards — "
+            "looking up pause_precompute_shard function...",
+            n,
+            total_shards,
+        )
+        fn = modal.Function.from_name(
+            "egomimic-scan", "pause_precompute_shard", environment_name="robotics"
+        )
+        epsilons = [self.pause_removal_epsilon] * total_shards
+
+        n_total = 0
+        n_kept = 0
+        n_errs = 0
+        completed = 0
+        log_every = max(1, total_shards // 20)
+        for shard_result in fn.map(shards, epsilons):
+            completed += 1
+            for episode_hash, raw_total, indices in shard_result:
+                ds = datasets.get(episode_hash)
+                if ds is None:
+                    n_errs += 1
+                    continue
+                if raw_total == 0:
+                    n_errs += 1
+                    continue
+                ds._raw_total_frames = int(raw_total)
+                ds.keep_indices = np.asarray(indices, dtype=np.int64)
+                n_total += raw_total
+                n_kept += len(indices)
+            if completed % log_every == 0 or completed == total_shards:
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "Pause precompute via Modal: shard %d/%d done | kept=%d/%d "
+                    "errors=%d | elapsed %.0fs",
+                    completed,
+                    total_shards,
+                    n_kept,
+                    n_total,
+                    n_errs,
+                    elapsed,
+                )
+
+        elapsed = time.monotonic() - t0
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        logger.info(
+            "Pause precompute via Modal fan-out complete (epsilon=%s): kept %d/%d "
+            "frames (%.1f%%) across %d episodes in %.1fs (errors=%d, shards=%d)",
+            self.pause_removal_epsilon,
+            n_kept,
+            n_total,
+            pct,
+            n,
+            elapsed,
+            n_errs,
+            total_shards,
+        )
+
 
 # Backward-compat alias — YAML configs that reference LocalSQLEpisodeResolver continue to work.
 LocalSQLEpisodeResolver = ModalEpisodeResolver
@@ -1454,6 +1593,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         key_map: dict,
         transform_list: list | None = None,
         norm_stats: dict | None = None,
+        pause_removal_epsilon: float | None = None,
         _total_frames: int | None = None,
         _embodiment: str | None = None,
         precomputed_metadata: dict | None = None,
@@ -1467,15 +1607,15 @@ class ZarrDataset(torch.utils.data.Dataset):
                 {"quantile_1": tensor, "quantile_99": tensor} bounds. When provided, any
                 loaded sample whose values fall outside [quantile_1, quantile_99] for any
                 tracked key triggers the random index fallback.
+            pause_removal_epsilon: when set, the resolver calls
+                ``precompute_pause_filter()`` after construction, which sets
+                ``keep_indices`` from left/right obs_ee_pose deltas. ``__len__``
+                then returns the kept count and ``__getitem__`` translates
+                through keep_indices. None leaves the episode unchanged.
             _total_frames: if provided (e.g. from SQL), skip zarr open at init and defer to first __getitem__.
             _embodiment: if provided alongside _total_frames, also skip zarr open at init.
             precomputed_metadata: full .zattrs dict pre-loaded externally (e.g. from _modal_fanout_load).
                 When provided, skips zarr open at init and populates all metadata fields immediately.
-
-        Pause filtering is driven externally: the resolver populates
-        ``keep_indices`` from a precomputed cache JSON when one is configured;
-        ``__len__`` and ``__getitem__`` honor it transparently. With no cache
-        configured, ``keep_indices`` stays ``None`` and every frame is kept.
         """
         self.episode_path = Episode_path
         self.metadata = None
@@ -1498,6 +1638,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.key_map = key_map
         self.transform = transform_list
         self.norm_stats = norm_stats or {}
+        self.pause_removal_epsilon = pause_removal_epsilon
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
@@ -1886,6 +2027,8 @@ class ZarrDataset(torch.utils.data.Dataset):
         if load_images and image_key not in self.key_map:
             return None, None
 
+        if self.pause_removal_epsilon is not None and self.keep_indices is None:
+            self.precompute_pause_filter()
         self.preload_zarr_arrays()
 
         n_logical = len(self)
@@ -1990,6 +2133,54 @@ class ZarrDataset(torch.utils.data.Dataset):
             image_decode_workers=image_decode_workers,
             load_images=True,
         )
+
+    def precompute_pause_filter(self) -> tuple[int, int]:
+        """Build the per-episode pause keep-mask from raw obs_ee_pose deltas.
+
+        Idempotent; caches on ``self.keep_indices``. Reads the pose arrays so
+        the zarr store is opened on first call. Returns
+        ``(raw_total_frames, kept_frames)``. If the episode does not have both
+        PAUSE_DETECT_KEYS, keeps all frames.
+        """
+        if self.pause_removal_epsilon is None:
+            return (self.total_frames, self.total_frames)
+        if self.keep_indices is not None:
+            return (self._raw_total_frames or self.total_frames, len(self.keep_indices))
+
+        self._ensure_episode_reader()
+        store = self.episode_reader._store
+        left_key, right_key = PAUSE_DETECT_KEYS
+        try:
+            left_pose = np.asarray(store[left_key][:])
+            right_pose = np.asarray(store[right_key][:])
+        except KeyError:
+            self._raw_total_frames = int(self.total_frames)
+            self.keep_indices = np.arange(self.total_frames, dtype=np.int64)
+            return (self.total_frames, self.total_frames)
+
+        # Keypoints are optional — some embodiments / older episodes don't
+        # have them; in that case the detector falls back to ee_pose-only.
+        left_kp_key, right_kp_key = PAUSE_DETECT_KEYPOINT_KEYS
+        left_kp = right_kp = None
+        try:
+            left_kp = np.asarray(store[left_kp_key][:])
+        except KeyError:
+            pass
+        try:
+            right_kp = np.asarray(store[right_kp_key][:])
+        except KeyError:
+            pass
+
+        keep = _build_pause_keep_mask(
+            left_pose=left_pose,
+            right_pose=right_pose,
+            epsilon=self.pause_removal_epsilon,
+            left_keypoints=left_kp,
+            right_keypoints=right_kp,
+        )
+        self._raw_total_frames = int(self.total_frames)
+        self.keep_indices = np.flatnonzero(keep).astype(np.int64)
+        return (self._raw_total_frames, int(len(self.keep_indices)))
 
     def _chunk_end_idx(self, start_idx: int, horizon: int, key_type: str | None) -> int:
         """End index (exclusive) for a windowed read starting at ``start_idx``.
