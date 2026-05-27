@@ -20,15 +20,17 @@ run_pause_precompute (orchestrator, CPU — main training image)
      shard volume + honors mode/valid_ratio/debug), and union the
      resulting shard paths.
   3. Fan out ``_pause_precompute_tar_shard.map(...)`` across up to 500
-     CPU containers — one shard per container.
-  4. Aggregate the returned dicts and write
+     CPU containers — one shard per container, all epsilons in a single
+     extraction.
+  4. Aggregate the returned dicts and write one cache per epsilon to
      ``/mnt/zarr-wds/pause_cache/<run>_eps<epsilon>/cache.json``.
 
 _pause_precompute_tar_shard (CPU worker, up to 500 concurrent)
   • Extracts the tar shard onto local NVMe (~3 GB sequential read).
-  • Opens each zarr inside; builds the keep-mask with the SAME algorithm
-    as ``_build_pause_keep_mask`` in zarr_dataset_multi (kept in sync).
-  • Returns ``{episode_hash: {"raw_total": int, "keep_indices": [int]}}``.
+  • Opens each zarr inside; computes per-frame deltas once and thresholds
+    them per epsilon. Same keep-mask algorithm as
+    ``_build_pause_keep_mask`` in zarr_dataset_multi (kept in sync).
+  • Returns ``{eps_str: {episode_hash: {"raw_total": int, "keep_indices": [int]}}}``.
   • Cleans up the extracted directory so /tmp stays bounded.
 
 Output JSON shape (matches ``_apply_pause_precompute_cache`` consumer)::
@@ -40,13 +42,14 @@ Usage
     python egomimic/modal/pause_precompute_modal.py \\
         name=pause_run description=mecka_10k \\
         pause_config_name=train_zarr_cartesian_pi \\
-        pause_epsilon=0.005 \\
+        pause_epsilon=0.0075,0.01,0.015 \\
         data=mecka_10k_pause_filter
 
-``pause_epsilon=<float>`` is required.
+``pause_epsilon=<float[,float,...]>`` is required. Pass a single value or
+a comma-separated list; one ``cache.json`` is emitted per epsilon.
 
-After completion the cache path is printed; wire it into your training
-data config::
+After completion the cache paths are printed; wire one into your
+training data config::
 
     pause_precompute_cache: /mnt/zarr-wds/pause_cache/<run>_eps<eps>/cache.json
 """
@@ -94,6 +97,16 @@ PAUSE_MAX_CONTAINERS = int(os.environ.get("EGOMIMIC_PAUSE_MAX_CONTAINERS", "500"
 _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 
 
+def _format_eps(eps: float) -> str:
+    """Canonical epsilon → string form used in cache paths and dict keys.
+
+    Keeps trailing precision (no ``0.005`` → ``0.005000000000001`` artifacts)
+    while stripping useless trailing zeros so ``0.0075`` stays ``0.0075``.
+    """
+    s = f"{eps:.10f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
 # ---------------------------------------------------------------------------
 # Shard worker
 # ---------------------------------------------------------------------------
@@ -114,15 +127,18 @@ _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 )
 def _pause_precompute_tar_shard(
     shard_id: int,
-    epsilon: float,
+    epsilons: tuple[float, ...],
     tar_path: str,
-) -> tuple[int, dict[str, dict]]:
-    """Extract one tar shard, compute keep-indices per episode inside.
+) -> tuple[int, dict[str, dict[str, dict]]]:
+    """Extract one tar shard, compute keep-indices per episode for each epsilon.
 
-    Returns ``(shard_id, {episode_hash: entry})`` where
+    Returns ``(shard_id, {eps_str: {episode_hash: entry}})`` where
     ``entry = {"raw_total": int, "keep_indices": [int, ...]}``. Failures
     collapse to ``raw_total == 0`` so the consumer surfaces them as
     cache-miss errors at training time.
+
+    Deltas are computed once per episode; only the threshold and pause-run
+    state machine are re-run per epsilon.
     """
     import shutil
     import tarfile
@@ -137,6 +153,8 @@ def _pause_precompute_tar_shard(
     LEFT_KP = "left.obs_keypoints"
     RIGHT_KP = "right.obs_keypoints"
 
+    eps_strs = [_format_eps(e) for e in epsilons]
+
     # Catch any shard writes that landed since the container last warmed.
     wds_volume.reload()
 
@@ -149,19 +167,21 @@ def _pause_precompute_tar_shard(
         per_landmark_norm = np.linalg.norm(diff, axis=-1)
         return per_landmark_norm.max(axis=-1)
 
-    def _build_keep_mask(left_pose, right_pose, left_kp, right_kp) -> np.ndarray:
-        T = len(left_pose)
+    def _keep_indices_from_deltas(
+        T: int,
+        left_d: np.ndarray,
+        right_d: np.ndarray,
+        left_kp_d: np.ndarray | None,
+        right_kp_d: np.ndarray | None,
+        epsilon: float,
+    ) -> list[int]:
         if T < 2:
-            return np.ones(T, dtype=bool)
-        left_d = np.linalg.norm(np.diff(left_pose, axis=0), axis=-1)
-        right_d = np.linalg.norm(np.diff(right_pose, axis=0), axis=-1)
+            return list(range(T))
         is_paused = (left_d < epsilon) & (right_d < epsilon)
-        if left_kp is not None and len(left_kp) == T:
-            is_paused = is_paused & (_keypoint_max_delta(np.asarray(left_kp)) < epsilon)
-        if right_kp is not None and len(right_kp) == T:
-            is_paused = is_paused & (
-                _keypoint_max_delta(np.asarray(right_kp)) < epsilon
-            )
+        if left_kp_d is not None:
+            is_paused = is_paused & (left_kp_d < epsilon)
+        if right_kp_d is not None:
+            is_paused = is_paused & (right_kp_d < epsilon)
         keep = np.ones(T, dtype=bool)
         in_pause = False
         for t in range(1, T):
@@ -172,28 +192,32 @@ def _pause_precompute_tar_shard(
                     in_pause = True
             else:
                 in_pause = False
-        return keep
+        return np.flatnonzero(keep).astype(np.int64).tolist()
 
-    def _process_episode(ep_path: Path) -> tuple[str, int, list[int]]:
+    def _process_episode(ep_path: Path) -> tuple[str, int, dict[str, list[int]]]:
+        """Returns (episode_hash, raw_total, {eps_str: keep_indices})."""
         episode_hash = ep_path.name
         if episode_hash.endswith(".zarr"):
             episode_hash = episode_hash[: -len(".zarr")]
         try:
             store = zarr.open_group(str(ep_path), mode="r")
         except Exception:
-            return (episode_hash, 0, [])
+            return (episode_hash, 0, {s: [] for s in eps_strs})
         try:
             left = np.asarray(store[LEFT_EE][:])
             right = np.asarray(store[RIGHT_EE][:])
         except KeyError:
+            # No EE pose → treat every frame as kept (consumer handles this
+            # the same way as the single-epsilon path used to).
             try:
                 sample = next(iter(store.array_keys()), None)
                 total = int(store[sample].shape[0]) if sample else 0
             except Exception:
                 total = 0
-            return (episode_hash, total, list(range(total)))
+            return (episode_hash, total, {s: list(range(total)) for s in eps_strs})
         except Exception:
-            return (episode_hash, 0, [])
+            return (episode_hash, 0, {s: [] for s in eps_strs})
+        T = int(left.shape[0])
         left_kp = right_kp = None
         try:
             left_kp = np.asarray(store[LEFT_KP][:])
@@ -203,12 +227,32 @@ def _pause_precompute_tar_shard(
             right_kp = np.asarray(store[RIGHT_KP][:])
         except Exception:
             pass
+        # Compute deltas once; they're independent of epsilon.
         try:
-            keep = _build_keep_mask(left, right, left_kp, right_kp)
+            if T < 2:
+                per_eps = {s: list(range(T)) for s in eps_strs}
+                return (episode_hash, T, per_eps)
+            left_d = np.linalg.norm(np.diff(left, axis=0), axis=-1)
+            right_d = np.linalg.norm(np.diff(right, axis=0), axis=-1)
+            left_kp_d = (
+                _keypoint_max_delta(left_kp)
+                if left_kp is not None and len(left_kp) == T
+                else None
+            )
+            right_kp_d = (
+                _keypoint_max_delta(right_kp)
+                if right_kp is not None and len(right_kp) == T
+                else None
+            )
+            per_eps = {
+                s: _keep_indices_from_deltas(
+                    T, left_d, right_d, left_kp_d, right_kp_d, e
+                )
+                for s, e in zip(eps_strs, epsilons)
+            }
         except Exception:
-            return (episode_hash, 0, [])
-        indices = np.flatnonzero(keep).astype(np.int64).tolist()
-        return (episode_hash, int(left.shape[0]), indices)
+            return (episode_hash, 0, {s: [] for s in eps_strs})
+        return (episode_hash, T, per_eps)
 
     tar_p = Path(tar_path)
     scratch = Path("/tmp") / f"shard_{shard_id}_{tar_p.stem}"
@@ -217,7 +261,7 @@ def _pause_precompute_tar_shard(
     scratch.mkdir(parents=True)
 
     t0 = _time.monotonic()
-    out: dict[str, dict] = {}
+    out: dict[str, dict[str, dict]] = {s: {} for s in eps_strs}
     try:
         try:
             with tarfile.open(str(tar_p), "r") as tar:
@@ -238,18 +282,30 @@ def _pause_precompute_tar_shard(
             return shard_id, out
 
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for episode_hash, raw_total, indices in ex.map(_process_episode, ep_dirs):
-                out[episode_hash] = {"raw_total": raw_total, "keep_indices": indices}
+            for episode_hash, raw_total, per_eps in ex.map(_process_episode, ep_dirs):
+                for s in eps_strs:
+                    out[s][episode_hash] = {
+                        "raw_total": raw_total,
+                        "keep_indices": per_eps[s],
+                    }
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
-    n_kept = sum(len(v["keep_indices"]) for v in out.values())
-    n_total = sum(v["raw_total"] for v in out.values())
-    n_err = sum(1 for v in out.values() if v["raw_total"] == 0)
-    pct = (100.0 * n_kept / n_total) if n_total else 100.0
+    n_eps = len(eps_strs)
+    n_episodes = len(out[eps_strs[0]]) if eps_strs else 0
+    summary_parts = []
+    for s in eps_strs:
+        ep_dict = out[s]
+        n_kept = sum(len(v["keep_indices"]) for v in ep_dict.values())
+        n_total = sum(v["raw_total"] for v in ep_dict.values())
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        summary_parts.append(f"eps={s}:{n_kept}/{n_total}({pct:.1f}%)")
+    n_err = sum(
+        1 for v in out[eps_strs[0]].values() if v["raw_total"] == 0
+    ) if eps_strs else 0
     print(
-        f"[pause-shard {shard_id}] {tar_p.name} | {len(out)} eps, eps={epsilon} | "
-        f"kept {n_kept}/{n_total} ({pct:.1f}%) | errors={n_err} | "
+        f"[pause-shard {shard_id}] {tar_p.name} | {n_episodes} eps × {n_eps} ε | "
+        f"{' '.join(summary_parts)} | errors={n_err} | "
         f"{_time.monotonic() - t0:.1f}s"
     )
     return shard_id, out
@@ -276,12 +332,17 @@ def run_pause_precompute(
     git_remote: str,
     git_commit: str,
     config_name: str,
-    out_subdir: str,
-    epsilon: float,
+    out_subdir_base: str,
+    epsilons: tuple[float, ...],
     init_submodules: bool = True,
     hf_token: str = "",
-) -> str:
-    """Orchestrator: hydra-compose → enumerate tar shards → fan-out → aggregate."""
+) -> list[str]:
+    """Orchestrator: hydra-compose → enumerate tar shards → fan-out → aggregate.
+
+    Writes one ``cache.json`` per epsilon to
+    ``/mnt/zarr-wds/pause_cache/<out_subdir_base>_eps<eps>/cache.json``
+    and returns the list of written paths.
+    """
     import json
     import sys as _sys
     import time as _time
@@ -370,18 +431,20 @@ def run_pause_precompute(
         )
 
     total_shards = len(tar_shards)
+    eps_strs = [_format_eps(e) for e in epsilons]
     print(
         f"[pause-precompute] {total_shards} unique shard(s) "
-        f"(epsilon={epsilon}, max_containers={PAUSE_MAX_CONTAINERS})"
+        f"(epsilons={eps_strs}, max_containers={PAUSE_MAX_CONTAINERS})"
     )
 
-    # ── Fan out: one container per shard ─────────────────────────────────────
-    shard_args: list[tuple[int, float, str]] = [
-        (i, float(epsilon), path)
+    # ── Fan out: one container per shard; all epsilons computed in one pass ──
+    eps_tuple = tuple(float(e) for e in epsilons)
+    shard_args: list[tuple[int, tuple[float, ...], str]] = [
+        (i, eps_tuple, path)
         for i, path in enumerate(sorted(tar_shards.values()))
     ]
 
-    cache: dict[str, dict] = {}
+    caches: dict[str, dict[str, dict]] = {s: {} for s in eps_strs}
     completed = 0
     n_failures = 0
     log_every = max(1, total_shards // 20)
@@ -394,39 +457,53 @@ def run_pause_precompute(
             n_failures += 1
             print(f"[pause-precompute] shard FAILED: {result!r}", file=sys.stderr)
         else:
-            _, shard_dict = result
-            cache.update(shard_dict)
+            _, shard_per_eps = result
+            for s in eps_strs:
+                caches[s].update(shard_per_eps.get(s, {}))
         if completed % log_every == 0 or completed == total_shards:
             elapsed = _time.time() - t0
+            n_eps_count = len(caches[eps_strs[0]]) if eps_strs else 0
             print(
                 f"[pause-precompute] {completed}/{total_shards} shards done | "
-                f"failures={n_failures} | episodes={len(cache)} | "
+                f"failures={n_failures} | episodes={n_eps_count} | "
                 f"elapsed {elapsed:.0f}s"
             )
 
     elapsed = _time.time() - t0
-    n_kept = sum(len(v["keep_indices"]) for v in cache.values())
-    n_total = sum(v["raw_total"] for v in cache.values())
-    n_miss = sum(1 for v in cache.values() if v["raw_total"] == 0)
-    pct = (100.0 * n_kept / n_total) if n_total else 100.0
+    summary_lines = []
+    for s in eps_strs:
+        cache = caches[s]
+        n_kept = sum(len(v["keep_indices"]) for v in cache.values())
+        n_total = sum(v["raw_total"] for v in cache.values())
+        n_miss = sum(1 for v in cache.values() if v["raw_total"] == 0)
+        pct = (100.0 * n_kept / n_total) if n_total else 100.0
+        summary_lines.append(
+            f"  eps={s}: {len(cache)} episodes, kept {n_kept}/{n_total} "
+            f"({pct:.1f}%), misses={n_miss}"
+        )
     print(
-        f"[pause-precompute] complete — {len(cache)} episodes | "
-        f"kept {n_kept}/{n_total} ({pct:.1f}%) | misses={n_miss} | "
-        f"{elapsed:.1f}s"
+        f"[pause-precompute] complete in {elapsed:.1f}s\n"
+        + "\n".join(summary_lines)
     )
 
-    # ── Write cache.json next to the shards on the wds volume ───────────────
-    out_dir = Path(WDS_MOUNT_PATH) / "pause_cache" / out_subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = out_dir / "cache.json"
-    tmp_path = cache_path.with_suffix(".json.tmp")
-    with tmp_path.open("w") as f:
-        json.dump(cache, f)
-    tmp_path.replace(cache_path)
+    # ── Write one cache.json per epsilon ────────────────────────────────────
+    out_paths: list[str] = []
+    for s in eps_strs:
+        out_dir = Path(WDS_MOUNT_PATH) / "pause_cache" / f"{out_subdir_base}_eps{s}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = out_dir / "cache.json"
+        tmp_path = cache_path.with_suffix(".json.tmp")
+        with tmp_path.open("w") as f:
+            json.dump(caches[s], f)
+        tmp_path.replace(cache_path)
+        out_paths.append(str(cache_path))
     wds_volume.commit()
 
-    print(f"\n=== DONE ===\npause_precompute_cache: {cache_path}\n")
-    return str(cache_path)
+    print("\n=== DONE ===")
+    for p in out_paths:
+        print(f"pause_precompute_cache: {p}")
+    print()
+    return out_paths
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +518,10 @@ def submit_pause_precompute(*hydra_args: str) -> None:
     Recognized non-hydra args (stripped before composition):
       - ``pause_config_name=<name>`` — Hydra training config (required, e.g.
         ``train_zarr_cartesian`` or ``train_zarr_cartesian_pi``).
-      - ``pause_epsilon=<float>`` — pause-classification epsilon (required).
-        Appended to the output subdir as ``_eps<value>``.
+      - ``pause_epsilon=<float[,float,...]>`` — pause-classification epsilons
+        (required). Accepts a single value or comma-separated list; one
+        ``cache.json`` is produced per epsilon, all computed in a single
+        shard extraction pass.
       - ``init_submodules=<bool>`` — clone with --recurse-submodules.
       - ``name=<str>`` / ``description=<str>`` — used to label the output subdir.
     """
@@ -472,21 +551,25 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         )
     if epsilon_str is None:
         raise SystemExit(
-            "pause-precompute: pause_epsilon=<float> is required "
-            "(e.g. pause_epsilon=0.005)"
+            "pause-precompute: pause_epsilon=<float[,float,...]> is required "
+            "(e.g. pause_epsilon=0.005 or pause_epsilon=0.0075,0.01,0.015)"
         )
+    raw_parts = [p.strip() for p in epsilon_str.split(",") if p.strip()]
+    if not raw_parts:
+        raise SystemExit("pause-precompute: pause_epsilon must contain at least one value")
     try:
-        epsilon = float(epsilon_str)
+        epsilons = tuple(float(p) for p in raw_parts)
     except ValueError:
         raise SystemExit(
-            f"pause-precompute: pause_epsilon must be a float, got {epsilon_str!r}"
+            f"pause-precompute: pause_epsilon entries must be floats, got {epsilon_str!r}"
         )
+    # De-dupe while preserving order so users don't pay double for typos.
+    seen: set[float] = set()
+    epsilons = tuple(e for e in epsilons if not (e in seen or seen.add(e)))
 
     import time as _time
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
-    out_subdir = (
-        f"{name or 'pause'}_{description or config_name}_eps{epsilon_str}_{timestamp}"
-    )
+    out_subdir_base = f"{name or 'pause'}_{description or config_name}_{timestamp}"
 
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
@@ -496,8 +579,8 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         )
     print(
         f"Submitting pause-precompute at commit {git_commit[:12]} from {git_remote}\n"
-        f"  config_name={config_name}  epsilon={epsilon}\n"
-        f"  out_subdir={out_subdir}"
+        f"  config_name={config_name}  epsilons={list(epsilons)}\n"
+        f"  out_subdir_base={out_subdir_base}"
     )
 
     handle = run_pause_precompute.spawn(
@@ -505,8 +588,8 @@ def submit_pause_precompute(*hydra_args: str) -> None:
         git_remote,
         git_commit,
         config_name,
-        out_subdir,
-        epsilon,
+        out_subdir_base,
+        epsilons,
         init_submodules=init_submodules,
         hf_token=_local_hf_token(),
     )
@@ -519,7 +602,7 @@ def submit_pause_precompute(*hydra_args: str) -> None:
 # ---------------------------------------------------------------------------
 # python egomimic/modal/pause_precompute_modal.py \
 #     name=… description=… pause_config_name=train_zarr_cartesian_pi \
-#     pause_epsilon=0.005 \
+#     pause_epsilon=0.0075,0.01,0.015 \
 #     data=mecka_10k_pause_filter
 # ---------------------------------------------------------------------------
 
