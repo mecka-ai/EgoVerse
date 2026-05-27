@@ -2605,6 +2605,7 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         cache_dir: str = "/tmp/shard_cache",
         seed: int = 42,
         debug: int = 0,
+        bounds_check: bool = True,
         resolver=None,
         # kept for yaml compat with old configs
         prefetch_shards: int | None = None,
@@ -2620,6 +2621,7 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         self.cache_dir = Path(cache_dir)
         self.seed = seed
         self.debug = debug
+        self.bounds_check = bounds_check
 
         all_shards = sorted(self.shard_dir.glob("shard-*.tar"))
         if not all_shards:
@@ -2891,20 +2893,38 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                 self._global_indices_by_dataset[dataset_name].append(global_idx)
 
         sample_count = 0
+        skip_count = 0
         t_start = time.perf_counter()
 
+        # Each worker owns a non-overlapping slice [worker_id::n_workers].
+        # Bounds-check is done inline so bad frames are skipped entirely —
+        # no fallback that could land outside this worker's slice.
+        do_bounds = self.bounds_check and self.data_schematic is not None
         for global_idx in range(worker_id, len(self.index_map), n_workers):
+            dataset_name, local_idx = self.index_map[global_idx]
+            dataset = self.datasets.get(dataset_name)
+            if dataset is None:
+                skip_count += 1
+                continue
             try:
-                yield self.__getitem__(global_idx)
-                sample_count += 1
+                data = dataset[local_idx]
             except Exception as exc:
-                dataset_name, local_idx = self.index_map[global_idx]
                 logger.debug("Sample error %s[%d]: %s", dataset_name, local_idx, exc)
+                skip_count += 1
+                continue
+            if do_bounds:
+                violation = self._check_bounds(data, dataset, local_idx, dataset_name)
+                if violation is not None:
+                    self._mark_rejected_index(global_idx)
+                    skip_count += 1
+                    continue
+            yield data
+            sample_count += 1
 
         elapsed = time.perf_counter() - t_start
         logger.info(
-            "Worker %d ShardEpoch %d: %d samples in %.0fs (%.1f samples/s)",
-            worker_id, gen, sample_count, elapsed,
+            "Worker %d ShardEpoch %d: %d samples yielded, %d skipped in %.0fs (%.1f samples/s)",
+            worker_id, gen, sample_count, skip_count, elapsed,
             sample_count / elapsed if elapsed else 0,
         )
 
