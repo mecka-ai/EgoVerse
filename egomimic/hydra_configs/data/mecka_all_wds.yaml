@@ -5,6 +5,7 @@ train_datasets:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
     cache_dir: /tmp/shard_cache
+    debug: 50
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -25,6 +26,7 @@ valid_datasets:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
     cache_dir: /tmp/shard_cache
+    debug: 50
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -35,18 +37,23 @@ valid_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian     
+    mode: valid
 
 train_viz_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
+    shard_dir: /mnt/zarr-wds
+    cache_dir: /tmp/shard_cache
+    debug: 50
+    key_map:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+      mode: cartesian
+    transform_list:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+      mode: cartesian
     resolver:
-      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
-      folder_path: /mnt/zarr-data
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
-        mode: cartesian
-      transform_list:
-        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
     mode: train
 
