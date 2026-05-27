@@ -2,19 +2,18 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardMultiDataset
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.TarShardMultiDataset
     shard_dir: /mnt/zarr-wds
-    # debug: 1000  # uncomment to train on first ~1000 episodes only
+    # debug: 1000  # uncomment to use first ~1000 episodes only
     mode: train
     cache_dir: /tmp/shard_cache
+    max_workers: 8  # must match train_dataloader_params.num_workers
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
     transform_list:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
       mode: cartesian
-    # Plain config block (no _target_) that trainHydra.py uses to build the norm_stats
-    # dataset via resolver.key_map. norm_mode=True is injected at runtime. Not instantiated.
     resolver:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
@@ -22,10 +21,11 @@ train_datasets:
 
 valid_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardMultiDataset
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.TarShardMultiDataset
     shard_dir: /mnt/zarr-wds
     mode: valid
     cache_dir: /tmp/shard_cache
+    max_workers: 2  # must match valid_dataloader_params.num_workers
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -40,13 +40,10 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 768
-    # Keep num_workers modest: each worker ships full image tensors via /dev/shm.
-    # 24+ workers with batch 768 commonly triggers "bus error" (shm exhaustion) on Modal.
     num_workers: 8
     persistent_workers: true
     prefetch_factor: 1
-    # shuffle must be False — TarShardMultiDataset shuffles shards/episodes/frames internally
-    shuffle: false
+    shuffle: false  # TarShardMultiDataset shuffles frames internally
 
 valid_dataloader_params:
   mecka_bimanual:
@@ -54,3 +51,4 @@ valid_dataloader_params:
     num_workers: 2
     persistent_workers: true
     prefetch_factor: 1
+    shuffle: false

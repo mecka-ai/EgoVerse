@@ -22,10 +22,17 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import multiprocessing as _mp
 import os
+import pickle
 import random
+import shutil
 import subprocess
+import tarfile
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
@@ -2569,3 +2576,337 @@ class ZarrEpisode:
     def __repr__(self) -> str:
         """String representation of the episode."""
         return f"ZarrEpisode(path={self._path}, frames={len(self)})"
+
+
+# ---------------------------------------------------------------------------
+# TarShardMultiDataset
+# ---------------------------------------------------------------------------
+# One tar shard per epoch. Inherits MultiDataset.__getitem__ (bounds-checking,
+# rejection, index map) and ZarrDataset episode reading. Worker-0 orchestrates
+# shard extraction and prefetch; all DataLoader workers call __getitem__ via the
+# shared index map produced by worker-0.
+# ---------------------------------------------------------------------------
+
+_SHARD_EPISODES_NOMINAL = 20  # used only for debug-mode shard count
+
+
+class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
+    """One tar shard per epoch; DataLoader workers call MultiDataset.__getitem__."""
+
+    def __init__(
+        self,
+        shard_dir: str,
+        key_map=None,
+        transform_list=None,
+        norm_stats=None,
+        pause_removal_epsilon: float | None = None,
+        mode: str = "train",
+        valid_ratio: float = 0.1,
+        cache_dir: str = "/tmp/shard_cache",
+        seed: int = 42,
+        debug: int = 0,
+        max_workers: int = 12,
+        resolver=None,
+        # kept for yaml compat with old configs
+        prefetch_shards: int | None = None,
+        **kwargs,
+    ):
+        self.shard_dir = Path(shard_dir)
+        self.key_map = key_map
+        self.transform_list = transform_list
+        self.norm_stats = norm_stats
+        self.pause_removal_epsilon = pause_removal_epsilon
+        self.mode = mode
+        self.valid_ratio = valid_ratio
+        self.cache_dir = Path(cache_dir)
+        self.seed = seed
+        self.debug = debug
+        self.max_workers = max_workers
+
+        all_shards = sorted(self.shard_dir.glob("shard-*.tar"))
+        if not all_shards:
+            raise RuntimeError(
+                f"No shard-*.tar files found in {self.shard_dir}. "
+                "Run shard_zarr_to_tar.py first."
+            )
+
+        if debug > 0:
+            n_shards = max(1, math.ceil(debug / _SHARD_EPISODES_NOMINAL))
+            all_shards = all_shards[:n_shards]
+            logger.info(
+                "TarShardMultiDataset debug=%d: using first %d shards (~%d episodes)",
+                debug, len(all_shards), len(all_shards) * _SHARD_EPISODES_NOMINAL,
+            )
+
+        rng = random.Random(seed)
+        shuffled = list(all_shards)
+        rng.shuffle(shuffled)
+        n_valid = max(1, int(len(shuffled) * valid_ratio))
+        if mode == "valid":
+            self._shards = shuffled[:n_valid]
+        elif mode == "train":
+            self._shards = shuffled[n_valid:]
+        else:
+            self._shards = shuffled
+
+        # MultiDataset state (no datasets yet — built per-epoch)
+        self.datasets: dict[str, ZarrDataset] = {}
+        self._init_multidataset_state()
+
+        # Epoch tracking and worker synchronization.
+        # max_workers MUST equal the DataLoader's num_workers.
+        self._epoch_gen = 0
+        self._epoch_barrier = _mp.Barrier(max_workers)
+
+        # Prefetch state — only mutated inside worker-0's process.
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_ready = threading.Event()
+        self._prefetch_ok = False
+
+        # Don't call MultiDataset.__init__ (needs a datasets dict we don't have yet).
+        torch.utils.data.Dataset.__init__(self)
+
+        logger.info(
+            "TarShardMultiDataset [%s]: %d shards, max_workers=%d, shard_dir=%s",
+            mode, len(self._shards), max_workers, shard_dir,
+        )
+
+    # ------------------------------------------------------------------
+    # MultiDataset / trainHydra wiring
+    # ------------------------------------------------------------------
+
+    def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
+        self.data_schematic = data_schematic
+        self.bounds_slack = bounds_slack
+        if hasattr(data_schematic, "norm_stats") and self.norm_stats is None:
+            self.norm_stats = data_schematic.norm_stats
+
+    def __len__(self) -> int:
+        if self.index_map:
+            return len(self.index_map)
+        return len(self._shards) * _SHARD_EPISODES_NOMINAL * 2000
+
+    def __getitem__(self, idx: int):
+        # Called from the main process for shape probing by trainHydra.
+        if not self.index_map:
+            self._ensure_probe_shard()
+        return super().__getitem__(idx)  # MultiDataset.__getitem__
+
+    # ------------------------------------------------------------------
+    # Shared filesystem paths (stable across all worker processes)
+    # ------------------------------------------------------------------
+
+    @property
+    def _current_dir(self) -> Path:
+        return self.cache_dir / "extractor" / "current"
+
+    @property
+    def _next_dir(self) -> Path:
+        return self.cache_dir / "extractor" / "next"
+
+    @property
+    def _index_map_path(self) -> Path:
+        return self.cache_dir / "index_map.pkl"
+
+    # ------------------------------------------------------------------
+    # Worker-0 helpers
+    # ------------------------------------------------------------------
+
+    def _pick_shard(self, epoch_gen: int) -> Path:
+        """Random shard for train; sequential cycle for valid."""
+        if self.mode == "valid":
+            return self._shards[(epoch_gen - 1) % len(self._shards)]
+        return self._shards[
+            random.Random(self.seed + epoch_gen).randrange(len(self._shards))
+        ]
+
+    def _extract(self, shard_path: Path, dest: Path) -> None:
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        t0 = time.perf_counter()
+        size_mb = shard_path.stat().st_size / 1e6
+        with tarfile.open(shard_path, "r") as tf:
+            tf.extractall(path=dest)
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "Extracted %s  %.0f MB in %.1fs (%.0f MB/s)",
+            shard_path.name, size_mb, elapsed, size_mb / elapsed if elapsed else 0,
+        )
+
+    def _start_prefetch(self, shard_path: Path) -> None:
+        """Background thread: extract shard_path into _next_dir."""
+        dest = self._next_dir
+        self._prefetch_ready.clear()
+        self._prefetch_ok = False
+
+        def _run() -> None:
+            try:
+                self._extract(shard_path, dest)
+                self._prefetch_ok = True
+            except Exception as exc:
+                logger.warning("Prefetch failed for %s: %s", shard_path.name, exc)
+            finally:
+                self._prefetch_ready.set()
+
+        self._prefetch_thread = threading.Thread(target=_run, daemon=True)
+        self._prefetch_thread.start()
+        logger.info("Prefetch started: %s", shard_path.name)
+
+    def _build_epoch_index(self, tar_dir: Path, *, shuffle: bool) -> None:
+        """Load all episodes from tar_dir into self.datasets and rebuild index_map."""
+        datasets: dict[str, ZarrDataset] = {}
+        for ep_dir in sorted(tar_dir.iterdir()):
+            if not ep_dir.is_dir() or not (ep_dir / "zarr.json").exists():
+                continue
+            try:
+                ds = ZarrDataset(
+                    ep_dir,
+                    key_map=self.key_map,
+                    transform_list=self.transform_list,
+                    norm_stats=self.norm_stats,
+                    pause_removal_epsilon=self.pause_removal_epsilon,
+                )
+                if self.data_schematic is not None:
+                    ds.set_data_schematic(self.data_schematic, bounds_slack=self.bounds_slack)
+                datasets[ep_dir.name] = ds
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", ep_dir.name, exc)
+
+        self.datasets = datasets
+        self._build_index_map_from_datasets()
+        if shuffle:
+            random.Random(self.seed + self._epoch_gen).shuffle(self.index_map)
+
+        logger.info(
+            "ShardEpoch %d: %d episodes, %d frames from %s",
+            self._epoch_gen, len(self.datasets), len(self.index_map), tar_dir.name,
+        )
+
+    def _ensure_probe_shard(self) -> None:
+        """Extract one shard and build index for main-process shape probing."""
+        if self._current_dir.exists() and self.index_map:
+            return
+        probe = self._pick_shard(1)
+        logger.info("Probe: extracting %s for shape inference", probe.name)
+        self._extract(probe, self._current_dir)
+        self._epoch_gen = 1
+        self._build_epoch_index(self._current_dir, shuffle=False)
+
+    # ------------------------------------------------------------------
+    # Iteration — one full shard per epoch
+    # ------------------------------------------------------------------
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            # Main-process probe: yield one sample for shape inference.
+            self._ensure_probe_shard()
+            yield self[0]
+            return
+
+        worker_id = worker_info.id
+        n_workers = worker_info.num_workers
+        sequential = self.mode == "valid"
+        self._epoch_gen += 1
+        gen = self._epoch_gen
+        self.reset_rejected_indices()
+
+        # ------------------------------------------------------------------
+        # Worker-0: swap shard, build index, start prefetch.
+        # ------------------------------------------------------------------
+        if worker_id == 0:
+            if gen == 1:
+                shard = self._pick_shard(gen)
+                logger.info("ShardEpoch 1 cold start: extracting %s", shard.name)
+                self._extract(shard, self._current_dir)
+            else:
+                # Wait for the prefetch thread (should already be done mid-epoch).
+                t_wait = time.perf_counter()
+                self._prefetch_ready.wait(timeout=300)
+                waited = time.perf_counter() - t_wait
+                if waited > 1.0:
+                    logger.warning(
+                        "ShardEpoch %d: waited %.1fs for prefetch — "
+                        "extraction is slower than one epoch",
+                        gen, waited,
+                    )
+                # Delete old current, rename next → current.
+                if self._current_dir.exists():
+                    shutil.rmtree(self._current_dir, ignore_errors=True)
+                if self._prefetch_ok and self._next_dir.exists():
+                    self._next_dir.rename(self._current_dir)
+                    logger.info("ShardEpoch %d: swapped prefetch → current", gen)
+                else:
+                    logger.warning("ShardEpoch %d: prefetch unavailable, extracting synchronously", gen)
+                    self._extract(self._pick_shard(gen), self._current_dir)
+
+            self._build_epoch_index(self._current_dir, shuffle=not sequential)
+
+            # Write shuffled index map to shared file for other workers.
+            self._index_map_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._index_map_path, "wb") as f:
+                pickle.dump(self.index_map, f)
+
+            # Start prefetching the next shard while workers consume this one.
+            self._start_prefetch(self._pick_shard(gen + 1))
+
+        # ------------------------------------------------------------------
+        # Barrier: all workers wait until worker-0 finishes setup.
+        # ------------------------------------------------------------------
+        try:
+            self._epoch_barrier.wait(timeout=300)
+        except Exception as exc:
+            logger.warning("Epoch barrier failed (%s); proceeding", exc)
+
+        # ------------------------------------------------------------------
+        # All workers: load shared index map, rebuild datasets, yield frames.
+        # ------------------------------------------------------------------
+        with open(self._index_map_path, "rb") as f:
+            self.index_map = pickle.load(f)
+
+        self.datasets = {}
+        for ep_dir in sorted(self._current_dir.iterdir()):
+            if not ep_dir.is_dir() or not (ep_dir / "zarr.json").exists():
+                continue
+            try:
+                ds = ZarrDataset(
+                    ep_dir,
+                    key_map=self.key_map,
+                    transform_list=self.transform_list,
+                    norm_stats=self.norm_stats,
+                    pause_removal_epsilon=self.pause_removal_epsilon,
+                )
+                if self.data_schematic is not None:
+                    ds.set_data_schematic(self.data_schematic, bounds_slack=self.bounds_slack)
+                self.datasets[ep_dir.name] = ds
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", ep_dir.name, exc)
+
+        # Rebuild per-dataset global-index lookup (needed by MultiDataset.__getitem__).
+        self._global_indices_by_dataset = {name: [] for name in self.datasets}
+        for global_idx, (dataset_name, _) in enumerate(self.index_map):
+            if dataset_name in self._global_indices_by_dataset:
+                self._global_indices_by_dataset[dataset_name].append(global_idx)
+
+        sample_count = 0
+        t_start = time.perf_counter()
+
+        for global_idx in range(worker_id, len(self.index_map), n_workers):
+            try:
+                yield self.__getitem__(global_idx)
+                sample_count += 1
+            except Exception as exc:
+                dataset_name, local_idx = self.index_map[global_idx]
+                logger.debug("Sample error %s[%d]: %s", dataset_name, local_idx, exc)
+
+        elapsed = time.perf_counter() - t_start
+        logger.info(
+            "Worker %d ShardEpoch %d: %d samples in %.0fs (%.1f samples/s)",
+            worker_id, gen, sample_count, elapsed,
+            sample_count / elapsed if elapsed else 0,
+        )
+
+
+# Backward-compatible aliases for existing Hydra configs.
+TarShardIterableDataset = TarShardMultiDataset
