@@ -534,12 +534,6 @@ def _prepare_repo(
         ],
         check=True,
     )
-    oat_dir = Path(CFG.remote_repo_dir) / "external" / "oat"
-    if oat_dir.exists():
-        subprocess.run(
-            [CFG.python_bin, "-m", "pip", "install", "-e", str(oat_dir), "--no-deps", "-q"],
-            check=True,
-        )
 
     # Make openpi (external/openpi/src, imported by egomimic.algo.pi for pi0.5
     # models) importable in EVERY python process — including Lightning DDP child
