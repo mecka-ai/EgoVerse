@@ -256,12 +256,15 @@ class DataSchematic(object):
                     )
                     return
 
+        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
         loader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
             num_workers=num_workers,
-            shuffle=True,
-            generator=torch.Generator().manual_seed(seed),
+            **({} if is_iterable else {
+                "shuffle": True,
+                "generator": torch.Generator().manual_seed(seed),
+            }),
         )
 
         N = len(dataset)
