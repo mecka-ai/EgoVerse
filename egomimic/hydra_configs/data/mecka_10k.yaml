@@ -40,7 +40,7 @@ valid_datasets:
         mode: cartesian
     mode: valid
 train_dataloader_params:
-  mecka_bimanual:yes 
+  mecka_bimanual:
     batch_size: 32
     num_workers: 10
     persistent_workers: true
