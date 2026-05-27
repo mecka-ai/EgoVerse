@@ -4,7 +4,6 @@ train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
-    mode: train
     cache_dir: /tmp/shard_cache
     debug: 500 
     key_map:
@@ -25,7 +24,6 @@ valid_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
-    mode: valid
     cache_dir: /tmp/shard_cache
     debug: 500  
     key_map:
