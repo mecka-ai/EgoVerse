@@ -58,7 +58,7 @@ train_viz_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 64
-    num_workers: 30
+    num_workers: 10
     persistent_workers: true
     prefetch_factor: 4
     shuffle: false
@@ -66,7 +66,7 @@ train_dataloader_params:
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 64
-    num_workers: 10
+    num_workers: 2
     persistent_workers: true
     prefetch_factor: 2
     shuffle: false
@@ -74,7 +74,7 @@ valid_dataloader_params:
 train_viz_dataloader_params:
   mecka_bimanual:
     batch_size: 64
-    num_workers: 10
+    num_workers: 2
     persistent_workers: true
     prefetch_factor: 2
     shuffle: false
