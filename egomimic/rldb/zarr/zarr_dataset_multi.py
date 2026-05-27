@@ -1596,6 +1596,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
         super().__init__()
 
+    def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
+        """Propagate norm stats from a DataSchematic into this episode dataset."""
+        if hasattr(data_schematic, "norm_stats") and not self.norm_stats:
+            self.norm_stats = data_schematic.norm_stats
+
     def _ensure_episode_reader(self):
         """Open the zarr store on first access if it was deferred at init."""
         if self.episode_reader is None:
