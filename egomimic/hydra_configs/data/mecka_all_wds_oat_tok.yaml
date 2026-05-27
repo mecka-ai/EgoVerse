@@ -20,8 +20,6 @@ train_datasets:
     shard_dir: /mnt/zarr-wds
     mode: train
     cache_dir: /tmp/shard_cache
-    prefetch_shards: 2
-    max_workers: 30
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -39,8 +37,6 @@ valid_datasets:
     shard_dir: /mnt/zarr-wds
     mode: valid
     cache_dir: /tmp/shard_cache
-    prefetch_shards: 1
-    max_workers: 2
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
