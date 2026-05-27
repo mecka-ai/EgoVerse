@@ -167,7 +167,6 @@ class OATTokenizerTrainer(Algo):
             metrics[f"{embodiment_name}_reconst_mse"] = mse
         return metrics, {}
 
-    @override
     def visualize_preds(self, predictions, batch):
         return None
 
