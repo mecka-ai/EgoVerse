@@ -2605,7 +2605,6 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         cache_dir: str = "/tmp/shard_cache",
         seed: int = 42,
         debug: int = 0,
-        max_workers: int = 12,
         resolver=None,
         # kept for yaml compat with old configs
         prefetch_shards: int | None = None,
@@ -2621,7 +2620,6 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         self.cache_dir = Path(cache_dir)
         self.seed = seed
         self.debug = debug
-        self.max_workers = max_workers
 
         all_shards = sorted(self.shard_dir.glob("shard-*.tar"))
         if not all_shards:
@@ -2654,9 +2652,9 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         self._init_multidataset_state()
 
         # Epoch tracking and worker synchronization.
-        # max_workers MUST equal the DataLoader's num_workers.
+        # Barrier is created lazily in __iter__ once n_workers is known.
         self._epoch_gen = 0
-        self._epoch_barrier = _mp.Barrier(max_workers)
+        self._epoch_barrier: _mp.Barrier | None = None
 
         # Prefetch state — only mutated inside worker-0's process.
         self._prefetch_thread: threading.Thread | None = None
@@ -2667,8 +2665,8 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         torch.utils.data.Dataset.__init__(self)
 
         logger.info(
-            "TarShardMultiDataset [%s]: %d shards, max_workers=%d, shard_dir=%s",
-            mode, len(self._shards), max_workers, shard_dir,
+            "TarShardMultiDataset [%s]: %d shards, shard_dir=%s",
+            mode, len(self._shards), shard_dir,
         )
 
     # ------------------------------------------------------------------
@@ -2853,7 +2851,10 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
 
         # ------------------------------------------------------------------
         # Barrier: all workers wait until worker-0 finishes setup.
+        # Created lazily here so we use the real n_workers from DataLoader.
         # ------------------------------------------------------------------
+        if self._epoch_barrier is None or self._epoch_barrier.parties != n_workers:
+            self._epoch_barrier = _mp.Barrier(n_workers)
         try:
             self._epoch_barrier.wait(timeout=300)
         except Exception as exc:

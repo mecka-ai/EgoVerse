@@ -7,7 +7,6 @@ train_datasets:
     # debug: 1000  # uncomment to use first ~1000 episodes only
     mode: train
     cache_dir: /tmp/shard_cache
-    max_workers: 8  # must match train_dataloader_params.num_workers
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -25,7 +24,6 @@ valid_datasets:
     shard_dir: /mnt/zarr-wds
     mode: valid
     cache_dir: /tmp/shard_cache
-    max_workers: 2  # must match valid_dataloader_params.num_workers
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
