@@ -80,7 +80,7 @@ def _propagate_data_schematic_to_datasets(data_schematic, datasets, bounds_slack
     """
     split_datasets = datasets
     for dataset_name, dataset in split_datasets.items():
-        if not isinstance(dataset, MultiDataset):
+        if not isinstance(dataset, MultiDataset) and not hasattr(dataset, "set_data_schematic"):
             raise ValueError(
                 f"{dataset_name} is not a MultiDataset. All top level datasets in data config should be MultiDataset"
             )
