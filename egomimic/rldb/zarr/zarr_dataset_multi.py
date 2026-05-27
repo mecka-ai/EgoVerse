@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import multiprocessing as _mp
 import os
 import pickle
 import random
@@ -2653,10 +2652,8 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         self.datasets: dict[str, ZarrDataset] = {}
         self._init_multidataset_state()
 
-        # Epoch tracking and worker synchronization.
-        # Barrier is created lazily in __iter__ once n_workers is known.
+        # Epoch tracking. Sync uses a file sentinel (no /dev/shm / multiprocessing.Barrier).
         self._epoch_gen = 0
-        self._epoch_barrier: _mp.Barrier | None = None
 
         # Prefetch state — only mutated inside worker-0's process.
         self._prefetch_thread: threading.Thread | None = None
@@ -2707,6 +2704,9 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
     @property
     def _index_map_path(self) -> Path:
         return self.cache_dir / "index_map.pkl"
+
+    def _epoch_ready_path(self, gen: int) -> Path:
+        return self.cache_dir / f"epoch_{gen}.ready"
 
     # ------------------------------------------------------------------
     # Worker-0 helpers
@@ -2816,6 +2816,11 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         # Worker-0: swap shard, build index, start prefetch.
         # ------------------------------------------------------------------
         if worker_id == 0:
+            # Remove previous epoch's ready sentinel so it can't be mistaken
+            # for this epoch's. Also removes any stale files from crashed runs.
+            for stale in self.cache_dir.glob("epoch_*.ready"):
+                stale.unlink(missing_ok=True)
+
             if gen == 1:
                 shard = self._pick_shard(gen)
                 logger.info("ShardEpoch 1 cold start: extracting %s", shard.name)
@@ -2848,19 +2853,24 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
             with open(self._index_map_path, "wb") as f:
                 pickle.dump(self.index_map, f)
 
+            # Signal all workers that epoch setup is done.
+            self._epoch_ready_path(gen).touch()
+
             # Start prefetching the next shard while workers consume this one.
             self._start_prefetch(self._pick_shard(gen + 1))
 
         # ------------------------------------------------------------------
-        # Barrier: all workers wait until worker-0 finishes setup.
-        # Created lazily here so we use the real n_workers from DataLoader.
+        # All workers: wait for worker-0's setup sentinel (file-based, no shm).
         # ------------------------------------------------------------------
-        if self._epoch_barrier is None or self._epoch_barrier.parties != n_workers:
-            self._epoch_barrier = _mp.Barrier(n_workers)
-        try:
-            self._epoch_barrier.wait(timeout=300)
-        except Exception as exc:
-            logger.warning("Epoch barrier failed (%s); proceeding", exc)
+        ready_path = self._epoch_ready_path(gen)
+        t_deadline = time.monotonic() + 300
+        while not ready_path.exists():
+            if time.monotonic() > t_deadline:
+                raise RuntimeError(
+                    f"Worker {worker_id}: timeout waiting for epoch {gen} index map "
+                    f"(expected {ready_path})"
+                )
+            time.sleep(0.05)
 
         # ------------------------------------------------------------------
         # All workers: load shared index map, rebuild datasets, yield frames.
