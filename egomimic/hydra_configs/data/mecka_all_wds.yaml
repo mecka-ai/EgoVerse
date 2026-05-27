@@ -40,7 +40,7 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 768
-    num_workers: 8
+    num_workers: 30
     persistent_workers: true
     prefetch_factor: 1
     shuffle: false  # TarShardMultiDataset shuffles frames internally
