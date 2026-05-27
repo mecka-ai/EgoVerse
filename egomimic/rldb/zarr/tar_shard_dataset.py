@@ -385,6 +385,7 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         sequential = self.mode == "valid"
         self._epoch_gen += 1
         local_epoch_gen = self._epoch_gen
+        self.reset_rejected_indices()
 
         if worker_id == 0:
             gen = local_epoch_gen

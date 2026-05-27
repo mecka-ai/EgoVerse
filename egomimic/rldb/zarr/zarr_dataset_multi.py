@@ -1448,6 +1448,34 @@ class MultiDataset(torch.utils.data.Dataset):
         self._n_violation_samples = 0
         self._violation_log_every = 100
         self._shape_mismatch_warned: set = set()
+        self._rejected_global_indices: set[int] = set()
+        self._rejected_local_frames: dict[str, set[int]] = {}
+
+    def reset_rejected_indices(self) -> None:
+        """Clear out-of-bounds indices rejected during the current epoch/shard."""
+        self._rejected_global_indices.clear()
+        self._rejected_local_frames.clear()
+
+    def _mark_rejected_index(self, global_idx: int) -> None:
+        """Remember a frame that failed bounds so it is not loaded again."""
+        self._rejected_global_indices.add(global_idx)
+        dataset_name, local_idx = self.index_map[global_idx]
+        self._rejected_local_frames.setdefault(dataset_name, set()).add(local_idx)
+
+    def _is_rejected_index(self, global_idx: int) -> bool:
+        if global_idx in self._rejected_global_indices:
+            return True
+        dataset_name, local_idx = self.index_map[global_idx]
+        return local_idx in self._rejected_local_frames.get(dataset_name, set())
+
+    def _valid_fallback_candidates(self, dataset_name: str) -> list[int]:
+        rejected_local = self._rejected_local_frames.get(dataset_name, set())
+        return [
+            g
+            for g in self._global_indices_by_dataset[dataset_name]
+            if g not in self._rejected_global_indices
+            and self.index_map[g][1] not in rejected_local
+        ]
 
     def _build_index_map_from_datasets(
         self, datasets: dict | None = None
@@ -1517,6 +1545,20 @@ class MultiDataset(torch.utils.data.Dataset):
         Multidataset handles outlier rejection so that you don't need to propagate the norm stats down to every sub dataset.
         """
         dataset_name, local_idx = self.index_map[idx]
+
+        if self._is_rejected_index(idx):
+            candidates = self._valid_fallback_candidates(dataset_name)
+            next_idx, attempts = get_fallback_idx(
+                idx=idx,
+                candidates=candidates,
+                _attempts=_attempts,
+                max_attempts=len(candidates),
+                exhausted_error=(
+                    f"Entire dataset bad (no valid indices): dataset={dataset_name}"
+                ),
+            )
+            return self.__getitem__(next_idx, _attempts=attempts)
+
         dataset = self.datasets[dataset_name]
         data = dataset[local_idx]
 
@@ -1525,11 +1567,13 @@ class MultiDataset(torch.utils.data.Dataset):
 
         violation = self._check_bounds(data, dataset, local_idx, dataset_name)
         if violation is not None:
+            self._mark_rejected_index(idx)
+            candidates = self._valid_fallback_candidates(dataset_name)
             next_idx, attempts = get_fallback_idx(
                 idx=idx,
-                candidates=self._global_indices_by_dataset[dataset_name],
+                candidates=candidates,
                 _attempts=_attempts,
-                max_attempts=len(self._global_indices_by_dataset[dataset_name]),
+                max_attempts=len(candidates),
                 exhausted_error=(
                     f"Entire dataset bad (no valid indices): dataset={dataset_name}"
                 ),
