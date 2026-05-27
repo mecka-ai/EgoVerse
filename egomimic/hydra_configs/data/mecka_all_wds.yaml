@@ -40,7 +40,9 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 768
-    num_workers: 24
+    # Keep num_workers modest: each worker ships full image tensors via /dev/shm.
+    # 24+ workers with batch 768 commonly triggers "bus error" (shm exhaustion) on Modal.
+    num_workers: 8
     persistent_workers: true
     prefetch_factor: 1
     # shuffle must be False — TarShardMultiDataset shuffles shards/episodes/frames internally

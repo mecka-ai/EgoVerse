@@ -29,6 +29,26 @@ OmegaConf.register_new_resolver("multiply", lambda x, y: int(float(x)) * int(flo
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
+def _configure_dataloader_shm() -> None:
+    """Avoid DataLoader bus errors when /dev/shm is small (common on Modal/Docker).
+
+    Workers pass tensors through shared memory; large batches × many workers can
+    exceed the default shm cap. ``file_system`` uses disk-backed handles instead.
+    Override with env ``TORCH_SHARING_STRATEGY=default`` to disable.
+    """
+    strategy = os.environ.get("TORCH_SHARING_STRATEGY", "file_system")
+    if not strategy or strategy == "default":
+        return
+    try:
+        torch.multiprocessing.set_sharing_strategy(strategy)
+        log.info("torch multiprocessing sharing_strategy=%s", strategy)
+    except RuntimeError:
+        pass
+
+
+_configure_dataloader_shm()
+
+
 def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
     model_cfg = copy.deepcopy(cfg.model)
     if (
