@@ -178,6 +178,23 @@ class TarShardIterableDataset(torch.utils.data.IterableDataset):
                         ep_hash = ep_hash[:-5]
 
                     try:
+                        # Validate required zarr keys exist before constructing
+                        # ZarrDataset — avoids hundreds of per-frame retries for
+                        # episodes missing a camera or sensor key entirely.
+                        if self.key_map:
+                            store = zarr.open(str(ep_dir), mode="r")
+                            missing = [
+                                v["zarr_key"]
+                                for v in self.key_map.values()
+                                if "zarr_key" in v and v["zarr_key"] not in store
+                            ]
+                            if missing:
+                                logger.warning(
+                                    "Skipping %s: missing zarr keys %s",
+                                    ep_hash,
+                                    missing,
+                                )
+                                continue
                         ds = ZarrDataset(
                             ep_dir,
                             key_map=self.key_map,
