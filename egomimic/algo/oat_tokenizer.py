@@ -155,7 +155,6 @@ class OATTokenizerTrainer(Algo):
                 recons_dict[f"{embodiment_name}_{ac_key}"] = recons
         return recons_dict
 
-    @override
     def forward_eval_logging(self, batch):
         metrics: Dict[str, torch.Tensor] = {}
         for embodiment_id, _batch in batch.items():
