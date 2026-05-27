@@ -45,8 +45,8 @@ train_dataloader_params:
     num_workers: 10
     persistent_workers: true
     prefetch_factor: 2
-    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
     shuffle: false
+    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
 
 valid_dataloader_params:
   mecka_bimanual:
@@ -54,3 +54,4 @@ valid_dataloader_params:
     num_workers: 10
     persistent_workers: true
     prefetch_factor: 1
+    shuffle: false
