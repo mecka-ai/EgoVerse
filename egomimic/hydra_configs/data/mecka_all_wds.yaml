@@ -6,7 +6,6 @@ train_datasets:
     shard_dir: /mnt/zarr-wds
     mode: train
     cache_dir: /tmp/shard_cache
-    debug: 50  # 50 shards × 20 eps/shard ≈ 1000 episodes
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -19,6 +18,7 @@ train_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+    mode: train
 
 valid_datasets:
   mecka_bimanual:
@@ -26,7 +26,6 @@ valid_datasets:
     shard_dir: /mnt/zarr-wds
     mode: valid
     cache_dir: /tmp/shard_cache
-    debug: 50  # 50 shards × 20 eps/shard ≈ 1000 episodes
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
       mode: cartesian
@@ -37,19 +36,60 @@ valid_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+    mode: valid
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
+    shard_dir: /mnt/zarr-wds
+    mode: valid
+    cache_dir: /tmp/shard_cache
+    key_map:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+      mode: cartesian
+    transform_list:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+      mode: cartesian
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian     
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
 
 train_dataloader_params:
   mecka_bimanual:
-    batch_size: 32
-    num_workers: 8
+    batch_size: 64
+    num_workers: 30
     persistent_workers: true
-    prefetch_factor: 2
-    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
+    prefetch_factor: 4
     shuffle: false
 
 valid_dataloader_params:
   mecka_bimanual:
-    batch_size: 32
-    num_workers: 2
+    batch_size: 64
+    num_workers: 10
     persistent_workers: true
-    prefetch_factor: 1
+    prefetch_factor: 2
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 10
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: false
+
