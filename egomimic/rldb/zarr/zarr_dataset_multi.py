@@ -984,14 +984,13 @@ class ModalEpisodeResolver(EpisodeResolver):
         matched = matched.sort_values("episode_hash").reset_index(drop=True)
         logger.info("SQL filter matched %d episodes", len(matched))
 
-        if not episode_hashes:
+        if matched.empty:
             raise ValueError("SQL filter matched no episodes.")
 
         if self.debug:
             k = 10 if self.debug is True else int(self.debug)
             matched = matched.iloc[:k]
-            episode_hashes = matched["episode_hash"].tolist()
-            logger.info("Debug mode: using first %d episodes", len(episode_hashes))
+            logger.info("Debug mode: using first %d episodes", len(matched))
 
         if self.max_episodes is not None and len(matched) > self.max_episodes:
             before = len(matched)
@@ -1002,9 +1001,13 @@ class ModalEpisodeResolver(EpisodeResolver):
                 len(matched),
             )
 
-        out: list[tuple[str, Path, int, str]] = []
+        dataset_class = self._dataset_class or ZarrDataset
+        datasets: dict[str, ZarrDataset] = {}
         n_missing = 0
-        for episode_hash, (num_frames, robot_name) in meta_lookup.items():
+        for _, row in matched.iterrows():
+            episode_hash = row["episode_hash"]
+            num_frames = int(row["num_frames"])
+            robot_name = str(row["robot_name"])
             local_path = next(
                 (
                     p
