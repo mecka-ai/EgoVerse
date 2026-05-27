@@ -611,7 +611,6 @@ class AutoregressivePolicy(Algo):
 
         return unnorm_preds
 
-    @override
     def forward_eval_logging(self, batch):
         preds = self.forward_eval(batch)
         metrics = {}
@@ -622,7 +621,6 @@ class AutoregressivePolicy(Algo):
             images_dict[embodiment_id] = ims
         return metrics, images_dict
 
-    @override
     def visualize_preds(self, predictions, batch):
         if self.viz_func is None:
             raise ValueError("viz_func is not set")
