@@ -235,6 +235,87 @@ def get_fallback_idx(
     return random.choice(valid_candidates), attempts
 
 
+def check_sample_bounds(
+    data: dict,
+    data_schematic,
+    *,
+    episode_name: str,
+    frame_idx: int,
+    bounds_slack: float = 0.0,
+    shape_mismatch_warned: set | None = None,
+) -> str | None:
+    """Return a violation message if sample is outside norm quantile bounds.
+
+    Shared by MultiDataset and TarShardMultiDataset so reject_outliers behaves
+    the same across map-style and shard-per-epoch iterable training.
+    """
+    if data_schematic is None:
+        return None
+
+    embodiment_id = data.get("embodiment")
+    if embodiment_id is None:
+        raise ValueError("data has no embodiment metadata")
+
+    norm_stats = data_schematic.norm_stats.get(embodiment_id, {})
+    if not norm_stats:
+        return None
+
+    if shape_mismatch_warned is None:
+        shape_mismatch_warned = set()
+
+    for key_name, stats in norm_stats.items():
+        zarr_key = data_schematic.keyname_to_zarr_key(key_name, embodiment_id)
+        if zarr_key is None or zarr_key not in data:
+            continue
+
+        v = data[zarr_key]
+        if isinstance(v, torch.Tensor):
+            arr = v.float()
+        elif isinstance(v, np.ndarray):
+            arr = torch.from_numpy(v).float()
+        else:
+            continue
+
+        q_low = stats.get(
+            "quantile_0_01",
+            stats.get("quantile_0_1", stats["quantile_1"]),
+        )
+        q_high = stats.get(
+            "quantile_99_99",
+            stats.get("quantile_99_9", stats["quantile_99"]),
+        )
+        q_low = torch.as_tensor(q_low, device=arr.device, dtype=torch.float32)
+        q_high = torch.as_tensor(q_high, device=arr.device, dtype=torch.float32)
+        if bounds_slack:
+            q_low = q_low - bounds_slack
+            q_high = q_high + bounds_slack
+
+        try:
+            q_low = torch.broadcast_to(q_low, arr.shape)
+            q_high = torch.broadcast_to(q_high, arr.shape)
+        except RuntimeError:
+            shape_warn_key = (str(zarr_key), tuple(arr.shape), tuple(q_low.shape))
+            if shape_warn_key not in shape_mismatch_warned:
+                shape_mismatch_warned.add(shape_warn_key)
+                logger.warning(
+                    "Skipping bounds check for key=%s due to incompatible shapes: value=%s q_low=%s",
+                    zarr_key,
+                    tuple(arr.shape),
+                    tuple(q_low.shape),
+                )
+            continue
+
+        if torch.any(torch.isnan(arr)) or torch.any(torch.isinf(arr)):
+            return f"NaN/Inf violation ep={episode_name} frame={frame_idx} key={zarr_key}"
+
+        if torch.any(arr < q_low) or torch.any(arr > q_high):
+            return (
+                f"Bounds violation ep={episode_name} frame={frame_idx} key={zarr_key}"
+            )
+
+    return None
+
+
 class EpisodeResolver:
     """
     Base class for episode resolution utilities.
@@ -732,7 +813,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
     ):
         import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
@@ -1345,8 +1426,37 @@ class MultiDataset(torch.utils.data.Dataset):
         self.datasets = {rid: ds for rid, ds in datasets.items() if rid in chosen}
         assert self.datasets, "No datasets left after applying mode split."
 
+        for dataset_name, dataset in self.datasets.items():
+            if isinstance(dataset, torch.utils.data.IterableDataset):
+                raise TypeError(
+                    "MultiDataset expects map-style datasets with __len__/__getitem__. "
+                    f"Got IterableDataset for '{dataset_name}'. "
+                    "Use the iterable dataset directly in the datamodule config."
+                )
+
+        self._init_multidataset_state()
+        self._build_index_map_from_datasets()
+        super().__init__()
+
+    def _init_multidataset_state(self) -> None:
+        """Initialize index-map and bounds-check state (also used by TarShardMultiDataset)."""
+        self.index_map: list[tuple[str, int]] = []
+        self._global_indices_by_dataset: dict[str, list[int]] = {}
+        self.data_schematic = None
+        self.bounds_slack = 0.0
+        self._n_samples_checked = 0
+        self._n_violation_samples = 0
+        self._violation_log_every = 100
+        self._shape_mismatch_warned: set = set()
+
+    def _build_index_map_from_datasets(
+        self, datasets: dict | None = None
+    ) -> None:
+        """Rebuild flat (dataset_name, local_idx) index from ``self.datasets`` or override."""
+        if datasets is not None:
+            self.datasets = datasets
         self.index_map = []
-        self._global_indices_by_dataset: dict[str, list[int]] = {
+        self._global_indices_by_dataset = {
             dataset_name: [] for dataset_name in self.datasets
         }
         for dataset_name, dataset in self.datasets.items():
@@ -1354,13 +1464,6 @@ class MultiDataset(torch.utils.data.Dataset):
                 global_idx = len(self.index_map)
                 self.index_map.append((dataset_name, local_idx))
                 self._global_indices_by_dataset[dataset_name].append(global_idx)
-
-        self.data_schematic = None
-        self._n_samples_checked = 0
-        self._n_violation_samples = 0
-        self._violation_log_every = 100
-
-        super().__init__()
 
     def __len__(self) -> int:
         return len(self.index_map)
@@ -1378,71 +1481,19 @@ class MultiDataset(torch.utils.data.Dataset):
         if self.data_schematic is None:
             return None
 
-        embodiment_id = data.get("embodiment")
-        if embodiment_id is None:
-            raise ValueError("data has no embodiment metadata")
-
-        norm_stats = self.data_schematic.norm_stats.get(embodiment_id, {})
-        if not norm_stats:
-            return None
-
         self._n_samples_checked += 1
-        prefix: str | None = None
+        if not hasattr(self, "_shape_mismatch_warned"):
+            self._shape_mismatch_warned = set()
 
-        for key_name, stats in norm_stats.items():
-            zarr_key = self.data_schematic.keyname_to_zarr_key(key_name, embodiment_id)
-            if zarr_key is None or zarr_key not in data:
-                continue
-
-            v = data[zarr_key]
-            if isinstance(v, torch.Tensor):
-                arr = v.float()
-            elif isinstance(v, np.ndarray):
-                arr = torch.from_numpy(v).float()
-            else:
-                continue
-
-            q_low = stats.get(
-                "quantile_0_01",
-                stats.get("quantile_0_1", stats["quantile_1"]),
-            )
-            q_high = stats.get(
-                "quantile_99_99",
-                stats.get("quantile_99_9", stats["quantile_99"]),
-            )
-            q_low = torch.as_tensor(q_low, device=arr.device, dtype=torch.float32)
-            q_high = torch.as_tensor(q_high, device=arr.device, dtype=torch.float32)
-
-            try:
-                q_low = torch.broadcast_to(q_low, arr.shape)
-                q_high = torch.broadcast_to(q_high, arr.shape)
-            except RuntimeError:
-                shape_warn_key = (str(zarr_key), tuple(arr.shape), tuple(q_low.shape))
-                if shape_warn_key not in getattr(self, "_shape_mismatch_warned", set()):
-                    if not hasattr(self, "_shape_mismatch_warned"):
-                        self._shape_mismatch_warned = set()
-                    self._shape_mismatch_warned.add(shape_warn_key)
-                    logger.warning(
-                        "Skipping bounds check for key=%s due to incompatible shapes: value=%s q_low=%s",
-                        zarr_key,
-                        tuple(arr.shape),
-                        tuple(q_low.shape),
-                    )
-                continue
-
-            if torch.any(torch.isnan(arr)) or torch.any(torch.isinf(arr)):
-                episode_name = self._episode_name_for_dataset(dataset, dataset_name)
-                prefix = (
-                    f"NaN/Inf violation ep={episode_name} frame={idx} key={zarr_key}"
-                )
-                break
-
-            if torch.any(arr < q_low) or torch.any(arr > q_high):
-                episode_name = self._episode_name_for_dataset(dataset, dataset_name)
-                prefix = (
-                    f"Bounds violation ep={episode_name} frame={idx} key={zarr_key}"
-                )
-                break
+        episode_name = self._episode_name_for_dataset(dataset, dataset_name)
+        prefix = check_sample_bounds(
+            data,
+            self.data_schematic,
+            episode_name=episode_name,
+            frame_idx=idx,
+            bounds_slack=getattr(self, "bounds_slack", 0.0),
+            shape_mismatch_warned=self._shape_mismatch_warned,
+        )
 
         if prefix is not None:
             self._n_violation_samples += 1
@@ -1603,6 +1654,8 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._raw_total_frames: int | None = None
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
         super().__init__()
+        if self.episode_reader is not None:
+            self._validate_required_keys()
 
     def _ensure_episode_reader(self):
         """Open the zarr store on first access if it was deferred at init."""
@@ -1654,6 +1707,37 @@ class ZarrDataset(torch.utils.data.Dataset):
         """
         features = self.metadata.get("features", {})
         return {key for key, info in features.items() if info.get("dtype") == "json"}
+
+    def _validate_required_keys(self) -> None:
+        """Raise ValueError if any zarr key required by key_map is absent or unreadable.
+
+        Called eagerly at __init__ time so tar_shard_dataset skips bad episodes
+        with one warning before any frame loop starts — no O(N²) retries.
+        """
+        store = self.episode_reader._store
+        missing = []
+        for spec in self.key_map.values():
+            zarr_key = spec.get("zarr_key")
+            if not zarr_key or spec.get("key_type") == "annotation_keys":
+                continue
+            try:
+                store[zarr_key]
+            except KeyError:
+                missing.append(zarr_key)
+        if missing:
+            raise ValueError(
+                f"ep={Path(self.episode_path).name} missing zarr keys: {missing}"
+            )
+        # Probe frame 0 of each image key: zarr fill value (empty bytes) means
+        # missing inner chunks — no frame in this episode will decode.
+        for spec in self.key_map.values():
+            zarr_key = spec.get("zarr_key")
+            if zarr_key and zarr_key in self._image_keys:
+                probe = store[zarr_key][0:1][0]
+                if isinstance(probe, (bytes, bytearray)) and len(probe) == 0:
+                    raise ValueError(
+                        f"ep={Path(self.episode_path).name} has missing inner chunks for key {zarr_key}"
+                    )
 
     @staticmethod
     def _decode_json_entry(value):
@@ -2057,10 +2141,19 @@ class ZarrDataset(torch.utils.data.Dataset):
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
         """Decode one JPEG payload to float32 CHW in [0, 1]."""
+        # Unwrap types returned by zarr v3 reading zarr v2 VLenBytes arrays
+        if isinstance(jpeg_bytes, np.void):
+            jpeg_bytes = jpeg_bytes.item()
+        if isinstance(jpeg_bytes, memoryview):
+            jpeg_bytes = jpeg_bytes.tobytes()
+        if isinstance(jpeg_bytes, bytearray):
+            jpeg_bytes = bytes(jpeg_bytes)
         if isinstance(jpeg_bytes, np.ndarray):
             if jpeg_bytes.dtype == np.uint8 and jpeg_bytes.ndim >= 2:
                 return np.transpose(jpeg_bytes, (2, 0, 1)).astype(np.float32) / 255.0
             jpeg_bytes = jpeg_bytes.item() if jpeg_bytes.ndim == 0 else jpeg_bytes[0]
+        if not isinstance(jpeg_bytes, bytes):
+            jpeg_bytes = bytes(jpeg_bytes)
         decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
         return np.transpose(decoded, (2, 0, 1)).astype(np.float32) / 255.0
 
