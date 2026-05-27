@@ -2767,8 +2767,6 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                     norm_stats=self.norm_stats,
                     pause_removal_epsilon=self.pause_removal_epsilon,
                 )
-                if self.data_schematic is not None:
-                    ds.set_data_schematic(self.data_schematic, bounds_slack=self.bounds_slack)
                 datasets[ep_dir.name] = ds
             except Exception as exc:
                 logger.warning("Skipping %s: %s", ep_dir.name, exc)
@@ -2790,7 +2788,8 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         probe = self._pick_shard(1)
         logger.info("Probe: extracting %s for shape inference", probe.name)
         self._extract(probe, self._current_dir)
-        self._epoch_gen = 1
+        # Do NOT advance _epoch_gen here — workers inherit this value, and
+        # gen==1 in __iter__ is the signal for the cold-start branch.
         self._build_epoch_index(self._current_dir, shuffle=False)
 
     # ------------------------------------------------------------------
@@ -2822,9 +2821,13 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                 stale.unlink(missing_ok=True)
 
             if gen == 1:
-                shard = self._pick_shard(gen)
-                logger.info("ShardEpoch 1 cold start: extracting %s", shard.name)
-                self._extract(shard, self._current_dir)
+                if self._current_dir.exists() and self.index_map:
+                    # Probe already extracted this shard — reuse it directly.
+                    logger.info("ShardEpoch 1: reusing probe shard")
+                else:
+                    shard = self._pick_shard(gen)
+                    logger.info("ShardEpoch 1 cold start: extracting %s", shard.name)
+                    self._extract(shard, self._current_dir)
             else:
                 # Wait for the prefetch thread (should already be done mid-epoch).
                 t_wait = time.perf_counter()
@@ -2890,8 +2893,6 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                     norm_stats=self.norm_stats,
                     pause_removal_epsilon=self.pause_removal_epsilon,
                 )
-                if self.data_schematic is not None:
-                    ds.set_data_schematic(self.data_schematic, bounds_slack=self.bounds_slack)
                 self.datasets[ep_dir.name] = ds
             except Exception as exc:
                 logger.warning("Skipping %s: %s", ep_dir.name, exc)
