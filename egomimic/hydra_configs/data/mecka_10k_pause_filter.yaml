@@ -1,10 +1,9 @@
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
-
+pause_precompute_cache: /mnt/zarr-wds/pause_cache/pause_run_mecka_10k_eps0.005_2026-05-27_17-33-43/cache.json
 train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
-    mode: train
     cache_dir: /tmp/shard_cache
     debug: 500 
     key_map:
@@ -25,7 +24,6 @@ valid_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
     shard_dir: /mnt/zarr-wds
-    mode: valid
     cache_dir: /tmp/shard_cache
     debug: 500  
     key_map:
@@ -45,8 +43,8 @@ train_dataloader_params:
     num_workers: 10
     persistent_workers: true
     prefetch_factor: 2
-    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
     shuffle: false
+    # shuffle must be False — TarShardIterableDataset shuffles shards/episodes/frames internally
 
 valid_dataloader_params:
   mecka_bimanual:
@@ -54,3 +52,4 @@ valid_dataloader_params:
     num_workers: 10
     persistent_workers: true
     prefetch_factor: 1
+    shuffle: false
