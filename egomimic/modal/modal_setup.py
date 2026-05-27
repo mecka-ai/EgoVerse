@@ -500,6 +500,8 @@ def _prepare_repo(
         ["git", "-C", CFG.remote_repo_dir, "checkout", git_commit], check=True
     )
     if init_submodules:
+        # Only init external/oat — openpi and its sub-submodules (aloha, libero)
+        # are not needed for tokenizer training and take ~13 min to clone.
         subprocess.run(
             [
                 "git",
@@ -508,7 +510,7 @@ def _prepare_repo(
                 "submodule",
                 "update",
                 "--init",
-                "--recursive",
+                "external/oat",
             ],
             check=True,
         )
