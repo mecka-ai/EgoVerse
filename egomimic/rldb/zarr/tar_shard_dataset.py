@@ -52,6 +52,7 @@ from typing import Iterator
 
 import torch
 import torch.utils.data
+import zarr
 
 logger = logging.getLogger(__name__)
 
