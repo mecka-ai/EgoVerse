@@ -6,7 +6,7 @@ train_datasets:
     shard_dir: /mnt/zarr-wds
     # debug: 1000  # uncomment to use first ~1000 episodes only
     mode: train
-    cache_dir: /tmp/shard_cache
+    cache_dir: /cache/shard_cache
     bounds_check: true
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
@@ -24,7 +24,7 @@ valid_datasets:
     _target_: egomimic.rldb.zarr.zarr_dataset_multi.TarShardMultiDataset
     shard_dir: /mnt/zarr-wds
     mode: valid
-    cache_dir: /tmp/shard_cache
+    cache_dir: /cache/shard_cache
     bounds_check: true
     key_map:
       _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap

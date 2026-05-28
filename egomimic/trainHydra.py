@@ -30,12 +30,22 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 
 def _configure_dataloader_shm() -> None:
-    """Avoid DataLoader bus errors when /dev/shm is small (common on Modal/Docker).
+    """Avoid DataLoader bus errors when /dev/shm or /tmp tmpfs is small.
 
-    Workers pass tensors through shared memory; large batches × many workers can
-    exceed the default shm cap. ``file_system`` uses disk-backed handles instead.
-    Override with env ``TORCH_SHARING_STRATEGY=default`` to disable.
+    Modal/Docker containers have /tmp as a RAM-backed tmpfs (cap ~50% of RAM).
+    Large batches × many workers can overflow it even with an ephemeral disk,
+    because the ephemeral disk extends / (root overlay) but not the /tmp tmpfs.
+
+    Two things:
+    1. Use ``file_system`` sharing strategy (tensors via disk files, not /dev/shm).
+    2. Redirect tensor temp files to /cache, which sits on the ephemeral disk
+       (root overlay), not the RAM-backed /tmp tmpfs.
+
+    Override strategy with env ``TORCH_SHARING_STRATEGY=default`` to disable.
+    Override temp dir with env ``TORCH_MP_TEMP_DIR``.
     """
+    import tempfile
+
     strategy = os.environ.get("TORCH_SHARING_STRATEGY", "file_system")
     if not strategy or strategy == "default":
         return
@@ -44,6 +54,23 @@ def _configure_dataloader_shm() -> None:
         log.info("torch multiprocessing sharing_strategy=%s", strategy)
     except RuntimeError:
         pass
+
+    # Redirect tensor temp files off /tmp (tmpfs) onto the ephemeral disk.
+    # Try /cache first (Modal ephemeral disk root); fall back to /var or /root.
+    explicit = os.environ.get("TORCH_MP_TEMP_DIR")
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = ["/cache", "/var/torch_mp", "/root/torch_mp"]
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            tempfile.tempdir = candidate
+            os.environ["TMPDIR"] = candidate
+            log.info("torch multiprocessing temp_dir=%s", candidate)
+            break
+        except OSError:
+            continue
 
 
 _configure_dataloader_shm()
