@@ -4,6 +4,9 @@ import signal
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch.multiprocessing as _mp
+_mp.set_sharing_strategy("file_system")
+
 import hydra
 import lightning as L
 import torch
