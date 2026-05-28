@@ -112,13 +112,6 @@ class ModelWrapper(LightningModule):
             sync_dist=True,
         )
         self.log(
-            "TimingStep/Process_Batch_Sec",
-            t1 - t0,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=False,
-        )
-        self.log(
             "Timing/Forward_Pass_Sec",
             t2 - t1,
             on_step=False,
@@ -126,25 +119,11 @@ class ModelWrapper(LightningModule):
             sync_dist=True,
         )
         self.log(
-            "TimingStep/Forward_Pass_Sec",
-            t2 - t1,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=False,
-        )
-        self.log(
             "Timing/Compute_Losses_Sec",
             t3 - t2,
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-        )
-        self.log(
-            "TimingStep/Compute_Losses_Sec",
-            t3 - t2,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=False,
         )
 
         # Average over both the hand and robot batch if applicable
@@ -169,24 +148,7 @@ class ModelWrapper(LightningModule):
         info = {}
         info["losses"] = TensorUtils.detach(losses)
         for k, v in self.model.log_info(info).items():
-            self.log("TrainStep/" + k, v, sync_dist=False, on_step=True, on_epoch=False)
-            self.log("TrainEpoch/" + k, v, sync_dist=True, on_step=False, on_epoch=True)
-
-        # Explicit x-axis helpers for W&B custom charts by step.
-        self.log(
-            "TrainStep/global_step",
-            float(self.global_step),
-            sync_dist=False,
-            on_step=True,
-            on_epoch=False,
-        )
-        self.log(
-            "TrainStep/epoch",
-            float(self.current_epoch),
-            sync_dist=False,
-            on_step=True,
-            on_epoch=False,
-        )
+            self.log("Train/" + k, v, sync_dist=True, on_step=False, on_epoch=True)
 
         return losses["action_loss"]
 
