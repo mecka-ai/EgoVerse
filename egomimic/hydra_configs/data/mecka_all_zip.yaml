@@ -58,7 +58,7 @@ train_viz_datasets:
     cache_dir: /cache/zarr_cache_valid
     n_prefetch_epochs: 1
     n_prefetch_workers: 1
-    n_copy_threads: 4
+    n_copy_threads: 8
 
 train_dataloader_params:
   mecka_bimanual:
