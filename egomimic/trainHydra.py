@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import hydra
 import lightning as L
 import torch
+import torch.multiprocessing as _mp
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
