@@ -47,7 +47,7 @@ train_viz_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
-      debug: 10000
+      debug: 1000
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
