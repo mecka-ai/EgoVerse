@@ -4,8 +4,6 @@ import signal
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import torch.multiprocessing as _mp
-
 import hydra
 import lightning as L
 import torch
@@ -29,11 +27,6 @@ from egomimic.utils.utils import extras, task_wrapper
 OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("multiply", lambda x, y: int(float(x)) * int(float(y)))
 log = RankedLogger(__name__, rank_zero_only=True)
-
-# Use file_system strategy so worker tensor IPC goes to TMPDIR (NVMe /cache/torch_tmp
-# set by run_hydra_train) instead of /dev/shm. Called after all imports to avoid
-# import-time races where a newly created temp file is accessed by a subsequent import.
-_mp.set_sharing_strategy("file_system")
 
 
 def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
