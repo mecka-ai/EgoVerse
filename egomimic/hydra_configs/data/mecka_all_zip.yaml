@@ -43,7 +43,7 @@ valid_datasets:
 
 train_viz_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedIterableDataset
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
     resolver:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
@@ -58,7 +58,7 @@ train_viz_datasets:
     cache_dir: /cache/zarr_cache_valid
     n_prefetch_epochs: 1
     n_prefetch_workers: 1
-    n_copy_threads: 8
+    n_copy_threads: 4
 
 train_dataloader_params:
   mecka_bimanual:
