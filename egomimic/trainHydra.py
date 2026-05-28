@@ -1,11 +1,16 @@
-import copy
 import os
+import tempfile as _tempfile
+
+# Must be before ANY torch import — torch seeds tempfile's internal cache on first use.
+os.environ["TMPDIR"] = "/cache"
+_tempfile.tempdir = "/cache"
+
+import copy
 import signal
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch.multiprocessing as _mp
-os.environ.setdefault("TMPDIR", "/cache")
 _mp.set_sharing_strategy("file_system")
 
 import hydra
