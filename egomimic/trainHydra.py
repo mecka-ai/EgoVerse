@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch.multiprocessing as _mp
+os.environ.setdefault("TMPDIR", "/cache")
 _mp.set_sharing_strategy("file_system")
 
 import hydra
