@@ -5,10 +5,17 @@ defaults:
   - trainer: ddp
   - debug: null
   - logger: wandb
-  - data: eva
+  - data: mecka_all_zarr
   - callbacks: checkpoints
   - data_schematic: default
   - evaluator: eval_hpt
+  # Optional second evaluator for the train_viz val pass (dataloader_idx=1).
+  # Defaults to null (disabled). Enable via CLI:
+  #   evaluator@train_viz_evaluator=train_viz_hpt
+  # which loads hydra_configs/evaluator/train_viz_hpt.yaml into
+  # cfg.train_viz_evaluator. Pair with a data config that defines
+  # `train_viz_datasets`.
+  - evaluator@train_viz_evaluator: train_viz_hpt
   - override hydra/launcher: submitit
   - _self_
 
