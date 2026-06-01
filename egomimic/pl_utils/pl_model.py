@@ -68,6 +68,10 @@ class ModelWrapper(LightningModule):
 
         self.epoch_memory_stats = []  # Store memory stats per epoch
         self.evaluator = evaluator
+        # Optional second evaluator that consumes dataloader_idx=1 (the
+        # train_viz val pass). Wired by trainHydra.py when the data config
+        # populates train_viz_datasets.
+        self.train_viz_evaluator = None
 
     @staticmethod
     def _as_config(cfg):
@@ -199,30 +203,47 @@ class ModelWrapper(LightningModule):
             sync_dist=True,
         )
 
+    def _evaluator_for(self, dataloader_idx: int):
+        """Route val batches by dataloader_idx: 0 → eval, 1 → train_viz."""
+        if dataloader_idx == 0:
+            return self.evaluator
+        if dataloader_idx == 1:
+            return self.train_viz_evaluator
+        return None
+
     def on_validation_start(self):
         if self.evaluator is None:
             return
         self.model.device = self.device
 
         self.evaluator.on_validation_start()
+        if self.train_viz_evaluator is not None:
+            self.train_viz_evaluator.on_validation_start()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        """
-        Run a validation step on the batch, and save that batch of images into the val_image_buffer.  Once the buffer hits 1000 images, save that as a 30fps video using torchvision.io.write_video.
-        """
-        if self.evaluator is None:
+        evaluator = self._evaluator_for(dataloader_idx)
+        if evaluator is None:
             return
+        # When val_dataloader returns a list of CombinedLoaders (train_viz
+        # eval pass), Lightning's fetcher wraps each inner CombinedLoader
+        # batch as (batch_dict, batch_idx, sub_loader_idx).  Unwrap so
+        # process_batch_for_training always receives the raw dict.
+        if isinstance(batch, tuple) and len(batch) == 3 and isinstance(batch[0], dict):
+            batch = batch[0]
         batch = self.model.process_batch_for_training(batch)
         print(
-            f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}",
+            f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}, "
+            f"dataloader_idx={dataloader_idx}",
             flush=True,
         )
-        self.evaluator.on_validation_step(batch, batch_idx, dataloader_idx)
+        evaluator.on_validation_step(batch, batch_idx, dataloader_idx)
 
     def on_validation_end(self):
         print(f"[ON_VALIDATION_END] rank={self.global_rank}", flush=True)
         if self.evaluator is not None:
             self.evaluator.on_validation_end()
+        if self.train_viz_evaluator is not None:
+            self.train_viz_evaluator.on_validation_end()
 
         print(
             f"Rank {self.global_rank} on validation end, waiting for all ranks to synchronize",
