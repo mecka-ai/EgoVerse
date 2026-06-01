@@ -1,0 +1,95 @@
+# Data config for OAT tokenizer training on the zip-based pool architecture.
+#
+# Mirrors mecka_zip_a100 (single-A100 sliding-window NVMe pool) but tunes
+# batch sizes for the OAT tokenizer, which has no image encoder so forward
+# passes are very cheap even though images are still in the batch (needed for
+# the eval-time video viz that overlays GT vs reconstructed action chunks).
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_all_zip_oat_tok trainer=ddp_modal logger=wandb \
+#     model=oat_tokenizer evaluator=eval_tokenizer_video \
+#     name=<run> description=<desc> \
+#     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=1024 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false reject_outliers=false \
+#     launch_params.gpus_per_node=1
+#
+# Disk budget (1024 GB ephemeral):
+#   train pool ............ 280 GB
+#   valid pool .............. 80 GB
+#   probe + torch tmp ....... ~10 GB
+#   headroom ............... 650 GB
+#
+# Train pool sizing math (OAT tokenizer):
+#   batch_size 256 × limit_train_batches 100 = 25,600 frames/epoch
+#   ~500 eps/epoch × 1.5 lookahead = 750 eps held simultaneously
+#   At ~200 MB worst-case per episode: ~150 GB
+#   Capacity 280 GB → comfortable headroom.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 500
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 280
+    lookahead_epochs: 1.5
+    n_copy_threads: 32
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 300
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 80
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    # OAT tokenizer has no image encoder — forward pass is cheap even with
+    # images in the batch (needed for the eval-time viz overlay). Use a much
+    # larger batch than the HPT zip configs (which sit at 128 on a single A100).
+    batch_size: 256
+    num_workers: 16
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    # Validation batches feed the per-frame action-overlay viz; keep moderate
+    # so 1000-frame buffer flush fires every few batches without long stalls.
+    batch_size: 128
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
