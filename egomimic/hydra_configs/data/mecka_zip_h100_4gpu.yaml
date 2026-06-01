@@ -1,0 +1,93 @@
+# 4×H100 — sliding-window NVMe pool, disk-bound (deep prefetch for max GPU uptime).
+#
+# Global batch 512 = 128/rank × 4 ranks. 128 fully loads an H100 80 GB for a
+# ~300M model without wasting VRAM (the reason this targets H100 and not the
+# larger-VRAM H200/B200, which would sit half-empty at this batch size).
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_h100_4gpu trainer=ddp_modal logger=wandb \
+#     model=hpt_bc_flow_mecka_300m name=<run> description=<desc> \
+#     +modal_gpu=H100:4 +modal_cpu=96 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=2000 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false
+#
+# To trade saturation for wall-clock, change only two numbers:
+#   8×H100 → +modal_gpu=H100:8, batch_size 64   (more parallel, each GPU lighter)
+#   2×H100 → +modal_gpu=H100:2, batch_size 256  (max per-GPU saturation, less parallel)
+#
+# Disk budget (2000 GB ephemeral):
+#   train pool ........... 1500 GB  (filler fills to 0.92 → ~1380 GB live)
+#   valid pool ............. 150 GB
+#   /cache/torch_tmp + probe ~30 GB
+#   headroom .............. ~320 GB
+#
+# Train pool sizing (disk-bound, not lookahead-bound):
+#   episodes_per_epoch 1500 × lookahead 4.0 = 6000 eps the filler tries to stage ahead.
+#   At ~200 MB worst-case per episode that is ~1200 GB, under the 1380 GB live ceiling,
+#   so the pool runs nearly full at steady state — the GPUs always read warm NVMe.
+#   n_copy_threads 48 keeps extraction throughput well above the ~512 frames/step
+#   consumption rate so the window never collapses onto the training cursor.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 1500
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 1500
+    lookahead_epochs: 4.0
+    n_copy_threads: 48
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 400
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 150
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128          # per rank; global = 128 × 4 = 512
+    num_workers: 16          # × 4 ranks = 64 workers (cpu=96, OMP=1 → ~68 cores)
+    persistent_workers: false  # REQUIRED: workers respawn each epoch to inherit
+                               # PrefetchEpochCallback's fresh index_map via fork
+    prefetch_factor: 6       # 16 × 6 = 96 batches buffered per rank
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false

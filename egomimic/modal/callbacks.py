@@ -54,6 +54,20 @@ class ModalAutoRestartCallback(Callback):
         trainer.save_checkpoint(ckpt_path)
         log.info(f"[ModalAutoRestart] Checkpoint saved → {ckpt_path}")
 
+        # Persist the checkpoint to the outputs volume BEFORE spawning the
+        # continuation. run_hydra_train only commits after trainer.fit() unwinds,
+        # which is after this callback returns — so without an explicit commit
+        # here the continuation can start reading ckpt_path before it exists on
+        # the volume. Commit once, on rank zero (the mount is shared).
+        if trainer.is_global_zero:
+            try:
+                import modal as _modal
+
+                _modal.Volume.from_name("egoverse-training-outputs").commit()
+                log.info("[ModalAutoRestart] Committed checkpoint to outputs volume")
+            except Exception as exc:
+                log.error(f"[ModalAutoRestart] Volume commit failed: {exc}")
+
         wandb_run_id = None
         for lgr in trainer.loggers:
             if hasattr(lgr, "experiment") and hasattr(lgr.experiment, "id"):
