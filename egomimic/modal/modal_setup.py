@@ -246,7 +246,7 @@ image = (
 
 zarr_volume = modal.Volume.from_name("mecka_data_v2")
 wds_volume = modal.Volume.from_name("mecka_data_wds_v2", create_if_missing=True)
-zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True)
+zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True, version=2)
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
 # Map volume name → (Modal Volume object, container mount path)

@@ -157,6 +157,30 @@ def run_hydra_train(
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("HYDRA_FULL_ERROR", "1")
+    env.setdefault("WANDB_START_METHOD", "thread")
+    # Tensor IPC temp files → NVMe /cache (trainHydra enables file_system when TMPDIR is set).
+    # Prefer /cache/torch_tmp whenever /cache is writable (ephemeral disk or not).
+    _torch_tmp = "/cache/torch_tmp"
+    try:
+        os.makedirs(_torch_tmp, exist_ok=True)
+        test_file = os.path.join(_torch_tmp, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("1")
+        os.remove(test_file)
+        env["TMPDIR"] = _torch_tmp
+        print(f"DataLoader IPC: TMPDIR={_torch_tmp} (use +modal_ephemeral_disk_gb=600 if /cache is missing)")
+    except OSError:
+        if _ephemeral:
+            raise
+        print(
+            "WARNING: /cache/torch_tmp not writable — DataLoader will use /dev/shm. "
+            "Add +modal_ephemeral_disk_gb=600 to avoid SIGBUS with num_workers>8."
+        )
+    # Prevent thread explosion: many DataLoader workers × many CPU cores otherwise.
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
     if wandb_api_key:
         env["WANDB_API_KEY"] = wandb_api_key
 
