@@ -1,6 +1,7 @@
 import copy
 import os
 import signal
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import hydra
@@ -17,12 +18,14 @@ from egomimic.pl_utils.pl_model import ModelWrapper
 from egomimic.rldb.zarr.utils import DataSchematic, set_global_seed
 from egomimic.rldb.zarr.zarr_dataset_multi import MultiDataset
 from egomimic.utils.aws.aws_data_utils import load_env
+from egomimic.utils.dataloader_ipc import configure_dataloader_ipc
 from egomimic.utils.instantiators import instantiate_callbacks, instantiate_loggers
 from egomimic.utils.logging_utils import log_hyperparameters
 from egomimic.utils.pylogger import RankedLogger
 from egomimic.utils.utils import extras, task_wrapper
 
 OmegaConf.register_new_resolver("eval", eval)
+OmegaConf.register_new_resolver("multiply", lambda x, y: int(float(x)) * int(float(y)))
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
@@ -37,7 +40,11 @@ def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
     return OmegaConf.create({"model": model_cfg})
 
 
-def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> None:
+def _log_dataset_frame_counts(
+    train_datasets: dict,
+    valid_datasets: dict,
+    train_viz_datasets: dict | None = None,
+) -> None:
     rows = []
     for name, ds in train_datasets.items():
         rows.append(("train", name, len(ds)))
@@ -50,6 +57,16 @@ def _log_dataset_frame_counts(train_datasets: dict, valid_datasets: dict) -> Non
     if valid_datasets:
         rows.append(
             ("TOTAL", "(valid)", sum(len(ds) for ds in valid_datasets.values()))
+        )
+    if train_viz_datasets:
+        for name, ds in train_viz_datasets.items():
+            rows.append(("train_viz", name, len(ds)))
+        rows.append(
+            (
+                "TOTAL",
+                "(train_viz)",
+                sum(len(ds) for ds in train_viz_datasets.values()),
+            )
         )
     table = tabulate(
         rows,
@@ -64,11 +81,11 @@ def _propagate_data_schematic_to_datasets(data_schematic, datasets, bounds_slack
     """
     Set the shared data schematic on all top-level datasets.
     """
-    split_datasets = datasets
-    for dataset_name, dataset in split_datasets.items():
-        if not isinstance(dataset, MultiDataset):
+    for dataset_name, dataset in datasets.items():
+        if not hasattr(dataset, "set_data_schematic"):
             raise ValueError(
-                f"{dataset_name} is not a MultiDataset. All top level datasets in data config should be MultiDataset"
+                f"{dataset_name} does not implement set_data_schematic(). "
+                "Dataset must be a MultiDataset or PrefetchedIterableDataset."
             )
         dataset.set_data_schematic(data_schematic, bounds_slack=bounds_slack)
 
@@ -84,6 +101,10 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     :param cfg: A DictConfig configuration composed by Hydra.
     :return: A tuple with metrics and dict with all instantiated objects.
     """
+    # DDP rank processes are spawned after this call; IPC is configured again in
+    # MultiDataModuleWrapper.train_dataloader() where DataLoaders are built.
+    configure_dataloader_ipc()
+
     # set seed for random number generators in pytorch, numpy and python.random
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -110,17 +131,32 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             cfg.data.valid_datasets[dataset_name]
         )
 
+    train_viz_datasets = {}
+    train_viz_cfg = OmegaConf.select(cfg, "data.train_viz_datasets", default=None)
+    if train_viz_cfg:
+        for dataset_name in train_viz_cfg:
+            entry = train_viz_cfg[dataset_name]
+            if entry is None:
+                continue
+            train_viz_datasets[dataset_name] = hydra.utils.instantiate(entry)
+
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     assert (
         "MultiDataModuleWrapper" in cfg.data._target_
     ), "cfg.data._target_ must be 'MultiDataModuleWrapper'"
     datamodule: LightningDataModule = hydra.utils.instantiate(
-        cfg.data, train_datasets=train_datasets, valid_datasets=valid_datasets
+        cfg.data,
+        train_datasets=train_datasets,
+        valid_datasets=valid_datasets,
+        train_viz_datasets=train_viz_datasets,
     )
 
     for dataset_name, dataset in datamodule.train_datasets.items():
         log.info(f"Inferring shapes for dataset <{dataset_name}>")
+        t_shape = time.perf_counter()
         data_schematic.infer_shapes_from_batch(dataset[0])
+        log.info(f"[Timing] Shape inference for {dataset_name}: {time.perf_counter() - t_shape:.2f}s")
+
         instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
         keymap_cfg = instantiate_copy.resolver.key_map
         km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
@@ -131,6 +167,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         instantiate_copy.resolver.key_map = km
         norm_dataset = hydra.utils.instantiate(instantiate_copy)
         # infer_norm_from_dataset: load from precomputed JSON/dir if set, else compute (no disk write).
+        t_norm = time.perf_counter()
         data_schematic.infer_norm_from_dataset(
             norm_dataset,
             dataset_name,
@@ -140,6 +177,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 cfg, "norm_stats.precomputed_norm_path", default=None
             ),
         )
+        log.info(f"[Timing] Norm stats for {dataset_name}: {time.perf_counter() - t_norm:.2f}s")
         # Cache norm stats if save_cache_dir is set
         save_cache_dir = OmegaConf.select(
             cfg, "norm_stats.save_cache_dir", default=None
@@ -174,7 +212,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         scheduler_interval=cfg.model.get("scheduler_interval", "step"),
     )
 
-    _log_dataset_frame_counts(datamodule.train_datasets, datamodule.valid_datasets)
+    _log_dataset_frame_counts(
+        datamodule.train_datasets,
+        datamodule.valid_datasets,
+        getattr(datamodule, "train_viz_datasets", None),
+    )
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
@@ -183,6 +225,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         from egomimic.modal.callbacks import ModalAutoRestartCallback
         callbacks.append(ModalAutoRestartCallback())
         log.info("[ModalAutoRestart] Callback registered")
+
+    if any(hasattr(ds, "prepare_epoch") for ds in datamodule.train_datasets.values()):
+        from egomimic.modal.callbacks import PrefetchEpochCallback
+        callbacks.append(PrefetchEpochCallback(datamodule.train_datasets))
+        log.info("[PrefetchEpoch] Callback registered")
 
     # Resolve mode: support both new `mode` key and legacy `train`/`eval` booleans
     if cfg.get("mode") is not None:
@@ -263,6 +310,14 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             eval_obj.trainer = trainer
             eval_obj.model = model.model
             model.evaluator = eval_obj
+            if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+                train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
+                train_viz_eval.trainer = trainer
+                train_viz_eval.model = model.model
+                model.train_viz_evaluator = train_viz_eval
+                log.info(
+                    "train_viz_evaluator configured — wired to dataloader_idx=1"
+                )
         log.info("Starting training!")
         trainer.fit(
             model=model,
@@ -274,6 +329,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         eval_obj.trainer = trainer
         eval_obj.model = model.model
         model.evaluator = eval_obj
+        if OmegaConf.select(cfg, "train_viz_evaluator", default=None) is not None:
+            train_viz_eval: Eval = hydra.utils.instantiate(cfg.train_viz_evaluator)
+            train_viz_eval.trainer = trainer
+            train_viz_eval.model = model.model
+            model.train_viz_evaluator = train_viz_eval
         # Load checkpoint weights manually so we can reset the epoch counter
         ckpt_path = cfg.get("ckpt_path")
         if ckpt_path:
