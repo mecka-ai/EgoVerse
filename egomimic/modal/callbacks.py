@@ -112,15 +112,34 @@ class PrefetchEpochCallback(Callback):
 
     This must run before the DataLoader begins iterating so that workers
     (spawned after the callback) inherit the fresh index_map via fork.
+
+    Both train AND valid datasets are prepared. Preparing valid is required for
+    DDP correctness: without it the valid dataset stays in its probe-path
+    fallback (``_index_map is None``), and the rank-0-only pool staging means
+    ranks enter the validation loop doing unequal work — they then desync at the
+    first ``sync_dist`` all-reduce and hang until the 30-min NCCL watchdog kills
+    the run. ``prepare_epoch`` is deterministic by seed, so every rank builds an
+    identical valid index_map and blocks together until the shared-NVMe episodes
+    are ready — an in-lockstep sync point before any val collective fires.
     """
 
-    def __init__(self, train_datasets: dict) -> None:
+    def __init__(self, train_datasets: dict, valid_datasets: dict | None = None) -> None:
         super().__init__()
         self._train_datasets = train_datasets
+        self._valid_datasets = valid_datasets or {}
+
+    def _prepare(self, datasets: dict, epoch: int, split: str) -> None:
+        for name, ds in datasets.items():
+            if hasattr(ds, "prepare_epoch"):
+                log.info(
+                    "PrefetchEpochCallback: prepare_epoch(%d) for %s/%s", epoch, split, name
+                )
+                ds.prepare_epoch(epoch)
 
     def on_train_epoch_start(self, trainer, pl_module) -> None:
-        epoch = trainer.current_epoch
-        for name, ds in self._train_datasets.items():
-            if hasattr(ds, "prepare_epoch"):
-                log.info("PrefetchEpochCallback: prepare_epoch(%d) for %s", epoch, name)
-                ds.prepare_epoch(epoch)
+        self._prepare(self._train_datasets, trainer.current_epoch, "train")
+
+    def on_validation_epoch_start(self, trainer, pl_module) -> None:
+        # All ranks call this before the val loop → identical valid index_map +
+        # a synchronized barrier point, preventing the DDP collective desync.
+        self._prepare(self._valid_datasets, trainer.current_epoch, "valid")

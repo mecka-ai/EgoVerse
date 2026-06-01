@@ -233,10 +233,15 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         callbacks.append(ModalAutoRestartCallback())
         log.info("[ModalAutoRestart] Callback registered")
 
-    if any(hasattr(ds, "prepare_epoch") for ds in datamodule.train_datasets.values()):
+    if any(
+        hasattr(ds, "prepare_epoch")
+        for ds in (*datamodule.train_datasets.values(), *datamodule.valid_datasets.values())
+    ):
         from egomimic.modal.callbacks import PrefetchEpochCallback
-        callbacks.append(PrefetchEpochCallback(datamodule.train_datasets))
-        log.info("[PrefetchEpoch] Callback registered")
+        callbacks.append(
+            PrefetchEpochCallback(datamodule.train_datasets, datamodule.valid_datasets)
+        )
+        log.info("[PrefetchEpoch] Callback registered (train + valid)")
 
     # Resolve mode: support both new `mode` key and legacy `train`/`eval` booleans
     if cfg.get("mode") is not None:
