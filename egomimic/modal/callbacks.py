@@ -91,3 +91,22 @@ class ModalAutoRestartCallback(Callback):
 
         trainer.should_stop = True
         log.info("[ModalAutoRestart] Stopping current run — continuation job is running")
+
+
+class PrefetchEpochCallback(Callback):
+    """Call ``prepare_epoch`` on every PrefetchedMapDataset before each epoch.
+
+    This must run before the DataLoader begins iterating so that workers
+    (spawned after the callback) inherit the fresh index_map via fork.
+    """
+
+    def __init__(self, train_datasets: dict) -> None:
+        super().__init__()
+        self._train_datasets = train_datasets
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        epoch = trainer.current_epoch
+        for name, ds in self._train_datasets.items():
+            if hasattr(ds, "prepare_epoch"):
+                log.info("PrefetchEpochCallback: prepare_epoch(%d) for %s", epoch, name)
+                ds.prepare_epoch(epoch)
