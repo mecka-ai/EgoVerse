@@ -10,6 +10,8 @@ from termcolor import cprint
 from torch.utils.data import DataLoader, default_collate
 from transformers import AutoTokenizer
 
+from egomimic.utils.dataloader_ipc import apply_ipc_dataloader_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +62,8 @@ class MultiDataModuleWrapper(LightningDataModule):
         valid_datasets: dict,
         train_dataloader_params: dict,
         valid_dataloader_params: dict,
+        train_viz_datasets: dict | None = None,
+        train_viz_dataloader_params: dict | None = None,
         collate_max_length=128,
         model_name="google/paligemma-3b-mix-224",
         sampling_mode: Literal["first", "random"] = "random",
@@ -155,7 +159,7 @@ class MultiDataModuleWrapper(LightningDataModule):
                 dataset,
                 shuffle=shuffle,
                 collate_fn=self.collate_fn,
-                **dataset_params,
+                **apply_ipc_dataloader_params(dataset_params),
             )
 
         return CombinedLoader(iterables, "max_size_cycle")
@@ -174,7 +178,7 @@ class MultiDataModuleWrapper(LightningDataModule):
                 dataset,
                 shuffle=shuffle,
                 collate_fn=self.collate_fn,
-                **dataset_params,
+                **apply_ipc_dataloader_params(dataset_params),
             )
 
         return CombinedLoader(iterables, "max_size_cycle")
