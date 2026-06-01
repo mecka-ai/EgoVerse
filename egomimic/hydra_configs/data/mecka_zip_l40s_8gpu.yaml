@@ -1,0 +1,81 @@
+# 8×L40S — sliding-window NVMe pool, hard disk ceiling.
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_l40s_8gpu trainer=ddp_modal logger=wandb model=<model> \
+#     name=<run> description=<desc> \
+#     +modal_gpu=L40S:8 +modal_cpu=64 +modal_memory_gb=220 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=600 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false
+#
+# Disk budget (600 GB ephemeral):
+#   train pool ............ 280 GB  (worst-case ~150 GB for current+next epoch episodes)
+#   valid pool .............. 80 GB
+#   probe + torch tmp ....... ~10 GB
+#   headroom ............... 230 GB
+#
+# Train pool sizing math:
+#   900 eps/epoch × 1.5 epoch lookahead = 1350 eps held simultaneously
+#   At 200 MB worst-case per episode: 270 GB
+#   Capacity 280 GB → ~3% headroom above worst case before filler back-pressures.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 900
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 280
+    lookahead_epochs: 1.5
+    n_copy_threads: 32
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 400
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 80
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 6
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
