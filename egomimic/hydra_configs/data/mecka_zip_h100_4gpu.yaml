@@ -8,7 +8,7 @@
 #   python egomimic/modal/trainModal.py \
 #     data=mecka_zip_h100_4gpu trainer=ddp_modal logger=wandb \
 #     model=hpt_bc_flow_mecka_300m name=<run> description=<desc> \
-#     +modal_gpu=H100:4 +modal_cpu=96 +modal_memory_gb=200 \
+#     +modal_gpu=H100:4 +modal_cpu=64 +modal_memory_gb=200 \
 #     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=2000 \
 #     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
 #     init_submodules=false
@@ -78,7 +78,7 @@ valid_datasets:
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 128          # per rank; global = 128 × 4 = 512
-    num_workers: 16          # × 4 ranks = 64 workers (cpu=96, OMP=1 → ~68 cores)
+    num_workers: 12          # × 4 ranks = 48 workers (Modal cpu cap is 64; OMP=1)
     persistent_workers: false  # REQUIRED: workers respawn each epoch to inherit
                                # PrefetchEpochCallback's fresh index_map via fork
     prefetch_factor: 6       # 16 × 6 = 96 batches buffered per rank

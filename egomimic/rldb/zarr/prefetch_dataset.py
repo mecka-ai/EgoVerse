@@ -576,6 +576,19 @@ class PoolFillerThread(threading.Thread):
         while not self._stop_event.is_set():
             try:
                 self._tick()
+            except RuntimeError as e:
+                # Executor/interpreter is tearing down (process exit or Modal
+                # auto-restart): submit() raises "cannot schedule new futures
+                # after ... shutdown". Stop the filler cleanly instead of
+                # re-raising every 2s (which spams logs and stalls shutdown
+                # past the grace period).
+                if "shutdown" in str(e):
+                    logger.info(
+                        "PoolFillerThread: executor shutting down — stopping filler"
+                    )
+                    break
+                logger.exception("PoolFillerThread: tick failed; sleeping 2s")
+                time.sleep(2.0)
             except Exception:
                 logger.exception("PoolFillerThread: tick failed; sleeping 2s")
                 time.sleep(2.0)
@@ -947,9 +960,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # idx if the chosen episode has been evicted under us (which can
         # happen briefly at epoch boundaries with persistent_workers).
         attempts = 0
-        while attempts < 4:
+        while attempts < 16:
             ep_path, frame_idx = self._index_map[idx % len(self._index_map)]
-            if Path(ep_path, ".done").exists():
+            if Path(ep_path, ".done").exists() and not Path(ep_path, ".bad").exists():
                 if ep_path not in self._zarr_cache:
                     try:
                         self._zarr_cache[ep_path] = ZarrDataset(
@@ -961,29 +974,74 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                         )
                     except Exception as e:
                         logger.warning(
-                            "Failed to open %s (%s); skipping to next frame",
+                            "Failed to open %s (%s); marking .bad, skipping",
                             Path(ep_path).name, e,
                         )
+                        self._mark_episode_bad(ep_path, f"open failed: {e}")
                         idx = (idx + 1) % len(self._index_map)
                         attempts += 1
                         continue
-                return self._zarr_cache[ep_path][frame_idx]
-            # Evicted episode (eviction race at epoch boundary). Skip to
-            # next frame in the shuffled index_map.
+                try:
+                    return self._zarr_cache[ep_path][frame_idx]
+                except Exception as e:
+                    # Episode opened but a frame is unreadable/undecodable
+                    # (e.g. corrupt JPEG that exhausts ZarrDataset's in-episode
+                    # retries → "Entire episode bad"). Skip to a *different*
+                    # episode and mark this one .bad so prepare_epoch and the
+                    # filler drop it for the rest of the run instead of
+                    # re-selecting it. Without this the exception propagates
+                    # out and kills the DataLoader worker / training.
+                    logger.warning(
+                        "Read/decode failed for %s frame %s (%s); marking .bad, skipping",
+                        Path(ep_path).name, frame_idx, e,
+                    )
+                    self._mark_episode_bad(ep_path, f"read/decode failed: {e}")
+                    self._zarr_cache.pop(ep_path, None)
+                    idx = (idx + 1) % len(self._index_map)
+                    attempts += 1
+                    continue
+            # Evicted episode (eviction race at epoch boundary) or just-marked
+            # .bad. Skip to next frame in the shuffled index_map.
             idx = (idx + 1) % len(self._index_map)
             attempts += 1
 
-        # Last resort: bounded wait, then surface whatever's available.
+        # Last resort: bounded wait, then surface whatever's available — still
+        # tolerating a bad episode by skipping to a different index.
         self._wait_for_episode_path(ep_path)
-        if ep_path not in self._zarr_cache:
-            self._zarr_cache[ep_path] = ZarrDataset(
-                ep_path,
-                key_map=self.resolver.key_map,
-                transform_list=self.resolver.transform_list,
-                norm_stats=self.resolver.norm_stats,
-                pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+        try:
+            if ep_path not in self._zarr_cache:
+                self._zarr_cache[ep_path] = ZarrDataset(
+                    ep_path,
+                    key_map=self.resolver.key_map,
+                    transform_list=self.resolver.transform_list,
+                    norm_stats=self.resolver.norm_stats,
+                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                )
+            return self._zarr_cache[ep_path][frame_idx]
+        except Exception as e:
+            logger.warning(
+                "Read/decode failed for %s (%s) on last-resort path; marking .bad, skipping",
+                Path(ep_path).name, e,
             )
-        return self._zarr_cache[ep_path][frame_idx]
+            self._mark_episode_bad(ep_path, f"read/decode failed (last resort): {e}")
+            self._zarr_cache.pop(ep_path, None)
+            return self.__getitem__((idx + 1) % len(self._index_map))
+
+    @staticmethod
+    def _mark_episode_bad(ep_path: str, reason: str) -> None:
+        """Best-effort ``.bad`` sentinel, safe to call from any DataLoader
+        worker. Unlike ``PoolFiller._mark_bad`` we do NOT remove the episode
+        dir — other workers/ranks may be reading it concurrently. The sentinel
+        makes ``prepare_epoch`` drop the episode next epoch and short-circuits
+        the filler, so a corrupt-but-openable episode is selected at most once.
+        """
+        try:
+            Path(ep_path, ".bad").touch()
+        except OSError:
+            pass
+        logger.warning(
+            "PrefetchedMapDataset: %s marked .bad — %s", Path(ep_path).name, reason
+        )
 
     def _wait_for_episode_path(self, ep_path: str) -> None:
         """Defensive stall — should never fire under correct sizing."""
