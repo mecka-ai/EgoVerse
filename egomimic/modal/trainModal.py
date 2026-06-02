@@ -38,6 +38,7 @@ from modal_setup import (  # noqa: E402
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
+    _uses_pi_model,
     app,
     app_name_from_hydra_args,
     launch_detached,
@@ -170,6 +171,13 @@ def run_hydra_train(
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("HYDRA_FULL_ERROR", "1")
     env.setdefault("WANDB_START_METHOD", "thread")
+    # openpi's pi0.5 sampler (nets["policy"].sample_actions, used in
+    # PI.forward_eval) is wrapped in @torch.compile. The Modal image ships no C
+    # compiler, so TorchInductor crashes eval with "Failed to find C compiler".
+    # Force eager for pi runs — training (forward_training) is uncompiled and
+    # unaffected; only eval sampling runs slightly slower.
+    if _uses_pi_model(hydra_args):
+        env.setdefault("TORCHDYNAMO_DISABLE", "1")
     # Tensor IPC temp files → NVMe /cache (trainHydra enables file_system when TMPDIR is set).
     # Prefer /cache/torch_tmp whenever /cache is writable (ephemeral disk or not).
     _torch_tmp = "/cache/torch_tmp"
