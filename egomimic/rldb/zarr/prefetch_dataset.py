@@ -786,6 +786,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         cache_dir: str | Path = "/cache/zarr_cache",
         n_copy_threads: int = 16,
         seed: int = 42,
+        prepare_timeout_s: float = 3600.0,
     ):
         super().__init__()
         self.resolver = resolver
@@ -794,6 +795,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.n_copy_threads = int(n_copy_threads)
         self.seed = seed
+        # Max time prepare_epoch blocks waiting for the window to materialize.
+        # Default 1h is plenty for a normal sliding window; raise it for
+        # stage-all-first configs where episodes_per_epoch == a large subset
+        # (e.g. 20k episodes from a ~150 MB/s volume takes ~3h to stage).
+        self.prepare_timeout_s = float(prepare_timeout_s)
 
         self._episodes = resolver.split_catalog(mode)
         if not self._episodes:
@@ -1211,7 +1217,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         ready_count = 0
         bad_during_wait: set[str] = set()
         last_log = t0
-        deadline = t0 + 3600  # 1 hour
+        deadline = t0 + self.prepare_timeout_s
         pending = list(window_eps)
         while pending:
             still_pending = []
@@ -1229,8 +1235,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             now = time.monotonic()
             if now > deadline:
                 raise RuntimeError(
-                    f"prepare_epoch: timeout (1h) waiting for {len(pending)} episodes "
-                    f"for epoch {gen_label}"
+                    f"prepare_epoch: timeout ({self.prepare_timeout_s / 3600:.1f}h) waiting "
+                    f"for {len(pending)} episodes for epoch {gen_label}"
                 )
             if now - last_log > 30.0:
                 stats = self._filler.stats() if self._filler is not None else {}

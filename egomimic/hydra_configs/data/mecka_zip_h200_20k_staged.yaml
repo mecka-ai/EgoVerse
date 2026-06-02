@@ -53,6 +53,9 @@ train_datasets:
     pool_size_gb: 2900          # holds all ~18k train eps (no eviction)
     lookahead_epochs: 1.0       # window is the whole set; filler stages it once then idles
     n_copy_threads: 48
+    prepare_timeout_s: 21600    # 6h — staging ~20k eps from the ~150 MB/s volume takes
+                                # ~3h, far over the 1h default; raise so prepare_epoch
+                                # waits out the full initial stage instead of crashing
 
 valid_datasets:
   mecka_bimanual:
