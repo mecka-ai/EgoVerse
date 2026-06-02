@@ -32,6 +32,7 @@ def app_name_from_hydra_args(hydra_args: list[str]) -> str:
     Sanitizes to Modal-valid characters (alphanumeric, ``-``, ``_``, ``.``),
     max 64 chars. Falls back to ``egomimic-training`` if neither key is present.
     """
+
     def _san(s: object) -> str:
         t = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(s or "").strip())
         return t.strip("-_.") or ""
@@ -112,7 +113,7 @@ MODAL_COMPUTE_ARG_MAP: dict[str, str] = {
     "modal_cpu": "MODAL_CPU",
     "modal_memory_gb": "MODAL_MEMORY_GB",
     "modal_memory_mb": "MODAL_MEMORY_MB",
-    "modal_volume": "MODAL_VOLUME",           # e.g. mecka_data_v2 or mecka_data_wds
+    "modal_volume": "MODAL_VOLUME",  # e.g. mecka_data_v2 or mecka_data_wds
     "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",  # local NVMe in GB
 }
 
@@ -189,7 +190,9 @@ image = (
     # import it at module-load time (before the repo is cloned via _prepare_repo).
     # Path(__file__).parent resolves to /root/ in the container, so:
     #   from modal_setup import (...)  works in both local and remote contexts.
-    .add_local_file(Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True)
+    .add_local_file(
+        Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
+    )
     .pip_install(
         "lightning",
         "hydra-core",
@@ -242,6 +245,24 @@ image = (
         "torchvision==0.21.0",
         "s5cmd",
     )
+    # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
+    # JAX-first: even its pytorch model path imports jax/flax at module load
+    # (openpi.models.pi0_config, openpi.shared.image_tools). We add the jax/flax
+    # side here (flax pulls optax/orbax/msgpack/tensorstore transitively) and put
+    # external/openpi/src on PYTHONPATH at runtime — without disturbing the
+    # image's pinned torch 2.6.0 / transformers (openpi would otherwise pin
+    # torch==2.7.1, transformers==4.53.2). CPU jaxlib is fine: compute runs on
+    # the torch path; jax is only needed to import.
+    .pip_install(
+        "jax==0.5.3",
+        "jaxlib==0.5.3",
+        "flax==0.10.2",
+        "jaxtyping==0.2.36",
+        "beartype==0.19.0",
+        "ml_collections==1.0.0",
+        "equinox>=0.11.8",
+        "augmax>=0.3.4",
+    )
 )
 
 zarr_volume = modal.Volume.from_name("mecka_data_v2")
@@ -251,9 +272,9 @@ WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
-    "mecka_data_v2":    (zarr_volume, "/mnt/zarr-data"),
+    "mecka_data_v2": (zarr_volume, "/mnt/zarr-data"),
     "mecka_data_wds_v2": (wds_volume, "/mnt/zarr-wds"),
-    "mecka_data_zip":   (zip_volume,  "/mnt/zarr-zip"),
+    "mecka_data_zip": (zip_volume, "/mnt/zarr-zip"),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
@@ -284,10 +305,16 @@ def launch_detached(
     """
     _git_commit_and_push(Path(script_path).resolve().parent.parent.parent)
     cmd = [
-        sys.executable, "-m", "modal", "run",
-        "--detach", "--env", env,
+        sys.executable,
+        "-m",
+        "modal",
+        "run",
+        "--detach",
+        "--env",
+        env,
         f"{script_path}::{entrypoint}",
-        "--", *hydra_args,
+        "--",
+        *hydra_args,
     ]
     print(f"Launching detached: {entrypoint} -- {' '.join(hydra_args)}")
     result = subprocess.run(cmd, cwd=str(REPO_ROOT), env=modal_env or os.environ.copy())
@@ -296,13 +323,16 @@ def launch_detached(
 
 def _git_commit_and_push(repo_root: Path) -> None:
     """Auto-commit any local changes and push to remote before Modal submission."""
+
     def _run(cmd):
         return subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
 
     if _run(["git", "status", "--porcelain"]).stdout.strip():
         print("Auto-committing local changes before Modal submission...")
         _run(["git", "add", "-A"])
-        result = _run(["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"])
+        result = _run(
+            ["git", "commit", "--no-verify", "-m", "auto: pre-modal training commit"]
+        )
         if result.returncode != 0:
             print(f"[git commit] {result.stderr.strip()}")
 
@@ -414,7 +444,7 @@ def _resolve_git_state() -> tuple[str, str, bool]:
 def _ssh_to_https(url: str) -> str:
     """Convert git@github.com:org/repo.git → https://github.com/org/repo.git"""
     if url.startswith("git@github.com:"):
-        path = url[len("git@github.com:"):]
+        path = url[len("git@github.com:") :]
         return f"https://github.com/{path}"
     return url
 
@@ -498,7 +528,14 @@ def _prepare_repo_light(
             )
         else:
             subprocess.run(
-                ["git", "clone", "--depth=1", "--no-recurse-submodules", clone_url, str(repo_dir)],
+                [
+                    "git",
+                    "clone",
+                    "--depth=1",
+                    "--no-recurse-submodules",
+                    clone_url,
+                    str(repo_dir),
+                ],
                 check=True,
             )
 

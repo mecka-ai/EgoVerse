@@ -38,14 +38,13 @@ from modal_setup import (  # noqa: E402
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
+    app,
     app_name_from_hydra_args,
     launch_detached,
     pop_init_submodules,
-    app,
     training_outputs_volume,
     zarr_volume,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,7 +61,13 @@ def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     fixed = []
     for arg in hydra_args:
         key, sep, val = arg.partition("=")
-        if sep and key in _PATH_KEYS and val and val != "null" and not val.startswith("/"):
+        if (
+            sep
+            and key in _PATH_KEYS
+            and val
+            and val != "null"
+            and not val.startswith("/")
+        ):
             val = f"{CFG.output_mount_path}/{val}"
             arg = f"{key}={val}"
         fixed.append(arg)
@@ -75,8 +80,13 @@ def _download_run_artifacts(output_rel_path: str) -> None:
     print(f"Downloading artifacts to {local_dest} ...")
     result = subprocess.run(
         [
-            sys.executable, "-m", "modal", "volume", "get",
-            "--env", "robotics",
+            sys.executable,
+            "-m",
+            "modal",
+            "volume",
+            "get",
+            "--env",
+            "robotics",
             "egoverse-training-outputs",
             output_rel_path,
             str(local_dest),
@@ -168,7 +178,9 @@ def run_hydra_train(
             f.write("1")
         os.remove(test_file)
         env["TMPDIR"] = _torch_tmp
-        print(f"DataLoader IPC: TMPDIR={_torch_tmp} (use +modal_ephemeral_disk_gb=600 if /cache is missing)")
+        print(
+            f"DataLoader IPC: TMPDIR={_torch_tmp} (use +modal_ephemeral_disk_gb=600 if /cache is missing)"
+        )
     except OSError:
         if _ephemeral:
             raise
@@ -190,6 +202,14 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
+
+    # openpi (used by egomimic.algo.pi for pi0.5 models) lives in the
+    # external/openpi git submodule at external/openpi/src; put it on PYTHONPATH
+    # so `import openpi` resolves. Its jax/flax deps are baked into the image.
+    _openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+    env["PYTHONPATH"] = (
+        f"{_openpi_src}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _openpi_src
+    )
 
     print(f"Running: {shlex.join(cmd)}")
     process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
@@ -236,10 +256,50 @@ def _health_check() -> dict:
         results["volume"] = f"ERROR: {e}"
 
     import subprocess as _sp
+
     r = _sp.run(["s5cmd", "version"], capture_output=True, text=True)
     results["s5cmd"] = f"OK — {r.stdout.strip()}" if r.returncode == 0 else "MISSING"
 
     return results
+
+
+@app.function(
+    cpu=4.0,
+    memory=16384,
+    timeout=1200,
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+)
+def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
+    """CPU-only: clone the repo + submodules, then check `import egomimic.algo.pi`.
+
+    Mirrors how run_hydra_train sets up the container (clone + openpi on
+    PYTHONPATH) so we can confirm the pi0.5 model imports without spending a GPU.
+    """
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
+
+    env = os.environ.copy()
+    env["HYDRA_FULL_ERROR"] = "1"
+    openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+    env["PYTHONPATH"] = (
+        f"{openpi_src}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else openpi_src
+    )
+    proc = subprocess.run(
+        [
+            CFG.python_bin,
+            "-c",
+            "import egomimic.algo.pi as m; print('PI_IMPORT_OK', m.PI)",
+        ],
+        cwd=CFG.remote_repo_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "returncode": proc.returncode,
+        "ok": "PI_IMPORT_OK" in proc.stdout,
+        "stdout": proc.stdout[-2000:],
+        "stderr": proc.stderr[-4000:],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +326,31 @@ def verify() -> None:
 
 
 @app.local_entrypoint()
+def verify_pi() -> None:
+    """Clone on a cheap CPU container and confirm egomimic.algo.pi imports."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo dirty; Modal verifies the last committed state.")
+    print(f"Verifying pi import for commit {git_commit[:12]} ...")
+    res = _verify_pi_import.remote(git_remote, git_commit)
+    if res["ok"]:
+        print("✓ PI import OK:", res["stdout"].strip().splitlines()[-1])
+    else:
+        print(f"✗ PI import FAILED (exit {res['returncode']})")
+        print("--- stderr (tail) ---")
+        print(res["stderr"])
+        raise SystemExit("pi import failed — see traceback above.")
+
+
+@app.local_entrypoint()
 def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
     hydra_args, init_submodules = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
     print(f"Submitting commit {git_commit[:12]} from {git_remote}")
     if not init_submodules:
         print("Skipping git submodule init (init_submodules=false)")
@@ -325,7 +404,8 @@ if __name__ == "__main__":
             container_overrides.append(arg)
 
     container_overrides = [
-        a for a in container_overrides
+        a
+        for a in container_overrides
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
