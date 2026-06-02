@@ -81,7 +81,6 @@ train_dataloader_params:
     num_workers: 12          # × 4 ranks = 48 workers (Modal cpu cap is 64)
     persistent_workers: false  # workers respawn each epoch to inherit the fresh index_map
     prefetch_factor: 6
-    pin_memory: true         # pinned host mem → fast, overlapped H2D
     shuffle: true
 
 valid_dataloader_params:
@@ -90,5 +89,4 @@ valid_dataloader_params:
     num_workers: 4
     persistent_workers: false
     prefetch_factor: 2
-    pin_memory: true
     shuffle: false
