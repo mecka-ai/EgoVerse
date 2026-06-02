@@ -272,24 +272,22 @@ def _health_check() -> dict:
 def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
     """CPU-only: clone the repo + submodules, then check `import egomimic.algo.pi`.
 
-    Mirrors how run_hydra_train sets up the container (clone + openpi on
-    PYTHONPATH) so we can confirm the pi0.5 model imports without spending a GPU.
+    Confirms the pi0.5 model imports without spending a GPU. No PYTHONPATH is set
+    on purpose: it relies on the site-packages .pth that _prepare_repo writes,
+    which is the mechanism Lightning DDP child processes use (they re-exec the
+    script and do not inherit PYTHONPATH).
     """
     _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
 
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"
-    openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
-    env["PYTHONPATH"] = (
-        f"{openpi_src}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else openpi_src
-    )
     proc = subprocess.run(
         [
             CFG.python_bin,
             "-c",
             "import egomimic.algo.pi as m; print('PI_IMPORT_OK', m.PI)",
         ],
-        cwd=CFG.remote_repo_dir,
+        cwd="/",  # from / so CWD doesn't accidentally add the repo to sys.path
         env=env,
         capture_output=True,
         text=True,

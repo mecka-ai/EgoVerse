@@ -509,6 +509,27 @@ def _prepare_repo(
         check=True,
     )
 
+    # Make openpi (external/openpi/src, imported by egomimic.algo.pi for pi0.5
+    # models) importable in EVERY python process — including Lightning DDP child
+    # processes, which re-exec the script and do NOT reliably inherit PYTHONPATH.
+    # A .pth file in site-packages is read at interpreter startup, so it works
+    # for the main process and all re-execed ranks alike.
+    if init_submodules:
+        openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+        if Path(openpi_src).is_dir():
+            subprocess.run(
+                [
+                    CFG.python_bin,
+                    "-c",
+                    "import sysconfig, os, sys; "
+                    "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_openpi.pth'); "
+                    "open(p, 'w').write(sys.argv[1]); "
+                    "print('registered openpi path ->', sys.argv[1])",
+                    openpi_src,
+                ],
+                check=True,
+            )
+
 
 def _prepare_repo_light(
     git_remote: str,
