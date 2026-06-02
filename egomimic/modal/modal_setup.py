@@ -262,6 +262,7 @@ image = (
         "ml_collections==1.0.0",
         "equinox>=0.11.8",
         "augmax>=0.3.4",
+        "pytest",  # openpi.models_pytorch.gemma_pytorch imports pytest at module load
     )
 )
 
