@@ -25,6 +25,7 @@ train_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -49,6 +50,7 @@ valid_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
