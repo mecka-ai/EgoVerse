@@ -529,6 +529,13 @@ def _prepare_repo(
                 ],
                 check=True,
             )
+            # openpi's pi0.5 pytorch model requires transformers==4.53.2 + its
+            # transformers_replace overlay (pi0_pytorch asserts the version).
+            # Apply it here — in the baked modal_setup, which always runs — so it
+            # is in effect for trainHydra and every re-execed DDP rank. Presence
+            # of the openpi submodule (init_submodules=true) marks a pi-capable
+            # run; HPT runs use init_submodules=false and keep transformers 4.57.3.
+            _install_pi_transformers()
 
 
 def _uses_pi_model(hydra_args) -> bool:

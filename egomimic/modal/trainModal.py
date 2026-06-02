@@ -35,11 +35,9 @@ from modal_setup import (  # noqa: E402
     CFG,
     REPO_ROOT,
     VOLUME_MAP,
-    _install_pi_transformers,
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
-    _uses_pi_model,
     app,
     app_name_from_hydra_args,
     launch_detached,
@@ -164,11 +162,8 @@ def run_hydra_train(
         init_submodules=init_submodules,
     )
 
-    # pi0.5 models need openpi's patched transformers==4.53.2 (conflicts with
-    # egomimic's 4.57.3); apply it only for pi runs, in this container.
-    if _uses_pi_model(hydra_args):
-        _install_pi_transformers()
-
+    # (openpi's patched transformers==4.53.2 for pi0.5 is applied inside
+    # _prepare_repo when the openpi submodule is present.)
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
@@ -284,8 +279,8 @@ def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
     transformers_replace check fires — so we validate the full pi path without a
     GPU. No PYTHONPATH: relies on the site-packages .pth (the DDP-child path).
     """
+    # _prepare_repo applies the pi transformers swap (openpi submodule present).
     _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
-    _install_pi_transformers()
 
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"
