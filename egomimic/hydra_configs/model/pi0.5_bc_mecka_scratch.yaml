@@ -1,0 +1,10 @@
+defaults:
+  - pi0.5_bc_mecka
+  - _self_
+
+# Train the pi0.5 mecka BC model from randomly-initialized weights instead of
+# loading the pretrained pi05_base checkpoint. PI.__init__ (egomimic/algo/pi.py)
+# treats pytorch_weight_path=None as "train from scratch".
+robomimic_model:
+  config:
+    pytorch_weight_path: null
