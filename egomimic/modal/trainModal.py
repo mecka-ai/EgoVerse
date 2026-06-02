@@ -35,9 +35,11 @@ from modal_setup import (  # noqa: E402
     CFG,
     REPO_ROOT,
     VOLUME_MAP,
+    _install_pi_transformers,
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
+    _uses_pi_model,
     app,
     app_name_from_hydra_args,
     launch_detached,
@@ -162,6 +164,11 @@ def run_hydra_train(
         init_submodules=init_submodules,
     )
 
+    # pi0.5 models need openpi's patched transformers==4.53.2 (conflicts with
+    # egomimic's 4.57.3); apply it only for pi runs, in this container.
+    if _uses_pi_model(hydra_args):
+        _install_pi_transformers()
+
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
@@ -265,28 +272,35 @@ def _health_check() -> dict:
 
 @app.function(
     cpu=4.0,
-    memory=16384,
+    memory=49152,
     timeout=1200,
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
 )
 def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
-    """CPU-only: clone the repo + submodules, then check `import egomimic.algo.pi`.
+    """CPU-only: clone + apply pi transformers swap, then CONSTRUCT PI0Pytorch.
 
-    Confirms the pi0.5 model imports without spending a GPU. No PYTHONPATH is set
-    on purpose: it relies on the site-packages .pth that _prepare_repo writes,
-    which is the mechanism Lightning DDP child processes use (they re-exec the
-    script and do not inherit PYTHONPATH).
+    Mirrors run_hydra_train's setup (clone + .pth + transformers==4.53.2 overlay)
+    and actually builds the pi0.5 pytorch model — which is where the
+    transformers_replace check fires — so we validate the full pi path without a
+    GPU. No PYTHONPATH: relies on the site-packages .pth (the DDP-child path).
     """
     _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
+    _install_pi_transformers()
 
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"
+    script = (
+        "import transformers; print('transformers', transformers.__version__);"
+        "import openpi.models.pi0_config as c;"
+        "import openpi.models_pytorch.pi0_pytorch as p;"
+        "cfg=c.Pi0Config(dtype='bfloat16', action_dim=32, action_horizon=100,"
+        " max_token_len=180, paligemma_variant='gemma_2b',"
+        " action_expert_variant='gemma_300m', pi05=True);"
+        "m=p.PI0Pytorch(cfg);"
+        "print('PI0_CONSTRUCT_OK params=', sum(x.numel() for x in m.parameters()))"
+    )
     proc = subprocess.run(
-        [
-            CFG.python_bin,
-            "-c",
-            "import egomimic.algo.pi as m; print('PI_IMPORT_OK', m.PI)",
-        ],
+        [CFG.python_bin, "-c", script],
         cwd="/",  # from / so CWD doesn't accidentally add the repo to sys.path
         env=env,
         capture_output=True,
@@ -294,7 +308,7 @@ def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
     )
     return {
         "returncode": proc.returncode,
-        "ok": "PI_IMPORT_OK" in proc.stdout,
+        "ok": "PI0_CONSTRUCT_OK" in proc.stdout,
         "stdout": proc.stdout[-2000:],
         "stderr": proc.stderr[-4000:],
     }

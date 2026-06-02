@@ -531,6 +531,52 @@ def _prepare_repo(
             )
 
 
+def _uses_pi_model(hydra_args) -> bool:
+    """True if the run uses a pi0.5 model (needs openpi's patched transformers)."""
+    for a in hydra_args:
+        a = a.strip()
+        if a.startswith("model=") and "pi0.5" in a:
+            return True
+        if a.replace(" ", "").startswith("--config-name=") and a.endswith(
+            "train_zarr_cartesian_pi"
+        ):
+            return True
+    return False
+
+
+def _install_pi_transformers() -> None:
+    """Pin transformers to openpi's 4.53.2 and overlay its transformers_replace files.
+
+    egomimic pins transformers==4.57.3, but openpi's pi0.5 pytorch model requires
+    transformers==4.53.2 with custom gemma/paligemma/siglip modeling files copied
+    over the installed package (pi0_pytorch.py asserts transformers.__version__
+    == '4.53.2'). This is gated to pi runs because it downgrades transformers for
+    the rest of the stack in this container.
+    """
+    subprocess.run(
+        [CFG.python_bin, "-m", "pip", "install", "-q", "transformers==4.53.2"],
+        check=True,
+    )
+    replace_dir = (
+        f"{CFG.remote_repo_dir}"
+        "/external/openpi/src/openpi/models_pytorch/transformers_replace"
+    )
+    tdir = subprocess.run(
+        [
+            CFG.python_bin,
+            "-c",
+            "import transformers, os; print(os.path.dirname(transformers.__file__))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    # Merge openpi's replacement modeling files into the transformers package
+    # (the trailing "/." copies directory *contents*, overwriting in place).
+    subprocess.run(["cp", "-r", f"{replace_dir}/.", tdir], check=True)
+    print(f"pi: transformers==4.53.2 + transformers_replace overlaid into {tdir}")
+
+
 def _prepare_repo_light(
     git_remote: str,
     git_commit: str,
