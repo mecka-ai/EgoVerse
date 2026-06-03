@@ -53,14 +53,16 @@ def chain_worker_init_fn(user_init=None):
     if user_init is None:
 
         def _init(worker_id: int) -> None:
-            if worker_id == 0:
-                configure_dataloader_ipc(force=True)
+            # Force file_system in EVERY worker — fork inheritance of the sharing
+            # strategy is not reliable, so workers that default to file_descriptor
+            # route batch tensors through the small /dev/shm and SIGBUS once it
+            # fills (the bus errors we saw at high worker/prefetch counts).
+            configure_dataloader_ipc(force=True)
 
         return _init
 
     def _init(worker_id: int) -> None:
-        if worker_id == 0:
-            configure_dataloader_ipc(force=True)
+        configure_dataloader_ipc(force=True)
         user_init(worker_id)
 
     return _init
