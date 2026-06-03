@@ -51,4 +51,5 @@ CLAUDE.md
 tri-cmu-first-batch.json
 hydra_configs/data/extra/**
 settings.json
-failures.jsonlscratch/
+failures.jsonl
+scratch/
