@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 # Catalog entry
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class EpisodeCatalogEntry:
     """Lightweight descriptor for one zipped episode on the zip volume."""
@@ -89,6 +90,7 @@ class EpisodeCatalogEntry:
 # ---------------------------------------------------------------------------
 # Bounds-check mixin  (mirrors MultiDataset._check_bounds exactly)
 # ---------------------------------------------------------------------------
+
 
 class _BoundsCheckMixin:
     """Shared bounds-check logic for map-style and iterable datasets."""
@@ -124,14 +126,25 @@ class _BoundsCheckMixin:
                 continue
 
             slack = getattr(self, "bounds_slack", 0.0)
-            q_low = torch.as_tensor(
-                stats.get("quantile_0_01", stats.get("quantile_0_1", stats["quantile_1"])),
-                dtype=torch.float32,
-            ) - slack
-            q_high = torch.as_tensor(
-                stats.get("quantile_99_99", stats.get("quantile_99_9", stats["quantile_99"])),
-                dtype=torch.float32,
-            ) + slack
+            q_low = (
+                torch.as_tensor(
+                    stats.get(
+                        "quantile_0_01", stats.get("quantile_0_1", stats["quantile_1"])
+                    ),
+                    dtype=torch.float32,
+                )
+                - slack
+            )
+            q_high = (
+                torch.as_tensor(
+                    stats.get(
+                        "quantile_99_99",
+                        stats.get("quantile_99_9", stats["quantile_99"]),
+                    ),
+                    dtype=torch.float32,
+                )
+                + slack
+            )
 
             try:
                 q_low = torch.broadcast_to(q_low, arr.shape)
@@ -144,7 +157,9 @@ class _BoundsCheckMixin:
                     self._shape_mismatch_warned.add(key_sig)
                     logger.warning(
                         "Skipping bounds check for key=%s: value=%s q_low=%s",
-                        zarr_key, tuple(arr.shape), tuple(q_low.shape),
+                        zarr_key,
+                        tuple(arr.shape),
+                        tuple(q_low.shape),
                     )
                 continue
 
@@ -167,6 +182,7 @@ class _BoundsCheckMixin:
 # ---------------------------------------------------------------------------
 # ZipEpisodeResolver
 # ---------------------------------------------------------------------------
+
 
 class ZipEpisodeResolver(EpisodeResolver):
     """Resolves episodes from catalog.json on the zip volume."""
@@ -237,14 +253,20 @@ class ZipEpisodeResolver(EpisodeResolver):
 
         if self.debug:
             entries = entries[: int(self.debug)]
-            logger.info("ZipEpisodeResolver: debug=%d — using first %d episodes", self.debug, len(entries))
+            logger.info(
+                "ZipEpisodeResolver: debug=%d — using first %d episodes",
+                self.debug,
+                len(entries),
+            )
 
         if self.min_frames:
             before = len(entries)
             entries = [e for e in entries if e.n_frames >= self.min_frames]
             logger.info(
                 "ZipEpisodeResolver: min_frames=%d — kept %d/%d episodes",
-                self.min_frames, len(entries), before,
+                self.min_frames,
+                len(entries),
+                before,
             )
 
         logger.info(
@@ -280,6 +302,7 @@ class ZipEpisodeResolver(EpisodeResolver):
 # EpisodePlan — deterministic episode ordering across the run
 # ---------------------------------------------------------------------------
 
+
 class EpisodePlan:
     """Fixed-order schedule of episodes across all epochs.
 
@@ -299,7 +322,9 @@ class EpisodePlan:
         if not episodes:
             raise ValueError("EpisodePlan: empty episode list")
         if episodes_per_epoch <= 0:
-            raise ValueError(f"EpisodePlan: episodes_per_epoch must be > 0, got {episodes_per_epoch}")
+            raise ValueError(
+                f"EpisodePlan: episodes_per_epoch must be > 0, got {episodes_per_epoch}"
+            )
 
         rng = random.Random(seed)
         order = list(episodes)
@@ -317,7 +342,9 @@ class EpisodePlan:
             out.append(self.episodes[(start + i) % self.n])
         return out
 
-    def episodes_in_window(self, start_epoch: int, end_epoch_exclusive: int) -> list[EpisodeCatalogEntry]:
+    def episodes_in_window(
+        self, start_epoch: int, end_epoch_exclusive: int
+    ) -> list[EpisodeCatalogEntry]:
         """All distinct episodes scheduled in [start_epoch, end_epoch_exclusive)."""
         seen: set[str] = set()
         out: list[EpisodeCatalogEntry] = []
@@ -329,7 +356,10 @@ class EpisodePlan:
         return out
 
     def hashes_in_window(self, start_epoch: int, end_epoch_exclusive: int) -> set[str]:
-        return {ep.episode_hash for ep in self.episodes_in_window(start_epoch, end_epoch_exclusive)}
+        return {
+            ep.episode_hash
+            for ep in self.episodes_in_window(start_epoch, end_epoch_exclusive)
+        }
 
     def episode_at(self, plan_idx: int) -> EpisodeCatalogEntry:
         return self.episodes[plan_idx % self.n]
@@ -338,6 +368,7 @@ class EpisodePlan:
 # ---------------------------------------------------------------------------
 # EpisodePool — flat byte-tracked NVMe cache
 # ---------------------------------------------------------------------------
+
 
 class EpisodePool:
     """Hash-keyed NVMe cache with a hard byte ceiling and future-aware eviction.
@@ -383,11 +414,15 @@ class EpisodePool:
             self._sizes[ep_dir.name] = size
             n += 1
         if n_bad:
-            logger.info("EpisodePool: %d episodes carry .bad marker (will be skipped)", n_bad)
+            logger.info(
+                "EpisodePool: %d episodes carry .bad marker (will be skipped)", n_bad
+            )
         if n:
             logger.info(
                 "EpisodePool: restored %d episodes (%.1f GB) from existing cache at %s",
-                n, sum(self._sizes.values()) / 1e9, self.root,
+                n,
+                sum(self._sizes.values()) / 1e9,
+                self.root,
             )
 
     def episode_path(self, ep_hash: str) -> Path:
@@ -428,8 +463,10 @@ class EpisodePool:
         if victims:
             logger.info(
                 "EpisodePool: evicted %d episodes (%.1f GB freed, %.1f GB used / %.0f GB cap)",
-                len(victims), freed / 1e9,
-                self.used_bytes() / 1e9, self.capacity_bytes / 1e9,
+                len(victims),
+                freed / 1e9,
+                self.used_bytes() / 1e9,
+                self.capacity_bytes / 1e9,
             )
         return freed
 
@@ -437,6 +474,7 @@ class EpisodePool:
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_tar_to_dir(tar_path: Path, dest: Path) -> int:
     """Extract ``tar_path`` into ``dest`` and return total bytes written.
@@ -477,6 +515,7 @@ def _release_extract_lock(pool_dir: Path, ep_hash: str, fd: int) -> None:
 
 class _ENOSPCError(Exception):
     """Raised inside PoolFillerThread to swallow ENOSPC without spamming logs."""
+
     pass
 
 
@@ -492,6 +531,7 @@ _FILLER_REGISTRY_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # PoolFillerThread — persistent extractor on rank 0
 # ---------------------------------------------------------------------------
+
 
 class PoolFillerThread(threading.Thread):
     """Keeps the pool filled ``lookahead_episodes`` ahead of training.
@@ -525,8 +565,8 @@ class PoolFillerThread(threading.Thread):
         )
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
-        self._train_cursor = 0          # plan index that training has just consumed
-        self._extract_cursor = 0        # next plan index to consider for extraction
+        self._train_cursor = 0  # plan index that training has just consumed
+        self._extract_cursor = 0  # next plan index to consider for extraction
         self._inflight: dict[str, concurrent.futures.Future] = {}
         # Running estimate of the largest observed episode size (bytes); used
         # to gate submissions when free space might not fit one extraction.
@@ -599,8 +639,12 @@ class PoolFillerThread(threading.Thread):
                 logger.info(
                     "PoolFiller stats: train_cursor=%d extract_cursor=%d "
                     "inflight=%d used=%.1f GB / %.0f GB enospc=%d",
-                    s["train_cursor"], s["extract_cursor"], s["inflight"],
-                    s["used_gb"], s["cap_gb"], s["enospc_count"],
+                    s["train_cursor"],
+                    s["extract_cursor"],
+                    s["inflight"],
+                    s["used_gb"],
+                    s["cap_gb"],
+                    s["enospc_count"],
                 )
                 last_stats_log = now
 
@@ -700,7 +744,9 @@ class PoolFillerThread(threading.Thread):
                     if self._enospc_count <= 4 or self._enospc_count % 50 == 0:
                         logger.warning(
                             "PoolFiller: ENOSPC extracting %s (count=%d, used=%.1f GB)",
-                            entry.episode_hash, self._enospc_count, self.pool.used_bytes() / 1e9,
+                            entry.episode_hash,
+                            self._enospc_count,
+                            self.pool.used_bytes() / 1e9,
                         )
                     raise _ENOSPCError(entry.episode_hash)
                 # Any other OSError (missing tar, IO error, etc.) is
@@ -711,13 +757,17 @@ class PoolFillerThread(threading.Thread):
             except Exception as e:
                 # tarfile.ReadError, EOFError, etc. — corrupt archive.
                 shutil.rmtree(dest, ignore_errors=True)
-                self._mark_bad(entry.episode_hash, f"{type(e).__name__} on extract: {e}")
+                self._mark_bad(
+                    entry.episode_hash, f"{type(e).__name__} on extract: {e}"
+                )
                 return
 
             # Validate: zarr v3 needs `zarr.json` at the group root.
             # zarr v2 layout uses `.zgroup`. Accept either.
             if not ((dest / "zarr.json").exists() or (dest / ".zgroup").exists()):
-                self._mark_bad(entry.episode_hash, "no zarr group metadata after extract")
+                self._mark_bad(
+                    entry.episode_hash, "no zarr group metadata after extract"
+                )
                 return
 
             self.pool.register(entry.episode_hash, size)
@@ -730,7 +780,9 @@ class PoolFillerThread(threading.Thread):
             if time.perf_counter() - t0 > 30:
                 logger.info(
                     "PoolFiller: slow extract %s (%.1fs, %.0f MB)",
-                    entry.episode_hash, time.perf_counter() - t0, size / 1e6,
+                    entry.episode_hash,
+                    time.perf_counter() - t0,
+                    size / 1e6,
                 )
         finally:
             _release_extract_lock(self.pool.root, entry.episode_hash, lock_fd)
@@ -739,6 +791,7 @@ class PoolFillerThread(threading.Thread):
 # ---------------------------------------------------------------------------
 # PrefetchedMapDataset (sliding-window pool)
 # ---------------------------------------------------------------------------
+
 
 class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
     """Map-style dataset backed by an NVMe ``EpisodePool``.
@@ -786,8 +839,14 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         cache_dir: str | Path = "/cache/zarr_cache",
         n_copy_threads: int = 16,
         seed: int = 42,
+        prepare_timeout_s: float = 3600.0,
     ):
         super().__init__()
+        # Max seconds prepare_epoch blocks waiting for its window to materialize.
+        # Default 1h suits windowed configs (small window). Stage-all configs
+        # (episodes_per_epoch == full subset) must raise this above the full
+        # staging time (~4-5h for 20k episodes off the ~150 MB/s zip volume).
+        self.prepare_timeout_s = float(prepare_timeout_s)
         self.resolver = resolver
         self.mode = mode
         self.cache_dir = Path(cache_dir)
@@ -815,7 +874,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 episodes_per_epoch = len(self._episodes)
         self.episodes_per_epoch = int(episodes_per_epoch)
         self.epoch_frames = (
-            int(epoch_frames) if epoch_frames is not None
+            int(epoch_frames)
+            if epoch_frames is not None
             else int(self.episodes_per_epoch * avg_frames_per_ep)
         )
 
@@ -832,9 +892,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # RANK env var is only set after dist.init_process_group(), which runs
         # later in Trainer.fit(). Reading RANK here would default to "0" for
         # every child and start N fillers racing on the same pool directory.
-        self._rank = int(
-            os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
-        )
+        self._rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
         self._is_filler_rank = self._rank == 0
         self._filler: PoolFillerThread | None = None
         if self.mode == "train" and self._is_filler_rank:
@@ -862,7 +920,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     logger.info(
                         "PoolFillerThread started: lookahead=%d eps, n_copy_threads=%d, "
                         "pool_capacity=%.0f GB",
-                        self._lookahead_episodes, self.n_copy_threads, pool_size_gb,
+                        self._lookahead_episodes,
+                        self.n_copy_threads,
+                        pool_size_gb,
                     )
 
         # Valid mode does not start a filler. prepare_epoch synchronously
@@ -902,9 +962,14 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "PrefetchedMapDataset [%s]: %d episodes, %d total frames, "
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
             "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s)",
-            mode, len(self._episodes), total_frames,
-            self.episodes_per_epoch, lookahead_epochs,
-            pool_size_gb, cache_dir, self._rank,
+            mode,
+            len(self._episodes),
+            total_frames,
+            self.episodes_per_epoch,
+            lookahead_epochs,
+            pool_size_gb,
+            cache_dir,
+            self._rank,
             "yes" if self._is_filler_rank else "no",
         )
 
@@ -915,14 +980,12 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
     def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
         self.data_schematic = data_schematic
         self.bounds_slack = bounds_slack
-        if (
-            hasattr(data_schematic, "norm_stats")
-            and self.resolver.norm_stats is None
-        ):
+        if hasattr(data_schematic, "norm_stats") and self.resolver.norm_stats is None:
             self.resolver.norm_stats = data_schematic.norm_stats
         logger.info(
             "PrefetchedMapDataset [%s]: data_schematic set (bounds_slack=%.4f)",
-            self.mode, bounds_slack,
+            self.mode,
+            bounds_slack,
         )
 
     # ------------------------------------------------------------------
@@ -975,7 +1038,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     except Exception as e:
                         logger.warning(
                             "Failed to open %s (%s); marking .bad, skipping",
-                            Path(ep_path).name, e,
+                            Path(ep_path).name,
+                            e,
                         )
                         self._mark_episode_bad(ep_path, f"open failed: {e}")
                         idx = (idx + 1) % len(self._index_map)
@@ -993,7 +1057,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     # out and kills the DataLoader worker / training.
                     logger.warning(
                         "Read/decode failed for %s frame %s (%s); marking .bad, skipping",
-                        Path(ep_path).name, frame_idx, e,
+                        Path(ep_path).name,
+                        frame_idx,
+                        e,
                     )
                     self._mark_episode_bad(ep_path, f"read/decode failed: {e}")
                     self._zarr_cache.pop(ep_path, None)
@@ -1021,7 +1087,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         except Exception as e:
             logger.warning(
                 "Read/decode failed for %s (%s) on last-resort path; marking .bad, skipping",
-                Path(ep_path).name, e,
+                Path(ep_path).name,
+                e,
             )
             self._mark_episode_bad(ep_path, f"read/decode failed (last resort): {e}")
             self._zarr_cache.pop(ep_path, None)
@@ -1054,7 +1121,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if now - last_warn > self._STALL_WARN_INTERVAL_S:
                 logger.warning(
                     "Dataloader stalled %.1fs waiting for %s — pool sizing may be too small",
-                    now - t0, ep_path,
+                    now - t0,
+                    ep_path,
                 )
                 last_warn = now
 
@@ -1108,18 +1176,24 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             return
         logger.info(
             "Valid extractor: extracting %d/%d missing window episodes (%d threads)",
-            len(missing), len(window_eps), self.n_copy_threads,
+            len(missing),
+            len(window_eps),
+            self.n_copy_threads,
         )
         n_ok = n_err = 0
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.n_copy_threads, thread_name_prefix="valid-extract"
         ) as ex:
-            futs = {ex.submit(self._extract_episode_into_pool, ep): ep for ep in missing}
+            futs = {
+                ex.submit(self._extract_episode_into_pool, ep): ep for ep in missing
+            }
             for fut in concurrent.futures.as_completed(futs):
                 if fut.exception() is not None:
                     ep = futs[fut]
                     logger.warning(
-                        "Valid extractor: %s failed: %s", ep.episode_hash, fut.exception()
+                        "Valid extractor: %s failed: %s",
+                        ep.episode_hash,
+                        fut.exception(),
                     )
                     n_err += 1
                 else:
@@ -1148,25 +1222,33 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # Episodes previously found to be unextractable (.bad sentinel) are
         # excluded here so neither the wait loop nor the index_map ever sees
         # them. The filler also skips them (.bad short-circuits _extract_one).
-        window_eps = [e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)]
+        window_eps = [
+            e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)
+        ]
         n_bad_in_window = len(full_window_eps) - len(window_eps)
         if n_bad_in_window:
             logger.warning(
                 "prepare_epoch %d: skipping %d known-bad episodes from window",
-                gen_label, n_bad_in_window,
+                gen_label,
+                n_bad_in_window,
             )
         ep_hashes = {e.episode_hash for e in window_eps}
 
         # Calculate how many epochs of lookahead in terms of epochs (rounded up).
-        lookahead_epochs = max(1, (self._lookahead_episodes + self.episodes_per_epoch - 1)
-                               // self.episodes_per_epoch)
+        lookahead_epochs = max(
+            1,
+            (self._lookahead_episodes + self.episodes_per_epoch - 1)
+            // self.episodes_per_epoch,
+        )
         # Include the PREVIOUS epoch in keep_hashes: persistent_workers may
         # still hold in-flight batches from epoch N-1 in their prefetch
         # queue when prepare_epoch(N) runs eviction. Without the prev-epoch
         # buffer those workers would stall indefinitely on .done files that
         # just got removed. Costs at most 1 epoch (~900 eps) of extra disk.
         prev_epoch = max(0, epoch - 1)
-        keep_hashes = self._plan.hashes_in_window(prev_epoch, epoch + 1 + lookahead_epochs)
+        keep_hashes = self._plan.hashes_in_window(
+            prev_epoch, epoch + 1 + lookahead_epochs
+        )
 
         # Publish the new epoch FIRST so worker __getitem__ calls can rebuild
         # their local index_map before any eviction touches disk. With the
@@ -1177,7 +1259,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 tmp.write_text(str(epoch))
                 os.replace(tmp, self._epoch_file)
             except OSError as e:
-                logger.warning("Failed to publish epoch file %s: %s", self._epoch_file, e)
+                logger.warning(
+                    "Failed to publish epoch file %s: %s", self._epoch_file, e
+                )
 
         # Advance the filler's training cursor (rank 0 only).
         if self._filler is not None:
@@ -1191,7 +1275,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if freed:
                 logger.info(
                     "prepare_epoch %d: freed %.1f GB outside current window",
-                    gen_label, freed / 1e9,
+                    gen_label,
+                    freed / 1e9,
                 )
 
         # Valid mode has no background filler; extract the window inline.
@@ -1211,7 +1296,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         ready_count = 0
         bad_during_wait: set[str] = set()
         last_log = t0
-        deadline = t0 + 3600  # 1 hour
+        deadline = t0 + self.prepare_timeout_s
         pending = list(window_eps)
         while pending:
             still_pending = []
@@ -1229,14 +1314,17 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             now = time.monotonic()
             if now > deadline:
                 raise RuntimeError(
-                    f"prepare_epoch: timeout (1h) waiting for {len(pending)} episodes "
-                    f"for epoch {gen_label}"
+                    f"prepare_epoch: timeout ({self.prepare_timeout_s:.0f}s) waiting for "
+                    f"{len(pending)} episodes for epoch {gen_label}"
                 )
             if now - last_log > 30.0:
                 stats = self._filler.stats() if self._filler is not None else {}
                 logger.info(
                     "prepare_epoch %d: %d/%d episodes ready (%.0fs) %s",
-                    gen_label, ready_count, len(window_eps), now - t0,
+                    gen_label,
+                    ready_count,
+                    len(window_eps),
+                    now - t0,
                     f"filler={stats}" if stats else "",
                 )
                 last_log = now
@@ -1246,19 +1334,24 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # from window_eps/ep_hashes so the index_map and pre-warm don't
         # reference them.
         if bad_during_wait:
-            window_eps = [e for e in window_eps if e.episode_hash not in bad_during_wait]
+            window_eps = [
+                e for e in window_eps if e.episode_hash not in bad_during_wait
+            ]
             ep_hashes -= bad_during_wait
             new_paths = {str(self._pool.episode_path(h)) for h in ep_hashes}
             logger.warning(
                 "prepare_epoch %d: %d additional episodes marked .bad during wait — dropped",
-                gen_label, len(bad_during_wait),
+                gen_label,
+                len(bad_during_wait),
             )
 
         wait_s = time.monotonic() - t0
         if wait_s > 0.5:
             logger.info(
                 "prepare_epoch %d: %d episodes ready in %.1fs",
-                gen_label, len(window_eps), wait_s,
+                gen_label,
+                len(window_eps),
+                wait_s,
             )
 
         # Build frame-level index_map (deterministic per-epoch shuffle).
@@ -1274,7 +1367,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self._index_map = index_map
         logger.info(
             "[Timing] prepare_epoch %d: index_map built in %.3fs (%d frames)",
-            gen_label, time.perf_counter() - t_build, len(self._index_map),
+            gen_label,
+            time.perf_counter() - t_build,
+            len(self._index_map),
         )
 
         # Pre-open zarr stores in the main process so workers inherit warm
@@ -1298,7 +1393,10 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             except Exception as e:
                 logger.warning(
                     "prepare_epoch %d: dropping broken episode %s (%s: %s)",
-                    gen_label, Path(ep_path).name, type(e).__name__, e,
+                    gen_label,
+                    Path(ep_path).name,
+                    type(e).__name__,
+                    e,
                 )
                 broken.add(ep_path)
                 # Remove the bad pool entry so filler may re-extract.
@@ -1313,12 +1411,17 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             ]
             logger.warning(
                 "prepare_epoch %d: skipped %d broken episodes, index_map shrank %d → %d",
-                gen_label, len(broken), before, len(self._index_map),
+                gen_label,
+                len(broken),
+                before,
+                len(self._index_map),
             )
 
         logger.info(
             "[Timing] prepare_epoch %d: pre-opened %d zarr stores in %.3fs",
-            gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
+            gen_label,
+            len(new_paths) - len(broken),
+            time.perf_counter() - t_open,
         )
 
         # Publish the new epoch number atomically so persistent_workers can
@@ -1329,7 +1432,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 tmp.write_text(str(epoch))
                 os.replace(tmp, self._epoch_file)
             except OSError as e:
-                logger.warning("Failed to publish epoch file %s: %s", self._epoch_file, e)
+                logger.warning(
+                    "Failed to publish epoch file %s: %s", self._epoch_file, e
+                )
 
     # ------------------------------------------------------------------
     # Persistent-worker epoch sync
@@ -1352,7 +1457,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # deterministic (same seed across all processes), so the resulting
         # (ep_path, frame_idx) tuples match main's index_map exactly.
         full_window_eps = self._plan.epoch_episodes(published_epoch)
-        window_eps = [e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)]
+        window_eps = [
+            e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)
+        ]
         index_map: list[tuple[str, int]] = []
         for ep in window_eps:
             ep_path = str(self._pool.episode_path(ep.episode_hash))
