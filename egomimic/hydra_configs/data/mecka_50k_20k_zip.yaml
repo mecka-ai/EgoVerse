@@ -1,5 +1,16 @@
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
+# Language conditioning (pi0.5 is a VLA): tokenize the per-frame annotation so the
+# model gets tokenized_prompt and viz gets sampled_prompt. build_tokenized_collate
+# reads annotation_key from each sample (frame-aligned text from
+# get_keymap(annotations=true) + the data_schematic annotations entry), samples one
+# prompt, and tokenizes it. Mirrors the eva/cotrain_pi_base setup.
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
 # pi variant of mecka_50k_20k.yaml — same 50k-train / 20k-valid pool, but fed
 # through optimal's sliding-window NVMe prefetch pipeline instead of reading the
 # Modal Volume (/mnt/zarr-data) directly. Pair with model=pi0.5_bc_mecka_scratch
@@ -41,6 +52,7 @@ train_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -65,6 +77,7 @@ valid_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian

@@ -1,5 +1,16 @@
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
+# Language conditioning (pi0.5 is a VLA): tokenize the per-frame annotation so the
+# model gets tokenized_prompt and viz gets sampled_prompt. build_tokenized_collate
+# reads annotation_key from each sample (frame-aligned text from
+# get_keymap(annotations=true) + the data_schematic annotations entry), samples one
+# prompt, and tokenizes it. Mirrors the eva/cotrain_pi_base setup.
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
 # pi variant of mecka_10k_2k.yaml — smaller sibling of mecka_50k_20k_zip.yaml,
 # for smoke/dev runs of the pi pipeline on optimal's NVMe prefetch path.
 #
