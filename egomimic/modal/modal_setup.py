@@ -96,6 +96,11 @@ class _Config:
             "egoverse-mongodb",
             "egoverse-db",
             "egoverse-sql",
+            # HF_TOKEN for the gated paligemma tokenizer used by
+            # build_tokenized_collate (pi0.5 language conditioning). Create with:
+            #   modal secret create egoverse-hf HF_TOKEN=<token>
+            # (token must have accepted google/paligemma-3b-mix-224's license).
+            "egoverse-hf",
         ]
     )
 
