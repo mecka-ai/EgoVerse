@@ -1,0 +1,71 @@
+"""Tar extraction helpers, the running-filler registry, and the ENOSPC sentinel.
+
+Pure orchestration: no torch/numpy. Shared by the filler (background staging)
+and the dataset (synchronous valid-mode extraction).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import tarfile
+import threading
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # forward-ref only — importing filler here would cycle
+    from egomimic.rldb.zarr.prefetch.filler import PoolFillerThread
+
+logger = logging.getLogger(__name__)
+
+def _extract_tar_to_dir(tar_path: Path, dest: Path) -> int:
+    """Extract ``tar_path`` into ``dest`` and return total bytes written.
+
+    Caller is responsible for creating/cleaning ``dest``, touching ``.done``,
+    and registering the size with the pool.  Raises ``OSError`` (including
+    ENOSPC, errno 28) on failure.
+    """
+    with tarfile.open(tar_path, "r") as tf:
+        tf.extractall(path=dest)
+    return sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
+
+
+def _acquire_extract_lock(pool_dir: Path, ep_hash: str) -> int | None:
+    """Cross-process per-episode lock used during extraction.
+
+    Returns the file descriptor on success (caller must release it), or
+    ``None`` if another process is already extracting this episode (the
+    caller should wait for the ``.done`` sentinel).
+    """
+    lock_path = pool_dir / f".lock_{ep_hash}"
+    try:
+        return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+
+
+def _release_extract_lock(pool_dir: Path, ep_hash: str, fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        (pool_dir / f".lock_{ep_hash}").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+class _ENOSPCError(Exception):
+    """Raised inside PoolFillerThread to swallow ENOSPC without spamming logs."""
+    pass
+
+
+# Module-level registry of running PoolFillerThreads keyed by absolute cache_dir.
+# trainHydra.py instantiates the train dataset twice (once for the actual
+# DataLoader, once briefly for norm-stats inference). Without this registry,
+# both instances would start their own filler against the same pool directory
+# and race on rmtree+extract for the same episodes.
+_FILLER_REGISTRY: dict[str, "PoolFillerThread"] = {}
+_FILLER_REGISTRY_LOCK = threading.Lock()
+
+
