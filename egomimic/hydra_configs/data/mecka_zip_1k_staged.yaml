@@ -1,0 +1,96 @@
+# 4×H200 — STAGE-ALL-FIRST over a fixed 1k-episode subset, MAX dataloader workers.
+#
+# Purpose: stress-test the file_system IPC fix at a high worker count. With the
+# whole 1k subset pre-staged to local NVMe, every __getitem__ hits warm disk and
+# the only remaining throughput knob is decode parallelism — i.e. num_workers.
+# This config pushes workers to the cpu=64 cap (16/rank × 4 ranks) to measure
+# frames/sec on a fully-cached working set.
+#
+# Why this no longer SIGBUSes:
+#   chain_worker_init_fn forces torch.multiprocessing file_system in EVERY
+#   worker, so batch tensors are shared as files under TMPDIR (/cache/torch_tmp,
+#   NVMe ephemeral) instead of the small 160 GiB /dev/shm. The /dev/shm bus
+#   errors that capped us at ~8 workers are gone — workers scale to the CPU cap.
+#   REQUIRES +modal_ephemeral_disk_gb so trainModal sets TMPDIR=/cache/torch_tmp.
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_1k_staged trainer=ddp_modal logger=wandb \
+#     model=hpt_bc_flow_mecka_300m name=<run> description=<desc> \
+#     '~evaluator@train_viz_evaluator' \
+#     trainer.check_val_every_n_epoch=5 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=600 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false
+#
+# Disk budget (600 GB ephemeral):
+#   train pool ........... 200 GB  (1k × ~131 MB ≈ 131 GB live, no eviction)
+#   valid pool ............ 40 GB
+#   /cache/torch_tmp ..... ~120 GB  (16 workers × 4 ranks × prefetch 4 × 472 MB
+#                                    float32 batches, shared as NVMe files)
+#   headroom ............. ~240 GB
+#
+# Staging cost: ~131 GB off the ~150 MB/s volume ≈ 15 min of GPU-idle up front
+# (48 copy threads), then the filler idles and training reads warm NVMe.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 1000
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 1000   # >= train split → prepare_epoch(0) stages it all before training
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 200          # holds the whole ~131 GB subset (no eviction)
+    lookahead_epochs: 1.0      # window is the whole set; filler stages once then idles
+    n_copy_threads: 48
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 1000
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 100    # ~10% valid split of the 1k subset → staged before validation
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 40
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128          # per rank; global = 128 × 4 = 512
+    num_workers: 16          # MAX: 16 × 4 ranks = 64 = Modal cpu cap (OMP=1)
+    persistent_workers: false  # workers respawn each epoch to inherit the fresh index_map
+    prefetch_factor: 4       # 16 × 4 = 64 batches buffered per rank (file_system → NVMe)
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
