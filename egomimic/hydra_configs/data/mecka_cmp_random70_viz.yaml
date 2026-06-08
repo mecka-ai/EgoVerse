@@ -1,0 +1,78 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# CURATION COMPARISON — RANDOM-70%-per-task control arm, WITH train visualization.
+# Control for the DemInf curation experiment: instead of the top-70% by
+# mutual-information score, this selects a RANDOM 70% of each task (same per-task
+# counts as mecka_cmp_curated, 273 episodes total; seed=1234). Comparing this to
+# the curated arm isolates whether informativeness-based selection beats random
+# selection of equal size.
+#
+# Unlike the curated/all arms, this run does NOT share the pinned validation set.
+# It uses the resolver's normal train/valid split: the same eps_to_use file is
+# passed to both train (mode: train) and valid (mode: valid); split_dataset_names
+# (seed=42, valid_ratio=0.2) partitions the 273 into ~218 train / ~55 valid,
+# disjoint within this run.
+#
+# train_viz_datasets reuses the same 14 episodes (mecka_cmp_viz.json) as the other
+# viz runs so the rendered videos are comparable across all arms.
+# Pair with: evaluator@train_viz_evaluator=train_viz_hpt
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_cmp_random70.json
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_cmp_random70.json
+    mode: valid
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_cmp_viz.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 4
