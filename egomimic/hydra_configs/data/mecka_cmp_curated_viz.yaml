@@ -54,12 +54,12 @@ train_viz_datasets:
 
 train_dataloader_params:
   mecka_bimanual:
-    batch_size: 32
+    batch_size: 64
     num_workers: 12
 
 valid_dataloader_params:
   mecka_bimanual:
-    batch_size: 32
+    batch_size: 64
     num_workers: 12
 
 train_viz_dataloader_params:
