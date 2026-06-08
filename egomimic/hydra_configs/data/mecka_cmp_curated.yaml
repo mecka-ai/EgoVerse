@@ -1,0 +1,55 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# CURATION COMPARISON — curated arm.
+# Trains on the top-70% DemInf-curated episodes (14 tasks) MINUS the shared
+# validation set. Validates on the SHARED validation set (mecka_cmp_val.json),
+# which is identical to the non-curated arm (mecka_cmp_all.yaml) so the two runs
+# are directly comparable.
+#
+# Split derivation (see egomimic/scripts: split_dataset_names, seed=42, valid_ratio=0.2):
+#   V = 20% split of the 273 curated episodes = 54 episodes (held out of BOTH arms)
+#   train = 273 - V = 219 episodes
+# mode: total bypasses the resolver's internal random split — the episode lists
+# below are used verbatim, so validation parity is guaranteed by construction.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pause_removal_epsilon: 0.005
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_cmp_curated_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pause_removal_epsilon: 0.005
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_cmp_val.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 12
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 12
