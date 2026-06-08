@@ -113,4 +113,11 @@ class EvalVideo(Eval):
                 self.val_image_buffer[key].clear()
                 self.val_counter[key] += 1
 
-        self.trainer.lightning_module.log_dict(metrics, sync_dist=True)
+        # add_dataloader_idx=False: with the train_viz second val loader present,
+        # Lightning would otherwise suffix every key with /dataloader_idx_N. The
+        # two loaders already log disjoint keys (idx=0 → "Valid/...", train_viz
+        # idx=1 → "train_viz/Valid/..."), so the suffix is redundant and only
+        # splits the canonical Valid/ charts. Drop it to keep clean chart names.
+        self.trainer.lightning_module.log_dict(
+            metrics, sync_dist=True, add_dataloader_idx=False
+        )
