@@ -1,0 +1,52 @@
+defaults:
+  - cotrain_pi_lang
+  - _self_
+
+train_datasets:
+  eva_bimanual:
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_keymap
+        keymap_mode: cartesian_wristframe_ypr # check if this works with the transform list below
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian_wristframe_ypr
+  aria_bimanual:
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_transform_list
+        mode: cartesian_wristframe_ypr
+
+valid_datasets:
+  eva_bimanual:
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_keymap
+        keymap_mode: cartesian_wristframe_ypr
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian_wristframe_ypr
+  aria_bimanual:
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_transform_list
+        mode: cartesian_wristframe_ypr
+
+# Override the cam-frame default in cotrain_pi_base for the wristframe
+# pipeline below. Setting control_mode to a non-null dict activates the
+# "Control mode: ..." block in the prompt (Task: ..., Control mode: ...;
+# \nAction: ). Set the `proprio` / `embodiment_label` flags here too if you
+# also want those blocks; otherwise they inherit `false` from the base.
+control_mode:
+  aria: "wrist frame xyzypr per arm"
+  eva: "wrist frame xyzypr gripper per arm"

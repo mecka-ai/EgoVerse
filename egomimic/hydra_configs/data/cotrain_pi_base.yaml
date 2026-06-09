@@ -1,0 +1,114 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+train_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.S3EpisodeResolver
+      folder_path: /storage/project/r-dxu345-0/shared/egoverseS3ZarrDatasets
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+    filters: null
+    mode: train
+    valid_ratio: 0.05
+  aria_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.S3EpisodeResolver
+      folder_path: /storage/project/r-dxu345-0/shared/egoverseS3ZarrDatasets
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_transform_list
+        mode: cartesian
+    filters: null
+    mode: train
+    valid_ratio: 0.05
+
+valid_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.S3EpisodeResolver
+      folder_path: /storage/project/r-dxu345-0/shared/egoverseS3ZarrDatasets
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+    filters: null
+    mode: valid
+    valid_ratio: 0.05
+  aria_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.S3EpisodeResolver
+      folder_path: /storage/project/r-dxu345-0/shared/egoverseS3ZarrDatasets
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Aria.get_transform_list
+        mode: cartesian
+    filters: null
+    mode: valid
+    valid_ratio: 0.05
+
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: "random"
+annotation_key: null
+default_prompt: ""
+
+# Three orthogonal inclusion flags govern what gets spliced into the prompt:
+#   proprio          — append "State: <bins>" (pi0.5 discretized proprio)
+#   embodiment_label — append "Embodiment: <name>"
+#   control_mode     — append "Control mode: <descriptor>" (per-embodiment dict
+#                      or null to omit; falls back to "cam frame xyzypr ..."
+#                      defaults if a key isn't matched)
+#
+# If any of these is active, the prompt is rendered as
+#   "Task: {prompt}, <blocks>;\nAction: "
+# Otherwise the raw prompt is tokenized as-is (pre-pi0.5 / language behaviour).
+#
+# Proprio details: when `proprio: true`, the canonical concat key produced by
+# each embodiment's transform_list (`observations.state.ee_pose`) is read as
+# the proprio vector, clipped to [-1, 1], discretized into `state_num_bins`,
+# and spliced. Per-arm zarr keys are deleted by ConcatKeys (delete_old_keys),
+# so override `proprio_keys` only if you need a different source. State is
+# assumed normalized to [-1, 1] upstream — values outside are clipped.
+proprio: false
+embodiment_label: true
+state_num_bins: 256
+
+# Per-embodiment "Control mode:" descriptor. Keys are substrings matched
+# against the lowercased embodiment name (first match wins). Default (null)
+# omits the block entirely, matching the cartesian (head/cam-frame) transform
+# pipeline used in this base config. Wristframe pipelines should override this
+# — see cotrain_pi_lang_wrist.yaml.
+control_mode: null
+
+train_dataloader_params:
+  eva_bimanual:
+    batch_size: 32
+    num_workers: 6
+  aria_bimanual:
+    batch_size: 32
+    num_workers: 6
+
+valid_dataloader_params:
+  eva_bimanual:
+    batch_size: 32
+    num_workers: 6
+  aria_bimanual:
+    batch_size: 32
+    num_workers: 6

@@ -1,0 +1,46 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# All episodes processed by DemInf curation (scored + unscored). No debug
+# limit, no additional episode filtering — eps_to_use is the only selector.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pause_removal_epsilon: 0.005
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_all.json
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pause_removal_epsilon: 0.005
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_all.json
+    mode: valid
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 30
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 30
