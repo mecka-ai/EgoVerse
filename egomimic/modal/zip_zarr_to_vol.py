@@ -39,10 +39,18 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import modal
-from modal_setup import app, zarr_volume, zip_volume, image
+from modal_setup import app, zarr_volume, image
 
 INPUT_MOUNT = "/mnt/zarr-data"
 ZIP_MOUNT = "/mnt/zarr-zip"
+
+# Output volume is configurable via ZIP_VOLUME_NAME so a subset (e.g. a single
+# task) can be packed into a SEPARATE volume without touching the canonical
+# 70k mecka_data_zip. Defaults to the canonical training zip volume.
+ZIP_VOLUME_NAME = os.environ.get("ZIP_VOLUME_NAME", "mecka_data_zip")
+zip_volume = modal.Volume.from_name(
+    ZIP_VOLUME_NAME, create_if_missing=True, version=2
+)
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +269,15 @@ def write_catalog(entries: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
-    """Dispatch parallel per-episode conversion jobs to mecka_data_zip.
+def main(
+    debug: int = 0,
+    dry_run: bool = False,
+    force: bool = False,
+    episode_ids_file: str = "",
+) -> None:
+    """Dispatch parallel per-episode conversion jobs to the output zip volume.
+
+    Output volume is set by the ZIP_VOLUME_NAME env var (default mecka_data_zip).
 
     After the main conversion pass, scans for any tars missing their .done
     sentinel (container preempted mid-commit) and reconverts those episodes.
@@ -272,7 +287,11 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
         debug:   If > 0, limit conversion to this many episodes (for smoke-testing).
         dry_run: Print plan without launching any jobs.
         force:   If True, overwrite existing tars (use to fix corrupted tars).
+        episode_ids_file: If set, only pack episodes whose hash (one per line)
+            appears in this file. Hashes not present on the input volume are
+            skipped with a warning.
     """
+    print(f"Output zip volume: {ZIP_VOLUME_NAME} (/mnt/zarr-zip)")
     print("Listing episodes from mecka_data_v2 (/mnt/zarr-data)...")
     all_episodes = list_episodes.remote()
     n_total = len(all_episodes)
@@ -285,12 +304,25 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
 
     hash_to_dir: dict[str, str] = {_ep_hash(ep): ep for ep in all_episodes}
 
+    if episode_ids_file:
+        wanted = {
+            line.strip()
+            for line in Path(episode_ids_file).read_text().splitlines()
+            if line.strip()
+        }
+        all_episodes = [ep for ep in all_episodes if _ep_hash(ep) in wanted]
+        missing = len(wanted) - len(all_episodes)
+        print(
+            f"Filtered to {episode_ids_file}: {len(all_episodes):,} on-volume "
+            f"episodes match ({len(wanted):,} requested, {missing:,} not on input volume)"
+        )
+
     if debug > 0:
         all_episodes = all_episodes[:debug]
         print(f"Debug mode: converting first {len(all_episodes)} episodes")
 
     est_gb = len(all_episodes) * 0.167
-    print(f"Est. output: {est_gb:.0f} GB → mecka_data_zip (/mnt/zarr-zip)")
+    print(f"Est. output: {est_gb:.0f} GB → {ZIP_VOLUME_NAME} (/mnt/zarr-zip)")
     if force:
         print("Force mode: will overwrite existing tars")
 

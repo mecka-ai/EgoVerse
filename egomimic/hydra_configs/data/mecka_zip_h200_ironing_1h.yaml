@@ -1,0 +1,149 @@
+# 4×H200 — IRONING_CLOTHES, ~1h. DATA-SCALING POINT (64/GPU → 256 global batch).
+#
+# Single fixed task (ironing_clothes) held at ~1h of data. Smallest rung of the
+# ironing data-scaling ladder; the subsets are strictly NESTED:
+#   mecka_ironing_1h.json ⊂ _5h ⊂ _10h ⊂ _30h ⊂ mecka_ironing_all.json
+# The 1h subset is built by re-shuffling the existing ~5h subset with seed 42 and
+# taking the first 37 episodes, so every selected episode is already proven
+# present in the zip volume the larger sweeps trained on.
+#
+#   1h × 3600 s/h × 30 fps = 108,000 samples (frames) ÷ global batch 256
+#   = 422 steps per pass.
+# (30 fps is the recording rate — catalog mean ≈ 2890 frames / ~96.35 s ep.)
+# Global batch 256 = 4×H200 DDP × batch_size 64 per device.
+# NOTE: this config is paired with the existing pi0.5_ironing30h_lr* model
+# configs (same step horizon as the 5h/10h/30h runs), NOT a 1h-specific T_max.
+#
+#   task: ironing_clothes   subset = 37 eps (~1h @ ~96 s/ep)
+#   split: ~33 train / ~4 valid (resolver valid_ratio=0.1)
+#
+# Subset selected offline (re-shuffle the 5h JSON, seed 42, take ~1h) and pinned
+# via the resolver's `eps_to_use` allowlist (mecka_ironing_1h.json). Per-episode
+# frame counts are read from each staged zarr's metadata at index_map build time.
+# train_viz: one mid-trajectory sample.
+#
+# Launch (4×H200, PI/PaliGemma scratch + pretrained backbone, 64/GPU = 256
+# global batch):
+#   python egomimic/modal/trainModal.py --config-name=train_zarr_cartesian_pi \
+#     data=mecka_zip_h200_ironing_1h logger=wandb \
+#     model=pi0.5_ironing30h_lr5e5 \
+#     model.robomimic_model.config.paligemma_weight_path=paligemma_weights/paligemma-3b-pt-224 \
+#     name=<run> description=<desc> \
+#     evaluator@train_viz_evaluator=train_viz_pi \
+#     trainer.check_val_every_n_epoch=50 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=256 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=600 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
+#
+# Storage (~37 × ~198 MB ≈ 7 GB): pools train 15 + valid 10 + viz 10 ≈ 35 GB
+# caps, far within the 600 GB ephemeral disk. Stage-all sizing: the train split
+# (~33 eps × 198 MB ≈ 7 GB) must fit under 0.92×pool_size_gb=14 GB — the 15 GB
+# pool clears it with margin so the PoolFillerThread never deadlocks.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_ironing_1h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 37      # == full subset → stage-all before training
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 15            # holds all ~33 train eps (~7 GB measured) under 0.92 gate (14 GB); no eviction
+    lookahead_epochs: 2.0
+    n_copy_threads: 48
+    prepare_timeout_s: 3600     # ~7 GB off the ~150 MB/s volume; 48 copy threads finish in minutes
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_ironing_1h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 5       # full valid split (~4, ~10% of 37)
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 10            # holds all ~4 valid eps (~1 GB)
+    lookahead_epochs: 2.0
+    n_copy_threads: 16
+    prepare_timeout_s: 3600
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_ironing_1h_viz.json
+      valid_ratio: 1.0          # keep all viz episodes (no split)
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 1       # == n_tasks
+    epoch_frames: 80            # max_frames_per_episode=80 → 80 samples per task
+    max_frames_per_episode: 80
+    cache_dir: /cache/zarr_cache_viz
+    pool_size_gb: 10
+    lookahead_epochs: 1.0
+    n_copy_threads: 4
+    prepare_timeout_s: 3600
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64            # per-device; 4×H200 → 256 global batch
+    num_workers: 16
+    persistent_workers: false
+    prefetch_factor: 6
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32           # capped at 32 to avoid OOM; 80 viz samples/task span multiple batches
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false

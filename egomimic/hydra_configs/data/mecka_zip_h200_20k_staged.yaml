@@ -32,6 +32,16 @@
 
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
+# Language conditioning (pi0.5 VLA): tokenize the per-frame annotation so the
+# model gets tokenized_prompt and viz gets sampled_prompt. Mirrors the
+# eva/cotrain_pi_base setup. Requires the egoverse-hf HF_TOKEN secret (gated
+# paligemma tokenizer) wired into the training container.
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
 train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
@@ -43,6 +53,7 @@ train_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -53,9 +64,8 @@ train_datasets:
     pool_size_gb: 2900          # holds all ~18k train eps (no eviction)
     lookahead_epochs: 1.0       # window is the whole set; filler stages it once then idles
     n_copy_threads: 48
-    prepare_timeout_s: 21600    # 6h — staging ~20k eps from the ~150 MB/s volume takes
-                                # ~3h, far over the 1h default; raise so prepare_epoch
-                                # waits out the full initial stage instead of crashing
+    prepare_timeout_s: 21600    # 6h — stage-all of ~18k eps off the ~150 MB/s volume
+                                # (×3 concurrent runs contend) exceeds the 1h default
 
 valid_datasets:
   mecka_bimanual:
@@ -68,6 +78,7 @@ valid_datasets:
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -77,6 +88,7 @@ valid_datasets:
     pool_size_gb: 400
     lookahead_epochs: 1.0
     n_copy_threads: 16
+    prepare_timeout_s: 21600    # 6h — matches the train pool's stage-all budget
 
 train_dataloader_params:
   mecka_bimanual:
@@ -84,6 +96,7 @@ train_dataloader_params:
     num_workers: 12          # × 4 ranks = 48 workers (Modal cpu cap is 64)
     persistent_workers: false  # workers respawn each epoch to inherit the fresh index_map
     prefetch_factor: 6
+    pin_memory: true         # pinned host mem → fast, overlapped H2D
     shuffle: true
 
 valid_dataloader_params:
@@ -92,4 +105,5 @@ valid_dataloader_params:
     num_workers: 4
     persistent_workers: false
     prefetch_factor: 2
+    pin_memory: true
     shuffle: false

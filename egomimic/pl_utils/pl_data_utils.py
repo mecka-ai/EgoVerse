@@ -227,7 +227,10 @@ class MultiDataModuleWrapper(LightningDataModule):
             dataset_params = dict(dataset_params)
             dataset_params.pop("shuffle", None)
             iterables[dataset_name] = DataLoader(
-                dataset, shuffle=False, collate_fn=self.collate_fn, **dataset_params
+                dataset,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                **apply_ipc_dataloader_params(dataset_params),
             )
         return CombinedLoader(iterables, "max_size_cycle")
 

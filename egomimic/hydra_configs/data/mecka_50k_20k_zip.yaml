@@ -1,0 +1,107 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# Language conditioning (pi0.5 is a VLA): tokenize the per-frame annotation so the
+# model gets tokenized_prompt and viz gets sampled_prompt. build_tokenized_collate
+# reads annotation_key from each sample (frame-aligned text from
+# get_keymap(annotations=true) + the data_schematic annotations entry), samples one
+# prompt, and tokenizes it. Mirrors the eva/cotrain_pi_base setup.
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
+# pi variant of mecka_50k_20k.yaml — same 50k-train / 20k-valid pool, but fed
+# through optimal's sliding-window NVMe prefetch pipeline instead of reading the
+# Modal Volume (/mnt/zarr-data) directly. Pair with model=pi0.5_bc_mecka_scratch
+# (or pi0.5_bc_mecka).
+#
+# Episode-pool selection (mirrors mecka_50k_20k.yaml's max_episodes/valid_ratio):
+#   ZipEpisodeResolver loads catalog.json, takes the first `debug` episodes,
+#   then split_catalog(seed=42) shuffles and partitions by valid_ratio:
+#     n_valid = int(70000 * 0.285715) = 20000  ->  train = 50000
+#   Both resolvers read the same catalog with the same seed, so the train/valid
+#   split is deterministic and non-overlapping across the two datamodules.
+#
+# NOTE — windowed epochs: PrefetchedMapDataset does NOT load all 50k episodes per
+# epoch (that pool won't fit on NVMe). Each epoch consumes a contiguous
+# `episodes_per_epoch` slice of a fixed seed-42 permutation of the 50k pool; the
+# background filler (rank 0 only) stages `lookahead_epochs` worth ahead into
+# `cache_dir` under a hard `pool_size_gb` ceiling. Over a run the window cycles
+# through the whole 50k pool. To recover exact "all 50k every epoch" semantics
+# set episodes_per_epoch: null (requires a pool large enough for all 50k).
+#
+# Sizing below mirrors mecka_all_zip.yaml (modest, single-GPU-ish). To scale to
+# multi-GPU disk-bound training, copy the pool/threads/batch knobs from
+# mecka_zip_h100_4gpu.yaml.
+#
+# Requires the per-episode zip volume (mecka_data_zip) mounted at /mnt/zarr-zip
+# with a populated catalog.json — verify it contains >= 70000 mecka_bimanual
+# episodes before relying on the 70000 truncation.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 70000
+      valid_ratio: 0.285715
+      seed: 42
+      pause_removal_epsilon: 0.005
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 400
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 150
+    lookahead_epochs: 1.5
+    n_copy_threads: 16
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 70000
+      valid_ratio: 0.285715
+      seed: 42
+      pause_removal_epsilon: 0.005
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true   # expose batch["annotations"] for pi eval video viz
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 100
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 30
+    lookahead_epochs: 1.0
+    n_copy_threads: 4
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 24
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    pin_memory: true
+    shuffle: false
