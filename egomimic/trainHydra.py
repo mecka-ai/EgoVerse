@@ -28,6 +28,13 @@ OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("multiply", lambda x, y: int(float(x)) * int(float(y)))
 log = RankedLogger(__name__, rank_zero_only=True)
 
+# Enable TF32 tensor cores for fp32 matmuls/convs on Hopper (H100/H200). The HPT
+# attention runs as a materialized fp32 einsum; without this it takes the slow
+# full-fp32 path and leaves the tensor cores idle. Numerically safe for training.
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 def _build_model_config_tree(cfg: DictConfig) -> DictConfig:
     model_cfg = copy.deepcopy(cfg.model)

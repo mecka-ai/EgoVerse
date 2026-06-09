@@ -1,0 +1,70 @@
+# Data config for OAT tokenizer training over the full WDS (tar-shard) dataset.
+# Mirrors mecka_all_wds but uses larger batches — the OAT tokenizer has no image
+# encoder so forward passes are cheap, even though images are still in the batch.
+#
+# Pair with model=oat_tokenizer and evaluator=null:
+#
+#   python egomimic/modal/trainModal.py \
+#       model=oat_tokenizer \
+#       data=mecka_all_wds_oat_tok \
+#       evaluator=null \
+#       trainer=ddp_modal \
+#       reject_outliers=false \
+#       +modal_volume=mecka_data_wds_v2 \
+#       name=oat_tok description=mecka_bimanual_wds
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
+    shard_dir: /mnt/zarr-wds
+    mode: train
+    cache_dir: /tmp/shard_cache
+    prefetch_shards: 2
+    max_workers: 30
+    key_map:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+      mode: cartesian
+    transform_list:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+      mode: cartesian
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.tar_shard_dataset.TarShardIterableDataset
+    shard_dir: /mnt/zarr-wds
+    mode: valid
+    cache_dir: /tmp/shard_cache
+    prefetch_shards: 1
+    max_workers: 2
+    key_map:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+      mode: cartesian
+    transform_list:
+      _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+      mode: cartesian
+    resolver:
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+
+train_dataloader_params:
+  mecka_bimanual:
+    # Larger batch than HPT configs — OAT tokenizer has no image encoder so the
+    # forward pass is cheap even though WDS shards still deliver image tensors.
+    batch_size: 256
+    num_workers: 30
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: false
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 2
+    persistent_workers: true
+    prefetch_factor: 1

@@ -731,9 +731,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         filters: DatasetFilter | None = None,
         debug: int | bool | None = None,
     ):
-        import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
             logger.warning("Local path does not exist: %s", search_path)
@@ -865,6 +862,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
         allowed_episode_ids: list[str] | None = None,
+        max_episodes: int | None = None,
     ):
         super().__init__(
             folder_path,
@@ -874,24 +872,35 @@ class ModalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
         )
         self.debug = debug
+        self.max_episodes = max_episodes
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
                 self.exclude_hashes.update(json.load(f))
-            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
+            logger.info(
+                "eps_to_ignore: %d hashes from %s",
+                len(self.exclude_hashes),
+                eps_to_ignore,
+            )
         self.include_hashes: set[str] | None = None
         if eps_to_use:
             with open(eps_to_use) as f:
                 self.include_hashes = set(json.load(f))
-            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
+            logger.info(
+                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
+            )
         # allowed_episode_ids: restrict to exactly these hashes (used by curation per-task scoping)
         if allowed_episode_ids is not None:
             allowed_set = set(allowed_episode_ids)
             self.include_hashes = (
-                allowed_set if self.include_hashes is None
+                allowed_set
+                if self.include_hashes is None
                 else self.include_hashes & allowed_set
             )
-            logger.info("allowed_episode_ids: restricted to %d episodes", len(self.include_hashes))
+            logger.info(
+                "allowed_episode_ids: restricted to %d episodes",
+                len(self.include_hashes),
+            )
 
     def resolve(
         self,
@@ -926,6 +935,10 @@ class ModalEpisodeResolver(EpisodeResolver):
             axis=1,
         )
         matched = df.loc[mask, ["episode_hash", "num_frames", "robot_name"]]
+        # Stable sort so any truncation (debug / max_episodes) yields the same
+        # pool across resolver instances (e.g. train vs valid datamodules)
+        # regardless of SQL row order.
+        matched = matched.sort_values("episode_hash").reset_index(drop=True)
         episode_hashes = matched["episode_hash"].tolist()
         logger.info("SQL filter matched %d episodes", len(episode_hashes))
 
@@ -937,6 +950,16 @@ class ModalEpisodeResolver(EpisodeResolver):
             matched = matched.iloc[:k]
             episode_hashes = matched["episode_hash"].tolist()
             logger.info("Debug mode: using first %d episodes", len(episode_hashes))
+
+        if self.max_episodes is not None and len(matched) > self.max_episodes:
+            before = len(matched)
+            matched = matched.iloc[: int(self.max_episodes)]
+            episode_hashes = matched["episode_hash"].tolist()
+            logger.info(
+                "max_episodes: truncated %d → %d episodes (hash-sorted)",
+                before,
+                len(matched),
+            )
 
         dataset_class = self._dataset_class or ZarrDataset
 
@@ -1208,9 +1231,8 @@ class ModalEpisodeResolver(EpisodeResolver):
 
     @staticmethod
     def _should_use_modal_pause_precompute(datasets: dict) -> bool:
-        inside_modal = (
-            os.environ.get("MODAL_IS_REMOTE") == "1"
-            or bool(os.environ.get("MODAL_TASK_ID"))
+        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
+            os.environ.get("MODAL_TASK_ID")
         )
         if not inside_modal:
             return False
@@ -1230,7 +1252,9 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
         n = len(work)
-        n_shards = min(int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
         shards = [work[i::n_shards] for i in range(n_shards)]
         shards = [s for s in shards if s]
         total_shards = len(shards)
@@ -1733,9 +1757,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             cache[zarr_key] = np.asarray(store[zarr_key][:])
         self._zarr_bulk_cache = cache
 
-    def _read_key_slice(
-        self, zarr_key: str, start: int, end: int | None
-    ) -> np.ndarray:
+    def _read_key_slice(self, zarr_key: str, start: int, end: int | None) -> np.ndarray:
         if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
             arr = self._zarr_bulk_cache[zarr_key]
             if end is not None:
@@ -1798,13 +1820,19 @@ class ZarrDataset(torch.utils.data.Dataset):
         left = np.asarray(cache["left.obs_ee_pose"])
         right = np.asarray(cache["right.obs_ee_pose"])
         head_ok = self._pose_rows_valid(
-            head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            head,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         left_ok = self._pose_rows_valid(
-            left, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            left,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         right_ok = self._pose_rows_valid(
-            right, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            right,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
 
         valid: list[int] = []
@@ -1815,7 +1843,10 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
             if not head_ok[real_idx]:
                 continue
-            if not left_ok[real_idx:end_idx].all() or not right_ok[real_idx:end_idx].all():
+            if (
+                not left_ok[real_idx:end_idx].all()
+                or not right_ok[real_idx:end_idx].all()
+            ):
                 continue
             if not left_ok[real_idx] or not right_ok[real_idx]:
                 continue
@@ -1886,7 +1917,9 @@ class ZarrDataset(torch.utils.data.Dataset):
                 if horizon is not None:
                     end_idx = self._chunk_end_idx(real_idx, int(horizon), key_type)
                     window = self._read_key_slice(zarr_key, real_idx, end_idx)
-                    window = self._pad_sequences({zarr_key: window}, int(horizon))[zarr_key]
+                    window = self._pad_sequences({zarr_key: window}, int(horizon))[
+                        zarr_key
+                    ]
                     rows.append(np.asarray(window))
                 else:
                     rows.append(
@@ -1917,7 +1950,11 @@ class ZarrDataset(torch.utils.data.Dataset):
                 data = batch
                 for transform in self.transform:
                     data = transform.transform_batch(data)
-                out = {k: np.asarray(v) for k, v in data.items() if isinstance(v, np.ndarray)}
+                out = {
+                    k: np.asarray(v)
+                    for k, v in data.items()
+                    if isinstance(v, np.ndarray)
+                }
                 return out, np.arange(batch_size, dtype=np.int64)
             except Exception as exc:
                 logger.debug(
@@ -2400,14 +2437,22 @@ class ZarrEpisode:
             ... })
         """
         result = {}
-        for key, (start, end) in keys_with_ranges.items():
+        for key, idx_or_range in keys_with_ranges.items():
             arr = self._store[key]
-            if end is not None:
-                data = arr[start:end]
+            if isinstance(idx_or_range, np.ndarray):
+                # Fancy-index path: an explicit array of frame indices (a fully
+                # pause-filtered action chunk, where __getitem__ gathers
+                # keep_indices directly instead of a contiguous slice).
+                data = arr[idx_or_range]
             else:
-                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                data = arr[start : start + 1][0]
+                start, end = idx_or_range
+                if end is not None:
+                    data = arr[start:end]
+                else:
+                    # Single frame read - use slicing to avoid 0D array issues with
+                    # VariableLengthBytes. arr[start:start+1] gives a 1D array, then
+                    # [0] extracts the actual object.
+                    data = arr[start : start + 1][0]
             result[key] = data
         return result
 

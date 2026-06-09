@@ -1,0 +1,137 @@
+# 2×H200 — FOLD-CLOTHES single-task data-scaling sweep, point 1 of 3: ~50h.
+#
+# Single task = folding_clothes, packed into its OWN zip volume
+# (mecka_data_zip_fold_clothes, 5,313 eps ≈ 135.7h) — separate from the 70k
+# mecka_data_zip. Subsets are NESTED (50h ⊂ 100h ⊂ max), built by shuffle-once
+# (seed 42) then taking the prefix whose cumulative frames reach the hour
+# target. One median-length viz episode is held out and shared across all three
+# points. Per-episode frame counts come from the zip catalog.json (real
+# total_frames, ~92 s/ep mean).
+#
+#   task: folding_clothes   subset=1967 eps (~50.0h @ ~92 s/ep)
+#   split: ~1770 train / ~196 valid (resolver valid_ratio=0.1)
+#
+# Launch (2×H200, PI/PaliGemma scratch + pretrained backbone, batch 32, workers 16,
+# val every 50 epochs, 2 lookahead epochs, 48/16 copy threads):
+#   python egomimic/modal/trainModal.py --config-name=train_zarr_cartesian_pi \
+#     data=mecka_zip_fold_clothes_50h logger=wandb \
+#     model=pi0.5_bc_mecka_scratch \
+#     model.robomimic_model.config.paligemma_weight_path=paligemma_weights/paligemma-3b-pt-224 \
+#     name=<run> description=<desc> \
+#     evaluator@train_viz_evaluator=train_viz_pi \
+#     trainer.check_val_every_n_epoch=50 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:2 +modal_cpu=48 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip_fold_clothes +modal_ephemeral_disk_gb=1024 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
+#
+# Storage (~1967 × ~125 MB ≈ 246 GB): pools train 350 + valid 50 + viz 10 ≈
+# 410 GB caps, well within 1 TB ephemeral disk. Stage-all: train split
+# (~1770 × 125 MB ≈ 221 GB) must fit under 0.92×350=322 GB — clears with margin.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/fold_clothes_50h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 1967    # == full subset → stage-all before training
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 350           # holds all ~1770 train eps (~221 GB) under 0.92 gate (322 GB); no eviction
+    lookahead_epochs: 2.0
+    n_copy_threads: 48
+    prepare_timeout_s: 7200
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/fold_clothes_50h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 220     # full valid split (~196, ~10% of 1967)
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 50            # holds all ~196 valid eps (~25 GB)
+    lookahead_epochs: 2.0
+    n_copy_threads: 16
+    prepare_timeout_s: 7200
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/fold_clothes_viz.json
+      valid_ratio: 1.0          # keep all viz episodes (no split)
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 1       # == n_tasks
+    epoch_frames: 80            # max_frames_per_episode=80 → 80 samples per task
+    max_frames_per_episode: 80
+    cache_dir: /cache/zarr_cache_viz
+    pool_size_gb: 10
+    lookahead_epochs: 1.0
+    n_copy_threads: 4
+    prepare_timeout_s: 3600
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 16
+    persistent_workers: false
+    prefetch_factor: 6
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32           # capped at 32 to avoid OOM; 80 viz samples/task span multiple batches
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
