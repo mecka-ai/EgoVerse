@@ -58,7 +58,12 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
 
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
-    _PATH_KEYS = {"ckpt_path", "norm_stats.precomputed_norm_path"}
+    _PATH_KEYS = {
+        "ckpt_path",
+        "norm_stats.precomputed_norm_path",
+        "model.robomimic_model.config.paligemma_weight_path",
+        "model.robomimic_model.config.pytorch_weight_path",
+    }
     fixed = []
     for arg in hydra_args:
         key, sep, val = arg.partition("=")

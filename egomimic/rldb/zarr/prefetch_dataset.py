@@ -200,6 +200,7 @@ class ZipEpisodeResolver(EpisodeResolver):
         debug: int | None = None,
         min_frames: int | None = None,
         seed: int = 42,
+        eps_to_use: str | None = None,
     ):
         super().__init__(
             Path(zip_dir),
@@ -214,6 +215,17 @@ class ZipEpisodeResolver(EpisodeResolver):
         self.min_frames = min_frames
         self.seed = seed
         self._catalog: list[EpisodeCatalogEntry] | None = None
+
+        # Optional episode allowlist: restrict the catalog to exactly these
+        # episode hashes (a JSON list). Used to train on a task-balanced subset
+        # generated offline (see scripts/mecka_process/build_task_subset_configs.py).
+        self.include_hashes: set[str] | None = None
+        if eps_to_use:
+            with open(eps_to_use) as f:
+                self.include_hashes = set(json.load(f))
+            logger.info(
+                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
+            )
 
     def load_catalog(self) -> list[EpisodeCatalogEntry]:
         if self._catalog is not None:
@@ -251,6 +263,13 @@ class ZipEpisodeResolver(EpisodeResolver):
                 n_missing,
             )
 
+        if self.include_hashes is not None:
+            before = len(entries)
+            entries = [e for e in entries if e.episode_hash in self.include_hashes]
+            logger.info(
+                "eps_to_use: restricted to %d / %d episodes", len(entries), before
+            )
+
         if self.debug:
             entries = entries[: int(self.debug)]
             logger.info(
@@ -269,8 +288,11 @@ class ZipEpisodeResolver(EpisodeResolver):
                 before,
             )
 
+        # NOTE: catalog n_frames is a -1 placeholder for most episodes; the real
+        # per-episode frame count is read from the staged zarr at index_map build
+        # time (PrefetchedMapDataset._episode_n_frames), not from this sum.
         logger.info(
-            "ZipEpisodeResolver: %d episodes, %d total frames from %s",
+            "ZipEpisodeResolver: %d episodes (catalog frame total=%d, -1=unknown) from %s",
             len(entries),
             sum(e.n_frames for e in entries),
             catalog_path,
@@ -840,8 +862,17 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         n_copy_threads: int = 16,
         seed: int = 42,
         prepare_timeout_s: float = 3600.0,
+        max_frames_per_episode: int | None = None,
     ):
         super().__init__()
+        # Cap the frames each episode contributes to the index_map. Default None
+        # = every frame (normal train/valid). The train_viz set pairs a
+        # one-episode-per-task allowlist with max_frames_per_episode=1, so each
+        # task yields a single (mid-trajectory) sample and one viz batch covers
+        # one sample per task. Evenly spaced; k=1 → the middle frame.
+        self.max_frames_per_episode = (
+            int(max_frames_per_episode) if max_frames_per_episode else None
+        )
         # Max seconds prepare_epoch blocks waiting for its window to materialize.
         # Default 1h suits windowed configs (small window). Stage-all configs
         # (episodes_per_epoch == full subset) must raise this above the full
@@ -853,6 +884,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.n_copy_threads = int(n_copy_threads)
         self.seed = seed
+        # Max time prepare_epoch blocks waiting for the window to materialize.
+        # Default 1h is plenty for a normal sliding window; raise it for
+        # stage-all-first configs where episodes_per_epoch == a large subset
+        # (e.g. 20k episodes from a ~150 MB/s volume takes ~3h to stage).
+        self.prepare_timeout_s = float(prepare_timeout_s)
 
         self._episodes = resolver.split_catalog(mode)
         if not self._episodes:
@@ -936,6 +972,13 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self._index_map: list[tuple[str, int]] | None = None
         self._current_epoch: int = -1
 
+        # episode_hash -> real frame count, read from the staged zarr metadata
+        # (NOT the catalog, whose n_frames may be a -1 placeholder). Populated
+        # lazily during index_map construction; episode lengths never change so
+        # one read per episode suffices. Deterministic across ranks/workers
+        # because every process reads the same staged zarr.json.
+        self._frame_count_cache: dict[str, int] = {}
+
         # Probe path for shape/norm inference before prepare_epoch.
         self._probe_zarr_path: str | None = None
 
@@ -1004,8 +1047,16 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         if torch.utils.data.get_worker_info() is not None:
             self._maybe_reload_worker_epoch()
 
-        if self._index_map is None:
-            # Pre-prepare_epoch path: shape + norm-stats inference via probe.
+        if not self._index_map:
+            # Two cases land here, both safe to serve from the probe:
+            #   * Pre-prepare_epoch (index_map is None): shape + norm-stats
+            #     inference before the first window is built.
+            #   * A worker whose rebuild transiently produced an empty window
+            #     because its episodes were not materialized yet (valid-mode
+            #     synchronous extraction racing the rebuild). The worker retries
+            #     the rebuild on the next __getitem__ and switches to the real
+            #     index_map once zarr.json appears.
+            # Either way, return a probe sample rather than divide by zero below.
             if self._probe_zarr_path is None:
                 self._probe_zarr_path = self._extract_probe()
             if not hasattr(self, "_probe_ds"):
@@ -1200,6 +1251,53 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     n_ok += 1
         logger.info("Valid extractor: window ready (%d ok, %d failed).", n_ok, n_err)
 
+    def _episode_n_frames(self, ep_path: str, fallback: int = 0) -> int:
+        """Real frame count for a *staged* episode, from its root zarr.json.
+
+        The episode is guaranteed materialized (``.done``) before any index_map
+        is built, so ``<ep_path>/zarr.json`` is on local NVMe. We read its
+        ``attributes.total_frames`` rather than trusting the catalog's
+        ``n_frames`` (which is a -1 placeholder for most episodes). Cached per
+        episode; deterministic across ranks since every process reads the same
+        staged metadata. On a missing/corrupt zarr.json we return ``fallback``
+        (0 → the episode contributes no frames and the .bad machinery drops it).
+        """
+        cached = self._frame_count_cache.get(ep_path)
+        if cached is not None:
+            return cached
+        try:
+            with open(Path(ep_path) / "zarr.json") as f:
+                n = int(json.load(f)["attributes"]["total_frames"])
+        except (OSError, KeyError, ValueError, TypeError) as e:
+            # Do NOT cache the fallback. A missing/partial zarr.json almost always
+            # means the episode is mid-extraction (valid-mode synchronous staging
+            # races a worker index_map rebuild). Caching 0 here would poison the
+            # count permanently — the episode would contribute 0 frames forever,
+            # even after its zarr.json materializes. Returning uncached lets a
+            # later rebuild read the real total_frames once the file lands.
+            logger.warning(
+                "Could not read total_frames from %s/zarr.json (%s); using %d (uncached)",
+                ep_path,
+                e,
+                fallback,
+            )
+            return fallback
+        self._frame_count_cache[ep_path] = n
+        return n
+
+    def _episode_frame_indices(self, ep_path: str) -> list[int]:
+        """Frame indices this episode contributes to the index_map.
+
+        Normally every frame; with ``max_frames_per_episode`` set, an evenly
+        spaced subset (k=1 → the single middle frame). Deterministic, so the
+        main process and worker rebuilds produce identical index_maps.
+        """
+        n = self._episode_n_frames(ep_path)
+        if self.max_frames_per_episode and n > 0:
+            k = min(self.max_frames_per_episode, n)
+            return [int((i + 0.5) * n / k) for i in range(k)]
+        return list(range(n))
+
     # ------------------------------------------------------------------
     # Epoch lifecycle — called from Lightning callback on main process
     # ------------------------------------------------------------------
@@ -1314,8 +1412,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             now = time.monotonic()
             if now > deadline:
                 raise RuntimeError(
-                    f"prepare_epoch: timeout ({self.prepare_timeout_s:.0f}s) waiting for "
-                    f"{len(pending)} episodes for epoch {gen_label}"
+                    f"prepare_epoch: timeout ({self.prepare_timeout_s / 3600:.1f}h) waiting "
+                    f"for {len(pending)} episodes for epoch {gen_label}"
                 )
             if now - last_log > 30.0:
                 stats = self._filler.stats() if self._filler is not None else {}
@@ -1359,7 +1457,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         index_map: list[tuple[str, int]] = []
         for ep in window_eps:
             ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
+            for fi in self._episode_frame_indices(ep_path):
                 index_map.append((ep_path, fi))
         if self.mode == "train":
             rng = random.Random(self.seed + epoch + 99999)
@@ -1453,6 +1551,24 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         if published_epoch == self._worker_epoch_loaded:
             return
 
+        # Fast path for persistent_workers=False (the default/required mode): a
+        # freshly-forked worker inherits, via fork, the index_map the MAIN
+        # process built in prepare_epoch *after* every episode was materialized.
+        # That map is already correct and deterministic — identical to what a
+        # rebuild would reproduce (same seed + shuffle) — so adopt it instead of
+        # re-reading each episode's zarr.json. The re-read is exactly what races
+        # valid-mode synchronous extraction: the epoch file is published before
+        # extraction finishes (so worker rebuilds can run before eviction), and a
+        # rebuild in that window sees not-yet-written zarr.json, counts 0 frames
+        # for every episode, and yields an empty index_map → divide-by-zero.
+        if (
+            self._worker_epoch_loaded == -1
+            and self._current_epoch == published_epoch
+            and self._index_map
+        ):
+            self._worker_epoch_loaded = published_epoch
+            return
+
         # Build the same window the main process built. The plan is
         # deterministic (same seed across all processes), so the resulting
         # (ep_path, frame_idx) tuples match main's index_map exactly.
@@ -1463,8 +1579,24 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         index_map: list[tuple[str, int]] = []
         for ep in window_eps:
             ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
+            for fi in self._episode_frame_indices(ep_path):
                 index_map.append((ep_path, fi))
+
+        # A non-racing rebuild is always non-empty (EpisodePlan rejects an empty
+        # split and episodes_per_epoch>0). An empty result means this window's
+        # episodes are still mid-extraction and their zarr.json don't exist yet.
+        # Do NOT install an empty map (it would divide-by-zero in __getitem__)
+        # and do NOT advance _worker_epoch_loaded — leave the prior map (or None
+        # → probe path) in place and retry on the next __getitem__, by which
+        # point synchronous extraction has typically finished.
+        if not index_map:
+            logger.warning(
+                "worker rebuild for epoch %d produced an empty index_map "
+                "(episodes not materialized yet); keeping prior map, will retry",
+                published_epoch,
+            )
+            return
+
         if self.mode == "train":
             rng = random.Random(self.seed + published_epoch + 99999)
             rng.shuffle(index_map)
