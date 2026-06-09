@@ -29,13 +29,16 @@ logger = logging.getLogger(__name__)
 def _gather_points(latents_list: list, every_n: int):
     """Subsample every ``every_n``-th frame per episode.
 
-    Returns ``(X (N, D), ep_index (N,), time_frac (N,))`` where ``time_frac`` in
-    [0, 1] is the frame's normalized position in its episode (0 = first frame,
-    1 = last). Returns ``(None, None, None)`` if there are no frames.
+    Returns ``(X (N, D), ep_index (N,), time_frac (N,), frame_idx (N,))`` where
+    ``time_frac`` in [0, 1] is the frame's normalized position in its episode
+    (0 = first frame, 1 = last) and ``frame_idx`` is the frame's row index in
+    the episode's latent sequence. Returns ``(None, None, None, None)`` if
+    there are no frames.
     """
     pts: list = []
     ep_index: list = []
     time_frac: list = []
+    frame_idx: list = []
     for i, lat in enumerate(latents_list):
         lat = np.asarray(lat)
         T = len(lat)
@@ -45,12 +48,14 @@ def _gather_points(latents_list: list, every_n: int):
             pts.append(lat[j])
             ep_index.append(i)
             time_frac.append(j / max(1, T - 1))
+            frame_idx.append(j)
     if not pts:
-        return None, None, None
+        return None, None, None, None
     return (
         np.asarray(pts, dtype=np.float64),
         np.asarray(ep_index, dtype=np.int64),
         np.asarray(time_frac, dtype=np.float64),
+        np.asarray(frame_idx, dtype=np.int64),
     )
 
 
@@ -68,7 +73,7 @@ def _make_one(
     import matplotlib.pyplot as plt
     from sklearn.manifold import TSNE
 
-    X, ep_index, time_frac = _gather_points(latents_list, every_n)
+    X, ep_index, time_frac, _ = _gather_points(latents_list, every_n)
     if X is None or len(X) < 5:
         logger.warning(
             "tsne[%s/%s]: too few points (%s) — skipped",
@@ -147,3 +152,61 @@ def make_task_tsne_plots(
     state_png = _make_one(task_name, state_latents, "state", out_dir, every_n, seed)
     action_png = _make_one(task_name, action_latents, "action", out_dir, every_n, seed)
     return state_png, action_png
+
+
+def export_task_tsne3d(
+    task_name: str,
+    state_latents: list,
+    action_latents: list,
+    episode_hashes: list[str],
+    out_dir: str | Path,
+    every_n: int = 10,
+    seed: int = 42,
+) -> str | None:
+    """Export 3-D t-SNE coords + point metadata for the interactive viewer.
+
+    Writes ``tsne3d_<task>.json`` containing, for each modality (state/action),
+    parallel arrays ``x/y/z`` (3-D t-SNE coords), ``ep`` (index into
+    ``episodes``), ``frame`` (row index in the episode's latent sequence), and
+    ``t`` (normalized time in [0, 1]). Episode order is identical across
+    modalities so a viewer can color the same episode consistently.
+    """
+    import json
+
+    from sklearn.manifold import TSNE
+
+    out: dict = {"task": task_name, "episodes": list(episode_hashes), "every_n": every_n}
+    for modality, latents_list in (("state", state_latents), ("action", action_latents)):
+        X, ep_index, time_frac, frame_idx = _gather_points(latents_list, every_n)
+        if X is None or len(X) < 5:
+            logger.warning(
+                "tsne3d[%s/%s]: too few points — skipped", task_name, modality
+            )
+            continue
+        n = len(X)
+        perplexity = max(5.0, min(30.0, (n - 1) / 3.0))
+        emb = TSNE(
+            n_components=3,
+            perplexity=perplexity,
+            init="pca",
+            random_state=seed,
+        ).fit_transform(X)
+        out[modality] = {
+            "x": [round(float(v), 3) for v in emb[:, 0]],
+            "y": [round(float(v), 3) for v in emb[:, 1]],
+            "z": [round(float(v), 3) for v in emb[:, 2]],
+            "ep": ep_index.tolist(),
+            "frame": frame_idx.tolist(),
+            "t": [round(float(v), 4) for v in time_frac],
+        }
+        logger.info("tsne3d[%s/%s]: %d points embedded", task_name, modality, n)
+
+    if "state" not in out and "action" not in out:
+        return None
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"tsne3d_{task_name}.json"
+    with open(path, "w") as f:
+        json.dump(out, f, separators=(",", ":"))
+    logger.info("tsne3d[%s]: wrote %s", task_name, path)
+    return str(path)

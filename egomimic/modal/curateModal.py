@@ -434,6 +434,8 @@ def _score_task_split(
         try:
             from egomimic.curation.tsne_viz import make_task_tsne_plots
 
+            from egomimic.curation.tsne_viz import export_task_tsne3d
+
             tsne_dir = Path(run_output_dir) / "tsne"
             s_png, a_png = make_task_tsne_plots(
                 task_name,
@@ -443,10 +445,32 @@ def _score_task_split(
                 every_n=10,
                 seed=select_seed(cfg),
             )
+            # 3-D coords + (episode, frame) metadata for the interactive viewer
+            # (egomimic/scripts/build_latent_viz.py).
+            tsne3d_json = export_task_tsne3d(
+                task_name,
+                state_latents,
+                action_latents,
+                scored_hashes,
+                Path(run_output_dir) / "tsne3d",
+                every_n=10,
+                seed=select_seed(cfg),
+            )
+            # Raw latents: re-project later (different t-SNE params / UMAP / 2-D
+            # vs 3-D) without re-running the GPU embed pass.
+            lat_dir = Path(run_output_dir) / "latents"
+            lat_dir.mkdir(parents=True, exist_ok=True)
+            _np.savez_compressed(
+                lat_dir / f"latents_{task_name}.npz",
+                state=_np.concatenate(state_latents, axis=0),
+                action=_np.concatenate(action_latents, axis=0),
+                lengths=_np.asarray(ep_lengths, dtype=_np.int64),
+                hashes=_np.asarray(scored_hashes),
+            )
             training_outputs_volume.commit()
             print(
-                f"{tag} t-SNE plots written in {_time.perf_counter() - t_viz:.1f}s "
-                f"— state={s_png}, action={a_png}"
+                f"{tag} t-SNE viz written in {_time.perf_counter() - t_viz:.1f}s "
+                f"— state={s_png}, action={a_png}, tsne3d={tsne3d_json}"
             )
         except Exception as exc:
             import traceback
