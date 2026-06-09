@@ -1,7 +1,11 @@
+import logging
+
 from torchmetrics import MeanSquaredError
 
 from egomimic.eval.eval_video import EvalVideo
 from egomimic.rldb.embodiment.embodiment import get_embodiment
+
+logger = logging.getLogger(__name__)
 
 
 class PIEvalVideo(EvalVideo):
@@ -30,8 +34,21 @@ class PIEvalVideo(EvalVideo):
                     preds[pred_key][:, -1].cpu(), _batch[ac_key][:, -1].cpu()
                 )
 
-            ims = self._visualize_preds(preds, _batch)
-            images_dict[embodiment_id] = ims
+            # Visualization is non-essential: the Valid/*_mse metrics above are
+            # the training signal. A viz error (missing per-embodiment viz_func,
+            # unexpected image key, etc.) must never abort a (multi-hour) run, so
+            # log and skip images for this embodiment instead of raising.
+            try:
+                ims = self._visualize_preds(preds, _batch)
+            except Exception as exc:
+                logger.warning(
+                    "PIEvalVideo: visualization failed for %s (%r); skipping images",
+                    embodiment_name,
+                    exc,
+                )
+                ims = None
+            if ims is not None:
+                images_dict[embodiment_id] = ims
         return metrics, images_dict
 
     def _visualize_preds(self, predictions, batch):
@@ -40,4 +57,10 @@ class PIEvalVideo(EvalVideo):
             raise ValueError("viz_func is not set")
         embodiment_id = batch["embodiment"][0].item()
         embodiment_name = get_embodiment(embodiment_id).lower()
+        if embodiment_name not in algo.viz_func:
+            logger.warning(
+                "PIEvalVideo: no viz_func configured for embodiment '%s'; skipping viz",
+                embodiment_name,
+            )
+            return None
         return algo.viz_func[embodiment_name](predictions, batch)

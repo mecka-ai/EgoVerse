@@ -155,8 +155,68 @@ class PI(Algo):
             )
         else:
             logger.warning("No pytorch_weight_path specified — training from scratch")
+
+        # Optionally initialize ONLY the PaliGemma VLM backbone from pretrained
+        # weights (action expert + projections stay random). Mutually exclusive
+        # in spirit with pytorch_weight_path (a full pi0.5 checkpoint already
+        # contains PaliGemma); warn if both are set.
+        paligemma_weight_path = getattr(self.config, "paligemma_weight_path", None)
+        if paligemma_weight_path:
+            if self.config.pytorch_weight_path is not None:
+                logger.warning(
+                    "Both pytorch_weight_path and paligemma_weight_path set — "
+                    "loading PaliGemma backbone on top of the pi checkpoint."
+                )
+            self._load_paligemma_backbone(paligemma_weight_path)
+
         self.nets = nn.ModuleDict()
         self.nets["policy"] = self.model
+
+    def _load_paligemma_backbone(self, path: str) -> None:
+        """Initialize the PaliGemma VLM backbone from a pretrained HF snapshot.
+
+        Loads ``path`` (a local PaliGemma HF directory) and copies its
+        parameters into ``model.paligemma_with_expert.paligemma`` by name+shape
+        (strict=False), leaving the action expert and projection heads at their
+        random init. Raises if the match ratio is implausibly low, so a silent
+        key/shape mismatch can't masquerade as a successful pretrained init.
+        """
+        from transformers import PaliGemmaForConditionalGeneration
+
+        target = (
+            self.model.module
+            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+            else self.model
+        )
+        pg = target.paligemma_with_expert.paligemma
+
+        pretrained = PaliGemmaForConditionalGeneration.from_pretrained(path)
+        src_sd = pretrained.state_dict()
+        tgt_sd = pg.state_dict()
+        to_load = {
+            k: v
+            for k, v in src_sd.items()
+            if k in tgt_sd and tuple(v.shape) == tuple(tgt_sd[k].shape)
+        }
+        pg.load_state_dict(to_load, strict=False)
+
+        match_ratio = len(to_load) / max(1, len(tgt_sd))
+        logger.info(
+            "PaliGemma backbone init from %s: matched %d/%d target params "
+            "(%.1f%%); %d source keys unused",
+            path,
+            len(to_load),
+            len(tgt_sd),
+            100.0 * match_ratio,
+            len(src_sd) - len(to_load),
+        )
+        del pretrained, src_sd
+        if match_ratio < 0.95:
+            raise RuntimeError(
+                f"PaliGemma backbone init matched only {match_ratio:.1%} of target "
+                f"params from {path} — likely a key/shape mismatch, not a real "
+                "pretrained init. Refusing to proceed."
+            )
 
     @override
     def process_batch_for_training(self, batch):

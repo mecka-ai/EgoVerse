@@ -37,6 +37,9 @@ schematic_dict:
     actions_cartesian:
       key_type: action_keys
       zarr_key: actions_cartesian
+    annotations:
+      key_type: annotation_keys
+      zarr_key: annotations
   scale_bimanual:
     base_0_rgb:
       key_type: camera_keys
