@@ -231,6 +231,24 @@ class ModelWrapper(LightningModule):
         if isinstance(batch, tuple) and len(batch) == 3 and isinstance(batch[0], dict):
             batch = batch[0]
         batch = self.model.process_batch_for_training(batch)
+
+        # Log validation loss on the held-out valid set (dataloader_idx == 0).
+        # dataloader_idx == 1 is the train_viz pass (qualitative rollouts only),
+        # so it has no meaningful loss to report.
+        if dataloader_idx == 0:
+            predictions = self.model.forward_training(batch)
+            losses = self.model.compute_losses(predictions, batch)
+            info = {"losses": TensorUtils.detach(losses)}
+            for k, v in self.model.log_info(info).items():
+                self.log(
+                    "Valid/" + k,
+                    v,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    add_dataloader_idx=False,
+                )
+
         print(
             f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}, "
             f"dataloader_idx={dataloader_idx}",
