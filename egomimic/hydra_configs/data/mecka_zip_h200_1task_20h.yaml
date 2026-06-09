@@ -1,0 +1,150 @@
+# 2×H200 — DATA-SCALING (HOURS) SWEEP, point 4 of 5: ~20h on ONE task.
+#
+# Sweep design (inverse of the 20h task-scaling sweep): the task is held fixed
+# at the single top task (potting_plants, ~49h available) while the amount of
+# data grows (1 → 5 → 10 → 20 → 50h). The episode subsets are strictly NESTED
+# (1h ⊂ 5h ⊂ 10h ⊂ 20h ⊂ 50h), so the only varied factor is how many hours of
+# this one task the model sees. This config is the ~20h point (20h ⊃ 10h).
+#
+# NOTE: this is the hours-sweep's own NESTED 20h subset — distinct from the
+# task-sweep's mecka_zip_h200_20h_1task.yaml (same task, same ~747 eps count,
+# but a different random draw). Use this one to keep the hours sweep internally
+# nested; use the task-sweep file when comparing against 5/10-task at 20h.
+#
+#   task: potting_plants   subset≈747 eps (~20h @ ~96 s/ep)
+#   split: ~673 train / ~74 valid (resolver valid_ratio=0.1)
+#
+# Subset selected offline by build_task_subset_configs.py (shuffle-once then
+# prefix → nested) and pinned via the resolver's `eps_to_use` allowlist
+# (mecka_1task_20h.json). Per-episode frame counts are read from each staged
+# zarr's metadata at index_map build time. train_viz: one mid-trajectory sample
+# (1 sample, the same episode across every hours point).
+#
+# Launch (2×H200, PI/PaliGemma scratch + pretrained backbone, batch 32, workers 16,
+# val every 50 epochs, 2 lookahead epochs, 48/16 copy threads):
+#   python egomimic/modal/trainModal.py --config-name=train_zarr_cartesian_pi \
+#     data=mecka_zip_h200_1task_20h logger=wandb \
+#     model=pi0.5_bc_mecka_scratch \
+#     model.robomimic_model.config.paligemma_weight_path=paligemma_weights/paligemma-3b-pt-224 \
+#     name=<run> description=<desc> \
+#     evaluator@train_viz_evaluator=train_viz_pi \
+#     trainer.check_val_every_n_epoch=50 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:2 +modal_cpu=48 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=1024 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
+#   (--config-name=train_zarr_cartesian_pi sets data_schematic=pi, evaluator=eval_pi,
+#    trainer=ddp_pi, visualization=pi_cartesian_lang; init_submodules defaults true →
+#    openpi submodule + transformers 4.53.2 swap required by pi0.5.)
+#
+# Storage (~747 × ~198 MB ≈ 148 GB): pools train 200 + valid 40 + viz 10 ≈
+# 250 GB, well within the 1 TB (1024 GiB) ephemeral disk. Stage-all sizing: the train
+# split (~673 eps × 198 MB ≈ 133 GB measured) must fit under 0.92×pool_size_gb=184 GB —
+# 200 GB pool clears it with ~50 GB margin so the PoolFillerThread never deadlocks.
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_1task_20h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 747     # == full subset → stage-all before training
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 200           # holds all ~673 train eps (~133 GB measured) under 0.92 gate (184 GB); no eviction
+    lookahead_epochs: 2.0
+    n_copy_threads: 48
+    prepare_timeout_s: 3600     # 1h is ample for ~750 eps off the ~150 MB/s volume
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_1task_20h.json
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 80      # full valid split (~74, ~10% of 747)
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 40            # holds all ~74 valid eps (~11 GB)
+    lookahead_epochs: 2.0
+    n_copy_threads: 16
+    prepare_timeout_s: 3600
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_1task_20h_viz.json
+      valid_ratio: 1.0          # keep all viz episodes (no split)
+      debug: null
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 1       # == n_tasks
+    epoch_frames: 80            # max_frames_per_episode=80 → 80 samples per task
+    max_frames_per_episode: 80
+    cache_dir: /cache/zarr_cache_viz
+    pool_size_gb: 10
+    lookahead_epochs: 1.0
+    n_copy_threads: 4
+    prepare_timeout_s: 3600
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 16
+    persistent_workers: false
+    prefetch_factor: 6
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32           # capped at 32 to avoid OOM; 80 viz samples/task span multiple batches
+    num_workers: 1
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false

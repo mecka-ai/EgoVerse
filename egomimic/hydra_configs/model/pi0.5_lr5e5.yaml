@@ -1,0 +1,25 @@
+defaults:
+  - pi0.5_bc_mecka_scratch
+  - _self_
+
+# LR-sweep point 3/3 for the ironing_clothes 30h dataset
+# (data=mecka_zip_h200_ironing_30h). pi0.5 from scratch + pretrained PaliGemma
+# backbone (pass model.robomimic_model.config.paligemma_weight_path at launch).
+#
+# Cosine-schedule T_max (num_training_steps) = ONE pass over 30h of data:
+#   30h × 3600 s/h × 30 fps = 3,240,000 samples ÷ global batch 256 = 12,656 steps.
+#   (global batch 256 = 4×H200 DDP × 64 per-device; the scheduler steps once per
+#    global batch, so the divisor is 256, not the per-device 64.)
+# Warmup set to 2000 steps. num_cycles 0.5 → cosine decay, but FLOORED at a
+# minimum LR of 1e-6 (min-lr cosine variant) rather than decaying all the way to 0.
+optimizer:
+  lr: 5e-5
+
+scheduler:
+  # Full module path: the min-lr cosine helper is NOT re-exported at the
+  # transformers top level in the version pi0.5 pins (4.53.2), only under
+  # transformers.optimization. Using transformers.<name> fails at instantiation.
+  _target_: transformers.optimization.get_cosine_with_min_lr_schedule_with_warmup
+  num_warmup_steps: 2000
+  num_training_steps: 100000
+  min_lr: 1.0e-6
