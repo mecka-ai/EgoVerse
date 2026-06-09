@@ -512,9 +512,26 @@ def _prepare_repo(
             ],
             check=True,
         )
+    # Make egomimic importable WITHOUT `pip install -e .`. The editable install
+    # runs setuptools' egg-info file walk over the repo root, which on Modal
+    # contains `logs/` — a symlink to the ENTIRE egoverse-training-outputs volume
+    # (hundreds of GB of past runs). setuptools walks with followlinks=True and
+    # crawls the whole volume, so `pip install -e .` pins a core at ~100% for
+    # 15+ min (worsening as the volume grows) and never reaches training. A .pth
+    # on sys.path makes `import egomimic` resolve at interpreter startup for the
+    # main process AND every re-execed DDP rank — identical to the openpi .pth
+    # below — with no file walk. egomimic declares no entry points / console
+    # scripts, so the editable install provided nothing else here.
     subprocess.run(
-        [CFG.python_bin, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"],
-        cwd=CFG.remote_repo_dir,
+        [
+            CFG.python_bin,
+            "-c",
+            "import sysconfig, os, sys; "
+            "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_egomimic.pth'); "
+            "open(p, 'w').write(sys.argv[1]); "
+            "print('registered egomimic path ->', sys.argv[1])",
+            CFG.remote_repo_dir,
+        ],
         check=True,
     )
 
