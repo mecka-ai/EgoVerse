@@ -1,0 +1,92 @@
+# OAT tokenizer — STAGE-ALL-FIRST over the 14-task curation episode set, A100-40GB.
+#
+# Same 14 tasks as the curation comparison runs (deminf_cmp_*): the episode-hash
+# allowlist mecka_curated_14task_all.json (383 episodes) is applied to the zip
+# resolver via eps_to_use. episodes_per_epoch == the full subset, so
+# prepare_epoch(0) stages the whole train/valid split to local NVMe before the
+# first step — then the filler idles and every __getitem__ hits warm disk.
+#
+# Prereq: all 383 hashes must be present in the zip volume catalog. 150 were
+# already there; the other 233 are zipped via:
+#   python egomimic/modal/zip_zarr_to_vol.py \
+#     --only egomimic/hydra_configs/data/extra/mecka_14task_zip_missing.json
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_oat_tok_14task_staged trainer=ddp_modal logger=wandb \
+#     model=oat_tokenizer evaluator=eval_tokenizer_video \
+#     name=<run> description=<desc> \
+#     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=600 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false reject_outliers=false \
+#     launch_params.gpus_per_node=1
+#
+# Disk budget (600 GB ephemeral): 383 eps × ~131 MB ≈ 50 GB live.
+#   train pool ... 150 GB    valid pool ... 40 GB    torch tmp + probe ... ~40 GB
+#   headroom .... ~370 GB
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_14task_all.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 383   # >= train split → prepare_epoch(0) stages the whole set first
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 150         # holds the whole ~50 GB subset, no eviction
+    lookahead_epochs: 1.0     # window is the whole set; filler stages once then idles
+    n_copy_threads: 32
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_curated_14task_all.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 383   # >= valid split → whole valid split staged before validation
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 40
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    # OAT tokenizer has no image encoder — forward pass is cheap even with images
+    # in the batch (needed for the eval-time GT-vs-reconstructed overlay viz).
+    batch_size: 256
+    num_workers: 16
+    persistent_workers: true   # window == whole set every epoch → index_map is stable
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false

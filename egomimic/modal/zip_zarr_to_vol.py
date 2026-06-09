@@ -261,7 +261,7 @@ def write_catalog(entries: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 @app.local_entrypoint()
-def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
+def main(debug: int = 0, dry_run: bool = False, force: bool = False, only: str = "") -> None:
     """Dispatch parallel per-episode conversion jobs to mecka_data_zip.
 
     After the main conversion pass, scans for any tars missing their .done
@@ -272,6 +272,10 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
         debug:   If > 0, limit conversion to this many episodes (for smoke-testing).
         dry_run: Print plan without launching any jobs.
         force:   If True, overwrite existing tars (use to fix corrupted tars).
+        only:    Path to a JSON list of episode_hashes. If set, convert ONLY
+                 those episodes (used to top up a task subset without rescanning
+                 the whole volume). catalog.json write is merge-idempotent, so
+                 the new entries are added to the existing catalog.
     """
     print("Listing episodes from mecka_data_v2 (/mnt/zarr-data)...")
     all_episodes = list_episodes.remote()
@@ -284,6 +288,17 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False) -> None:
         return name[:-5] if name.endswith(".zarr") else name
 
     hash_to_dir: dict[str, str] = {_ep_hash(ep): ep for ep in all_episodes}
+
+    if only:
+        import json as _json
+        with open(only) as f:
+            want = set(_json.load(f))
+        all_episodes = [ep for ep in all_episodes if _ep_hash(ep) in want]
+        missing = want - {_ep_hash(ep) for ep in all_episodes}
+        print(f"--only={only}: {len(all_episodes)} of {len(want)} requested hashes "
+              f"present on zarr volume ({len(missing)} not found)")
+        if missing:
+            print(f"  not on zarr volume: {sorted(missing)[:10]}{' ...' if len(missing) > 10 else ''}")
 
     if debug > 0:
         all_episodes = all_episodes[:debug]

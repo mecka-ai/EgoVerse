@@ -42,6 +42,7 @@ class ZipEpisodeResolver(EpisodeResolver):
         valid_ratio: float = 0.1,
         debug: int | None = None,
         min_frames: int | None = None,
+        eps_to_use: str | None = None,
         seed: int = 42,
     ):
         super().__init__(
@@ -56,6 +57,17 @@ class ZipEpisodeResolver(EpisodeResolver):
         self.debug = debug
         self.min_frames = min_frames
         self.seed = seed
+        # Optional episode-hash allowlist (path to a JSON list of hashes). The
+        # zip catalog carries no task labels, so restricting to a specific task
+        # set (e.g. the 14-task curation episodes) is done by episode_hash.
+        self.include_hashes: set[str] | None = None
+        if eps_to_use:
+            with open(eps_to_use) as f:
+                self.include_hashes = set(json.load(f))
+            logger.info(
+                "ZipEpisodeResolver: eps_to_use=%s (%d hashes)",
+                eps_to_use, len(self.include_hashes),
+            )
         self._catalog: list[EpisodeCatalogEntry] | None = None
 
     def load_catalog(self) -> list[EpisodeCatalogEntry]:
@@ -92,6 +104,14 @@ class ZipEpisodeResolver(EpisodeResolver):
             logger.warning(
                 "ZipEpisodeResolver: %d catalog entries missing from zip volume (skipped)",
                 n_missing,
+            )
+
+        if self.include_hashes is not None:
+            before = len(entries)
+            entries = [e for e in entries if e.episode_hash in self.include_hashes]
+            logger.info(
+                "ZipEpisodeResolver: eps_to_use — kept %d/%d episodes (of %d requested)",
+                len(entries), before, len(self.include_hashes),
             )
 
         if self.debug:
