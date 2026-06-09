@@ -233,7 +233,11 @@ def episode_table_to_df(engine):
     import pandas as pd
 
     with engine.connect() as conn:
-        result = conn.execute(select(episodes_tbl))
+        # Deterministic row order. Without ORDER BY, Postgres may return rows in a
+        # different order across queries/containers; that order flows through to the
+        # train/valid episode ordering, so under limit_val_batches truncation two
+        # runs end up validating different episode subsets. Pin by episode_hash.
+        result = conn.execute(select(episodes_tbl).order_by(episodes_tbl.c.episode_hash))
         df = pd.DataFrame(result.fetchall(), columns=result.keys())
         if not df.empty:
             return df
