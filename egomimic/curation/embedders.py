@@ -86,6 +86,9 @@ class StateEmbedder:
         dinov3_model_name: HuggingFace model id when ``image_backbone=dinov3``.
         dinov3_dtype: Inference dtype for DINOv3 (e.g. ``float16``).
         norm_min_std: Minimum std used in Gaussian normalisation to avoid divide-by-zero.
+        project: When False (image mode), skip the random projection and return
+            the raw pooled backbone features (512-d resnet18 / hidden-dim DINOv3).
+            Used by k-NN grading, where retrieval quality needs the full features.
     """
 
     def __init__(
@@ -99,6 +102,7 @@ class StateEmbedder:
         dinov3_dtype: str = "float16",
         seed: int = 42,
         norm_min_std: float = 1e-6,
+        project: bool = True,
     ) -> None:
         self.mode = mode
         self.latent_dim = latent_dim
@@ -111,6 +115,7 @@ class StateEmbedder:
         self.dinov3_dtype = dinov3_dtype
         self._seed = seed
         self.norm_min_std = norm_min_std
+        self.project = project
         self._fitted = False
 
         self._mean: np.ndarray | None = None
@@ -262,7 +267,10 @@ class StateEmbedder:
             tensor = TF.normalize(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             with torch.no_grad():
                 feats = self._backbone(tensor.to(self.device)).flatten(1)
-                outputs.append(self._proj_layer(feats).cpu().numpy())
+                if not self.project:
+                    outputs.append(feats.float().cpu().numpy())
+                else:
+                    outputs.append(self._proj_layer(feats).cpu().numpy())
             logger.debug(
                 "ResNet18 batch [%d:%d] %.3fs (%.0f imgs/s)",
                 start, start + len(chunk), time.perf_counter() - tb,
@@ -298,10 +306,13 @@ class StateEmbedder:
                 hidden = self._backbone(pixel_values=pixel_values).last_hidden_state
                 patches = hidden[:, -self._num_patches :]
                 pooled = patches.float().mean(dim=1)
-                proj_in = self._proj_layer.weight.dtype
-                outputs.append(
-                    self._proj_layer(pooled.to(proj_in)).cpu().numpy()
-                )
+                if not self.project:
+                    outputs.append(pooled.cpu().numpy())
+                else:
+                    proj_in = self._proj_layer.weight.dtype
+                    outputs.append(
+                        self._proj_layer(pooled.to(proj_in)).cpu().numpy()
+                    )
             t_fwd = time.perf_counter()
             logger.debug(
                 "DINOv3 batch [%d:%d] decode=%.3fs preproc=%.3fs forward=%.3fs total=%.3fs (%.0f imgs/s)",

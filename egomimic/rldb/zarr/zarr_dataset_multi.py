@@ -2015,9 +2015,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         image_decode_workers: int,
         *,
         load_images: bool,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        proprio_key: str | None = None,
+        frame_stride: int = 1,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict | None]:
         if load_images and image_key not in self.key_map:
-            return None, None
+            return None, None, None
 
         if self.pause_removal_epsilon is not None and self.keep_indices is None:
             self.precompute_pause_filter()
@@ -2025,7 +2027,7 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         n_logical = len(self)
         if n_logical == 0:
-            return None, None
+            return None, None, None
 
         logical_valid = self._curation_valid_logical_indices()
         n_skipped_pose = n_logical - len(logical_valid)
@@ -2036,13 +2038,15 @@ class ZarrDataset(torch.utils.data.Dataset):
                 n_skipped_pose,
                 n_logical,
             )
+        if frame_stride > 1:
+            logical_valid = logical_valid[::frame_stride]
         if len(logical_valid) == 0:
-            return None, None
+            return None, None, None
 
         batched_in = self._build_batched_transform_batch(logical_valid)
         batched_out, ok_pos = self._apply_transform_list_batched(batched_in)
         if batched_out is None or action_key not in batched_out:
-            return None, None
+            return None, None, None
 
         if len(ok_pos) < len(logical_valid):
             logger.info(
@@ -2055,14 +2059,28 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         actions = np.asarray(batched_out[action_key], dtype=np.float32)
         if actions.ndim < 2:
-            return None, None
+            return None, None, None
+
+        info: dict = {
+            "frame_idx": np.asarray(logical_valid, dtype=np.int64),
+            "n_logical": int(n_logical),
+        }
+        if proprio_key is not None:
+            if proprio_key not in batched_out:
+                logger.warning(
+                    "curation ep=%s: proprio key %r missing from transform outputs",
+                    Path(self.episode_path).name,
+                    proprio_key,
+                )
+                return None, None, None
+            info["proprio"] = np.asarray(batched_out[proprio_key], dtype=np.float32)
 
         if not load_images:
-            return actions, None
+            return actions, None, info
 
         img_zarr_key = self.key_map[image_key]["zarr_key"]
         if self._zarr_bulk_cache is None or img_zarr_key not in self._zarr_bulk_cache:
-            return None, None
+            return None, None, None
 
         jpeg_frames = self._zarr_bulk_cache[img_zarr_key]
         if self.keep_indices is not None:
@@ -2089,7 +2107,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 f"action/image length mismatch ep={self.episode_path.name}: "
                 f"{len(actions)} vs {len(images)}"
             )
-        return actions, images
+        return actions, images, info
 
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
@@ -2119,12 +2137,52 @@ class ZarrDataset(torch.utils.data.Dataset):
             ``(actions, images)`` as ``(T, chunk, D)`` and ``(T, C, H, W)``, or
             ``(None, None)`` if empty / keys missing.
         """
-        return self._collect_curation_batched(
+        actions, images, _ = self._collect_curation_batched(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             load_images=True,
         )
+        return actions, images
+
+    def collect_grading_episode(
+        self,
+        action_key: str = "actions_cartesian",
+        image_key: str = "observations.images.front_img_1",
+        proprio_key: str = "observations.state.ee_pose",
+        image_decode_workers: int = 8,
+        frame_stride: int = 1,
+    ) -> dict | None:
+        """
+        k-NN grading featurise pass: like ``collect_curation_episode`` but also
+        returns proprio and supports frame striding (only every ``frame_stride``-th
+        valid timestep is transformed/decoded; action chunks stay full-rate since
+        chunk windows are gathered from the raw arrays per timestep).
+
+        Returns ``None`` or a dict with:
+            ``actions``   (T, chunk, D) float32
+            ``proprio``   (T, D_prop) float32
+            ``images``    (T, C, H, W) float32
+            ``frame_idx`` (T,) int64 — logical (post pause-filter) indices
+            ``n_logical`` int — logical episode length the indices refer to
+        """
+        actions, images, info = self._collect_curation_batched(
+            action_key=action_key,
+            image_key=image_key,
+            image_decode_workers=image_decode_workers,
+            load_images=True,
+            proprio_key=proprio_key,
+            frame_stride=max(1, int(frame_stride)),
+        )
+        if actions is None or images is None or info is None:
+            return None
+        return {
+            "actions": actions,
+            "proprio": info["proprio"],
+            "images": images,
+            "frame_idx": info["frame_idx"],
+            "n_logical": info["n_logical"],
+        }
 
     def precompute_pause_filter(self) -> tuple[int, int]:
         """Build the per-episode pause keep-mask from raw obs_ee_pose deltas.
