@@ -38,14 +38,14 @@ from modal_setup import (  # noqa: E402
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
+    _uses_pi_model,
+    app,
     app_name_from_hydra_args,
     launch_detached,
     pop_init_submodules,
-    app,
     training_outputs_volume,
     zarr_volume,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,11 +58,22 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
 
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
-    _PATH_KEYS = {"ckpt_path", "norm_stats.precomputed_norm_path"}
+    _PATH_KEYS = {
+        "ckpt_path",
+        "norm_stats.precomputed_norm_path",
+        "model.robomimic_model.config.paligemma_weight_path",
+        "model.robomimic_model.config.pytorch_weight_path",
+    }
     fixed = []
     for arg in hydra_args:
         key, sep, val = arg.partition("=")
-        if sep and key in _PATH_KEYS and val and val != "null" and not val.startswith("/"):
+        if (
+            sep
+            and key in _PATH_KEYS
+            and val
+            and val != "null"
+            and not val.startswith("/")
+        ):
             val = f"{CFG.output_mount_path}/{val}"
             arg = f"{key}={val}"
         fixed.append(arg)
@@ -75,8 +86,13 @@ def _download_run_artifacts(output_rel_path: str) -> None:
     print(f"Downloading artifacts to {local_dest} ...")
     result = subprocess.run(
         [
-            sys.executable, "-m", "modal", "volume", "get",
-            "--env", "robotics",
+            sys.executable,
+            "-m",
+            "modal",
+            "volume",
+            "get",
+            "--env",
+            "robotics",
             "egoverse-training-outputs",
             output_rel_path,
             str(local_dest),
@@ -152,11 +168,46 @@ def run_hydra_train(
         init_submodules=init_submodules,
     )
 
+    # (openpi's patched transformers==4.53.2 for pi0.5 is applied inside
+    # _prepare_repo when the openpi submodule is present.)
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("HYDRA_FULL_ERROR", "1")
+    env.setdefault("WANDB_START_METHOD", "thread")
+    # openpi's pi0.5 sampler (nets["policy"].sample_actions, used in
+    # PI.forward_eval) is wrapped in @torch.compile. The Modal image ships no C
+    # compiler, so TorchInductor crashes eval with "Failed to find C compiler".
+    # Force eager for pi runs — training (forward_training) is uncompiled and
+    # unaffected; only eval sampling runs slightly slower.
+    if _uses_pi_model(hydra_args):
+        env.setdefault("TORCHDYNAMO_DISABLE", "1")
+    # Tensor IPC temp files → NVMe /cache (trainHydra enables file_system when TMPDIR is set).
+    # Prefer /cache/torch_tmp whenever /cache is writable (ephemeral disk or not).
+    _torch_tmp = "/cache/torch_tmp"
+    try:
+        os.makedirs(_torch_tmp, exist_ok=True)
+        test_file = os.path.join(_torch_tmp, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("1")
+        os.remove(test_file)
+        env["TMPDIR"] = _torch_tmp
+        print(
+            f"DataLoader IPC: TMPDIR={_torch_tmp} (use +modal_ephemeral_disk_gb=600 if /cache is missing)"
+        )
+    except OSError:
+        if _ephemeral:
+            raise
+        print(
+            "WARNING: /cache/torch_tmp not writable — DataLoader will use /dev/shm. "
+            "Add +modal_ephemeral_disk_gb=600 to avoid SIGBUS with num_workers>8."
+        )
+    # Prevent thread explosion: many DataLoader workers × many CPU cores otherwise.
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
     if wandb_api_key:
         env["WANDB_API_KEY"] = wandb_api_key
 
@@ -166,6 +217,14 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
+
+    # openpi (used by egomimic.algo.pi for pi0.5 models) lives in the
+    # external/openpi git submodule at external/openpi/src; put it on PYTHONPATH
+    # so `import openpi` resolves. Its jax/flax deps are baked into the image.
+    _openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+    env["PYTHONPATH"] = (
+        f"{_openpi_src}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _openpi_src
+    )
 
     print(f"Running: {shlex.join(cmd)}")
     process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
@@ -212,10 +271,55 @@ def _health_check() -> dict:
         results["volume"] = f"ERROR: {e}"
 
     import subprocess as _sp
+
     r = _sp.run(["s5cmd", "version"], capture_output=True, text=True)
     results["s5cmd"] = f"OK — {r.stdout.strip()}" if r.returncode == 0 else "MISSING"
 
     return results
+
+
+@app.function(
+    cpu=4.0,
+    memory=49152,
+    timeout=1200,
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+)
+def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
+    """CPU-only: clone + apply pi transformers swap, then CONSTRUCT PI0Pytorch.
+
+    Mirrors run_hydra_train's setup (clone + .pth + transformers==4.53.2 overlay)
+    and actually builds the pi0.5 pytorch model — which is where the
+    transformers_replace check fires — so we validate the full pi path without a
+    GPU. No PYTHONPATH: relies on the site-packages .pth (the DDP-child path).
+    """
+    # _prepare_repo applies the pi transformers swap (openpi submodule present).
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
+
+    env = os.environ.copy()
+    env["HYDRA_FULL_ERROR"] = "1"
+    script = (
+        "import transformers; print('transformers', transformers.__version__);"
+        "import openpi.models.pi0_config as c;"
+        "import openpi.models_pytorch.pi0_pytorch as p;"
+        "cfg=c.Pi0Config(dtype='bfloat16', action_dim=32, action_horizon=100,"
+        " max_token_len=180, paligemma_variant='gemma_2b',"
+        " action_expert_variant='gemma_300m', pi05=True);"
+        "m=p.PI0Pytorch(cfg);"
+        "print('PI0_CONSTRUCT_OK params=', sum(x.numel() for x in m.parameters()))"
+    )
+    proc = subprocess.run(
+        [CFG.python_bin, "-c", script],
+        cwd="/",  # from / so CWD doesn't accidentally add the repo to sys.path
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "returncode": proc.returncode,
+        "ok": "PI0_CONSTRUCT_OK" in proc.stdout,
+        "stdout": proc.stdout[-2000:],
+        "stderr": proc.stderr[-4000:],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -242,12 +346,31 @@ def verify() -> None:
 
 
 @app.local_entrypoint()
+def verify_pi() -> None:
+    """Clone on a cheap CPU container and confirm egomimic.algo.pi imports."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo dirty; Modal verifies the last committed state.")
+    print(f"Verifying pi import for commit {git_commit[:12]} ...")
+    res = _verify_pi_import.remote(git_remote, git_commit)
+    if res["ok"]:
+        print("✓ PI import OK:", res["stdout"].strip().splitlines()[-1])
+    else:
+        print(f"✗ PI import FAILED (exit {res['returncode']})")
+        print("--- stderr (tail) ---")
+        print(res["stderr"])
+        raise SystemExit("pi import failed — see traceback above.")
+
+
+@app.local_entrypoint()
 def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
     hydra_args, init_submodules = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print("Warning: local repo has uncommitted changes. Modal will run the last committed state only.")
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
     print(f"Submitting commit {git_commit[:12]} from {git_remote}")
     if not init_submodules:
         print("Skipping git submodule init (init_submodules=false)")
@@ -301,7 +424,8 @@ if __name__ == "__main__":
             container_overrides.append(arg)
 
     container_overrides = [
-        a for a in container_overrides
+        a
+        for a in container_overrides
         if not a.lstrip("+").startswith("launch_params.gpus_per_node=")
     ]
     container_overrides.append(f"launch_params.gpus_per_node={gpu_count}")
