@@ -112,7 +112,7 @@ MODAL_COMPUTE_ARG_MAP: dict[str, str] = {
     "modal_cpu": "MODAL_CPU",
     "modal_memory_gb": "MODAL_MEMORY_GB",
     "modal_memory_mb": "MODAL_MEMORY_MB",
-    "modal_volume": "MODAL_VOLUME",           # e.g. mecka_data_v2 or mecka_data_wds
+    "modal_volume": "MODAL_VOLUME",           # e.g. mecka_data_v2 or mecka_data_zip
     "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",  # local NVMe in GB
 }
 
@@ -245,14 +245,11 @@ image = (
 )
 
 zarr_volume = modal.Volume.from_name("mecka_data_v2")
-wds_volume = modal.Volume.from_name("mecka_data_wds_v2", create_if_missing=True)
 zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True)
-WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
     "mecka_data_v2":    (zarr_volume, "/mnt/zarr-data"),
-    "mecka_data_wds_v2": (wds_volume, "/mnt/zarr-wds"),
     "mecka_data_zip":   (zip_volume,  "/mnt/zarr-zip"),
 }
 training_outputs_volume = modal.Volume.from_name(
