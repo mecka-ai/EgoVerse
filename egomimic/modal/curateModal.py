@@ -293,6 +293,7 @@ def _score_task_split(
     git_commit: str,
     hydra_args: tuple[str, ...],
     hf_token: str = "",
+    run_output_dir: str = "",
 ) -> tuple[str, dict]:
     """
     CPU orchestrator for one task: norm stats → shard GPU embed → KSG.
@@ -423,6 +424,35 @@ def _score_task_split(
         f"{tag} KSG input: {len(scored_hashes)} episodes, {n_total} timesteps "
         f"({n_shard_failures} shard failure(s))"
     )
+
+    # ── Per-task t-SNE viz of state/action latents (before KSG frees them) ─────
+    # state_latents/action_latents are per-episode (T, D) arrays in the same
+    # order, so each episode gets a consistent hue across both plots. Auxiliary
+    # to scoring: a viz failure is logged loudly but never aborts the run.
+    if run_output_dir:
+        t_viz = _time.perf_counter()
+        try:
+            from egomimic.curation.tsne_viz import make_task_tsne_plots
+
+            tsne_dir = Path(run_output_dir) / "tsne"
+            s_png, a_png = make_task_tsne_plots(
+                task_name,
+                state_latents,
+                action_latents,
+                tsne_dir,
+                every_n=10,
+                seed=select_seed(cfg),
+            )
+            training_outputs_volume.commit()
+            print(
+                f"{tag} t-SNE plots written in {_time.perf_counter() - t_viz:.1f}s "
+                f"— state={s_png}, action={a_png}"
+            )
+        except Exception as exc:
+            import traceback
+
+            print(f"{tag} t-SNE viz FAILED (continuing to KSG): {exc}")
+            traceback.print_exc()
 
     # ── KSG scoring on combined latents ───────────────────────────────────────
     from egomimic.curation.scoring import trajectory_scorer_from_cfg
@@ -633,6 +663,7 @@ def run_curate(
                 git_commit,
                 hydra_args,
                 hf_token,
+                str(output_dir),
             ),
         )
         for task_name, episode_hashes in sorted(by_task.items())
