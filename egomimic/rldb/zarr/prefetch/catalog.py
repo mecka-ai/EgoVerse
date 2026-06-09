@@ -137,6 +137,10 @@ class ZipEpisodeResolver(EpisodeResolver):
 
     def split_catalog(self, mode: str) -> list[EpisodeCatalogEntry]:
         catalog = self.load_catalog()
+        if mode == "total":
+            # Use the whole (eps_to_use-filtered) catalog, no train/valid split.
+            # Used by train_viz datasets whose eps_to_use is already a curated set.
+            return list(catalog)
         rng = random.Random(self.seed)
         shuffled = list(catalog)
         rng.shuffle(shuffled)

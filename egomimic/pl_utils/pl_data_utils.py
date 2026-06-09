@@ -120,6 +120,13 @@ class MultiDataModuleWrapper(LightningDataModule):
         self.valid_datasets = {k: v for k, v in valid_datasets.items() if v is not None}
         self.train_dataloader_params = train_dataloader_params
         self.valid_dataloader_params = valid_dataloader_params
+        # Optional train-viz leg of the val loop (dataloader_idx=1): visualizes
+        # the model on in-distribution (training) episodes. Empty unless the data
+        # config defines train_viz_datasets + train_viz_dataloader_params.
+        self.train_viz_datasets = {
+            k: v for k, v in (train_viz_datasets or {}).items() if v is not None
+        }
+        self.train_viz_dataloader_params = train_viz_dataloader_params or {}
         if use_tokenizer:
             self.collate_fn = build_tokenized_collate(
                 max_length=collate_max_length,
@@ -181,6 +188,33 @@ class MultiDataModuleWrapper(LightningDataModule):
                 **apply_ipc_dataloader_params(dataset_params),
             )
 
+        eval_loader = CombinedLoader(iterables, "max_size_cycle")
+        if not self.train_viz_datasets:
+            return eval_loader
+        # [eval, train_viz] → Lightning iterates each with a distinct
+        # dataloader_idx: 0 = held-out eval, 1 = in-distribution train-viz.
+        # pl_model._evaluator_for routes idx=1 to the train_viz_evaluator.
+        return [eval_loader, self._build_train_viz_loader()]
+
+    def _build_train_viz_loader(self):
+        """Non-shuffled loader over train_viz datasets (shuffle forced off so
+        the same in-distribution episodes appear each epoch — comparable videos)."""
+        iterables = dict()
+        for dataset_name, dataset in self.train_viz_datasets.items():
+            dataset_params = self.train_viz_dataloader_params.get(dataset_name)
+            if dataset_params is None or len(dataset_params) == 0:
+                raise ValueError(
+                    f"No dataloader params found for train_viz dataset {dataset_name}. "
+                    f"Please add {dataset_name} into your data config train_viz_dataloader_params."
+                )
+            dataset_params = dict(dataset_params)
+            dataset_params.pop("shuffle", None)
+            iterables[dataset_name] = DataLoader(
+                dataset,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                **apply_ipc_dataloader_params(dataset_params),
+            )
         return CombinedLoader(iterables, "max_size_cycle")
 
 

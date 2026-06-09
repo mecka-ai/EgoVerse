@@ -73,6 +73,34 @@ valid_datasets:
     lookahead_epochs: 1.0
     n_copy_threads: 8
 
+# In-distribution action-reconstruction viz: a FIXED set of 12 train-split
+# episodes (mecka_14task_train_viz.json — all guaranteed in-distribution), run on
+# the dataloader_idx=1 leg of the val loop via train_viz_tokenizer. mode=total
+# uses the whole fixed set; shuffle off → the same episodes every val pass so
+# reconstruction quality is comparable across training.
+# Enable with: evaluator@train_viz_evaluator=train_viz_tokenizer
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_14task_train_viz.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total                 # use all 12 fixed in-distribution episodes
+    episodes_per_epoch: 12
+    cache_dir: /cache/zarr_cache_train_viz
+    pool_size_gb: 20
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
 train_dataloader_params:
   mecka_bimanual:
     # OAT tokenizer has no image encoder — forward pass is cheap even with images
@@ -82,6 +110,14 @@ train_dataloader_params:
     persistent_workers: true   # window == whole set every epoch → index_map is stable
     prefetch_factor: 2
     shuffle: true
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
 
 valid_dataloader_params:
   mecka_bimanual:

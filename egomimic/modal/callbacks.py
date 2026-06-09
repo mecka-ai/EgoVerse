@@ -123,10 +123,19 @@ class PrefetchEpochCallback(Callback):
     are ready — an in-lockstep sync point before any val collective fires.
     """
 
-    def __init__(self, train_datasets: dict, valid_datasets: dict | None = None) -> None:
+    def __init__(
+        self,
+        train_datasets: dict,
+        valid_datasets: dict | None = None,
+        train_viz_datasets: dict | None = None,
+    ) -> None:
         super().__init__()
         self._train_datasets = train_datasets
         self._valid_datasets = valid_datasets or {}
+        # train_viz is the dataloader_idx=1 leg of the val loop. As a prefetch
+        # dataset it must be staged on the same schedule as valid, else it stays
+        # in the probe-path fallback and desyncs ranks at the val all-reduce.
+        self._train_viz_datasets = train_viz_datasets or {}
 
     def _prepare(self, datasets: dict, epoch: int, split: str) -> None:
         for name, ds in datasets.items():
@@ -143,3 +152,4 @@ class PrefetchEpochCallback(Callback):
         # All ranks call this before the val loop → identical valid index_map +
         # a synchronized barrier point, preventing the DDP collective desync.
         self._prepare(self._valid_datasets, trainer.current_epoch, "valid")
+        self._prepare(self._train_viz_datasets, trainer.current_epoch, "train_viz")
