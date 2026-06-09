@@ -554,12 +554,13 @@ class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.
 
-    A random orthogonal projection preserves MI (bijective when action_dim ≤
+    A random orthogonal projection preserves MI (bijective when feat_dim ≤
     latent_dim; MI-preserving via Johnson-Lindenstrauss otherwise).
 
-    Accepts per-timestep actions (T, action_dim) — the step-0 action vector
-    from the post-transform actions_cartesian chunk, in end-effector Cartesian
-    pose (head frame).
+    Accepts per-timestep actions (T, feat_dim), where each frame's action is the
+    full post-transform actions_cartesian chunk (chunk_size, action_dim) flattened
+    to feat_dim = chunk_size * action_dim, in end-effector Cartesian pose (head
+    frame). The whole chunk is embedded — not a single step.
 
     Args:
         latent_dim: Output dimensionality (default 32).
@@ -614,7 +615,9 @@ class ActionEmbedder:
         Embed a batch of actions.
 
         Args:
-            data: (T, action_dim) float32 — per-timestep action vectors.
+            data: (T, ...) float32 — per-timestep action chunks. Anything past
+                the first axis is flattened to feat_dim = chunk_size * action_dim
+                (so (T, chunk_size, action_dim) is accepted directly).
 
         Returns:
             (T, latent_dim) float32 array.
