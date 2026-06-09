@@ -1,5 +1,5 @@
 defaults:
-  - data: cotrain_pi_lang
+  - data: mecka_all_zarr
   - visualization: cotrain_lang
   - _self_
 

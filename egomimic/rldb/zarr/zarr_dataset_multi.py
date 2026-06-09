@@ -1549,6 +1549,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         _total_frames: int | None = None,
         _embodiment: str | None = None,
         precomputed_metadata: dict | None = None,
+        defer_open: bool = False,
     ):
         """
         Args:
@@ -1568,6 +1569,8 @@ class ZarrDataset(torch.utils.data.Dataset):
             _embodiment: if provided alongside _total_frames, also skip zarr open at init.
             precomputed_metadata: full .zattrs dict pre-loaded externally (e.g. from _modal_fanout_load).
                 When provided, skips zarr open at init and populates all metadata fields immediately.
+            defer_open: if True, do not mmap the zarr store until the first ``__getitem__``
+                (used by PrefetchedIterableDataset workers).
         """
         self.episode_path = Episode_path
         self.metadata = None
@@ -1579,6 +1582,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         if precomputed_metadata is not None:
             # Full metadata pre-loaded externally (e.g. from Modal fan-out load_shard)
             self._init_from_metadata(precomputed_metadata)
+        elif defer_open:
+            # Prefetch workers: open the store inside __getitem__, not at construction.
+            self.total_frames = 0
+            self.embodiment = ""
+            self.keys_dict = {}
         elif _total_frames is not None and _embodiment is not None:
             # Lightweight fast path from SQL — defer zarr open to first access
             self.total_frames = _total_frames
@@ -1605,6 +1613,14 @@ class ZarrDataset(torch.utils.data.Dataset):
         """Eagerly open the zarr group and populate all metadata-derived fields."""
         self.episode_reader = ZarrEpisode(self.episode_path)
         self._init_from_metadata(self.episode_reader.metadata)
+
+    def close(self) -> None:
+        """Release zarr mmap handles and in-memory caches (for lazy episode loading)."""
+        if self.episode_reader is not None:
+            self.episode_reader.close()
+            self.episode_reader = None
+        self._zarr_bulk_cache = None
+        self._annotations = None
 
     def _init_from_metadata(self, metadata: dict) -> None:
         """Populate metadata-derived fields from a pre-loaded `.zattrs` dict."""
@@ -2257,10 +2273,10 @@ class ZarrDataset(torch.utils.data.Dataset):
                             f"Entire episode bad (no valid indices): ep={Path(self.episode_path).name}"
                         ),
                     )
-                    logger.warning(
-                        f"Transform failed ep={Path(self.episode_path).name} frame={idx} ({type(e).__name__}: {e}) | "
-                        f"attempt {attempts}, trying random idx {next_idx}"
-                    )
+                    # logger.warning(
+                    #     f"Transform failed ep={Path(self.episode_path).name} frame={idx} ({type(e).__name__}: {e}) | "
+                    #     f"attempt {attempts}, trying random idx {next_idx}"
+                    # )
                     result = self.__getitem__(
                         next_idx, _fallback_origin=origin, _attempts=attempts
                     )
@@ -2354,6 +2370,16 @@ class ZarrEpisode:
         self._store = zarr.open_group(str(self._path), mode="r")
         self.metadata = dict(self._store.attrs)
         self.keys = self.metadata["features"]
+
+    def close(self) -> None:
+        """Close the underlying zarr store to drop mmap mappings."""
+        store = getattr(self, "_store", None)
+        if store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+            self._store = None
 
     def read(
         self, keys_with_ranges: dict[str, tuple[int, int | None]]

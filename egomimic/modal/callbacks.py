@@ -54,6 +54,20 @@ class ModalAutoRestartCallback(Callback):
         trainer.save_checkpoint(ckpt_path)
         log.info(f"[ModalAutoRestart] Checkpoint saved → {ckpt_path}")
 
+        # Persist the checkpoint to the outputs volume BEFORE spawning the
+        # continuation. run_hydra_train only commits after trainer.fit() unwinds,
+        # which is after this callback returns — so without an explicit commit
+        # here the continuation can start reading ckpt_path before it exists on
+        # the volume. Commit once, on rank zero (the mount is shared).
+        if trainer.is_global_zero:
+            try:
+                import modal as _modal
+
+                _modal.Volume.from_name("egoverse-training-outputs").commit()
+                log.info("[ModalAutoRestart] Committed checkpoint to outputs volume")
+            except Exception as exc:
+                log.error(f"[ModalAutoRestart] Volume commit failed: {exc}")
+
         wandb_run_id = None
         for lgr in trainer.loggers:
             if hasattr(lgr, "experiment") and hasattr(lgr.experiment, "id"):
@@ -91,3 +105,41 @@ class ModalAutoRestartCallback(Callback):
 
         trainer.should_stop = True
         log.info("[ModalAutoRestart] Stopping current run — continuation job is running")
+
+
+class PrefetchEpochCallback(Callback):
+    """Call ``prepare_epoch`` on every PrefetchedMapDataset before each epoch.
+
+    This must run before the DataLoader begins iterating so that workers
+    (spawned after the callback) inherit the fresh index_map via fork.
+
+    Both train AND valid datasets are prepared. Preparing valid is required for
+    DDP correctness: without it the valid dataset stays in its probe-path
+    fallback (``_index_map is None``), and the rank-0-only pool staging means
+    ranks enter the validation loop doing unequal work — they then desync at the
+    first ``sync_dist`` all-reduce and hang until the 30-min NCCL watchdog kills
+    the run. ``prepare_epoch`` is deterministic by seed, so every rank builds an
+    identical valid index_map and blocks together until the shared-NVMe episodes
+    are ready — an in-lockstep sync point before any val collective fires.
+    """
+
+    def __init__(self, train_datasets: dict, valid_datasets: dict | None = None) -> None:
+        super().__init__()
+        self._train_datasets = train_datasets
+        self._valid_datasets = valid_datasets or {}
+
+    def _prepare(self, datasets: dict, epoch: int, split: str) -> None:
+        for name, ds in datasets.items():
+            if hasattr(ds, "prepare_epoch"):
+                log.info(
+                    "PrefetchEpochCallback: prepare_epoch(%d) for %s/%s", epoch, split, name
+                )
+                ds.prepare_epoch(epoch)
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        self._prepare(self._train_datasets, trainer.current_epoch, "train")
+
+    def on_validation_epoch_start(self, trainer, pl_module) -> None:
+        # All ranks call this before the val loop → identical valid index_map +
+        # a synchronized barrier point, preventing the DDP collective desync.
+        self._prepare(self._valid_datasets, trainer.current_epoch, "valid")

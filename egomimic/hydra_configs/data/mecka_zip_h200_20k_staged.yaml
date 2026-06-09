@@ -1,0 +1,95 @@
+# 4×H200 — STAGE-ALL-FIRST over a fixed 20k-episode subset (debug=20000).
+#
+# Strategy: episodes_per_epoch == the full subset, so prepare_epoch(0) BLOCKS
+# until all ~20k episodes are extracted to local NVMe before the first training
+# step. After that the filler is idle and every __getitem__ hits cached disk —
+# no volume streaming, no train-vs-filler contention. This is the "cache the
+# whole working set, then train on it" pattern (the fix for the slow ~150 MB/s
+# volume), at the largest subset that fits in Modal's 3 TiB ephemeral disk.
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_h200_20k_staged trainer=ddp_modal logger=wandb \
+#     model=hpt_bc_flow_mecka_300m name=<run> description=<desc> \
+#     '~evaluator@train_viz_evaluator' \
+#     trainer.check_val_every_n_epoch=5 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=3000 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false
+#
+# Storage (20k × ~131 MB ≈ 2.6 TB; Modal ephemeral hard cap is 3 TiB, and the
+# +modal_ephemeral_disk_gb flag is ×1024 MiB internally, so 3000 is the safe max):
+#   train pool ... 2900 GB ceiling (holds ~18k train eps, no eviction)
+#   valid pool ....  400 GB ceiling (holds ~2k valid eps)
+#   /cache tmp ....  ~30 GB
+#
+# Two known costs of stage-all-first (see option-#2 pool-warm gate to avoid the
+# second): (1) ~4.8 h of GPU-idle staging up front (ephemeral disk is per-
+# container, so staging must happen on the GPU box); (2) episodes_per_epoch=20000
+# re-opens ~20k zarr stores each epoch (~70 s) — a per-epoch pre-open tax on top
+# of compute. A small episodes_per_epoch + a pre-fit pool-warm gate removes (2).
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 20000
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 20000   # == full subset → prepare_epoch(0) stages all before training
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 2900          # holds all ~18k train eps (no eviction)
+    lookahead_epochs: 1.0       # window is the whole set; filler stages it once then idles
+    n_copy_threads: 48
+    prepare_timeout_s: 21600    # 6h — staging ~20k eps from the ~150 MB/s volume takes
+                                # ~3h, far over the 1h default; raise so prepare_epoch
+                                # waits out the full initial stage instead of crashing
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: 20000
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 2000    # == full valid split → staged before validation
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 400
+    lookahead_epochs: 1.0
+    n_copy_threads: 16
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128          # per rank; global = 128 × 4 = 512
+    num_workers: 12          # × 4 ranks = 48 workers (Modal cpu cap is 64)
+    persistent_workers: false  # workers respawn each epoch to inherit the fresh index_map
+    prefetch_factor: 6
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false

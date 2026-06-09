@@ -5,7 +5,7 @@ defaults:
   - trainer: ddp
   - debug: null
   - logger: wandb
-  - data: eva
+  - data: mecka_all_zarr
   - callbacks: checkpoints
   - data_schematic: default
   - evaluator: eval_hpt
