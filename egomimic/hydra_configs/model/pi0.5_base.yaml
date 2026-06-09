@@ -2,9 +2,15 @@ _target_: egomimic.pl_utils.pl_model.ModelWrapper
 robomimic_model:
   _target_: egomimic.algo.pi.PI
   data_schematic: _${data.dataset.data_schematic}
-  config:      
+  config:
     pytorch_training_precision: bfloat16
     pytorch_weight_path: /storage/home/hcoda1/4/paphiwetsa3/r-dxu345-0/projects/EgoVerse/egomimic/algo/pi_checkpoints/pi05_base_pytorch
+    # Optional: init only the PaliGemma VLM backbone from a pretrained HF
+    # snapshot (action expert stays random). Leave null to keep the
+    # pytorch_weight_path / from-scratch behavior. On Modal, pass a
+    # volume-relative path (trainModal rewrites it to the outputs mount), e.g.
+    # model.robomimic_model.config.paligemma_weight_path=paligemma_weights/paligemma-3b-pt-224
+    paligemma_weight_path: null
     model:
       pi05: true
       action_dim: 32

@@ -6,4 +6,10 @@ defaults:
   - override trainer: ddp_pi
   - override visualization: pi_cartesian_lang
   - override evaluator: eval_pi
+  # The base config defaults train_viz_evaluator to train_viz_hpt, whose
+  # HPTEvalVideo references algo.shared_ac_key — an attribute the PI algo does
+  # not have, so the train_viz validation pass dies with
+  #   AttributeError: 'PI' object has no attribute 'shared_ac_key'.
+  # PI runs must use the PI train-viz evaluator, mirroring the eval_pi override.
+  - override evaluator@train_viz_evaluator: train_viz_pi
   - override hydra/launcher: submitit_pace
