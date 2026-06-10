@@ -37,6 +37,8 @@ from pathlib import Path
 # Self-hosted Modal MP4 viewer (egomimic/modal/episode_preview.py) — serves
 # raw H.264 MP4s with range support, so the grid embeds native <video> players.
 VIDEO_BASE = "https://mecka-robotics--egoverse-episode-preview-viewer.modal.run/video/"
+# Encode rate used by episode_preview.py (frame index / FPS = seek time).
+FPS = 30
 
 _TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -78,6 +80,17 @@ _TEMPLATE = """<!DOCTYPE html>
   .links { padding: 7px 10px; font-size: 12px; display: flex; gap: 14px; }
   .links a { color: #7fd4ff; text-decoration: none; }
   button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  /* ---- click-to-frame preview (t-SNE page) ---- */
+  #preview { position: fixed; right: 16px; bottom: 16px; width: 440px; background: #181818;
+             border: 1px solid #333; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.6);
+             display: none; z-index: 50; overflow: hidden; }
+  #preview video { width: 100%; display: block; background: #000; }
+  #pv-cap { font-size: 12px; padding: 7px 10px; color: #ccc; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #pv-cap b { color: #7fd4ff; }
+  #pv-cap button { padding: 2px 8px; font-size: 12px; }
+  #pv-close { position: absolute; top: 6px; right: 8px; cursor: pointer; color: #aaa; font-size: 16px;
+              background: rgba(0,0,0,.5); border-radius: 50%; width: 22px; height: 22px; text-align: center; line-height: 22px; }
+  #pv-close:hover { color: #fff; }
 </style>
 </head>
 <body>
@@ -98,6 +111,11 @@ _TEMPLATE = """<!DOCTYPE html>
   <div id="gridhead"></div>
   <div id="grid"></div>
 </div>
+<div id="preview">
+  <div id="pv-close" onclick="hidePreview()">✕</div>
+  <video id="pv-video" muted playsinline preload="metadata"></video>
+  <div id="pv-cap"></div>
+</div>
 <script>
 const DATA = __DATA__;
 const SCORES = __SCORES__;
@@ -109,6 +127,57 @@ function hsv2rgb(h, s, v) {
   const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
   const c = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i % 6];
   return `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
+}
+
+/* ---------------- click-to-frame preview ---------------- */
+const FPS = __FPS__;
+let pvHash = null, pvTask = "", pvFrame = 0, pvTfrac = null;
+
+function showFrame(task, hash, frame, tfrac) {
+  pvTask = task; pvFrame = frame; pvTfrac = tfrac;
+  const v = document.getElementById("pv-video");
+  document.getElementById("preview").style.display = "block";
+  const seek = () => { v.pause(); v.currentTime = pvFrame / FPS; };
+  if (pvHash !== hash) {
+    pvHash = hash;
+    v.src = VIDEO_BASE + hash;
+    v.onloadedmetadata = seek;
+  } else {
+    seek();
+  }
+  updateCap();
+}
+
+function updateCap() {
+  document.getElementById("pv-cap").innerHTML =
+    `<b>${pvHash ? pvHash.slice(0,12) : ""}</b> · ${pvTask} · frame <b>${pvFrame}</b>` +
+    (pvTfrac != null ? ` (${Math.round(pvTfrac*100)}%)` : "") +
+    ` <button onclick="stepFrame(-1)">−1f</button>` +
+    ` <button onclick="stepFrame(1)">+1f</button>` +
+    ` <button onclick="togglePlay()">▶/⏸</button>` +
+    ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open ↗</a>` +
+    ` <span style="color:#666">frame = curation-sequence index; pause-filtered eps may be offset</span>`;
+}
+
+function stepFrame(d) {
+  const v = document.getElementById("pv-video");
+  pvFrame = Math.max(0, pvFrame + d);
+  pvTfrac = null;
+  v.pause();
+  v.currentTime = pvFrame / FPS;
+  updateCap();
+}
+
+function togglePlay() {
+  const v = document.getElementById("pv-video");
+  if (v.paused) { v.play(); }
+  else { v.pause(); pvFrame = Math.round(v.currentTime * FPS); pvTfrac = null; updateCap(); }
+}
+
+function hidePreview() {
+  const v = document.getElementById("pv-video");
+  v.pause();
+  document.getElementById("preview").style.display = "none";
 }
 
 /* ---------------- t-SNE page ---------------- */
@@ -161,6 +230,7 @@ function renderTsne(task) {
         `episode <b>${p.data.meta.hash}</b> · frame <b>${frame}</b> ` +
         `(${Math.round(tfrac * 100)}% through) · ` +
         `<a href="${VIDEO_BASE}${p.data.meta.hash}" target="_blank" style="color:#7fd4ff">video ↗</a>`;
+      showFrame(task, p.data.meta.hash, frame, tfrac);
     });
     el.on("plotly_legendclick", ev => {
       const name = ev.data[ev.curveNumber].name;
@@ -341,6 +411,7 @@ def main() -> None:
         .replace("__SCORES__", json.dumps(scores, separators=(",", ":")))
         .replace("__VAL__", json.dumps(val, separators=(",", ":")))
         .replace("__VIDEO_BASE__", VIDEO_BASE)
+        .replace("__FPS__", str(FPS))
     )
     out = Path(args.out)
     out.write_text(html)
