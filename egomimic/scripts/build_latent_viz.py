@@ -12,8 +12,8 @@ Two pages in one HTML file (no server needed):
   * **Video grid** — per-task grid of every scored episode (from
     ``scores_by_task.json``), sorted by MI score: rank, score, percentile bar,
     top-60% / bottom-40% badge, optional VAL badge. Each card click-loads the
-    episode's video page in an embedded frame and always offers an
-    "open ↗" link to https://studio.atlascapture.io/dashboard/qa2/episode/<hash>.
+    episode's MP4 inline (native <video>, served by the self-hosted Modal
+    viewer egomimic/modal/episode_preview.py) and offers an "open ↗" link.
 
 Usage (local dirs/files):
   python egomimic/scripts/build_latent_viz.py /path/to/tsne3d \\
@@ -34,7 +34,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-VIDEO_BASE = "https://studio.atlascapture.io/dashboard/qa2/episode/"
+# Self-hosted Modal MP4 viewer (egomimic/modal/episode_preview.py) — serves
+# raw H.264 MP4s with range support, so the grid embeds native <video> players.
+VIDEO_BASE = "https://mecka-robotics--egoverse-episode-preview-viewer.modal.run/video/"
 
 _TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -178,7 +180,7 @@ function renderTsne(task) {
 /* ---------------- video grid page ---------------- */
 function loadVideo(cellId, hash) {
   const cell = document.getElementById(cellId);
-  cell.innerHTML = `<iframe src="${VIDEO_BASE}${hash}" loading="lazy" allow="autoplay; fullscreen"></iframe>`;
+  cell.innerHTML = `<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata" style="width:100%;height:100%;object-fit:contain;background:#000"></video>`;
 }
 
 function renderGrid(task) {
@@ -192,7 +194,7 @@ function renderGrid(task) {
   document.getElementById("gridhead").innerHTML =
     `<b>${task}</b> — ${n} episodes · MI mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] · sorted best→worst ` +
     `<button onclick="loadAll()">Load all videos</button>` +
-    `<span style="color:#777">▶ loads the episode page inline; if your dashboard login blocks embedding, use open ↗</span>`;
+    `<span style="color:#777">▶ streams the episode MP4 inline (self-hosted viewer)</span>`;
 
   const cards = entries.map(([hash, score], i) => {
     const pct = mx > mn ? (score - mn) / (mx - mn) : 0.5;
