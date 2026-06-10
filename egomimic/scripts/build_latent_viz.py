@@ -67,7 +67,15 @@ _TEMPLATE = """<!DOCTYPE html>
   .tool { display: flex; gap: 7px; align-items: center; }
   .tool label { color:#9aa; }
   #plots { display: flex; }
-  .panel { width: 50vw; height: calc(100vh - 104px); }
+  .panel { width: calc((100vw - 180px) / 2); height: calc(100vh - 104px); }
+  #legend { width: 180px; height: calc(100vh - 104px); overflow-y: auto; background: #14151a;
+            border-left: 1px solid var(--line); font-size: 12px; }
+  #legend .lg-head { padding: 8px 10px; color: #9aa; position: sticky; top: 0; background: #14151a; }
+  .lg-row { display: flex; align-items: center; gap: 7px; padding: 4px 10px; cursor: pointer;
+            font-family: ui-monospace, monospace; color: #cdd; white-space: nowrap; }
+  .lg-row:hover { background: #1f2027; }
+  .lg-row.active { background: #24344f; }
+  .lg-dot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
   h3 { margin: 0; font-weight: 700; letter-spacing:.3px; }
   button { background: #2a2b33; color: #ddd; border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px; cursor: pointer; }
   button:hover { background:#33353f; }
@@ -128,7 +136,7 @@ _TEMPLATE = """<!DOCTYPE html>
         <option value="score">MI score (red→green)</option>
       </select></span>
     <span class="tool"><label>Episode</label>
-      <select id="epSel" onchange="applyStyle()"><option value="all">all</option></select></span>
+      <select id="epSel" onchange="applyStyle(); markLegend()"><option value="all">all</option></select></span>
     <span class="tool"><label class="chk"><input type="checkbox" id="hlOn" onchange="applyStyle()"> highlight frame</label>
       <input type="number" id="hlFrame" value="0" min="0" step="10" onchange="hlChanged()">
       <label>±</label><input type="number" id="hlWin" value="15" min="0" step="5" onchange="hlChanged()"></span>
@@ -144,6 +152,7 @@ _TEMPLATE = """<!DOCTYPE html>
   <div id="plots">
     <div id="state" class="panel"></div>
     <div id="action" class="panel"></div>
+    <div id="legend"></div>
   </div>
 </div>
 
@@ -332,7 +341,38 @@ function renderTsne(task) {
   const nPts = ["state","action"].reduce((a,m) => a + ((d[m]||{}).x||[]).length, 0);
   document.getElementById("tstats").textContent =
     `${(d.episodes||[]).length} episodes · ${nPts.toLocaleString()} points · every ${d.every_n||10}th frame`;
+  buildLegend(task);
   applyStyle();
+}
+
+/* episode color legend sidebar — swatch = episode hue; click isolates */
+function buildLegend(task) {
+  const eps = DATA[task] ? DATA[task].episodes : [];
+  const sn = scoreNorm(task);
+  const rows = eps.map((h, i) => {
+    const c = rgb(hsv2rgb(i / Math.max(1, eps.length), 0.85, 0.85));
+    const sc = SCORES[task] ? (SCORES[task].find(e => e[0] === h) || [0, NaN])[1] : NaN;
+    return `<div class="lg-row" id="lg_${i}" onclick="legendClick(${i})" title="MI ${isNaN(sc) ? "?" : sc.toFixed(4)}">` +
+           `<span class="lg-dot" style="background:${c}"></span>${h.slice(0, 10)}</div>`;
+  }).join("");
+  document.getElementById("legend").innerHTML =
+    `<div class="lg-head">episodes (click = isolate)</div>` +
+    `<div class="lg-row" id="lg_all" onclick="legendClick('all')"><span class="lg-dot" style="background:#888"></span>show all</div>` + rows;
+  markLegend();
+}
+
+function legendClick(i) {
+  const sel = document.getElementById("epSel");
+  sel.value = (String(i) === sel.value) ? "all" : String(i);   // toggle
+  applyStyle();
+  markLegend();
+}
+
+function markLegend() {
+  const cur = document.getElementById("epSel").value;
+  document.querySelectorAll("#legend .lg-row").forEach(r => r.classList.remove("active"));
+  const el = document.getElementById(cur === "all" ? "lg_all" : `lg_${cur}`);
+  if (el) el.classList.add("active");
 }
 
 function crossHighlight(task, epIdx, frame) {

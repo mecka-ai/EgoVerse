@@ -43,10 +43,12 @@ outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
 
 @app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume},
+    cpu=4.0,
+    memory=8192,
     min_containers=0,
-    scaledown_window=300,
+    scaledown_window=600,
 )
-@modal.concurrent(max_inputs=20)
+@modal.concurrent(max_inputs=50)
 @modal.asgi_app()
 def viewer():
     import json

@@ -68,12 +68,17 @@ FPS = 30                       # obs/control rate; tune if playback looks off
 
 @app.function(
     volumes={ZARR_MOUNT: zarr_volume, PREVIEW_MOUNT: previews_volume},
-    cpu=4.0,
-    memory=8192,
+    gpu="L40S",
+    cpu=8.0,
+    memory=16384,
     timeout=1200,
 )
 def render_episode(episode_hash: str, fps: int = FPS, force: bool = False) -> dict:
     """Decode images.front_1 from the episode zarr and write an H.264 MP4.
+
+    Runs on an L40S and encodes with NVENC (h264_nvenc) — hardware video
+    encoding — falling back to libx264 if NVENC is unavailable. 8 CPUs cover
+    the JPEG-decode feed side.
 
     Idempotent: skips episodes whose MP4 already exists unless force=True.
     """
@@ -108,34 +113,51 @@ def render_episode(episode_hash: str, fps: int = FPS, force: bool = False) -> di
     outW, outH = (w // 2) - (w // 2) % 2, (h // 2) - (h // 2) % 2  # half-res, even dims
 
     tmp = Path("/tmp") / f"{episode_hash}.mp4"
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{w}x{h}", "-r", str(fps),
-        "-i", "-",
-        "-an",
-        "-vf", f"scale={outW}:{outH}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-crf", "23", "-preset", "fast",
-        "-movflags", "+faststart",   # web-streamable (moov atom up front)
-        str(tmp),
+
+    def _cmd(codec_args: list[str]) -> list[str]:
+        return [
+            "ffmpeg", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", str(fps),
+            "-i", "-",
+            "-an",
+            "-vf", f"scale={outW}:{outH}",
+            *codec_args,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",   # web-streamable (moov atom up front)
+            str(tmp),
+        ]
+
+    # NVENC (GPU hardware encoder) first; libx264 fallback if unavailable.
+    encoders = [
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23"]),
+        ("libx264",    ["-c:v", "libx264", "-crf", "23", "-preset", "fast"]),
     ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     n = 0
-    try:
-        for jb in jpegs:
-            frame = simplejpeg.decode_jpeg(bytes(jb), colorspace="RGB")
-            if frame.shape[:2] != (h, w):  # guard against ragged frames
-                continue
-            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
-            n += 1
-        proc.stdin.close()
-        err = proc.stderr.read()
-        if proc.wait() != 0:
-            return {"hash": episode_hash, "status": f"ffmpeg_fail: {err.decode(errors='replace')[-300:]}", "frames": n}
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+    last_err = ""
+    for enc_name, codec_args in encoders:
+        proc = subprocess.Popen(_cmd(codec_args), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        n = 0
+        try:
+            for jb in jpegs:
+                frame = simplejpeg.decode_jpeg(bytes(jb), colorspace="RGB")
+                if frame.shape[:2] != (h, w):  # guard against ragged frames
+                    continue
+                proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+                n += 1
+            proc.stdin.close()
+            err = proc.stderr.read()
+            if proc.wait() == 0:
+                break  # encoded successfully
+            last_err = err.decode(errors="replace")[-300:]
+        except BrokenPipeError:
+            last_err = proc.stderr.read().decode(errors="replace")[-300:]
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        print(f"[{episode_hash[:8]}] {enc_name} failed, trying fallback: {last_err[-160:]}")
+    else:
+        return {"hash": episode_hash, "status": f"ffmpeg_fail: {last_err}", "frames": n}
 
     out_path.write_bytes(tmp.read_bytes())
     tmp.unlink(missing_ok=True)
@@ -174,8 +196,14 @@ def render_all(hashes: str = "", force: bool = False) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.function(volumes={PREVIEW_MOUNT: previews_volume}, min_containers=0)
-@modal.concurrent(max_inputs=20)
+@app.function(
+    volumes={PREVIEW_MOUNT: previews_volume},
+    cpu=4.0,
+    memory=8192,
+    min_containers=0,
+    scaledown_window=600,
+)
+@modal.concurrent(max_inputs=50)
 @modal.asgi_app()
 def viewer():
     from fastapi import FastAPI
