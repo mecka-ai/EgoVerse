@@ -1,0 +1,45 @@
+# Curation/grading data — 10 h of folding_clothes (394 eps, 9.997 h @30fps).
+# For curateModal.py / knnGradeModal.py only (not the training DataLoader).
+#
+# Episode allowlist is the prefix of fold_clothes_50h.json summing to 10 h
+# (num_frames from app.episodes @ 30 fps), so 10h ⊂ 50h ⊂ 100h ⊂ max nesting
+# holds and feature caches are shared across budgets.
+#
+#   python egomimic/modal/knnGradeModal.py name=<run> description=<desc> \
+#       data=deminf_fold_clothes_10h
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_ignore: null
+      eps_to_use: egomimic/hydra_configs/data/extra/fold_clothes_10h.json
+    filters:
+      _target_: egomimic.rldb.filters.DatasetFilter
+      filter_lambdas:
+        - "lambda row: row['task'] in ['folding_clothes']"
+    mode: total
+
+# Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
+# episode_workers: parallel episode loaders (CPU threads).
+# pass2_image_decode_workers: JPEG decode threads per episode.
+# frame_queue_maxsize: loaded episodes buffered between producers and GPU consumer.
+#   RAM budget: frame_queue_maxsize × ~180 MB/ep ≈ 5.4 GB at 30.
+#   Producers block when queue is full — GPU controls loading rate.
+# global_frame_batch_size: frames per GPU embed call.
+#   512 × (3×224×224) float32 ≈ 300 MB input — tune to fill VRAM.
+curation_loader:
+  mecka_bimanual:
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 3072
