@@ -5,15 +5,18 @@ Build a self-contained interactive latent + episode-video viewer.
 Two pages in one HTML file (no server needed):
 
   * **t-SNE 3-D** — per-task 3-D scatters of state/action latents from
-    ``tsne3d_<task>.json`` (written by curateModal to ``<run>/tsne3d/``):
-    task dropdown, state|action panels, same episode = same color in both,
-    darker = later frame, click a point → episode hash + frame index,
-    legend click isolates an episode across both panels.
+    ``tsne3d_<task>.json`` (written by curateModal to ``<run>/tsne3d/``).
+    Tools: color by episode / time / MI score; frame-number highlight (±window)
+    applied to BOTH panels; time-range filter; point-size control; synced
+    cameras; click a point → frame preview (seekable video) + cross-highlight
+    of the same (episode, frame) in the other panel; legend click isolates an
+    episode in both panels.
   * **Video grid** — per-task grid of every scored episode (from
-    ``scores_by_task.json``), sorted by MI score: rank, score, percentile bar,
-    top-60% / bottom-40% badge, optional VAL badge. Each card click-loads the
-    episode's MP4 inline (native <video>, served by the self-hosted Modal
-    viewer egomimic/modal/episode_preview.py) and offers an "open ↗" link.
+    ``scores_by_task.json``), sorted/filtered (score asc/desc, TOP-60%/BOT-40%,
+    VAL-only, hash search), with rank, score, percentile bar and badges.
+    Cards stream the episode MP4 inline (native <video>, served by the
+    self-hosted Modal viewer egomimic/modal/episode_preview.py).
+    Load-all / Play-all / Pause-all / playback-speed controls.
 
 Usage (local dirs/files):
   python egomimic/scripts/build_latent_viz.py /path/to/tsne3d \\
@@ -47,21 +50,35 @@ _TEMPLATE = """<!DOCTYPE html>
 <title>EgoVerse latent + episode viewer</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
-  body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; background: #111; color: #eee; }
-  #bar { padding: 10px 16px; display: flex; gap: 14px; align-items: center; background: #1c1c1c; flex-wrap: wrap; }
-  #bar select { font-size: 15px; padding: 4px 8px; }
-  #info { font-size: 13px; padding: 6px 12px; background: #222; border-radius: 6px; min-width: 380px; }
+  :root { --bg:#101014; --bar:#1a1b21; --card:#1c1d24; --line:#2b2d36; --acc:#3b82f6; --txt:#e8e8ea; }
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; background: var(--bg); color: var(--txt); }
+  #bar { padding: 10px 16px; display: flex; gap: 14px; align-items: center; background: var(--bar); flex-wrap: wrap;
+         border-bottom: 1px solid var(--line); }
+  select, input[type=number], input[type=text] { font-size: 13px; padding: 4px 8px; background:#26272f; color:var(--txt);
+         border:1px solid var(--line); border-radius:6px; }
+  input[type=number] { width: 70px; } input[type=text] { width: 130px; }
+  input[type=range] { accent-color: var(--acc); }
+  #info { font-size: 13px; padding: 6px 12px; background: #222; border-radius: 6px; min-width: 320px; }
   #info b { color: #7fd4ff; }
-  .tab { padding: 6px 14px; border-radius: 6px; cursor: pointer; background: #2a2a2a; user-select: none; }
-  .tab.active { background: #2f6fb3; }
+  .tab { padding: 6px 16px; border-radius: 8px; cursor: pointer; background: #2a2b33; user-select: none; font-weight:600; }
+  .tab.active { background: var(--acc); }
+  #tools, #gtools { padding: 8px 16px; display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+           background: #15161b; border-bottom: 1px solid var(--line); font-size: 13px; color:#bbb; }
+  .tool { display: flex; gap: 7px; align-items: center; }
+  .tool label { color:#9aa; }
   #plots { display: flex; }
-  .panel { width: 50vw; height: calc(100vh - 60px); }
-  h3 { margin: 0; font-weight: 600; }
+  .panel { width: 50vw; height: calc(100vh - 104px); }
+  h3 { margin: 0; font-weight: 700; letter-spacing:.3px; }
+  button { background: #2a2b33; color: #ddd; border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px; cursor: pointer; }
+  button:hover { background:#33353f; }
+  button.primary { background: var(--acc); border-color: var(--acc); color:#fff; }
+  .chk { display:flex; align-items:center; gap:4px; cursor:pointer; user-select:none; }
   /* ---- video grid ---- */
-  #gridpage { display: none; padding: 14px 18px; }
-  #gridhead { margin: 4px 0 12px; color: #bbb; font-size: 14px; display:flex; gap:16px; align-items:center;}
+  #gridpage { display: none; }
+  #gridwrap { padding: 14px 18px; }
+  #gridhead { margin: 4px 0 12px; color: #bbb; font-size: 14px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
   #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
-  .card { background: #1b1b1b; border: 1px solid #2c2c2c; border-radius: 10px; overflow: hidden; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
   .card .hdr { display: flex; align-items: center; gap: 8px; padding: 8px 10px; font-size: 13px; }
   .rank { color: #888; min-width: 34px; }
   .hash { font-family: ui-monospace, monospace; color: #9ecbff; }
@@ -72,20 +89,20 @@ _TEMPLATE = """<!DOCTYPE html>
   .b-val { background: #4d3d1d; color: #ffd97b; }
   .pct { height: 4px; background: #333; }
   .pct > div { height: 100%; background: linear-gradient(90deg, #e05555, #e0c14f, #54c46c); }
-  .vid { position: relative; aspect-ratio: 16/10; background: #0d0d0d; }
-  .vid iframe { width: 100%; height: 100%; border: 0; }
+  .vid { position: relative; aspect-ratio: 16/10; background: #0a0a0c; }
+  .vid video { width:100%; height:100%; object-fit:contain; background:#000; }
   .vid .ph { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; cursor: pointer; color: #999; }
-  .vid .ph:hover { color: #fff; background: #161616; }
+  .vid .ph:hover { color: #fff; background: #15161b; }
   .ph .play { font-size: 34px; }
   .links { padding: 7px 10px; font-size: 12px; display: flex; gap: 14px; }
   .links a { color: #7fd4ff; text-decoration: none; }
-  button { background: #2a2a2a; color: #ddd; border: 1px solid #3a3a3a; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
-  /* ---- click-to-frame preview (t-SNE page) ---- */
-  #preview { position: fixed; right: 16px; bottom: 16px; width: 440px; background: #181818;
-             border: 1px solid #333; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.6);
+  #histo { height: 30px; }
+  /* ---- click-to-frame preview ---- */
+  #preview { position: fixed; right: 16px; bottom: 16px; width: 440px; background: #17181d;
+             border: 1px solid #34363f; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.65);
              display: none; z-index: 50; overflow: hidden; }
   #preview video { width: 100%; display: block; background: #000; }
-  #pv-cap { font-size: 12px; padding: 7px 10px; color: #ccc; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #pv-cap { font-size: 12px; padding: 7px 10px; color: #ccc; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   #pv-cap b { color: #7fd4ff; }
   #pv-cap button { padding: 2px 8px; font-size: 12px; }
   #pv-close { position: absolute; top: 6px; right: 8px; cursor: pointer; color: #aaa; font-size: 16px;
@@ -98,39 +115,244 @@ _TEMPLATE = """<!DOCTYPE html>
   <h3>EgoVerse viewer</h3>
   <span class="tab active" id="tab-tsne" onclick="showPage('tsne')">t-SNE 3-D</span>
   <span class="tab" id="tab-grid" onclick="showPage('grid')">Video grid</span>
-  <label>Task: <select id="task"></select></label>
-  <div id="info">t-SNE: click a point to inspect. Grid: click ▶ to load a video.</div>
+  <label class="tool">Task <select id="task"></select></label>
+  <div id="info">Click a point to inspect · legend click isolates an episode</div>
 </div>
+
 <div id="tsnepage">
+  <div id="tools">
+    <span class="tool"><label>Color</label>
+      <select id="colorMode" onchange="render()">
+        <option value="episode">episode</option>
+        <option value="time">time (light→dark)</option>
+        <option value="score">MI score (red→green)</option>
+      </select></span>
+    <span class="tool"><label class="chk"><input type="checkbox" id="hlOn" onchange="render()"> highlight frame</label>
+      <input type="number" id="hlFrame" value="0" min="0" step="10" onchange="hlChanged()">
+      <label>±</label><input type="number" id="hlWin" value="15" min="0" step="5" onchange="hlChanged()"></span>
+    <span class="tool"><label>Time range %</label>
+      <input type="number" id="t0" value="0" min="0" max="100" onchange="render()">–
+      <input type="number" id="t1" value="100" min="0" max="100" onchange="render()"></span>
+    <span class="tool"><label>Size</label>
+      <input type="range" id="psize" min="1" max="8" value="3" oninput="render()"></span>
+    <span class="tool"><label class="chk"><input type="checkbox" id="syncCam" checked> sync cameras</label></span>
+    <button onclick="resetTools()">reset</button>
+    <span id="tstats" style="color:#777"></span>
+  </div>
   <div id="plots">
     <div id="state" class="panel"></div>
     <div id="action" class="panel"></div>
   </div>
 </div>
+
 <div id="gridpage">
-  <div id="gridhead"></div>
-  <div id="grid"></div>
+  <div id="gtools">
+    <span class="tool"><label>Sort</label>
+      <select id="gsort" onchange="render()">
+        <option value="desc">score ↓ (best first)</option>
+        <option value="asc">score ↑ (worst first)</option>
+      </select></span>
+    <span class="tool">
+      <label class="chk"><input type="checkbox" id="fTop" checked onchange="render()"> TOP 60%</label>
+      <label class="chk"><input type="checkbox" id="fBot" checked onchange="render()"> BOT 40%</label>
+      <label class="chk"><input type="checkbox" id="fVal" onchange="render()"> VAL only</label></span>
+    <span class="tool"><label>Find</label><input type="text" id="gsearch" placeholder="hash prefix…" oninput="render()"></span>
+    <button onclick="loadAll()">Load all</button>
+    <button class="primary" onclick="playAll()">▶ Play all</button>
+    <button onclick="pauseAll()">⏸ Pause all</button>
+    <span class="tool"><label>Speed</label>
+      <select id="gspeed" onchange="setSpeed()">
+        <option>0.5</option><option selected>1</option><option>2</option><option>4</option>
+      </select></span>
+  </div>
+  <div id="gridwrap">
+    <div id="gridhead"></div>
+    <div id="grid"></div>
+  </div>
 </div>
+
 <div id="preview">
   <div id="pv-close" onclick="hidePreview()">✕</div>
   <video id="pv-video" muted playsinline preload="metadata"></video>
   <div id="pv-cap"></div>
 </div>
+
 <script>
 const DATA = __DATA__;
 const SCORES = __SCORES__;
 const VAL = new Set(__VAL__);
 const VIDEO_BASE = "__VIDEO_BASE__";
+const FPS = __FPS__;
 
+/* ---------------- color helpers ---------------- */
 function hsv2rgb(h, s, v) {
   const i = Math.floor(h * 6), f = h * 6 - i;
   const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
   const c = [[v,t,p],[q,v,p],[p,v,t],[p,q,v],[t,p,v],[v,p,q]][i % 6];
-  return `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
+  return [c[0]*255, c[1]*255, c[2]*255];
+}
+function rgba(c, a) { return `rgba(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])},${a})`; }
+function lerp3(a, b, t) { return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t]; }
+const redGreen = t => lerp3([224,85,85], [84,196,108], t);
+
+/* per-task hash→normalized score (0=worst, 1=best) */
+function scoreNorm(task) {
+  const e = SCORES[task] || [];
+  if (!e.length) return {};
+  const vals = e.map(x => x[1]), mn = Math.min(...vals), mx = Math.max(...vals);
+  const out = {};
+  e.forEach(([h, s]) => out[h] = mx > mn ? (s - mn) / (mx - mn) : 0.5);
+  return out;
+}
+
+/* ---------------- t-SNE page ---------------- */
+function uiState() {
+  return {
+    mode: document.getElementById("colorMode").value,
+    hlOn: document.getElementById("hlOn").checked,
+    hlF: +document.getElementById("hlFrame").value,
+    hlW: +document.getElementById("hlWin").value,
+    t0: +document.getElementById("t0").value / 100,
+    t1: +document.getElementById("t1").value / 100,
+    size: +document.getElementById("psize").value,
+  };
+}
+
+function tracesFor(mod, task) {
+  const d = (DATA[task] || {})[mod];
+  if (!d) return [];
+  const eps = DATA[task].episodes, nEp = eps.length;
+  const sn = scoreNorm(task);
+  const u = uiState();
+  const byEp = {};
+  for (let k = 0; k < d.x.length; k++) {
+    const e = d.ep[k];
+    if (!byEp[e]) byEp[e] = {x:[], y:[], z:[], c:[], s:[], f:[], t:[]};
+    const b = byEp[e];
+    const fr = d.frame[k], tf = d.t[k];
+    // base color by mode
+    let base;
+    if (u.mode === "time")       base = lerp3([170,215,255], [10,40,90], tf);
+    else if (u.mode === "score") base = redGreen(sn[eps[e]] ?? 0.5);
+    else                          base = hsv2rgb(e / Math.max(1, nEp), 0.85, 1.0 - 0.65 * tf);
+    // visibility: time-range filter + optional frame highlight
+    const inRange = tf >= u.t0 && tf <= u.t1;
+    const inHl = !u.hlOn || Math.abs(fr - u.hlF) <= u.hlW;
+    const on = inRange && inHl;
+    b.c.push(rgba(base, on ? 1.0 : 0.05));
+    b.s.push(on && u.hlOn ? u.size * 2.2 : u.size);
+    b.x.push(d.x[k]); b.y.push(d.y[k]); b.z.push(d.z[k]);
+    b.f.push(fr); b.t.push(tf);
+  }
+  const tr = Object.keys(byEp).sort((a,b)=>a-b).map(e => {
+    const b = byEp[e];
+    return {
+      type: "scatter3d", mode: "markers",
+      name: eps[e].slice(0, 10),
+      meta: {hash: eps[e], mod: mod},
+      x: b.x, y: b.y, z: b.z,
+      customdata: b.f.map((fr, i) => [fr, b.t[i]]),
+      marker: {size: b.s, color: b.c},
+      hovertemplate: "ep " + eps[e].slice(0,10) +
+        " · frame %{customdata[0]} (t=%{customdata[1]:.0%})<extra></extra>",
+    };
+  });
+  // cross-highlight overlay trace (filled on click)
+  tr.push({ type: "scatter3d", mode: "markers", name: "selected", showlegend: false,
+            x: [], y: [], z: [], hoverinfo: "skip",
+            marker: {size: 14, color: "rgba(255,215,0,0.95)", symbol: "diamond",
+                     line: {color: "#fff", width: 2}} });
+  return tr;
+}
+
+const LAYOUT = (title) => ({
+  title: {text: title, font: {color: "#eee", size: 15}},
+  paper_bgcolor: "#101014", plot_bgcolor: "#101014",
+  scene: { xaxis: {visible: false}, yaxis: {visible: false}, zaxis: {visible: false}, bgcolor: "#101014" },
+  legend: {font: {color: "#ccc", size: 10}, itemsizing: "constant"},
+  margin: {l: 0, r: 0, t: 36, b: 0},
+});
+
+let camLock = false;
+function renderTsne(task) {
+  Plotly.react("state",  tracesFor("state", task),  LAYOUT("STATE — " + task),  {responsive: true});
+  Plotly.react("action", tracesFor("action", task), LAYOUT("ACTION — " + task), {responsive: true});
+  const d = DATA[task] || {};
+  const nPts = ["state","action"].reduce((a,m) => a + ((d[m]||{}).x||[]).length, 0);
+  document.getElementById("tstats").textContent =
+    `${(d.episodes||[]).length} episodes · ${nPts.toLocaleString()} points · every ${d.every_n||10}th frame`;
+
+  for (const div of ["state", "action"]) {
+    const el = document.getElementById(div);
+    el.removeAllListeners && el.removeAllListeners("plotly_click");
+    el.on("plotly_click", ev => {
+      const p = ev.points[0];
+      if (!p.data.meta) return;
+      const [frame, tfrac] = p.customdata;
+      document.getElementById("info").innerHTML =
+        `<b>${p.data.meta.mod.toUpperCase()}</b> · <b>${p.data.meta.hash}</b> · frame <b>${frame}</b> ` +
+        `(${Math.round(tfrac * 100)}%) · ` +
+        `<a href="${VIDEO_BASE}${p.data.meta.hash}" target="_blank" style="color:#7fd4ff">video ↗</a>`;
+      document.getElementById("hlFrame").value = frame;   // wire click → highlight input
+      showFrame(task, p.data.meta.hash, frame, tfrac);
+      crossHighlight(task, p.data.meta.hash, frame);
+    });
+    el.on("plotly_legendclick", ev => {
+      const name = ev.data[ev.curveNumber].name;
+      if (name === "selected") return false;
+      const alreadyIsolated = ev.data.every(
+        tr => tr.name === "selected" ? true :
+              (tr.name === name ? tr.visible !== "legendonly" : tr.visible === "legendonly")
+      );
+      for (const d2 of ["state", "action"]) {
+        const el2 = document.getElementById(d2);
+        const vis = el2.data.map(tr => tr.name === "selected" || alreadyIsolated || tr.name === name ? true : "legendonly");
+        Plotly.restyle(el2, {visible: vis}, el2.data.map((_, i) => i));
+      }
+      return false;
+    });
+    el.on("plotly_relayout", ev => {
+      if (!document.getElementById("syncCam").checked || camLock) return;
+      if (ev["scene.camera"]) {
+        camLock = true;
+        const other = div === "state" ? "action" : "state";
+        Plotly.relayout(other, {"scene.camera": ev["scene.camera"]}).then(() => camLock = false);
+      }
+    });
+  }
+}
+
+/* mark the same (episode, frame) point in BOTH panels with a gold diamond */
+function crossHighlight(task, hash, frame) {
+  const eps = DATA[task].episodes;
+  const e = eps.indexOf(hash);
+  for (const mod of ["state", "action"]) {
+    const d = (DATA[task] || {})[mod];
+    const el = document.getElementById(mod);
+    if (!d || !el.data) continue;
+    let xs = [], ys = [], zs = [];
+    for (let k = 0; k < d.x.length; k++) {
+      if (d.ep[k] === e && d.frame[k] === frame) { xs.push(d.x[k]); ys.push(d.y[k]); zs.push(d.z[k]); break; }
+    }
+    const idx = el.data.findIndex(t => t.name === "selected");
+    if (idx >= 0) Plotly.restyle(el, {x: [xs], y: [ys], z: [zs]}, [idx]);
+  }
+}
+
+function hlChanged() { document.getElementById("hlOn").checked = true; render(); }
+
+function resetTools() {
+  document.getElementById("colorMode").value = "episode";
+  document.getElementById("hlOn").checked = false;
+  document.getElementById("hlFrame").value = 0;
+  document.getElementById("hlWin").value = 15;
+  document.getElementById("t0").value = 0;
+  document.getElementById("t1").value = 100;
+  document.getElementById("psize").value = 3;
+  render();
 }
 
 /* ---------------- click-to-frame preview ---------------- */
-const FPS = __FPS__;
 let pvHash = null, pvTask = "", pvFrame = 0, pvTfrac = null;
 
 function showFrame(task, hash, frame, tfrac) {
@@ -142,131 +364,85 @@ function showFrame(task, hash, frame, tfrac) {
     pvHash = hash;
     v.src = VIDEO_BASE + hash;
     v.onloadedmetadata = seek;
-  } else {
-    seek();
-  }
+  } else { seek(); }
   updateCap();
 }
 
 function updateCap() {
   document.getElementById("pv-cap").innerHTML =
-    `<b>${pvHash ? pvHash.slice(0,12) : ""}</b> · ${pvTask} · frame <b>${pvFrame}</b>` +
+    `<b>${pvHash ? pvHash.slice(0,12) : ""}</b> · frame <b>${pvFrame}</b>` +
     (pvTfrac != null ? ` (${Math.round(pvTfrac*100)}%)` : "") +
     ` <button onclick="stepFrame(-1)">−1f</button>` +
     ` <button onclick="stepFrame(1)">+1f</button>` +
     ` <button onclick="togglePlay()">▶/⏸</button>` +
-    ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open ↗</a>` +
-    ` <span style="color:#666">frame = curation-sequence index; pause-filtered eps may be offset</span>`;
+    ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open ↗</a>`;
 }
 
 function stepFrame(d) {
   const v = document.getElementById("pv-video");
-  pvFrame = Math.max(0, pvFrame + d);
-  pvTfrac = null;
-  v.pause();
-  v.currentTime = pvFrame / FPS;
+  pvFrame = Math.max(0, pvFrame + d); pvTfrac = null;
+  v.pause(); v.currentTime = pvFrame / FPS;
   updateCap();
 }
 
 function togglePlay() {
   const v = document.getElementById("pv-video");
-  if (v.paused) { v.play(); }
+  if (v.paused) v.play();
   else { v.pause(); pvFrame = Math.round(v.currentTime * FPS); pvTfrac = null; updateCap(); }
 }
 
 function hidePreview() {
-  const v = document.getElementById("pv-video");
-  v.pause();
+  document.getElementById("pv-video").pause();
   document.getElementById("preview").style.display = "none";
-}
-
-/* ---------------- t-SNE page ---------------- */
-function tracesFor(mod, task) {
-  const d = (DATA[task] || {})[mod];
-  if (!d) return [];
-  const eps = DATA[task].episodes, nEp = eps.length;
-  const byEp = {};
-  for (let k = 0; k < d.x.length; k++) {
-    const e = d.ep[k];
-    if (!byEp[e]) byEp[e] = {x:[], y:[], z:[], c:[], f:[], t:[]};
-    const b = byEp[e];
-    b.x.push(d.x[k]); b.y.push(d.y[k]); b.z.push(d.z[k]);
-    b.c.push(hsv2rgb(e / Math.max(1, nEp), 0.85, 1.0 - 0.65 * d.t[k]));
-    b.f.push(d.frame[k]); b.t.push(d.t[k]);
-  }
-  return Object.keys(byEp).sort((a,b)=>a-b).map(e => {
-    const b = byEp[e];
-    return {
-      type: "scatter3d", mode: "markers",
-      name: eps[e].slice(0, 10),
-      meta: {hash: eps[e], mod: mod},
-      x: b.x, y: b.y, z: b.z,
-      customdata: b.f.map((fr, i) => [fr, b.t[i]]),
-      marker: {size: 3, color: b.c},
-      hovertemplate: "ep " + eps[e].slice(0,10) +
-        " · frame %{customdata[0]} (t=%{customdata[1]:.0%})<extra></extra>",
-    };
-  });
-}
-
-const LAYOUT = (title) => ({
-  title: {text: title, font: {color: "#eee", size: 15}},
-  paper_bgcolor: "#111", plot_bgcolor: "#111",
-  scene: { xaxis: {visible: false}, yaxis: {visible: false}, zaxis: {visible: false}, bgcolor: "#111" },
-  legend: {font: {color: "#ccc", size: 10}, itemsizing: "constant"},
-  margin: {l: 0, r: 0, t: 36, b: 0},
-});
-
-function renderTsne(task) {
-  Plotly.react("state",  tracesFor("state", task),  LAYOUT("STATE — " + task),  {responsive: true});
-  Plotly.react("action", tracesFor("action", task), LAYOUT("ACTION — " + task), {responsive: true});
-  for (const div of ["state", "action"]) {
-    const el = document.getElementById(div);
-    el.on("plotly_click", ev => {
-      const p = ev.points[0];
-      const [frame, tfrac] = p.customdata;
-      document.getElementById("info").innerHTML =
-        `<b>${p.data.meta.mod.toUpperCase()}</b> · task <b>${task}</b> · ` +
-        `episode <b>${p.data.meta.hash}</b> · frame <b>${frame}</b> ` +
-        `(${Math.round(tfrac * 100)}% through) · ` +
-        `<a href="${VIDEO_BASE}${p.data.meta.hash}" target="_blank" style="color:#7fd4ff">video ↗</a>`;
-      showFrame(task, p.data.meta.hash, frame, tfrac);
-    });
-    el.on("plotly_legendclick", ev => {
-      const name = ev.data[ev.curveNumber].name;
-      const alreadyIsolated = ev.data.every(
-        tr => tr.name === name ? tr.visible !== "legendonly" : tr.visible === "legendonly"
-      );
-      for (const d2 of ["state", "action"]) {
-        const el2 = document.getElementById(d2);
-        const vis = el2.data.map(tr => alreadyIsolated || tr.name === name ? true : "legendonly");
-        Plotly.restyle(el2, {visible: vis}, el2.data.map((_, i) => i));
-      }
-      return false;
-    });
-  }
 }
 
 /* ---------------- video grid page ---------------- */
 function loadVideo(cellId, hash) {
   const cell = document.getElementById(cellId);
-  cell.innerHTML = `<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata" style="width:100%;height:100%;object-fit:contain;background:#000"></video>`;
+  cell.innerHTML = `<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata"></video>`;
+}
+
+function histoSVG(scores) {
+  if (!scores.length) return "";
+  const mn = Math.min(...scores), mx = Math.max(...scores), nb = 24;
+  const bins = new Array(nb).fill(0);
+  scores.forEach(s => bins[Math.min(nb-1, Math.floor((s-mn)/((mx-mn)||1)*nb))]++);
+  const bmax = Math.max(...bins);
+  const bars = bins.map((b,i) =>
+    `<rect x="${i*8}" y="${28-26*b/bmax}" width="6" height="${26*b/bmax}" fill="${rgba(redGreen(i/(nb-1)),0.9)}"/>`).join("");
+  return `<svg id="histo" width="${nb*8}" height="30" title="score distribution">${bars}</svg>`;
 }
 
 function renderGrid(task) {
-  const entries = SCORES[task] || [];           // [[hash, score], ...] sorted desc
-  const n = entries.length;
-  const nTop = Math.ceil(0.6 * n);
-  const scores = entries.map(e => e[1]);
-  const mn = Math.min(...scores), mx = Math.max(...scores);
-  const mean = scores.reduce((a,b)=>a+b,0) / Math.max(1,n);
+  let entries = (SCORES[task] || []).slice();      // [[hash, score], ...] desc
+  const n = entries.length, nTop = Math.ceil(0.6 * n);
+  const rank = {}; entries.forEach((e, i) => rank[e[0]] = i);
+  const allScores = entries.map(e => e[1]);
+  const mn = Math.min(...allScores), mx = Math.max(...allScores);
+  const mean = allScores.reduce((a,b)=>a+b,0) / Math.max(1,n);
+
+  // filters + sort + search
+  const fTop = document.getElementById("fTop").checked;
+  const fBot = document.getElementById("fBot").checked;
+  const fVal = document.getElementById("fVal").checked;
+  const q = document.getElementById("gsearch").value.trim().toLowerCase();
+  entries = entries.filter(([h]) => {
+    const isTop = rank[h] < nTop;
+    if (isTop && !fTop) return false;
+    if (!isTop && !fBot) return false;
+    if (fVal && !VAL.has(h)) return false;
+    if (q && !h.toLowerCase().startsWith(q)) return false;
+    return true;
+  });
+  if (document.getElementById("gsort").value === "asc") entries.reverse();
 
   document.getElementById("gridhead").innerHTML =
-    `<b>${task}</b> — ${n} episodes · MI mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] · sorted best→worst ` +
-    `<button onclick="loadAll()">Load all videos</button>` +
-    `<span style="color:#777">▶ streams the episode MP4 inline (self-hosted viewer)</span>`;
+    `<b>${task}</b> — showing ${entries.length}/${n} · MI mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] ` +
+    histoSVG(allScores) +
+    `<span style="color:#777">▶ streams MP4s from the self-hosted viewer</span>`;
 
-  const cards = entries.map(([hash, score], i) => {
+  const cards = entries.map(([hash, score]) => {
+    const i = rank[hash];
     const pct = mx > mn ? (score - mn) / (mx - mn) : 0.5;
     const badge = i < nTop ? '<span class="badge b-top">TOP 60%</span>'
                            : '<span class="badge b-bot">BOT 40%</span>';
@@ -290,8 +466,19 @@ function renderGrid(task) {
   document.getElementById("grid").innerHTML = cards.join("");
 }
 
-function loadAll() {
-  document.querySelectorAll("#grid .ph").forEach(ph => ph.click());
+function loadAll() { document.querySelectorAll("#grid .ph").forEach(ph => ph.click()); }
+
+function playAll() {
+  loadAll();
+  setSpeed();
+  document.querySelectorAll("#grid video").forEach(v => { v.muted = true; v.play().catch(()=>{}); });
+}
+
+function pauseAll() { document.querySelectorAll("#grid video").forEach(v => v.pause()); }
+
+function setSpeed() {
+  const r = parseFloat(document.getElementById("gspeed").value);
+  document.querySelectorAll("#grid video").forEach(v => v.playbackRate = r);
 }
 
 /* ---------------- nav ---------------- */
