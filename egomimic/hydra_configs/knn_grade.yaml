@@ -25,7 +25,7 @@
 #   +modal_gpu=L40S:1 +modal_cpu=32 +modal_memory_gb=128
 
 defaults:
-  - data: deminf_mecka
+  - data: deminf_ironing_10h
   - _self_
 
 name: knn_grade
