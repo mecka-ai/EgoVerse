@@ -22,10 +22,10 @@ MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py
 MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --debug 1000 --dry-run
 
 # Force-reconvert everything (overwrites existing tars):
-MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --force
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py --force
 
 # Convert only a specific list of episodes from a JSON file:
-MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --only /path/to/episodes.json
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py --only egomimic/modal/eps.json
 """
 
 from __future__ import annotations
@@ -100,6 +100,9 @@ def convert_episode(ep_dir: str, force: bool = False) -> dict | None:
     """
     import shutil
     import zarr
+
+    # Reload volume to get fresh view — avoids stale cache false-positives
+    zip_volume.reload()
 
     ep_path = Path(ep_dir)
     ep_name = ep_path.name
@@ -202,6 +205,7 @@ def scan_and_fix() -> list[str]:
     tar was moved to the volume but before (or during) commit.  Deleting them
     ensures the next conversion pass starts from a clean state.
     """
+    zip_volume.reload()
     zip_path = Path(ZIP_MOUNT)
     tars  = {p.stem for p in zip_path.glob("*.tar")}
     dones = {p.stem for p in zip_path.glob("*.done")}
@@ -235,6 +239,7 @@ def scan_and_fix() -> list[str]:
 )
 def write_catalog(entries: list[dict]) -> None:
     """Write catalog.json to the zip volume root, merging with any existing entries."""
+    zip_volume.reload()
     catalog_path = Path(ZIP_MOUNT) / "catalog.json"
 
     existing: dict[str, dict] = {}
