@@ -316,7 +316,14 @@ function renderTsne(task) {
     ], LAYOUT((mod === "state" ? "STATE — " : "ACTION — ") + task), {responsive: true});
 
     el.removeAllListeners && el.removeAllListeners("plotly_click");
+    // Plotly 3-D fires plotly_click when a rotate-drag happens to end on a
+    // point. Track pointer travel and only accept near-stationary clicks, so
+    // the video preview never loads mid-orbit.
+    el.onpointerdown = e => { el._px = e.clientX; el._py = e.clientY; };
+    el.onpointerup   = e => { el._drag = Math.hypot(e.clientX - (el._px ?? e.clientX),
+                                                    e.clientY - (el._py ?? e.clientY)) > 5; };
     el.on("plotly_click", ev => {
+      if (el._drag) return;                       // rotation release, not a click
       const p = ev.points[0];
       if (p.curveNumber !== 0) return;
       const [frame, tpct, , epIdx] = p.customdata;
