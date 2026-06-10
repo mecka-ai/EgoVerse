@@ -56,7 +56,6 @@ if _HERE not in sys.path:
 
 from modal_setup import (  # noqa: E402
     CFG,
-    CURATE_ORCHESTRATOR,
     MODAL_COMPUTE_ARG_MAP,
     ModalCompute,
     _local_hf_token,
@@ -79,8 +78,14 @@ TASK_COMPUTE = ModalCompute.from_environ(
     default_memory_mb=131072,
 )
 
-# Per-task CPU scorer (cache diff + k-NN grading) — fixed, no GPU.
-GRADE_SCORE_COMPUTE = ModalCompute(gpu=None, cpu=16.0, memory_mb=65536)
+# Long-lived coordinators ride a small GPU: Modal's CPU-only worker pool has
+# shown sustained preemption churn (containers killed every few minutes) while
+# GPU workers stay up, and these two must survive the whole run. The T4 is
+# idle ballast — it just buys placement in the stable pool.
+ORCHESTRATOR_COMPUTE = ModalCompute(gpu="T4", cpu=4.0, memory_mb=8192)
+
+# Per-task scorer (cache diff + k-NN grading).
+GRADE_SCORE_COMPUTE = ModalCompute(gpu="T4", cpu=16.0, memory_mb=65536)
 
 # Grid renderer — light CPU, needs the zarr volume for frame decode.
 GRID_RENDER_COMPUTE = ModalCompute(gpu=None, cpu=8.0, memory_mb=32768)
@@ -519,9 +524,9 @@ def _build_grid_specs(result: dict, per_task: int, neighbors_shown: int) -> list
 
 
 @app.function(
-    gpu=CURATE_ORCHESTRATOR.gpu,
-    cpu=CURATE_ORCHESTRATOR.cpu,
-    memory=CURATE_ORCHESTRATOR.memory_mb,
+    gpu=ORCHESTRATOR_COMPUTE.gpu,
+    cpu=ORCHESTRATOR_COMPUTE.cpu,
+    memory=ORCHESTRATOR_COMPUTE.memory_mb,
     timeout=CFG.timeout_seconds,
     secrets=_SHARED_SECRETS,
     volumes={
@@ -769,7 +774,7 @@ if __name__ == "__main__":
     )
     print(f"Modal app:                                  {modal_env['MODAL_APP_NAME']}")
     print(
-        f"Modal grading orchestrator (fixed):         {CURATE_ORCHESTRATOR.summary()}"
+        f"Modal grading orchestrator (fixed):         {ORCHESTRATOR_COMPUTE.summary()}"
     )
     print(
         f"Modal grading per-task CPU scorer:          {GRADE_SCORE_COMPUTE.summary()}"
