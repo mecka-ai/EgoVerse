@@ -68,6 +68,7 @@ valid_datasets:
         mode: cartesian
     mode: valid
     episodes_per_epoch: 90      # full shared eval set (30/task)
+    max_frames_per_episode: 24  # 90×24=2160 frames → all 90 eps covered (33/33/33 by frame)
     cache_dir: /cache/zarr_cache_valid
     pool_size_gb: 25
     lookahead_epochs: 2.0
