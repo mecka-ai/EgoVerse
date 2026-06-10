@@ -23,6 +23,9 @@ MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --debu
 
 # Force-reconvert everything (overwrites existing tars):
 MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --force
+
+# Convert only a specific list of episodes from a JSON file:
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/zip_zarr_to_vol.py -- --only /path/to/episodes.json
 """
 
 from __future__ import annotations
@@ -272,10 +275,9 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False, only: str =
         debug:   If > 0, limit conversion to this many episodes (for smoke-testing).
         dry_run: Print plan without launching any jobs.
         force:   If True, overwrite existing tars (use to fix corrupted tars).
-        only:    Path to a JSON list of episode_hashes. If set, convert ONLY
-                 those episodes (used to top up a task subset without rescanning
-                 the whole volume). catalog.json write is merge-idempotent, so
-                 the new entries are added to the existing catalog.
+        only:    Path to a JSON file containing a list of episode_hashes to convert.
+                 If set, only those episodes are converted. The catalog.json write
+                 is merge-idempotent, so new entries are added to the existing catalog.
     """
     print("Listing episodes from mecka_data_v2 (/mnt/zarr-data)...")
     all_episodes = list_episodes.remote()
@@ -290,9 +292,8 @@ def main(debug: int = 0, dry_run: bool = False, force: bool = False, only: str =
     hash_to_dir: dict[str, str] = {_ep_hash(ep): ep for ep in all_episodes}
 
     if only:
-        import json as _json
         with open(only) as f:
-            want = set(_json.load(f))
+            want = set(json.load(f))
         all_episodes = [ep for ep in all_episodes if _ep_hash(ep) in want]
         missing = want - {_ep_hash(ep) for ep in all_episodes}
         print(f"--only={only}: {len(all_episodes)} of {len(want)} requested hashes "
