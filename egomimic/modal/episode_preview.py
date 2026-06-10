@@ -1,0 +1,223 @@
+"""Render episode image-obs to MP4 and serve them from a self-hosted web viewer.
+
+Replaces the external "Atlas Capture" viewer: reads the per-frame JPEG image
+observations (``images.front_1``) straight from the episode zarr stores on the
+``mecka_data_v2`` volume, encodes each episode to an H.264 MP4 on a dedicated
+previews volume, and serves a browser viewer (index + streaming) via a Modal
+web endpoint.
+
+Standalone app — does NOT import egomimic/torch. The image obs is a zarr array
+of dtype VariableLengthBytes (native zarr 3.x), one JPEG per frame, so reading
+needs only zarr + simplejpeg; encoding uses the ffmpeg CLI (apt-installed here).
+
+Usage
+-----
+# 1) Render all 383 fourteen-task episodes to MP4 (parallel, idempotent):
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all
+
+# Render a custom hash list / single episode:
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all --hashes 69b0a081db7a56404d0f5517
+
+# 2) Deploy the viewer (persistent URL):
+MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/episode_preview.py
+#    → open the printed https URL; it lists every rendered episode and plays it.
+"""
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import modal
+
+# ---------------------------------------------------------------------------
+# App / image / volumes
+# ---------------------------------------------------------------------------
+
+# Default episode set: the 383 fourteen-task hashes (same set the deminf64 /
+# tokenizer runs use). Baked in so render_all needs no local file at run time.
+_HASHES_FILE = Path(__file__).resolve().parents[1] / "hydra_configs/data/extra/mecka_curated_14task_all.json"
+
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg")
+    .pip_install(
+        "zarr==3.1.5",
+        "simplejpeg",
+        "numpy",
+        "fastapi[standard]",
+    )
+)
+
+app = modal.App("egoverse-episode-preview", image=image)
+
+# Source episodes (read-only) and a dedicated previews volume (read/write).
+zarr_volume = modal.Volume.from_name("mecka_data_v2")
+previews_volume = modal.Volume.from_name("mecka-episode-previews", create_if_missing=True)
+
+ZARR_MOUNT = "/mnt/zarr-data"
+PREVIEW_MOUNT = "/mnt/previews"
+IMAGE_KEY = "images.front_1"   # Mecka cartesian camera obs key
+FPS = 30                       # obs/control rate; tune if playback looks off
+
+
+# ---------------------------------------------------------------------------
+# Render one episode → MP4 on the previews volume
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    volumes={ZARR_MOUNT: zarr_volume, PREVIEW_MOUNT: previews_volume},
+    cpu=4.0,
+    memory=8192,
+    timeout=1200,
+)
+def render_episode(episode_hash: str, fps: int = FPS, force: bool = False) -> dict:
+    """Decode images.front_1 from the episode zarr and write an H.264 MP4.
+
+    Idempotent: skips episodes whose MP4 already exists unless force=True.
+    """
+    import numpy as np
+    import simplejpeg
+    import zarr
+
+    out_path = Path(PREVIEW_MOUNT) / f"{episode_hash}.mp4"
+    if out_path.exists() and not force:
+        return {"hash": episode_hash, "status": "skipped", "frames": 0}
+
+    # Episode dirs are stored as "<hash>.zarr" (bare "<hash>" also seen).
+    store_path = None
+    for cand in (f"{episode_hash}.zarr", episode_hash):
+        if (Path(ZARR_MOUNT) / cand).is_dir():
+            store_path = Path(ZARR_MOUNT) / cand
+            break
+    if store_path is None:
+        return {"hash": episode_hash, "status": "missing_zarr", "frames": 0}
+
+    store = zarr.open_group(str(store_path), mode="r")
+    if IMAGE_KEY not in store:
+        return {"hash": episode_hash, "status": f"no_key:{IMAGE_KEY}", "frames": 0}
+
+    jpegs = store[IMAGE_KEY][:]  # object array of JPEG byte strings, length T
+    if len(jpegs) == 0:
+        return {"hash": episode_hash, "status": "empty", "frames": 0}
+
+    # Decode first frame to get dimensions, then stream all frames into ffmpeg.
+    first = simplejpeg.decode_jpeg(bytes(jpegs[0]), colorspace="RGB")
+    h, w = first.shape[:2]
+    outW, outH = (w // 2) - (w // 2) % 2, (h // 2) - (h // 2) % 2  # half-res, even dims
+
+    tmp = Path("/tmp") / f"{episode_hash}.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}", "-r", str(fps),
+        "-i", "-",
+        "-an",
+        "-vf", f"scale={outW}:{outH}",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-crf", "23", "-preset", "fast",
+        "-movflags", "+faststart",   # web-streamable (moov atom up front)
+        str(tmp),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    n = 0
+    try:
+        for jb in jpegs:
+            frame = simplejpeg.decode_jpeg(bytes(jb), colorspace="RGB")
+            if frame.shape[:2] != (h, w):  # guard against ragged frames
+                continue
+            proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+            n += 1
+        proc.stdin.close()
+        err = proc.stderr.read()
+        if proc.wait() != 0:
+            return {"hash": episode_hash, "status": f"ffmpeg_fail: {err.decode(errors='replace')[-300:]}", "frames": n}
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    out_path.write_bytes(tmp.read_bytes())
+    tmp.unlink(missing_ok=True)
+    previews_volume.commit()
+    return {"hash": episode_hash, "status": "ok", "frames": n}
+
+
+@app.local_entrypoint()
+def render_all(hashes: str = "", force: bool = False) -> None:
+    """Render every requested episode in parallel.
+
+    hashes: comma-separated episode hashes; empty → the baked 383-episode set.
+    """
+    if hashes:
+        targets = [h.strip() for h in hashes.split(",") if h.strip()]
+    else:
+        targets = json.loads(_HASHES_FILE.read_text())
+    print(f"Rendering {len(targets)} episode(s) → mecka-episode-previews volume")
+
+    ok = skipped = failed = 0
+    for r in render_episode.map(targets, kwargs={"force": force}):
+        st = r["status"]
+        if st == "ok":
+            ok += 1
+        elif st == "skipped":
+            skipped += 1
+        else:
+            failed += 1
+            print(f"  ! {r['hash']}: {st}")
+    print(f"\nDone: {ok} rendered, {skipped} already present, {failed} failed.")
+    print("Deploy the viewer:  modal deploy egomimic/modal/episode_preview.py")
+
+
+# ---------------------------------------------------------------------------
+# Web viewer: index page + MP4 streaming
+# ---------------------------------------------------------------------------
+
+
+@app.function(volumes={PREVIEW_MOUNT: previews_volume}, min_containers=0)
+@modal.concurrent(max_inputs=20)
+@modal.asgi_app()
+def viewer():
+    from fastapi import FastAPI
+    from fastapi.responses import FileResponse, HTMLResponse, Response
+
+    web = FastAPI(title="EgoVerse Episode Viewer")
+
+    def _episodes() -> list[str]:
+        previews_volume.reload()
+        return sorted(p.stem for p in Path(PREVIEW_MOUNT).glob("*.mp4"))
+
+    @web.get("/", response_class=HTMLResponse)
+    def index():
+        eps = _episodes()
+        cards = "\n".join(
+            f'<div class="card"><div class="h">{h}</div>'
+            f'<video controls preload="metadata" src="/video/{h}"></video></div>'
+            for h in eps
+        )
+        return f"""<!doctype html><html><head><meta charset=utf-8>
+<title>EgoVerse Episodes ({len(eps)})</title>
+<style>
+ body{{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:0;padding:16px}}
+ h1{{font-size:16px;font-weight:600}}
+ .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}}
+ .card{{background:#1c1c1c;border-radius:8px;padding:8px}}
+ .card video{{width:100%;border-radius:4px;background:#000}}
+ .h{{font:12px ui-monospace,monospace;color:#9ad;margin-bottom:6px;word-break:break-all}}
+</style></head><body>
+<h1>EgoVerse episode previews — {len(eps)} episodes (images.front_1)</h1>
+<div class="grid">{cards or '<p>No MP4s yet — run <code>modal run ...::render_all</code>.</p>'}</div>
+</body></html>"""
+
+    @web.get("/video/{episode_hash}")
+    def video(episode_hash: str):
+        # Basename guard: no path traversal.
+        safe = Path(episode_hash).name
+        path = Path(PREVIEW_MOUNT) / f"{safe}.mp4"
+        if not path.exists():
+            previews_volume.reload()
+        if not path.exists():
+            return Response(status_code=404)
+        return FileResponse(str(path), media_type="video/mp4")
+
+    return web
