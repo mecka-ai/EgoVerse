@@ -137,7 +137,13 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         )
         self._is_filler_rank = self._rank == 0
         self._filler: PoolFillerThread | None = None
-        if self.mode == "train" and self._is_filler_rank:
+        # Any non-valid dataset stages in the background via the filler; only the
+        # valid split uses synchronous inline extraction (rare, small). This must
+        # key off "not valid" rather than '== "train"': configs that select an
+        # exact episode list via eps_to_use use mode="total" (verbatim, no split),
+        # and those still need the background filler — otherwise nothing stages and
+        # prepare_epoch blocks until its timeout (the deminf64 stage-all hang).
+        if self.mode != "valid" and self._is_filler_rank:
             registry_key = str(self.cache_dir.resolve())
             with _FILLER_REGISTRY_LOCK:
                 existing = _FILLER_REGISTRY.get(registry_key)
