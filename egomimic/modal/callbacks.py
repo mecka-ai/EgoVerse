@@ -86,18 +86,17 @@ class ModalAutoRestartCallback(Callback):
         git_remote = os.environ.get("MODAL_GIT_REMOTE", "")
         git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
         wandb_api_key = os.environ.get("WANDB_API_KEY", "")
+        init_submodules = os.environ.get("MODAL_INIT_SUBMODULES", "1") == "1"
 
         if trainer.is_global_zero:
             try:
-                import modal as _modal
-
-                fn = _modal.Function.from_name(
-                    "egomimic-training",
-                    "run_hydra_train",
-                    environment_name="robotics",
-                )
+                fn = self._continuation_fn()
                 handle = fn.spawn(
-                    tuple(new_args), git_remote, git_commit, wandb_api_key
+                    tuple(new_args),
+                    git_remote,
+                    git_commit,
+                    wandb_api_key,
+                    init_submodules=init_submodules,
                 )
                 log.info(f"[ModalAutoRestart] Spawned continuation: {handle.object_id}")
             except Exception as exc:
@@ -105,6 +104,38 @@ class ModalAutoRestartCallback(Callback):
 
         trainer.should_stop = True
         log.info("[ModalAutoRestart] Stopping current run — continuation job is running")
+
+    @staticmethod
+    def _continuation_fn():
+        """Resolve the run_hydra_train function to spawn the continuation on.
+
+        Prefer the hydrated function object from the in-container trainModal
+        module (the entrypoint Modal loaded for this very job): spawning it
+        targets the SAME ephemeral app, so the continuation inherits this run's
+        app name, GPU type, and image. Same-app sibling spawns are the
+        established pattern (see curateModal.py fan-out).
+
+        Falls back to a deployed-app lookup only if the module isn't loaded —
+        note Function.from_name resolves DEPLOYED apps only, so the fallback
+        works only if an `egomimic-training` app has been `modal deploy`ed.
+        """
+        import sys
+
+        tm = sys.modules.get("trainModal")
+        if tm is not None and hasattr(tm, "run_hydra_train"):
+            return tm.run_hydra_train
+
+        import modal as _modal
+
+        log.warning(
+            "[ModalAutoRestart] trainModal module not loaded — falling back to "
+            "deployed-app lookup (requires a deployed 'egomimic-training' app)"
+        )
+        return _modal.Function.from_name(
+            "egomimic-training",
+            "run_hydra_train",
+            environment_name="robotics",
+        )
 
 
 class PrefetchEpochCallback(Callback):

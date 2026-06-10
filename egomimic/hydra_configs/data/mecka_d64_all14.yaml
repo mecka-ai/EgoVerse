@@ -1,0 +1,52 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# DEMINF-64 COMPARISON — ALL-EPISODES arm.
+# Source scores: deminf_tsne/14task_dim64_k10_20_viz3d_2026-06-09_19-49-48 (64-dim
+# latents, KSG k=[10,20]). Trains on every 14-task episode EXCEPT the shared
+# 14-episode validation set (one bottom-40%-scored episode per task, seed 42),
+# which is identical across the all14 / top60 / rand60 arms.
+#   train = 383 - 14 = 369 episodes  |  valid = 14 (mecka_d64_val.json)
+# mode: total — episode lists are used verbatim (no internal random split), so
+# validation parity across arms is guaranteed by construction. Run with
+# trainer.limit_val_batches=1.0 so every frame of all 14 val episodes is
+# validated each cycle.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_all14_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_val.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12

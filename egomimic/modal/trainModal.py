@@ -217,6 +217,9 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
+    # Carried into the ModalAutoRestart continuation spawn so a run launched
+    # with init_submodules=false doesn't re-init submodules after restarting.
+    env["MODAL_INIT_SUBMODULES"] = "1" if init_submodules else "0"
 
     # openpi (used by egomimic.algo.pi for pi0.5 models) lives in the
     # external/openpi git submodule at external/openpi/src; put it on PYTHONPATH
