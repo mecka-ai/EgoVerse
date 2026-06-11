@@ -1,0 +1,119 @@
+# OAT tokenizer over the EXACT deminf64 splits — stage-all-first, A100-40GB.
+#
+# Same 14 tasks AND the same train/validation membership as the deminf64 runs:
+#   train = mecka_d64_all14_train.json (369 eps = all 383 minus the shared val)
+#   valid = mecka_d64_val.json (the SHARED 14-episode set, one bottom-40%-scored
+#           episode per task, seed 42 — identical to all deminf64 arms)
+# Both mode: total → episode lists used verbatim, no internal split. Launch with
+# trainer.limit_val_batches=1.0 so every frame of all 14 val episodes is
+# covered each cycle (cheap here: the tokenizer forward has no image encoder).
+#
+# train_viz: the FIXED 12-episode in-distribution set (mecka_14task_train_viz.json
+# — verified ⊆ d64 train set and disjoint from val) on the dataloader_idx=1 leg,
+# writing GT-vs-reconstructed action videos via train_viz_tokenizer.
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_oat_tok_d64 trainer=ddp_modal logger=wandb \
+#     model=oat_tokenizer evaluator=eval_tokenizer_video \
+#     evaluator@train_viz_evaluator=train_viz_tokenizer \
+#     name=oat_tok_d64 description=all14_bs64 \
+#     trainer.check_val_every_n_epoch=30 trainer.limit_val_batches=1.0 \
+#     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=600 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false reject_outliers=false \
+#     launch_params.gpus_per_node=1
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_all14_train.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total                 # d64 train list used verbatim (no split)
+    episodes_per_epoch: 369     # == full subset → prepare_epoch(0) stages it all first
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 150           # holds the whole ~50 GB subset, no eviction
+    lookahead_epochs: 1.0
+    n_copy_threads: 32
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_val.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total                 # shared 14-episode val set, identical to deminf64 arms
+    episodes_per_epoch: 14
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 20
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_14task_train_viz.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total                 # fixed 12 in-distribution eps (⊆ d64 train, ∩ val = ∅)
+    episodes_per_epoch: 12
+    cache_dir: /cache/zarr_cache_train_viz
+    pool_size_gb: 20
+    lookahead_epochs: 1.0
+    n_copy_threads: 8
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 16
+    persistent_workers: true    # window == whole set every epoch → index_map stable
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
