@@ -1,4 +1,7 @@
-"""Per-task t-SNE visualization of curation state/action latents.
+"""Per-task t-SNE visualization of state/action latents.
+
+Shared by the curation pipeline (curateModal.py) and the general latent-viz
+export (latentVizModal.py) — nothing here depends on curation scoring.
 
 For one task, projects the per-frame state and action latents to 2-D with t-SNE
 and renders a scatter where:

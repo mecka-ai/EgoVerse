@@ -2,29 +2,35 @@
 """
 Build a self-contained interactive latent + episode-video viewer.
 
+Only input required is a directory of ``tsne3d_<task>.json`` files (written by
+``egomimic/modal/latentVizModal.py`` for any data config, or by a curation
+run). Per-episode scores and a VAL-episode list are OPTIONAL extras — the
+viewer renders fully without them.
+
 Two pages in one HTML file (works as a local file or served by the Modal web
 app ``egomimic/modal/latent_viz_app.py``):
 
   * **t-SNE 3-D** — per-task 3-D scatters of state/action latents from
     ``tsne3d_<task>.json``. Fast single-trace WebGL engine: per-task color
-    tables (episode / time / MI score) are precomputed once and every control
+    tables (episode / time / score) are precomputed once and every control
     change is an in-place restyle (no scene rebuild). Tools: frame-number
     highlight (±window) across BOTH panels, time-range filter, episode
     isolate, point size, synced cameras, click → frame-seek video preview +
     gold cross-highlight of the same (episode, frame) in the other panel.
-  * **Video grid** — per-task grid of every scored episode (from
-    ``scores_by_task.json``): sort/filter/search, rank/score/percentile,
-    TOP-60%/BOT-40%/VAL badges, score histogram, Load-all / Play-all /
-    Pause-all / playback-speed. MP4s stream from the self-hosted Modal viewer
+  * **Video grid** — per-task grid of every episode. With scores: sort by
+    score, rank/percentile, histogram. Always: search, VAL badges (when a VAL
+    list is given), Load-all / Play-all / Pause-all / playback-speed. MP4s
+    stream from the self-hosted Modal viewer
     (egomimic/modal/episode_preview.py).
 
 Usage (local dirs/files):
   python egomimic/scripts/build_latent_viz.py /path/to/tsne3d \\
-      --scores /path/to/scores_by_task.json --out latent_viz.html
+      [--scores /path/to/scores_by_task.json] --out latent_viz.html
 
-Usage (volume paths — auto-downloads tsne3d/ and the run's scores_by_task.json):
+Usage (volume paths — auto-downloads tsne3d/ and, if present, the run's
+scores_by_task.json):
   python egomimic/scripts/build_latent_viz.py \\
-      deminf_tsne/<run>/tsne3d --volume egoverse-training-outputs --out latent_viz.html
+      latent_viz/<run>/tsne3d --volume egoverse-training-outputs --out latent_viz.html
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ _TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>EgoVerse latent + episode viewer</title>
+<title>EgoVerse latent viewer</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
   :root { --bg:#101014; --bar:#1a1b21; --card:#1c1d24; --line:#2b2d36; --acc:#3b82f6; --txt:#e8e8ea; }
@@ -92,8 +98,6 @@ _TEMPLATE = """<!DOCTYPE html>
   .hash { font-family: ui-monospace, monospace; color: #9ecbff; }
   .score { margin-left: auto; font-weight: 700; }
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 700; }
-  .b-top { background: #1d4d2b; color: #7be495; }
-  .b-bot { background: #4d1d1d; color: #ff9d9d; }
   .b-val { background: #4d3d1d; color: #ffd97b; }
   .pct { height: 4px; background: #333; }
   .pct > div { height: 100%; background: linear-gradient(90deg, #e05555, #e0c14f, #54c46c); }
@@ -133,7 +137,7 @@ _TEMPLATE = """<!DOCTYPE html>
       <select id="colorMode" onchange="applyStyle()">
         <option value="episode">episode</option>
         <option value="time">time (light→dark)</option>
-        <option value="score">MI score (red→green)</option>
+        <option value="score">score (red→green)</option>
       </select></span>
     <span class="tool"><label>Episode</label>
       <select id="epSel" onchange="applyStyle(); markLegend()"><option value="all">all</option></select></span>
@@ -158,14 +162,12 @@ _TEMPLATE = """<!DOCTYPE html>
 
 <div id="gridpage">
   <div id="gtools">
-    <span class="tool"><label>Sort</label>
+    <span class="tool" id="gsortWrap"><label>Sort</label>
       <select id="gsort" onchange="render()">
         <option value="desc">score ↓ (best first)</option>
         <option value="asc">score ↑ (worst first)</option>
       </select></span>
-    <span class="tool">
-      <label class="chk"><input type="checkbox" id="fTop" checked onchange="render()"> TOP 60%</label>
-      <label class="chk"><input type="checkbox" id="fBot" checked onchange="render()"> BOT 40%</label>
+    <span class="tool" id="fValWrap">
       <label class="chk"><input type="checkbox" id="fVal" onchange="render()"> VAL only</label></span>
     <span class="tool"><label>Find</label><input type="text" id="gsearch" placeholder="hash prefix…" oninput="render()"></span>
     <button onclick="loadAll()">Load all</button>
@@ -215,6 +217,7 @@ function scoreNorm(task) {
   e.forEach(([h, s]) => out[h] = mx > mn ? (s - mn) / (mx - mn) : 0.5);
   return out;
 }
+function hasScores(task) { return (SCORES[task] || []).length > 0; }
 
 /* ---------------- t-SNE fast engine ----------------
    One trace per panel. Per (task, mode) color tables are computed ONCE and
@@ -293,6 +296,11 @@ let camLock = false;
 function renderTsne(task) {
   if (!CACHE[task]) CACHE[task] = buildCache(task);
   curTask = task;
+  // score color mode only makes sense when this task has scores
+  const scoreOpt = document.querySelector('#colorMode option[value="score"]');
+  scoreOpt.disabled = !hasScores(task);
+  const cm = document.getElementById("colorMode");
+  if (cm.value === "score" && scoreOpt.disabled) cm.value = "episode";
   const u = uiState();
   // episode dropdown
   const epSel = document.getElementById("epSel");
@@ -359,7 +367,8 @@ function buildLegend(task) {
   const rows = eps.map((h, i) => {
     const c = rgb(hsv2rgb(i / Math.max(1, eps.length), 0.85, 0.85));
     const sc = SCORES[task] ? (SCORES[task].find(e => e[0] === h) || [0, NaN])[1] : NaN;
-    return `<div class="lg-row" id="lg_${i}" onclick="legendClick(${i})" title="MI ${isNaN(sc) ? "?" : sc.toFixed(4)}">` +
+    const tip = isNaN(sc) ? h : `${h} · score ${sc.toFixed(4)}`;
+    return `<div class="lg-row" id="lg_${i}" onclick="legendClick(${i})" title="${tip}">` +
            `<span class="lg-dot" style="background:${c}"></span>${h.slice(0, 10)}</div>`;
   }).join("");
   document.getElementById("legend").innerHTML =
@@ -471,51 +480,54 @@ function histoSVG(scores) {
 }
 
 function renderGrid(task) {
-  let entries = (SCORES[task] || []).slice();
-  const n = entries.length, nTop = Math.ceil(0.6 * n);
+  const scored = hasScores(task);
+  // With scores: [hash, score] ranked best-first. Without: episode list from
+  // the t-SNE data, in episode order, no score UI.
+  let entries = scored ? SCORES[task].slice()
+                       : ((DATA[task] || {}).episodes || []).map(h => [h, null]);
+  const n = entries.length;
   const rank = {}; entries.forEach((e, i) => rank[e[0]] = i);
-  const allScores = entries.map(e => e[1]);
+  const allScores = scored ? entries.map(e => e[1]) : [];
   const mn = Math.min(...allScores), mx = Math.max(...allScores);
   const mean = allScores.reduce((a,b)=>a+b,0) / Math.max(1,n);
 
-  const fTop = document.getElementById("fTop").checked;
-  const fBot = document.getElementById("fBot").checked;
-  const fVal = document.getElementById("fVal").checked;
+  document.getElementById("gsortWrap").style.display = scored ? "" : "none";
+  document.getElementById("fValWrap").style.display = VAL.size ? "" : "none";
+
+  const fVal = VAL.size && document.getElementById("fVal").checked;
   const q = document.getElementById("gsearch").value.trim().toLowerCase();
   entries = entries.filter(([h]) => {
-    const isTop = rank[h] < nTop;
-    if (isTop && !fTop) return false;
-    if (!isTop && !fBot) return false;
     if (fVal && !VAL.has(h)) return false;
     if (q && !h.toLowerCase().startsWith(q)) return false;
     return true;
   });
-  if (document.getElementById("gsort").value === "asc") entries.reverse();
+  if (scored && document.getElementById("gsort").value === "asc") entries.reverse();
 
   document.getElementById("gridhead").innerHTML =
-    `<b>${task}</b> — showing ${entries.length}/${n} · MI mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] ` +
-    histoSVG(allScores) +
+    `<b>${task}</b> — showing ${entries.length}/${n} ` +
+    (scored
+      ? `· score mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] ` +
+        histoSVG(allScores)
+      : "") +
     `<span style="color:#777">▶ streams MP4s from the self-hosted viewer</span>`;
 
   const cards = entries.map(([hash, score]) => {
     const i = rank[hash];
-    const pct = mx > mn ? (score - mn) / (mx - mn) : 0.5;
-    const badge = i < nTop ? '<span class="badge b-top">TOP 60%</span>'
-                           : '<span class="badge b-bot">BOT 40%</span>';
     const valb = VAL.has(hash) ? ' <span class="badge b-val">VAL</span>' : '';
     const cid = `v_${task}_${i}`;
+    const pct = scored && mx > mn ? (score - mn) / (mx - mn) : null;
     return `<div class="card">
       <div class="hdr"><span class="rank">#${i+1}</span>
-        <span class="hash">${hash}</span>${badge}${valb}
-        <span class="score">${score.toFixed(4)}</span></div>
-      <div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>
+        <span class="hash">${hash}</span>${valb}
+        ${scored ? `<span class="score">${score.toFixed(4)}</span>` : ""}</div>
+      ${pct != null ? `<div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>` : ""}
       <div class="vid" id="${cid}">
         <div class="ph" onclick="loadVideo('${cid}','${hash}')">
           <div class="play">▶</div><div>load video</div></div>
       </div>
       <div class="links">
         <a href="${VIDEO_BASE}${hash}" target="_blank">open ↗</a>
-        <span style="color:#666">rank ${i+1}/${n} · percentile ${(100*(1-i/Math.max(1,n-1))).toFixed(0)}</span>
+        ${scored ? `<span style="color:#666">rank ${i+1}/${n} · percentile ${(100*(1-i/Math.max(1,n-1))).toFixed(0)}</span>` : ""}
       </div>
     </div>`;
   });
@@ -566,25 +578,36 @@ render();
 """
 
 
-def build_html(tsne_dir: Path, scores_raw: dict, val: list) -> str:
-    """Assemble the viewer HTML from a local tsne3d dir + raw scores dict."""
+def build_html(
+    tsne_dir: Path,
+    scores_raw: dict | None = None,
+    val: list | None = None,
+    video_base: str = VIDEO_BASE,
+) -> str:
+    """Assemble the viewer HTML from a local tsne3d dir.
+
+    ``scores_raw`` ({task: {hash: score}}) and ``val`` (episode-hash list) are
+    optional — without them the viewer simply omits score- and VAL-based UI.
+    """
     data: dict = {}
     for f in sorted(Path(tsne_dir).glob("tsne3d_*.json")):
         d = json.load(open(f))
         data[d["task"]] = d
+    if not data:
+        raise FileNotFoundError(f"No tsne3d_*.json files in {tsne_dir}")
     scores = {
         t: sorted(
             ([h, s] for h, s in v.items()),
             key=lambda kv: (not math.isfinite(kv[1]), -(kv[1] if math.isfinite(kv[1]) else 0), kv[0]),
         )
-        for t, v in scores_raw.items()
+        for t, v in (scores_raw or {}).items()
     }
     return (
         _TEMPLATE
         .replace("__DATA__", json.dumps(data, separators=(",", ":")))
         .replace("__SCORES__", json.dumps(scores, separators=(",", ":")))
-        .replace("__VAL__", json.dumps(val, separators=(",", ":")))
-        .replace("__VIDEO_BASE__", VIDEO_BASE)
+        .replace("__VAL__", json.dumps(val or [], separators=(",", ":")))
+        .replace("__VIDEO_BASE__", video_base)
         .replace("__FPS__", str(FPS))
     )
 
@@ -632,16 +655,18 @@ def _load_scores(args, tsne_local: Path) -> dict:
         tmp = Path(tempfile.mktemp(suffix=".json"))
         if _download(args.volume, args.env, remote, tmp):
             return json.load(open(tmp))
-    print("WARNING: no scores_by_task.json found — video grid will be empty.")
+    print("No scores_by_task.json found — building score-free viewer.")
     return {}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tsne3d_dir", help="Local dir of tsne3d_*.json, or volume-relative path")
-    ap.add_argument("--scores", default=None, help="scores_by_task.json (local or volume-relative); default: sibling of tsne3d dir")
-    ap.add_argument("--val-json", default="egomimic/hydra_configs/data/extra/mecka_d64_val.json",
-                    help="Optional episode-hash list to badge as VAL in the grid")
+    ap.add_argument("--scores", default=None, help="Optional scores_by_task.json (local or volume-relative); default: sibling of tsne3d dir if present")
+    ap.add_argument("--val-json", default=None,
+                    help="Optional episode-hash list to badge as VAL in the grid; default: sibling val_episodes.json if present")
+    ap.add_argument("--video-base", default=VIDEO_BASE,
+                    help="Base URL of the episode MP4 server (episode_preview.py deployment)")
     ap.add_argument("--volume", default=None, help="Modal volume to download from if paths not local")
     ap.add_argument("--env", default="robotics", help="Modal environment (default: robotics)")
     ap.add_argument("--out", default="latent_viz.html", help="Output HTML path")
@@ -651,12 +676,12 @@ def main() -> None:
     raw_scores = _load_scores(args, src)
 
     val: list = []
-    vp = Path(args.val_json) if args.val_json else None
+    vp = Path(args.val_json) if args.val_json else src.parent / "val_episodes.json"
     if vp and vp.is_file():
         val = json.load(open(vp))
         print(f"VAL badges: {len(val)} episodes from {vp}")
 
-    html = build_html(src, raw_scores, val)
+    html = build_html(src, raw_scores, val, video_base=args.video_base)
     out = Path(args.out)
     out.write_text(html)
     print(f"Wrote {out.resolve()}  ({out.stat().st_size/1e6:.1f} MB)")

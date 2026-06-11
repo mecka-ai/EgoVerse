@@ -12,11 +12,10 @@ needs only zarr + simplejpeg; encoding uses the ffmpeg CLI (apt-installed here).
 
 Usage
 -----
-# 1) Render all 383 fourteen-task episodes to MP4 (parallel, idempotent):
-MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all
-
-# Render a custom hash list / single episode:
+# 1) Render episodes to MP4 (parallel, idempotent). Pass hashes inline or as a
+#    JSON list file (e.g. the episode_hashes.json a latentVizModal run writes):
 MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all --hashes 69b0a081db7a56404d0f5517
+MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all --hashes-file /path/to/episode_hashes.json
 
 # 2) Deploy the viewer (persistent URL):
 MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/episode_preview.py
@@ -24,7 +23,6 @@ MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/episode_preview.py
 """
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -33,10 +31,6 @@ import modal
 # ---------------------------------------------------------------------------
 # App / image / volumes
 # ---------------------------------------------------------------------------
-
-# Default episode set: the 383 fourteen-task hashes (same set the deminf64 /
-# tokenizer runs use). Baked in so render_all needs no local file at run time.
-_HASHES_FILE = Path(__file__).resolve().parents[1] / "hydra_configs/data/extra/mecka_curated_14task_all.json"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -166,15 +160,19 @@ def render_episode(episode_hash: str, fps: int = FPS, force: bool = False) -> di
 
 
 @app.local_entrypoint()
-def render_all(hashes: str = "", force: bool = False) -> None:
+def render_all(hashes: str = "", hashes_file: str = "", force: bool = False) -> None:
     """Render every requested episode in parallel.
 
-    hashes: comma-separated episode hashes; empty → the baked 383-episode set.
+    hashes: comma-separated episode hashes.
+    hashes_file: local path to a JSON list of hashes (e.g. the
+        episode_hashes.json written into a latentVizModal run dir).
     """
-    if hashes:
-        targets = [h.strip() for h in hashes.split(",") if h.strip()]
-    else:
-        targets = json.loads(_HASHES_FILE.read_text())
+    targets = [h.strip() for h in hashes.split(",") if h.strip()]
+    if hashes_file:
+        targets += json.loads(Path(hashes_file).read_text())
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        raise SystemExit("Pass --hashes and/or --hashes-file (no default episode set).")
     print(f"Rendering {len(targets)} episode(s) → mecka-episode-previews volume")
 
     ok = skipped = failed = 0
