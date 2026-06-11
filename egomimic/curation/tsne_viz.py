@@ -176,7 +176,7 @@ def _hsv(h: float, s: float, v: float) -> tuple[float, float, float]:
 
 
 def _rgb(c: tuple[float, float, float]) -> str:
-    return f"rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})"
+    return f"#{int(c[0]*255):02x}{int(c[1]*255):02x}{int(c[2]*255):02x}"
 
 
 def _lerp(a: list[float], b: list[float], t: float) -> tuple[float, float, float]:

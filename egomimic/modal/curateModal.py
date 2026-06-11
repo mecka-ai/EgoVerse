@@ -484,17 +484,6 @@ def _score_task_split(
             lang_texts = language_texts if language_texts else None
             lang_mode = lang_cfg.mode if lang_cfg.enabled else None
 
-            tsne_dir = Path(run_output_dir) / "tsne"
-            png_paths = make_task_tsne_plots(
-                task_name,
-                state_latents,
-                action_latents,
-                tsne_dir,
-                language_latents=lang_lats,
-                language_texts_by_episode=lang_texts,
-                language_mode=lang_mode,
-                settings=viz_settings,
-            )
             tsne3d_json = export_task_tsne3d(
                 task_name,
                 state_latents,
@@ -506,6 +495,24 @@ def _score_task_split(
                 language_mode=lang_mode,
                 settings=viz_settings,
             )
+            training_outputs_volume.commit()
+            tsne_dir = Path(run_output_dir) / "tsne"
+            try:
+                png_paths = make_task_tsne_plots(
+                    task_name,
+                    state_latents,
+                    action_latents,
+                    tsne_dir,
+                    language_latents=lang_lats,
+                    language_texts_by_episode=lang_texts,
+                    language_mode=lang_mode,
+                    settings=viz_settings,
+                )
+            except Exception as _png_exc:
+                import traceback as _tb
+                print(f"{tag} 2D PNG generation failed (non-fatal): {_png_exc}")
+                _tb.print_exc()
+                png_paths = {}
             lat_dir = Path(run_output_dir) / "latents"
             lat_dir.mkdir(parents=True, exist_ok=True)
             npz_kwargs: dict = dict(
