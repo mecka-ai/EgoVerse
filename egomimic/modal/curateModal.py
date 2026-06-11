@@ -87,8 +87,9 @@ TASK_COMPUTE = ModalCompute.from_environ(
     default_memory_mb=131072,
 )
 
-# Per-task CPU orchestrator (shard fan-out + KSG) — fixed, no GPU.
-TASK_SCORE_COMPUTE = ModalCompute(gpu=None, cpu=16.0, memory_mb=32768)
+# Per-task CPU orchestrator (shard fan-out + KSG) — fixed, no GPU. 32 CPUs so the
+# KSG k-NN queries / parallel marginals can use a high model.ksg.n_threads.
+TASK_SCORE_COMPUTE = ModalCompute(gpu=None, cpu=32.0, memory_mb=49152)
 
 _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 
