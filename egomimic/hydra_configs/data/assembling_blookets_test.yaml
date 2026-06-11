@@ -11,6 +11,12 @@
 #         = 2,999 s ≈ 50 min ≈ 0.83 h @ 30 fps (mean ~85.7 s/ep)
 #   split: 32 train / 3 valid (resolver n_valid = max(1, int(35×0.1)) = 3)
 #
+# Resolver seed: 14 (NOT the default 42) — chosen so the former train_viz
+# episode 69b26795c99cb9af9efbc514 lands in the valid split, alongside two
+# fresh val episodes (69b520b3557b5c79a6d7a85e, 69cea6b6be1e83288192dcf9).
+# The seed-42 val episodes (69b4bb94…, 69b4c950…, 69b493d8…) moved back to
+# train; 69b493d81afbcc4514532682 is the new train_viz episode.
+#
 # Pinned via the resolver's `eps_to_use` allowlist (assembling_blookets_test.json).
 # NOTE: 13 of the 35 catalog entries carry n_frames=-1 (sentinel); actual
 # per-episode frame counts are read from each staged zarr's metadata at
@@ -62,6 +68,7 @@ train_datasets:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      seed: 14                  # puts the old viz ep in val — see header comment
       debug: null
       min_frames: null
       key_map:
@@ -87,6 +94,7 @@ valid_datasets:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      seed: 14                  # must match the train resolver seed
       debug: null
       min_frames: null
       key_map:
