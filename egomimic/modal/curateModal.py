@@ -231,7 +231,7 @@ def _embed_task_shard(
     )
 
     t_pass2 = _time.perf_counter()
-    state_latents, action_latents, hashes, ep_lengths = run_pass2_embed_episodes(
+    state_latents, action_latents, hashes, ep_lengths, _raw_frame_idx = run_pass2_embed_episodes(
         all_episodes,
         set(all_episodes.keys()),
         action_key,

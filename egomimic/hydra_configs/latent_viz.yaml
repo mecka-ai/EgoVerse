@@ -38,7 +38,13 @@ write_pngs: true
 # transform_list / eps_to_use / eps_to_ignore / pause_removal_epsilon / debug.
 # This is what lets zip- and S3-based training data configs run here without
 # mounting their own volumes; episodes missing from the zarr volume are
-# skipped with a warning. Set false to instantiate resolvers as declared.
+# skipped with a warning. Caveat for zip configs: the episode set is
+# re-derived from the SQL episode table — zip-catalog scoping is not
+# reproduced and the resolver's debug cap is intentionally dropped (its
+# first-N catalog semantics don't carry over); pin the subset with
+# eps_to_use if it must match training. Set false to instantiate resolvers
+# as declared (Modal/S3 resolvers only — zip resolvers have no resolve()
+# and their volume is not mounted here).
 force_modal_resolver: true
 
 # Action norm stats for the Gaussian action embedder:

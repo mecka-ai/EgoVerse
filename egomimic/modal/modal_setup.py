@@ -400,9 +400,16 @@ def _git_output(args: list[str]) -> str:
 
 def pop_init_submodules(
     args: tuple[str, ...] | list[str],
+    *,
+    default: bool = True,
 ) -> tuple[tuple[str, ...], bool]:
-    """Strip ``init_submodules=…`` from launch args; return (remaining, init_submodules)."""
-    init_submodules = True
+    """Strip ``init_submodules=…`` from launch args; return (remaining, init_submodules).
+
+    ``default`` is the value when no ``init_submodules=`` arg is present — entry
+    points that never import openpi/lerobot should pass ``default=False`` to
+    skip the submodule clone and the pi transformers==4.53.2 downgrade.
+    """
+    init_submodules = default
     kept: list[str] = []
     for arg in args:
         key, sep, val = arg.lstrip("+").partition("=")

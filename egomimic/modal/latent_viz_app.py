@@ -21,6 +21,10 @@ Run selection:
   unset              newest run dir with a tsne3d/ subdir under the roots in
                      LATENT_VIZ_ROOTS (default: latent_viz, deminf_tsne)
 
+Both vars are read from the DEPLOYING shell and baked into the image, so
+re-pinning requires a redeploy. /health reports whether the served run came
+from a pin or auto-discovery.
+
 Deploy:
   MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/latent_viz_app.py
   → https://mecka-robotics--egoverse-latent-viz-viewer.modal.run
@@ -42,6 +46,13 @@ _BUILDER = _HERE.parent / "scripts" / "build_latent_viz.py"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("fastapi[standard]")
+    # _discover_run_dir runs in the remote container, which never sees the
+    # local shell — capture LATENT_VIZ_RUN/ROOTS at deploy time by baking them
+    # into the image (module-level code executes locally during `modal deploy`).
+    .env({
+        "LATENT_VIZ_RUN": os.environ.get("LATENT_VIZ_RUN", ""),
+        "LATENT_VIZ_ROOTS": os.environ.get("LATENT_VIZ_ROOTS", DEFAULT_ROOTS),
+    })
     # Bake the builder so the app needs no repo clone.
     .add_local_file(_BUILDER, remote_path="/root/build_latent_viz.py", copy=True)
 )
@@ -109,9 +120,10 @@ def viewer():
 
     html = build_html(tsne_dir, scores, val)
     rel = run_dir.relative_to(OUTPUTS_MOUNT)
+    run_mode = "pinned" if os.environ.get("LATENT_VIZ_RUN") else "auto-discovered"
     print(
-        f"viewer: built {len(html)/1e6:.1f} MB HTML from {rel} "
-        f"(scores={'yes' if scores else 'no'}, val={'yes' if val else 'no'})"
+        f"viewer: built {len(html)/1e6:.1f} MB HTML from {rel} ({run_mode}, "
+        f"scores={'yes' if scores else 'no'}, val={'yes' if val else 'no'})"
     )
 
     web = FastAPI()
@@ -122,6 +134,6 @@ def viewer():
 
     @web.get("/health", response_class=PlainTextResponse)
     def health():
-        return f"ok ({rel}, {len(html)} bytes)"
+        return f"ok ({rel}, {run_mode}, {len(html)} bytes)"
 
     return web

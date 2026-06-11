@@ -1786,38 +1786,33 @@ class ZarrDataset(torch.utils.data.Dataset):
         if cache is None:
             return np.array([], dtype=np.int64)
 
-        required = {
-            "obs_head_pose",
-            "left.obs_ee_pose",
-            "right.obs_ee_pose",
-        }
-        if not required.issubset(cache.keys()):
-            return np.array([], dtype=np.int64)
+        pose_keys = ("obs_head_pose", "left.obs_ee_pose", "right.obs_ee_pose")
+        available = [k for k in pose_keys if k in cache]
+        if not available:
+            # Embodiment without head/ee-pose keys in its key_map: nothing to
+            # gate on — keep all frames.
+            return np.arange(n_logical, dtype=np.int64)
 
-        head = np.asarray(cache["obs_head_pose"])
-        left = np.asarray(cache["left.obs_ee_pose"])
-        right = np.asarray(cache["right.obs_ee_pose"])
-        head_ok = self._pose_rows_valid(
-            head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
-        )
-        left_ok = self._pose_rows_valid(
-            left, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
-        )
-        right_ok = self._pose_rows_valid(
-            right, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
-        )
+        ok = {
+            k: self._pose_rows_valid(
+                np.asarray(cache[k]),
+                min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+                sentinel=self._CURATION_POSE_SENTINEL,
+            )
+            for k in available
+        }
+        n_rows = len(next(iter(ok.values())))
+        ee_keys = [k for k in available if k != "obs_head_pose"]
 
         valid: list[int] = []
         for logical_idx in range(n_logical):
             real_idx = self._logical_to_real_index(logical_idx)
-            end_idx = min(real_idx + horizon, left.shape[0])
+            end_idx = min(real_idx + horizon, n_rows)
             if real_idx >= end_idx:
                 continue
-            if not head_ok[real_idx]:
+            if "obs_head_pose" in ok and not ok["obs_head_pose"][real_idx]:
                 continue
-            if not left_ok[real_idx:end_idx].all() or not right_ok[real_idx:end_idx].all():
-                continue
-            if not left_ok[real_idx] or not right_ok[real_idx]:
+            if any(not ok[k][real_idx:end_idx].all() for k in ee_keys):
                 continue
             valid.append(logical_idx)
 

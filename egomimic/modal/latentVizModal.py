@@ -11,8 +11,10 @@ Pipeline (single GPU container)
 1. Resolve episodes from ``data=<config>`` ``train_datasets`` (+
    ``valid_datasets`` when present) — resolver + filters + eps_to_use lists.
    With ``force_modal_resolver`` (default) any resolver type is re-rooted at
-   the mounted ``mecka_data_v2`` zarr volume, so zip/S3 training configs work
-   unmodified.
+   the mounted ``mecka_data_v2`` zarr volume. NOTE for zip configs: the
+   episode set is re-derived from the SQL episode table — zip-volume catalog
+   scoping (and its ``debug`` cap) cannot be reproduced; pin the exact subset
+   via ``eps_to_use`` if it matters.
 2. Group episodes (``group_by``: task | dataset | none).
 3. Action norm stats: precomputed file when configured, else fit from a
    sample of the resolved episodes (actions-only zarr reads — cheap).
@@ -183,20 +185,48 @@ def run_latent_viz(
     # ── 1. Resolve episodes from the data config ──────────────────────────────
     def _resolver_cfg(ds_cfg):
         resolver_cfg = ds_cfg.resolver
+        src_target = str(OmegaConf.select(resolver_cfg, "_target_", default=""))
+        is_catalog = src_target.rsplit(".", 1)[-1] == "ZipEpisodeResolver"
         if not bool(OmegaConf.select(cfg, "force_modal_resolver", default=True)):
+            if is_catalog:
+                raise ValueError(
+                    f"force_modal_resolver=false is not supported for zip data configs: "
+                    f"{src_target} has no resolve() and /mnt/zarr-zip is not mounted in "
+                    f"this app. Use the default force_modal_resolver=true."
+                )
             return resolver_cfg
+        if is_catalog:
+            print(
+                f"WARNING: {src_target} scopes episodes by zip-volume catalog membership "
+                "(zip_dir / min_frames / valid_ratio); force_modal_resolver re-resolves "
+                "from the FULL SQL episode table instead. To match the training subset "
+                "exactly, dump the catalog's episode hashes and pass "
+                "+data...resolver.eps_to_use=<hashes> (or add a filters block)."
+            )
         out: dict = {
             "_target_": "egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver",
             "folder_path": CFG.volume_mount_path,
         }
         for key in _RESOLVER_CARRY_KEYS:
             node = OmegaConf.select(resolver_cfg, key, default=None)
-            if node is not None:
-                out[key] = (
-                    OmegaConf.to_container(node, resolve=True)
-                    if OmegaConf.is_config(node)
-                    else node
+            if node is None:
+                continue
+            if is_catalog and key == "debug":
+                # ZipEpisodeResolver.debug caps to the first-N entries of the zip
+                # volume's catalog.json — first-N rows of the SQL episode table is
+                # an unrelated, order-unstable subset, so don't pretend otherwise.
+                print(
+                    f"WARNING: dropping debug={node} from {src_target}: its first-N "
+                    "catalog semantics do not carry over to the SQL episode table; "
+                    "embedding the full resolved set — cap explicitly with eps_to_use "
+                    "if needed."
                 )
+                continue
+            out[key] = (
+                OmegaConf.to_container(node, resolve=True)
+                if OmegaConf.is_config(node)
+                else node
+            )
         return OmegaConf.create(out)
 
     datasets: dict = {}          # episode_hash -> ZarrDataset
@@ -309,7 +339,7 @@ def run_latent_viz(
         for ep_hash in sample:
             zarr_ds = datasets[ep_hash]
             try:
-                actions, _ = zarr_ds._collect_curation_batched(
+                actions, _, _ = zarr_ds._collect_curation_batched(
                     action_key=action_key,
                     image_key=image_key,
                     image_decode_workers=0,
@@ -322,7 +352,10 @@ def run_latent_viz(
         if not act_parts:
             raise RuntimeError(
                 f"Could not load actions ({action_key}) from any of "
-                f"{len(sample)} sampled episodes — cannot fit norm stats."
+                f"{len(sample)} sampled episodes — cannot fit norm stats. "
+                "Episodes returning no actions may have been emptied by the "
+                "pose-validity gate (missing or invalid obs_head_pose / "
+                "left.obs_ee_pose / right.obs_ee_pose in the config's key_map)."
             )
         action_mean, action_std = _fit_gaussian_stats(
             act_parts, min_std=embed_cfg.norm_min_std
@@ -351,7 +384,7 @@ def run_latent_viz(
     for group in sorted(groups):
         hashes = groups[group]
         t0 = _time.perf_counter()
-        state_latents, action_latents, done_hashes, ep_lengths = run_pass2_embed_episodes(
+        state_latents, action_latents, done_hashes, ep_lengths, ep_raw_indices = run_pass2_embed_episodes(
             {h: datasets[h] for h in hashes},
             set(hashes),
             action_key,
@@ -381,6 +414,7 @@ def run_latent_viz(
             run_dir / "tsne3d",
             every_n=every_n,
             seed=seed,
+            raw_index_lists=ep_raw_indices,
         )
         if write_pngs:
             make_task_tsne_plots(
@@ -401,8 +435,16 @@ def run_latent_viz(
             action=_np.concatenate(action_latents, axis=0),
             lengths=_np.asarray(ep_lengths, dtype=_np.int64),
             hashes=_np.asarray(done_hashes),
+            frame_idx=_np.concatenate(ep_raw_indices, axis=0),
         )
         training_outputs_volume.commit()
+        if tsne3d_json is None:
+            print(
+                f"[{group}] {len(done_hashes)} episodes, {total_frames} frames — "
+                f"tsne3d skipped (<5 points after every_n={every_n}); "
+                "omitted from manifest (raw latents still saved)"
+            )
+            continue
         manifest_groups[group] = {
             "episodes": len(done_hashes),
             "frames": total_frames,
@@ -415,6 +457,11 @@ def run_latent_viz(
         )
 
     # ── 6. Manifest + episode list ────────────────────────────────────────────
+    if not manifest_groups:
+        print(
+            "WARNING: no group produced a tsne3d export (all groups skipped or "
+            "too small) — the viewer will have nothing to show for this run."
+        )
     with open(run_dir / "episode_hashes.json", "w") as f:
         json.dump(sorted(datasets), f)
     with open(run_dir / "viz_manifest.json", "w") as f:
@@ -467,8 +514,13 @@ def run_latent_viz(
 
 @app.local_entrypoint()
 def submit_latent_viz(*hydra_args: str) -> None:
-    """Fire-and-forget: spawn a latent-viz export from an already-pushed commit."""
-    hydra_args, init_submodules = pop_init_submodules(hydra_args)
+    """Fire-and-forget: spawn a latent-viz export from an already-pushed commit.
+
+    Submodules default OFF: this entry point never imports openpi/lerobot, and
+    initializing them would downgrade transformers to 4.53.2, which cannot load
+    the default DINOv3 state backbone.
+    """
+    hydra_args, init_submodules = pop_init_submodules(hydra_args, default=False)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print(
@@ -497,6 +549,13 @@ if __name__ == "__main__":
     for arg in sys.argv[1:]:
         key, sep, val = arg.lstrip("+").partition("=")
         if sep and key in MODAL_COMPUTE_ARG_MAP:
+            if key in ("modal_volume", "modal_ephemeral_disk_gb"):
+                sys.exit(
+                    f"+{key} is not supported by latentVizModal.py — episodes are "
+                    "always read from the mecka_data_v2 zarr volume "
+                    "(force_modal_resolver re-roots any data config there). "
+                    "Drop the flag."
+                )
             modal_env[MODAL_COMPUTE_ARG_MAP[key]] = val
         else:
             hydra_args.append(arg)

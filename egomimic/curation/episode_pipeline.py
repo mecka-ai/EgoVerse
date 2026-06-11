@@ -160,7 +160,7 @@ def run_pass2_embed_episodes(
     state_embedder: StateEmbedder,
     *,
     progress: str | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[int]]:
+) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[int], list[np.ndarray]]:
     """
     Pass 2: producer-consumer pipeline.
 
@@ -177,7 +177,10 @@ def run_pass2_embed_episodes(
         the buffer. Loading and embedding run concurrently — the GPU never waits
         for a full episode chunk to finish loading.
 
-    Returns ``(state_latents, action_latents, episode_hashes, ep_lengths)``.
+    Returns ``(state_latents, action_latents, episode_hashes, ep_lengths,
+    raw_frame_indices)`` — the last is one ``(T,)`` int64 array per episode of
+    RAW video-frame indices (pre pause/pose filtering), row-aligned with that
+    episode's latents.
     """
     items = [
         (h, episodes[h], action_key, image_key, loader.pass2_image_decode_workers)
@@ -211,7 +214,7 @@ def run_pass2_embed_episodes(
                         result = future.result()
                     except Exception as exc:
                         logger.error("episode %s load failed: %s", ep_hash[:8], exc)
-                        result = (ep_hash, None, None)
+                        result = (ep_hash, None, None, None)
                     ep_queue.put(result)  # blocks when queue full → backpressure
         finally:
             ep_queue.put(None)  # sentinel: all episodes submitted
@@ -226,13 +229,14 @@ def run_pass2_embed_episodes(
     action_latents: list[np.ndarray] = []
     hashes: list[str] = []
     ep_lengths: list[int] = []
+    raw_indices: list[np.ndarray] = []
     n_skipped = 0
     t0 = time.perf_counter()
 
     # Frame buffer: whole episodes queued here before embedding
     buf_imgs: list[np.ndarray] = []
     buf_acts: list[np.ndarray] = []
-    buf_ep_meta: list[tuple[str, int]] = []  # (hash, n_frames) in order
+    buf_ep_meta: list[tuple[str, int, np.ndarray]] = []  # (hash, n_frames, raw_idx) in order
     buf_n_frames = 0
 
     def _flush() -> None:
@@ -286,11 +290,12 @@ def run_pass2_embed_episodes(
 
         # Scatter latents back to per-episode slices
         offset = 0
-        for h, ep_n in buf_ep_meta:
+        for h, ep_n, fidx in buf_ep_meta:
             state_latents.append(s_all[offset : offset + ep_n])
             action_latents.append(a_all[offset : offset + ep_n])
             hashes.append(h)
             ep_lengths.append(ep_n)
+            raw_indices.append(fidx)
             offset += ep_n
 
         buf_imgs.clear()
@@ -309,7 +314,7 @@ def run_pass2_embed_episodes(
         if item is None:  # sentinel: producer finished
             break
 
-        ep_hash, flat_actions, img_f32 = item
+        ep_hash, flat_actions, img_f32, frame_idx = item
         if pbar is not None:
             pbar.update(1)
 
@@ -319,9 +324,11 @@ def run_pass2_embed_episodes(
             continue
 
         n_ep = img_f32.shape[0]
+        if frame_idx is None:
+            frame_idx = np.arange(n_ep, dtype=np.int64)
         buf_imgs.append(img_f32)
         buf_acts.append(flat_actions)
-        buf_ep_meta.append((ep_hash, n_ep))
+        buf_ep_meta.append((ep_hash, n_ep, np.asarray(frame_idx, dtype=np.int64)))
         buf_n_frames += n_ep
         logger.debug(
             "received episode %s: %d frames (buffer: %d frames, %d eps)",
@@ -347,4 +354,4 @@ def run_pass2_embed_episodes(
         n_frames_total / elapsed if elapsed > 0 else 0,
     )
 
-    return state_latents, action_latents, hashes, ep_lengths
+    return state_latents, action_latents, hashes, ep_lengths, raw_indices

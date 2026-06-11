@@ -211,10 +211,13 @@ const redGreen = t => lerp3([224,85,85], [84,196,108], t);
 
 function scoreNorm(task) {
   const e = SCORES[task] || [];
-  if (!e.length) return {};
-  const vals = e.map(x => x[1]), mn = Math.min(...vals), mx = Math.max(...vals);
+  const vals = e.map(x => x[1]).filter(Number.isFinite);
+  if (!vals.length) return {};
+  const mn = Math.min(...vals), mx = Math.max(...vals);
   const out = {};
-  e.forEach(([h, s]) => out[h] = mx > mn ? (s - mn) / (mx - mn) : 0.5);
+  // Non-finite scores (NaN/Inf from failed-KSG episodes) are left out and fall
+  // through to the viewer's 0.5 mid-color default.
+  e.forEach(([h, s]) => { if (Number.isFinite(s)) out[h] = mx > mn ? (s - mn) / (mx - mn) : 0.5; });
   return out;
 }
 function hasScores(task) { return (SCORES[task] || []).length > 0; }
@@ -227,7 +230,9 @@ const CACHE = {};   // task -> {mods: {state:{d, tables:{episode,time,score}}, a
 let curTask = null;
 
 function buildCache(task) {
-  const eps = DATA[task].episodes, nEp = eps.length;
+  // Tasks can exist in SCORES without a tsne3d JSON (skipped exports, old
+  // curation runs) — degrade to empty panels instead of throwing.
+  const eps = (DATA[task] || {}).episodes || [], nEp = eps.length;
   const sn = scoreNorm(task);
   const mods = {};
   for (const mod of ["state", "action"]) {
@@ -487,9 +492,9 @@ function renderGrid(task) {
                        : ((DATA[task] || {}).episodes || []).map(h => [h, null]);
   const n = entries.length;
   const rank = {}; entries.forEach((e, i) => rank[e[0]] = i);
-  const allScores = scored ? entries.map(e => e[1]) : [];
+  const allScores = scored ? entries.map(e => e[1]).filter(Number.isFinite) : [];
   const mn = Math.min(...allScores), mx = Math.max(...allScores);
-  const mean = allScores.reduce((a,b)=>a+b,0) / Math.max(1,n);
+  const mean = allScores.reduce((a,b)=>a+b,0) / Math.max(1, allScores.length);
 
   document.getElementById("gsortWrap").style.display = scored ? "" : "none";
   document.getElementById("fValWrap").style.display = VAL.size ? "" : "none";
@@ -505,7 +510,7 @@ function renderGrid(task) {
 
   document.getElementById("gridhead").innerHTML =
     `<b>${task}</b> — showing ${entries.length}/${n} ` +
-    (scored
+    (scored && allScores.length
       ? `· score mean ${mean.toFixed(3)} · range [${mn.toFixed(3)}, ${mx.toFixed(3)}] ` +
         histoSVG(allScores)
       : "") +
@@ -515,11 +520,11 @@ function renderGrid(task) {
     const i = rank[hash];
     const valb = VAL.has(hash) ? ' <span class="badge b-val">VAL</span>' : '';
     const cid = `v_${task}_${i}`;
-    const pct = scored && mx > mn ? (score - mn) / (mx - mn) : null;
+    const pct = scored && mx > mn && Number.isFinite(score) ? (score - mn) / (mx - mn) : null;
     return `<div class="card">
       <div class="hdr"><span class="rank">#${i+1}</span>
         <span class="hash">${hash}</span>${valb}
-        ${scored ? `<span class="score">${score.toFixed(4)}</span>` : ""}</div>
+        ${scored ? `<span class="score">${Number.isFinite(score) ? score.toFixed(4) : "—"}</span>` : ""}</div>
       ${pct != null ? `<div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>` : ""}
       <div class="vid" id="${cid}">
         <div class="ph" onclick="loadVideo('${cid}','${hash}')">
@@ -607,7 +612,7 @@ def build_html(
         .replace("__DATA__", json.dumps(data, separators=(",", ":")))
         .replace("__SCORES__", json.dumps(scores, separators=(",", ":")))
         .replace("__VAL__", json.dumps(val or [], separators=(",", ":")))
-        .replace("__VIDEO_BASE__", video_base)
+        .replace("__VIDEO_BASE__", video_base.rstrip("/") + "/")
         .replace("__FPS__", str(FPS))
     )
 
@@ -659,6 +664,28 @@ def _load_scores(args, tsne_local: Path) -> dict:
     return {}
 
 
+def _load_val(args, tsne_local: Path) -> list:
+    """Resolve val_episodes.json: --val-json path, sibling of tsne3d dir, or volume."""
+    if args.val_json:
+        p = Path(args.val_json)
+        if p.is_file():
+            return json.load(open(p))
+        if args.volume:
+            tmp = Path(tempfile.mktemp(suffix=".json"))
+            if _download(args.volume, args.env, args.val_json, tmp):
+                return json.load(open(tmp))
+        sys.exit(f"--val-json not found: {args.val_json}")
+    sib = tsne_local.parent / "val_episodes.json"
+    if sib.is_file():
+        return json.load(open(sib))
+    if args.volume:
+        remote = str(Path(args.tsne3d_dir.rstrip("/")).parent / "val_episodes.json")
+        tmp = Path(tempfile.mktemp(suffix=".json"))
+        if _download(args.volume, args.env, remote, tmp):
+            return json.load(open(tmp))
+    return []
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tsne3d_dir", help="Local dir of tsne3d_*.json, or volume-relative path")
@@ -666,7 +693,9 @@ def main() -> None:
     ap.add_argument("--val-json", default=None,
                     help="Optional episode-hash list to badge as VAL in the grid; default: sibling val_episodes.json if present")
     ap.add_argument("--video-base", default=VIDEO_BASE,
-                    help="Base URL of the episode MP4 server (episode_preview.py deployment)")
+                    help="Base URL of the episode MP4 endpoint — the full /video/ route of an "
+                         "episode_preview.py deployment, e.g. "
+                         "https://<org>--egoverse-episode-preview-viewer.modal.run/video/")
     ap.add_argument("--volume", default=None, help="Modal volume to download from if paths not local")
     ap.add_argument("--env", default="robotics", help="Modal environment (default: robotics)")
     ap.add_argument("--out", default="latent_viz.html", help="Output HTML path")
@@ -675,11 +704,9 @@ def main() -> None:
     src = _load_tsne_dir(args.tsne3d_dir, args.volume, args.env)
     raw_scores = _load_scores(args, src)
 
-    val: list = []
-    vp = Path(args.val_json) if args.val_json else src.parent / "val_episodes.json"
-    if vp and vp.is_file():
-        val = json.load(open(vp))
-        print(f"VAL badges: {len(val)} episodes from {vp}")
+    val = _load_val(args, src)
+    if val:
+        print(f"VAL badges: {len(val)} episodes")
 
     html = build_html(src, raw_scores, val, video_base=args.video_base)
     out = Path(args.out)

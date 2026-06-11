@@ -29,14 +29,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _gather_points(latents_list: list, every_n: int):
+def _gather_points(latents_list: list, every_n: int, raw_index_lists: list | None = None):
     """Subsample every ``every_n``-th frame per episode.
 
     Returns ``(X (N, D), ep_index (N,), time_frac (N,), frame_idx (N,))`` where
     ``time_frac`` in [0, 1] is the frame's normalized position in its episode
-    (0 = first frame, 1 = last) and ``frame_idx`` is the frame's row index in
-    the episode's latent sequence. Returns ``(None, None, None, None)`` if
-    there are no frames.
+    (0 = first frame, 1 = last) and ``frame_idx`` is the frame's RAW video-frame
+    index when ``raw_index_lists`` (per-episode arrays row-aligned with the
+    latents) is given, else the row index in the episode's latent sequence.
+    Returns ``(None, None, None, None)`` if there are no frames.
     """
     pts: list = []
     ep_index: list = []
@@ -47,11 +48,12 @@ def _gather_points(latents_list: list, every_n: int):
         T = len(lat)
         if T == 0:
             continue
+        raw = raw_index_lists[i] if raw_index_lists is not None else None
         for j in range(0, T, every_n):
             pts.append(lat[j])
             ep_index.append(i)
             time_frac.append(j / max(1, T - 1))
-            frame_idx.append(j)
+            frame_idx.append(int(raw[j]) if raw is not None else j)
     if not pts:
         return None, None, None, None
     return (
@@ -165,14 +167,20 @@ def export_task_tsne3d(
     out_dir: str | Path,
     every_n: int = 10,
     seed: int = 42,
+    raw_index_lists: list | None = None,
 ) -> str | None:
     """Export 3-D t-SNE coords + point metadata for the interactive viewer.
 
     Writes ``tsne3d_<task>.json`` containing, for each modality (state/action),
     parallel arrays ``x/y/z`` (3-D t-SNE coords), ``ep`` (index into
-    ``episodes``), ``frame`` (row index in the episode's latent sequence), and
-    ``t`` (normalized time in [0, 1]). Episode order is identical across
-    modalities so a viewer can color the same episode consistently.
+    ``episodes``), ``frame``, and ``t`` (normalized time in [0, 1]).
+
+    ``frame`` is the RAW video-frame index when ``raw_index_lists`` is given
+    (one per-episode array of raw indices, row-aligned with the latents — the
+    viewer seeks MP4s by raw frame, so pass it whenever the latents were
+    pause/pose-filtered), else the row index in the episode's latent sequence.
+    Episode order is identical across modalities so a viewer can color the
+    same episode consistently.
     """
     import json
 
@@ -180,7 +188,7 @@ def export_task_tsne3d(
 
     out: dict = {"task": task_name, "episodes": list(episode_hashes), "every_n": every_n}
     for modality, latents_list in (("state", state_latents), ("action", action_latents)):
-        X, ep_index, time_frac, frame_idx = _gather_points(latents_list, every_n)
+        X, ep_index, time_frac, frame_idx = _gather_points(latents_list, every_n, raw_index_lists)
         if X is None or len(X) < 5:
             logger.warning(
                 "tsne3d[%s/%s]: too few points — skipped", task_name, modality
