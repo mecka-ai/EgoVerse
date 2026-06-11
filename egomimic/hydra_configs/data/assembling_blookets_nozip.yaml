@@ -50,7 +50,6 @@ train_datasets:
       folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
       debug: null
-      min_frames: null
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
@@ -69,7 +68,6 @@ valid_datasets:
       folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
       debug: null
-      min_frames: null
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
@@ -87,9 +85,7 @@ train_viz_datasets:
       _target_:  egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
       folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test_viz.json
-      valid_ratio: 1.0          # keep all viz episodes (no split)
       debug: null
-      min_frames: null
       key_map:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
