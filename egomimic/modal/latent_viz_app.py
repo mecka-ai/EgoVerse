@@ -56,10 +56,13 @@ def _discover_run_dir() -> Path:
     if run:
         return Path(OUTPUTS_MOUNT) / run
     roots = os.environ.get("LATENT_VIZ_ROOTS", DEFAULT_ROOTS).split(",")
+    # latent_viz runs sit at <root>/<name>/<desc_ts>/tsne3d; old curation runs
+    # at <root>/<run>/tsne3d — search both depths.
     candidates = [
         t.parent
         for root in roots
-        for t in (Path(OUTPUTS_MOUNT) / root.strip()).glob("*/*/tsne3d")
+        for pattern in ("*/tsne3d", "*/*/tsne3d")
+        for t in (Path(OUTPUTS_MOUNT) / root.strip()).glob(pattern)
         if t.is_dir()
     ]
     if not candidates:

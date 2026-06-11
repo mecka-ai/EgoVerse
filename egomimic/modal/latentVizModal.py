@@ -174,8 +174,8 @@ def run_latent_viz(
     run_dir = (
         Path(CFG.output_mount_path)
         / "latent_viz"
-        / str(cfg.name)
-        / f"{cfg.description}_{stamp}"
+        / _safe_group_name(str(cfg.name))
+        / f"{_safe_group_name(str(cfg.description))}_{stamp}"
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     run_rel = run_dir.relative_to(CFG.output_mount_path)

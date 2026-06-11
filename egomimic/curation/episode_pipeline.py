@@ -120,19 +120,20 @@ def build_embedders(
 
 def _load_episode(
     item: tuple[str, "ZarrDataset", str, str, int],
-) -> tuple[str, np.ndarray | None, np.ndarray | None]:
+) -> tuple[str, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Load and decode one episode (CPU-only, runs in thread pool)."""
     episode_hash, zarr_ds, action_key, image_key, image_decode_workers = item
     t0 = time.perf_counter()
     try:
-        actions, images = zarr_ds.collect_curation_episode(
+        actions, images, frame_idx = zarr_ds.collect_curation_episode(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
+            return_frame_indices=True,
         )
         if actions is None or images is None:
             logger.debug("episode %s: skip (None data returned)", episode_hash[:8])
-            return episode_hash, None, None
+            return episode_hash, None, None, None
         t = actions.shape[0]
         flat_actions = actions.reshape(t, -1).astype(np.float32)
         img_f32 = images.astype(np.float32)
@@ -144,7 +145,7 @@ def _load_episode(
             flat_actions.shape, flat_actions.dtype,
         )
         del actions, images
-        return episode_hash, flat_actions, img_f32
+        return episode_hash, flat_actions, img_f32, frame_idx
     finally:
         _release_episode_cache(zarr_ds)
 

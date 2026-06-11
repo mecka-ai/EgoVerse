@@ -1978,9 +1978,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         image_decode_workers: int,
         *,
         load_images: bool,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
         if load_images and image_key not in self.key_map:
-            return None, None
+            return None, None, None
 
         if self.pause_removal_epsilon is not None and self.keep_indices is None:
             self.precompute_pause_filter()
@@ -1988,7 +1988,7 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         n_logical = len(self)
         if n_logical == 0:
-            return None, None
+            return None, None, None
 
         logical_valid = self._curation_valid_logical_indices()
         n_skipped_pose = n_logical - len(logical_valid)
@@ -2000,12 +2000,12 @@ class ZarrDataset(torch.utils.data.Dataset):
                 n_logical,
             )
         if len(logical_valid) == 0:
-            return None, None
+            return None, None, None
 
         batched_in = self._build_batched_transform_batch(logical_valid)
         batched_out, ok_pos = self._apply_transform_list_batched(batched_in)
         if batched_out is None or action_key not in batched_out:
-            return None, None
+            return None, None, None
 
         if len(ok_pos) < len(logical_valid):
             logger.info(
@@ -2018,14 +2018,22 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         actions = np.asarray(batched_out[action_key], dtype=np.float32)
         if actions.ndim < 2:
-            return None, None
+            return None, None, None
+
+        # Raw video-frame index of each surviving row (before pause/pose
+        # filtering) — viewers seek the raw MP4 by frame, so exports must use
+        # these rather than positions in the filtered sequence.
+        if self.keep_indices is not None:
+            raw_frame_idx = np.asarray(self.keep_indices, dtype=np.int64)[logical_valid]
+        else:
+            raw_frame_idx = np.asarray(logical_valid, dtype=np.int64)
 
         if not load_images:
-            return actions, None
+            return actions, None, raw_frame_idx
 
         img_zarr_key = self.key_map[image_key]["zarr_key"]
         if self._zarr_bulk_cache is None or img_zarr_key not in self._zarr_bulk_cache:
-            return None, None
+            return None, None, None
 
         jpeg_frames = self._zarr_bulk_cache[img_zarr_key]
         if self.keep_indices is not None:
@@ -2052,7 +2060,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 f"action/image length mismatch ep={self.episode_path.name}: "
                 f"{len(actions)} vs {len(images)}"
             )
-        return actions, images
+        return actions, images, raw_frame_idx
 
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
@@ -2069,7 +2077,8 @@ class ZarrDataset(torch.utils.data.Dataset):
         action_key: str = "actions_cartesian",
         image_key: str = "observations.images.front_img_1",
         image_decode_workers: int = 8,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return_frame_indices: bool = False,
+    ) -> tuple:
         """
         DemInf Pass 2 per episode: bulk zarr read, batched transforms, aligned decode.
 
@@ -2080,14 +2089,18 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         Returns:
             ``(actions, images)`` as ``(T, chunk, D)`` and ``(T, C, H, W)``, or
-            ``(None, None)`` if empty / keys missing.
+            ``(None, None)`` if empty / keys missing. With
+            ``return_frame_indices=True``, a third ``(T,)`` int64 array of RAW
+            video-frame indices (pre pause/pose filtering) is appended — use it
+            whenever a row must be mapped back to a video frame.
         """
-        return self._collect_curation_batched(
+        out = self._collect_curation_batched(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             load_images=True,
         )
+        return out if return_frame_indices else out[:2]
 
     def precompute_pause_filter(self) -> tuple[int, int]:
         """Build the per-episode pause keep-mask from raw obs_ee_pose deltas.
