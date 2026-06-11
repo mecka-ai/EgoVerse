@@ -113,4 +113,10 @@ class EvalVideo(Eval):
                 self.val_image_buffer[key].clear()
                 self.val_counter[key] += 1
 
-        self.trainer.lightning_module.log_dict(metrics, sync_dist=True)
+        # Keys are already unique across val dataloaders (the train_viz pass
+        # prefixes its metrics with train_viz/), so suppress Lightning's
+        # /dataloader_idx_N suffix to keep keys comparable across runs that
+        # predate the second val dataloader.
+        self.trainer.lightning_module.log_dict(
+            metrics, sync_dist=True, add_dataloader_idx=False
+        )
