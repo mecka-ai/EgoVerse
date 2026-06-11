@@ -171,9 +171,9 @@ _TEMPLATE = """<!DOCTYPE html>
         <option value="score">MI score</option>
         <option value="language">language</option>
       </select></span>
-    <span class="tool"><label>Episode</label>
-      <select id="epSel" onchange="applyStyle();markLegend()">
-        <option value="all">all</option></select></span>
+    <span class="tool"><label>Episodes</label>
+      <span id="epCount" style="background:#26272f;padding:3px 8px;border-radius:5px;font-size:12px;color:#cdd">all</span>
+      <button onclick="clearEpSel()">clear</button></span>
     <div class="sep"></div>
     <span class="tool"><label class="chk"><input type="checkbox" id="hlOn" onchange="applyStyle()"> frame</label>
       <input type="number" id="hlFrame" value="0" min="0" step="10" onchange="hlChanged()">
@@ -235,6 +235,8 @@ const VAL = new Set(__VAL__);
 const VIDEO_BASE = "__VIDEO_BASE__";
 const FPS = __FPS__;
 const DIM = "rgba(110,110,120,0.05)";
+const HIDDEN = "rgba(0,0,0,0)";
+let selectedEps = new Set();
 
 /* color helpers */
 function hsv2rgb(h,s,v){
@@ -310,7 +312,6 @@ function buildCache(task){
 function uiState(){
   return{
     mode:document.getElementById("colorMode").value,
-    ep:document.getElementById("epSel").value,
     hlOn:document.getElementById("hlOn").checked,
     hlF:+document.getElementById("hlFrame").value,
     hlW:+document.getElementById("hlWin").value,
@@ -340,9 +341,9 @@ function applyStyle(){
     if(u.hlOn)sizes=new Array(N);
     for(let k=0;k<N;k++){
       const on=d.t[k]>=u.t0&&d.t[k]<=u.t1
-        &&(u.ep==="all"||d.ep[k]===+u.ep)
+        &&(selectedEps.size===0||selectedEps.has(d.ep[k]))
         &&(!u.hlOn||Math.abs(d.frame[k]-u.hlF)<=u.hlW);
-      colors[k]=on?base[k]:DIM;
+      colors[k]=on?base[k]:(selectedEps.size>0?HIDDEN:DIM);
       if(u.hlOn)sizes[k]=on?u.size*2.2:u.size;
     }
     Plotly.restyle("panel_"+mod,{"marker.color":[colors],"marker.size":Array.isArray(sizes)?[sizes]:sizes},[0]);
@@ -407,10 +408,6 @@ function renderTsne(task,preserveToggles){
   if(!preserveToggles)buildModToggles(task);
 
   const u=uiState();
-  const epSel=document.getElementById("epSel");
-  const eps=DATA[task]?DATA[task].episodes:[];
-  epSel.innerHTML='<option value="all">all</option>'+
-    eps.map((h,i)=>`<option value="${i}">${h.slice(0,10)}</option>`).join("");
 
   ensurePanels(activeMods);
 
