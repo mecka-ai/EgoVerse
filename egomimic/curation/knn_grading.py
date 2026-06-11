@@ -46,11 +46,15 @@ class KnnGradeSettings:
     image_weight: float = 1.0
     proprio_weight: float = 1.0
     phase_weight: float = 0.5
+    # At most this many neighbors per source episode (0 = uncapped). Without a
+    # cap, consecutive frames of a single near-duplicate episode can fill the
+    # whole neighbor set, collapsing the spread denominator and inflating z.
+    max_neighbors_per_episode: int = 3
     # Coverage gate: a state is "covered" when its 1-NN distance is within
     # median + multiplier × MAD of the task's 1-NN distance distribution.
     # (A percentile gate would cap the gated fraction and mis-score tasks
     # where rare states are common.)
-    coverage_mad_multiplier: float = 5.0
+    coverage_mad_multiplier: float = 2.0
     query_block: int = 256
 
     # Chunk metrics
@@ -344,7 +348,16 @@ def grade_task(
         grip = np.concatenate([ep.chunk_feats.gripper for ep in episodes])
 
     # ── Pass 1: leave-one-episode-out top-k neighbor search ─────────────────
-    k = min(settings.k, N - max(lengths))
+    n_eps = len(episodes)
+    cap = settings.max_neighbors_per_episode
+    if cap > 0:
+        # Each other episode contributes at most min(cap, len) candidates; k
+        # must fit the worst-off query episode (the longest one excluded).
+        avail = np.array([min(cap, ln) for ln in lengths], dtype=np.int64)
+        max_k = int((avail.sum() - avail).min())
+    else:
+        max_k = N - max(lengths)
+    k = min(settings.k, max_k)
     if k < settings.min_neighbors:
         result["task_summary"]["skipped"] = (
             f"only {k} cross-episode neighbors available (< min_neighbors)"
@@ -353,17 +366,35 @@ def grade_task(
 
     nbr_idx = np.empty((N, k), dtype=np.int64)
     nbr_sim = np.empty((N, k), dtype=np.float32)
-    for e in range(len(episodes)):
+    for e in range(n_eps):
         e_start, e_end = int(bounds[e]), int(bounds[e + 1])
         for q0 in range(e_start, e_end, settings.query_block):
             q1 = min(q0 + settings.query_block, e_end)
+            B = q1 - q0
+            rows = np.arange(B)[:, None]
             sims = keys[q0:q1] @ keys.T  # (B, N)
             sims[:, e_start:e_end] = -np.inf  # leave own episode out
+            idx_map = None
+            if cap > 0:
+                # Reduce each source episode to its top-`cap` states before the
+                # global top-k, so no single episode can dominate the set.
+                cand_sim = np.full((B, n_eps * cap), -np.inf, dtype=np.float32)
+                cand_idx = np.zeros((B, n_eps * cap), dtype=np.int64)
+                for o in range(n_eps):
+                    if o == e:
+                        continue
+                    o0, o1 = int(bounds[o]), int(bounds[o + 1])
+                    c = min(cap, o1 - o0)
+                    seg = sims[:, o0:o1]
+                    top_local = np.argpartition(seg, -c, axis=1)[:, -c:]
+                    cand_sim[:, o * cap : o * cap + c] = seg[rows, top_local]
+                    cand_idx[:, o * cap : o * cap + c] = top_local + o0
+                sims, idx_map = cand_sim, cand_idx
             top = np.argpartition(sims, -k, axis=1)[:, -k:]
-            rows = np.arange(q1 - q0)[:, None]
             top_sims = sims[rows, top]
             order = np.argsort(-top_sims, axis=1)
-            nbr_idx[q0:q1] = top[rows, order]
+            top = top[rows, order]
+            nbr_idx[q0:q1] = top if idx_map is None else idx_map[rows, top]
             nbr_sim[q0:q1] = top_sims[rows, order]
 
     # ── Coverage gate: 1-NN distance an outlier vs the task's bulk → the state

@@ -56,7 +56,8 @@ knn:
   image_weight: 1.0           # retrieval-key block weights
   proprio_weight: 1.0
   phase_weight: 0.5
-  coverage_mad_multiplier: 5.0  # 1-NN dist > median + mult×MAD → no-coverage
+  max_neighbors_per_episode: 3  # cap per source episode (0 = uncapped) — stops one near-duplicate episode filling the neighbor set
+  coverage_mad_multiplier: 2.0  # 1-NN dist > median + mult×MAD → no-coverage (5.0 never fired: fold/ironing 10h had 100% coverage)
   z_threshold: 2.0            # disagreement z above this → state flagged
   n_resample: 20              # arc-length resample points per chunk path
   n_speed_bins: 10            # time bins for velocity profiles

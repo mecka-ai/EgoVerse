@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -215,6 +217,24 @@ def test_grade_task_no_coverage_not_flagged():
     assert per_ep["rare"]["coverage_frac"] < 0.2
     flagged = per_ep["rare"]["frac_flagged_spatial"]
     assert np.isnan(flagged) or flagged < 0.5
+
+
+def test_grade_task_caps_neighbors_per_episode():
+    rng = np.random.default_rng(13)
+    dir_a = np.array([1.0, 0.0, 0.0])
+    episodes = [_make_episode(f"good_{i}", dir_a, rng) for i in range(10)]
+    # Twin pair sharing a distinctive key offset: uncapped, each twin's
+    # neighbor list would be filled entirely by the other twin.
+    episodes.append(_make_episode("twin_a", dir_a, rng, key_offset=10.0))
+    episodes.append(_make_episode("twin_b", dir_a, rng, key_offset=10.0))
+
+    result = grade_task(episodes, SETTINGS)
+    cap = SETTINGS.max_neighbors_per_episode
+    assert cap > 0 and SETTINGS.debug_neighbors > cap
+    for dbg in result["debug_states"]["twin_a"]:
+        counts = Counter(n["hash"] for n in dbg["neighbors"])
+        assert counts.get("twin_b", 0) <= cap
+        assert len(counts) >= 2, "neighbor set should span multiple episodes"
 
 
 def test_grade_task_skips_small_tasks():
