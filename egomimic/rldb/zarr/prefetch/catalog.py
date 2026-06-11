@@ -1,7 +1,8 @@
 """Episode catalog: the per-episode entry and the zip-volume resolver.
 
-``ZipEpisodeResolver`` reads ``catalog.json`` from the zip volume and inherits
-key_map / transform_list / norm_stats plumbing from ``EpisodeResolver``.
+``ZipEpisodeResolver`` discovers complete episodes on the zip volume from
+``{episode_hash}.tar`` + ``{episode_hash}.done`` pairs and reads frame counts
+from each tar's root ``zarr.json``.  An optional ``catalog.json`` is ignored.
 """
 
 from __future__ import annotations
@@ -9,12 +10,53 @@ from __future__ import annotations
 import json
 import logging
 import random
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from egomimic.rldb.zarr.zarr_dataset_multi import EpisodeResolver
 
 logger = logging.getLogger(__name__)
+
+
+def _read_episode_meta_from_tar(tar_path: Path) -> tuple[int, str]:
+    """Read ``total_frames`` and ``embodiment`` from a zipped zarr v3 episode."""
+    with tarfile.open(tar_path, "r") as tf:
+        try:
+            member = tf.getmember("zarr.json")
+        except KeyError as exc:
+            raise ValueError(f"{tar_path.name}: missing zarr.json in tar") from exc
+        with tf.extractfile(member) as f:
+            zarr_json = json.load(f)
+
+    attrs = zarr_json.get("attributes")
+    if not isinstance(attrs, dict):
+        attrs = {}
+    n_frames = int(attrs.get("total_frames", 0) or 0)
+    embodiment = str(attrs.get("embodiment", "mecka_bimanual"))
+    return n_frames, embodiment
+
+
+def _discover_complete_episodes(
+    zip_dir: Path,
+    include_hashes: set[str] | None,
+) -> list[tuple[str, Path]]:
+    """Return ``(episode_hash, tar_path)`` for every complete tar+.done pair."""
+    if include_hashes is not None:
+        pairs: list[tuple[str, Path]] = []
+        for episode_hash in sorted(include_hashes):
+            tar_path = zip_dir / f"{episode_hash}.tar"
+            if tar_path.exists() and (zip_dir / f"{episode_hash}.done").exists():
+                pairs.append((episode_hash, tar_path))
+        return pairs
+
+    done_hashes = {p.stem for p in zip_dir.glob("*.done")}
+    pairs = []
+    for episode_hash in sorted(done_hashes):
+        tar_path = zip_dir / f"{episode_hash}.tar"
+        if tar_path.exists():
+            pairs.append((episode_hash, tar_path))
+    return pairs
 
 @dataclass
 class EpisodeCatalogEntry:
@@ -28,9 +70,7 @@ class EpisodeCatalogEntry:
 
 
 class ZipEpisodeResolver(EpisodeResolver):
-    """Resolves episodes from catalog.json on the zip volume."""
-
-    CATALOG_FILENAME = "catalog.json"
+    """Resolves episodes from tar+.done pairs on the zip volume."""
 
     def __init__(
         self,
@@ -74,49 +114,55 @@ class ZipEpisodeResolver(EpisodeResolver):
         if self._catalog is not None:
             return self._catalog
 
-        catalog_path = self.zip_dir / self.CATALOG_FILENAME
-        if not catalog_path.exists():
+        pairs = _discover_complete_episodes(self.zip_dir, self.include_hashes)
+        if not pairs:
             raise FileNotFoundError(
-                f"Catalog not found: {catalog_path}. "
+                f"No complete episodes (.tar + .done) found in {self.zip_dir}. "
                 "Run `zip_zarr_to_vol.py` first to populate the zip volume."
             )
 
-        with open(catalog_path) as f:
-            raw: list[dict] = json.load(f)
+        if self.include_hashes is not None:
+            logger.info(
+                "ZipEpisodeResolver: eps_to_use — found %d/%d episodes on zip volume",
+                len(pairs),
+                len(self.include_hashes),
+            )
+
+        if self.debug:
+            pairs = pairs[: int(self.debug)]
+            logger.info(
+                "ZipEpisodeResolver: debug=%d — using first %d episodes",
+                self.debug,
+                len(pairs),
+            )
 
         entries: list[EpisodeCatalogEntry] = []
-        n_missing = 0
-        for e in raw:
-            tar_path = self.zip_dir / e["tar_filename"]
-            if not tar_path.exists():
-                n_missing += 1
+        n_meta_errors = 0
+        for episode_hash, tar_path in pairs:
+            try:
+                n_frames, embodiment = _read_episode_meta_from_tar(tar_path)
+            except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+                n_meta_errors += 1
+                logger.warning(
+                    "ZipEpisodeResolver: skipping %s — could not read tar metadata: %s",
+                    episode_hash,
+                    exc,
+                )
                 continue
             entries.append(
                 EpisodeCatalogEntry(
                     tar_path=tar_path,
-                    episode_hash=e["episode_hash"],
-                    n_frames=int(e["n_frames"]),
-                    embodiment=e.get("embodiment", "mecka_bimanual"),
+                    episode_hash=episode_hash,
+                    n_frames=n_frames,
+                    embodiment=embodiment,
                 )
             )
 
-        if n_missing:
+        if n_meta_errors:
             logger.warning(
-                "ZipEpisodeResolver: %d catalog entries missing from zip volume (skipped)",
-                n_missing,
+                "ZipEpisodeResolver: skipped %d episodes with unreadable tar metadata",
+                n_meta_errors,
             )
-
-        if self.include_hashes is not None:
-            before = len(entries)
-            entries = [e for e in entries if e.episode_hash in self.include_hashes]
-            logger.info(
-                "ZipEpisodeResolver: eps_to_use — kept %d/%d episodes (of %d requested)",
-                len(entries), before, len(self.include_hashes),
-            )
-
-        if self.debug:
-            entries = entries[: int(self.debug)]
-            logger.info("ZipEpisodeResolver: debug=%d — using first %d episodes", self.debug, len(entries))
 
         if self.min_frames:
             before = len(entries)
@@ -126,11 +172,17 @@ class ZipEpisodeResolver(EpisodeResolver):
                 self.min_frames, len(entries), before,
             )
 
+        if not entries:
+            raise FileNotFoundError(
+                f"No usable episodes found in {self.zip_dir} "
+                "(complete tar+.done pairs exist but metadata could not be read)."
+            )
+
         logger.info(
             "ZipEpisodeResolver: %d episodes, %d total frames from %s",
             len(entries),
             sum(e.n_frames for e in entries),
-            catalog_path,
+            self.zip_dir,
         )
         self._catalog = entries
         return self._catalog

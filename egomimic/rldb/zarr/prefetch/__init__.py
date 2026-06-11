@@ -3,9 +3,10 @@
 Architecture
 ------------
 ZipEpisodeResolver
-    Reads ``catalog.json`` from the zip volume (``/mnt/zarr-zip``).
+    Discovers ``{hash}.tar`` + ``{hash}.done`` pairs on the zip volume
+    (``/mnt/zarr-zip``) and reads frame counts from each tar's ``zarr.json``.
     Inherits key_map / transform_list / norm_stats / pause_removal_epsilon
-    plumbing from EpisodeResolver. Frame counts come from the catalog.
+    plumbing from EpisodeResolver.
 
 EpisodePlan
     Deterministic permutation of the full train (or valid) catalog, fixed
