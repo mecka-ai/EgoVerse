@@ -1,0 +1,50 @@
+# Megatron-Energon loader — the SAME per-sample tar shards (<key>.jpg + <key>.npy) as
+# data=mecka_all_sb, streamed by Energon's SavableDataLoader (byte-range reads, reservoir shuffle,
+# cross-shard interleave, rank×worker sharding, exact deterministic resume; NVIDIA-maintained).
+#
+# One-time prep per shard collection (writes a .nv-meta sidecar beside the tars):
+#   energon prepare <shard_dir> --non-interactive --split-ratio "1.0,0,0" \
+#       --sample-type CrudeWebdataset
+#
+# Launch (norm stats are precomputed → norm pass is skipped):
+#   python -m egomimic.trainHydra model=hpt_bc_flow_mecka data=mecka_all_energon trainer=ddp \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     data.train_datasets.mecka_bimanual.shard_dir=/shards/materialized/1gib-e1c6c3f9 \
+#     data.valid_datasets.mecka_bimanual.shard_dir=/shards/materialized/1gib-e1c6c3f9
+#
+# Energon shards across world_size × num_workers consumers; requires #shards ≥ that product.
+
+_target_: egomimic.pl_utils.pl_data_utils.EnergonMultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
+    shard_dir: /shards/materialized/1gib-e1c6c3f9
+    split_part: train
+    # Reservoir size in samples, held PER worker as DECODED samples. Container RAM ≈
+    #   shuffle_buffer_size × decoded_sample_bytes (~2.7 MB f32 image) × (world_size × num_workers).
+    # e.g. 4000 × 2.7 MB × (8 GPUs × 8 workers) ≈ 690 GB. Keep this modest on multi-GPU — the
+    # cross-shard interleave does most of the mixing, so a 2–4k buffer mixes ~as well as 10k
+    # (see mixing table in the PR). 10k × H100:8 would need ~1.7 TB and OOM the box.
+    shuffle_buffer_size: 4000
+    embodiment_name: mecka_bimanual
+    max_samples_per_sequence: null  # null → whole-shard cross-shard interleave
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
+    shard_dir: /shards/materialized/1gib-e1c6c3f9
+    split_part: train              # prepared with split-ratio 1.0,0,0; val unused (limit_val_batches=0)
+    shuffle_buffer_size: 4000
+    embodiment_name: mecka_bimanual
+    max_samples_per_sequence: null
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 8                  # Energon worker processes (via WorkerConfig)
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4

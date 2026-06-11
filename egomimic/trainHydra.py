@@ -157,15 +157,25 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         data_schematic.infer_shapes_from_batch(dataset[0])
         log.info(f"[Timing] Shape inference for {dataset_name}: {time.perf_counter() - t_shape:.2f}s")
 
-        instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
-        keymap_cfg = instantiate_copy.resolver.key_map
-        km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
+        precomputed_norm_path = OmegaConf.select(
+            cfg, "norm_stats.precomputed_norm_path", default=None
+        )
+        # Build the norm-stats dataset (a plain pose/action reader) only when we actually compute
+        # norm from data. With a precomputed path the stats are loaded from JSON and the dataset is
+        # never touched (see DataSchematic.infer_norm_from_dataset) — so skip the build entirely.
+        # This also lets loaders whose config has no `resolver.key_map` (e.g. data=mecka_all_energon)
+        # run, as long as norm stats are precomputed.
+        norm_dataset = None
+        if precomputed_norm_path is None:
+            instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
+            keymap_cfg = instantiate_copy.resolver.key_map
+            km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
 
-        # this remove annotation and image keys from the keymap
-        km["norm_mode"] = True
+            # this remove annotation and image keys from the keymap
+            km["norm_mode"] = True
 
-        instantiate_copy.resolver.key_map = km
-        norm_dataset = hydra.utils.instantiate(instantiate_copy)
+            instantiate_copy.resolver.key_map = km
+            norm_dataset = hydra.utils.instantiate(instantiate_copy)
         # infer_norm_from_dataset: load from precomputed JSON/dir if set, else compute (no disk write).
         t_norm = time.perf_counter()
         data_schematic.infer_norm_from_dataset(
@@ -173,9 +183,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             dataset_name,
             sample_frac=OmegaConf.select(cfg, "norm_stats.sample_frac", default=1.0),
             num_workers=OmegaConf.select(cfg, "norm_stats.num_workers", default=4),
-            precomputed_norm_path=OmegaConf.select(
-                cfg, "norm_stats.precomputed_norm_path", default=None
-            ),
+            precomputed_norm_path=precomputed_norm_path,
         )
         log.info(f"[Timing] Norm stats for {dataset_name}: {time.perf_counter() - t_norm:.2f}s")
         # Cache norm stats if save_cache_dir is set

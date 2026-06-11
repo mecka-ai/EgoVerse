@@ -232,6 +232,68 @@ class MultiDataModuleWrapper(LightningDataModule):
         return CombinedLoader(iterables, "max_size_cycle")
 
 
+class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
+    """Same multi-embodiment ``{name: batch}`` contract as :class:`MultiDataModuleWrapper`, but each
+    embodiment's loader is **Megatron-Energon's own** ``SavableDataLoader`` rather than a torch
+    ``DataLoader`` wrapping an ``IterableDataset`` — Energon *is* the loader (reservoir shuffle +
+    cross-shard interleave + rank×worker sharding + exact resume) and can't be nested inside torch
+    DataLoader workers.
+
+    The objects in ``train_datasets`` / ``valid_datasets`` are
+    :class:`~egomimic.rldb.energon.mecka_energon.EnergonShardDataset` config-holders; this builds the
+    real Energon loader from their fields. ``batch_size``/``num_workers`` come from the matching
+    ``*_dataloader_params`` entry, and ``rank``/``world_size`` from ``torch.distributed`` (this runs
+    per-rank after DDP init). ``CombinedLoader`` keys each loader by embodiment name, yielding the
+    ``{name: batch}`` dict the model's ``process_batch_for_training`` consumes. The class name
+    contains ``MultiDataModuleWrapper`` so trainHydra's datamodule assertion passes unchanged.
+    """
+
+    def _energon_loaders(self, datasets, params):
+        import torch.distributed as dist
+        from megatron.energon import WorkerConfig, get_loader, get_train_dataset
+
+        if dist.is_available() and dist.is_initialized():
+            rank, world_size = dist.get_rank(), dist.get_world_size()
+        else:
+            rank, world_size = 0, 1
+
+        iterables = {}
+        for name, ds in datasets.items():
+            p = params.get(name)
+            if not p:
+                raise ValueError(
+                    f"No dataloader params for dataset {name}. Add it to *_dataloader_params."
+                )
+            p = dict(p)
+            bs = int(p["batch_size"])
+            num_workers = int(p.get("num_workers", 0))
+            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers)
+            eds = get_train_dataset(
+                ds.shard_dir,
+                split_part=ds.split_part,
+                worker_config=wc,
+                batch_size=bs,
+                shuffle_buffer_size=ds.shuffle_buffer_size,
+                max_samples_per_sequence=ds.max_samples_per_sequence,
+                task_encoder=ds.encoder(),
+            )
+            logger.info(
+                "[energon] %s: rank=%d/%d num_workers=%d bs=%d buffer=%d dir=%s",
+                name, rank, world_size, num_workers, bs, ds.shuffle_buffer_size, ds.shard_dir,
+            )
+            # NOTE: swap get_loader -> get_savable_loader in the resume follow-up PR; that exposes
+            # save_state_global / restore_state_global for exact mid-epoch resume (see PR notes).
+            iterables[name] = get_loader(eds)
+        return CombinedLoader(iterables, "max_size_cycle")
+
+    def train_dataloader(self):
+        return self._energon_loaders(self.train_datasets, self.train_dataloader_params)
+
+    def val_dataloader(self):
+        # Built so Lightning has a val loader; with limit_val_batches=0 it is never iterated.
+        return self._energon_loaders(self.valid_datasets, self.valid_dataloader_params)
+
+
 class DualDataModuleWrapper(LightningDataModule):
     """
     Same as DataModuleWrapper but there are two train datasets and two valid datasets
