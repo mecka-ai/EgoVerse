@@ -1,10 +1,13 @@
-# Train-viz evaluator for the OAT tokenizer: wraps EvalTokenizerVideo and runs
-# it on the dataloader_idx=1 (train_viz) leg of the val loop, writing the
-# GT-vs-reconstructed action videos to videos_train_viz/ — i.e. in-distribution
-# action reconstruction on training episodes.
+# Train-viz evaluator for the OAT tokenizer: runs the SAME encode→decode→overlay
+# logic on the dataloader_idx=1 (train_viz) leg of the val loop, writing the
+# GT-vs-reconstructed action videos to videos_train_viz/ and logging metrics
+# under train_viz/Valid/... — i.e. in-distribution reconstruction on training
+# episodes.
+#
+# Note: this is a direct EvalTokenizerVideo subclass, NOT the EvalVideo-based
+# TrainVizEvalVideo wrapper — the tokenizer evaluator overrides on_validation_step
+# wholesale and has no compute_metrics_and_viz for that wrapper to call.
 #
 # Enable via: evaluator@train_viz_evaluator=train_viz_tokenizer
 # (pair with a data config that defines train_viz_datasets).
-_target_: egomimic.eval.train_viz_eval_video.TrainVizEvalVideo
-base:
-  _target_: egomimic.eval.eval_tokenizer_video.EvalTokenizerVideo
+_target_: egomimic.eval.eval_tokenizer_video.TrainVizTokenizerEvalVideo

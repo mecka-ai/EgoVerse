@@ -44,6 +44,10 @@ class EvalTokenizerVideo(Eval):
         self.model = None
         self.val_image_buffer = {}
         self.val_counter = {}
+        # Overridden by the train-viz subclass so the two val-loop legs write to
+        # distinct dirs and log disjoint metric keys (no collision / no suffix).
+        self.metric_prefix = "Valid/"
+        self.video_dirname = "videos"
         self.override_dict = {
             "strategy": "ddp_find_unused_parameters_true",
             "limit_train_batches": 0,
@@ -55,7 +59,7 @@ class EvalTokenizerVideo(Eval):
         }
 
     def video_dir(self):
-        return os.path.join(self.root_dir(), "videos")
+        return os.path.join(self.root_dir(), self.video_dirname)
 
     def _wandb_logger(self):
         """Return the WandbLogger experiment handle, or None if not attached."""
@@ -108,7 +112,7 @@ class EvalTokenizerVideo(Eval):
 
                 wandb_run.log(
                     {
-                        f"videos/{embodiment_name}/recon_overlay": wandb.Video(
+                        f"{self.video_dirname}/{embodiment_name}/recon_overlay": wandb.Video(
                             path, fps=30, format="mp4",
                             caption=f"epoch={epoch} chunk={chunk_idx}",
                         ),
@@ -154,7 +158,7 @@ class EvalTokenizerVideo(Eval):
             actions = _batch[ac_key]               # normalized GT actions
             recons = recons_dict[recons_key]       # normalized reconstructions
 
-            metrics[f"Valid/{embodiment_name}_reconst_mse"] = F.mse_loss(
+            metrics[f"{self.metric_prefix}{embodiment_name}_reconst_mse"] = F.mse_loss(
                 recons, actions
             )
 
@@ -192,4 +196,24 @@ class EvalTokenizerVideo(Eval):
             k: (v.to(device) if torch.is_tensor(v) else torch.tensor(v, device=device))
             for k, v in metrics.items()
         }
-        self.trainer.lightning_module.log_dict(metrics, sync_dist=True)
+        # add_dataloader_idx=False: the val (idx=0) and train_viz (idx=1) legs
+        # log disjoint keys (Valid/... vs train_viz/Valid/...), so the suffix is
+        # redundant and only splits the canonical charts.
+        self.trainer.lightning_module.log_dict(
+            metrics, sync_dist=True, add_dataloader_idx=False
+        )
+
+
+class TrainVizTokenizerEvalVideo(EvalTokenizerVideo):
+    """Train-viz leg for the OAT tokenizer (dataloader_idx=1).
+
+    Reuses EvalTokenizerVideo's encode→decode→overlay logic verbatim, but writes
+    to ``videos_train_viz/`` and prefixes metrics with ``train_viz/`` so it does
+    not collide with the canonical validation leg. Instantiated directly (no
+    wrapper) via hydra_configs/evaluator/train_viz_tokenizer.yaml.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.metric_prefix = "train_viz/Valid/"
+        self.video_dirname = "videos_train_viz"
