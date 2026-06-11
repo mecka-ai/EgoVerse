@@ -29,6 +29,19 @@
 #     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=256 \
 #     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
 #
+# Launch (1×H200, pretrained pi05_base, per-device batch 64 = global batch 64):
+#   python egomimic/modal/trainModal.py --config-name=train_zarr_cartesian_pi \
+#     data=assembling_blookets_test logger=wandb \
+#     model=pi0.5_lr5e5 \
+#     model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \
+#     data.train_dataloader_params.mecka_bimanual.batch_size=64 \
+#     name=<run> description=<desc> \
+#     evaluator@train_viz_evaluator=train_viz_pi \
+#     trainer.check_val_every_n_epoch=50 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:1 +modal_cpu=48 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=256 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
+#
 # Storage (~35 × ~176 MB ≈ 6 GB): pools train 15 + valid 10 + viz 10 ≈ 35 GB
 # caps. Stage-all sizing: the train split (32 eps ≈ 5.6 GB) must fit under
 # 0.92×pool_size_gb = 13.8 GB — the 15 GB pool clears it with margin so the
