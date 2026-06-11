@@ -47,7 +47,7 @@ train_datasets:
     _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
     resolver:
       _target_:  egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
-      zip_dir: /mnt/zarr-zip
+      folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
       debug: null
       min_frames: null
@@ -66,7 +66,7 @@ valid_datasets:
     _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
     resolver:
       _target_:  egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
-      zip_dir: /mnt/zarr-zip
+      folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test.json
       debug: null
       min_frames: null
@@ -85,7 +85,7 @@ train_viz_datasets:
     _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
     resolver:
       _target_:  egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
-      zip_dir: /mnt/zarr-zip
+      folder_path: /mnt/zarr-data
       eps_to_use: egomimic/hydra_configs/data/extra/assembling_blookets_test_viz.json
       valid_ratio: 1.0          # keep all viz episodes (no split)
       debug: null
