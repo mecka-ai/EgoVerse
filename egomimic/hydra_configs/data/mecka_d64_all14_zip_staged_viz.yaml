@@ -1,0 +1,121 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# DEMINF-64 ALL-14 — zip volume, STAGE-ALL-FIRST (no background prefetch).
+#
+# Reads per-episode tars from mecka_data_zip (/mnt/zarr-zip). Before the first
+# training step, prepare_epoch(0) synchronously extracts the FULL train split
+# (369 eps) to /cache. Valid + train_viz splits are extracted before their
+# first val pass the same way. background_filler=false → no PoolFillerThread;
+# episodes stay on ephemeral disk for the rest of the run.
+#
+# SHARED ACROSS deminf64 ARMS:
+#   valid     → mecka_d64_val.json
+#   train_viz → mecka_14task_train_viz.json
+#
+# ARM-SPECIFIC:
+#   train = 369 (mecka_d64_all14_train.json)
+#
+# Launch (1 TB ephemeral, precomputed norm stats):
+#   python egomimic/modal/trainModal.py data=mecka_d64_all14_zip_staged_viz ...
+#   +modal_volume=mecka_data_zip +modal_ephemeral_disk_gb=1000
+#   norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr
+#
+# Disk budget (~1 TB): train pool 450 GB + valid 30 GB + train_viz 30 GB +
+#   probe/tmp headroom; ~369×~130 MB ≈ 48 GB live train data.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_all14_train.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total
+    episodes_per_epoch: 369
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 450
+    lookahead_epochs: 0
+    background_filler: false
+    n_copy_threads: 32
+    prepare_timeout_s: 14400
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_d64_val.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total
+    episodes_per_epoch: 14
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 30
+    lookahead_epochs: 0
+    background_filler: false
+    n_copy_threads: 8
+    prepare_timeout_s: 3600
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      debug: null
+      min_frames: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_14task_train_viz.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: total
+    episodes_per_epoch: 14
+    cache_dir: /cache/zarr_cache_train_viz
+    pool_size_gb: 30
+    lookahead_epochs: 0
+    background_filler: false
+    n_copy_threads: 8
+    prepare_timeout_s: 3600
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false

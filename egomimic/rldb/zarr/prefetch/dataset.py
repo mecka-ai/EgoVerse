@@ -81,6 +81,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         n_copy_threads: int = 16,
         seed: int = 42,
         prepare_timeout_s: float = 3600.0,
+        background_filler: bool = True,
     ):
         super().__init__()
         self.resolver = resolver
@@ -94,6 +95,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # stage-all-first configs where episodes_per_epoch == a large subset
         # (e.g. 20k episodes from a ~150 MB/s volume takes ~3h to stage).
         self.prepare_timeout_s = float(prepare_timeout_s)
+        self._background_filler = bool(background_filler)
 
         self._episodes = resolver.split_catalog(mode)
         if not self._episodes:
@@ -143,7 +145,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # exact episode list via eps_to_use use mode="total" (verbatim, no split),
         # and those still need the background filler — otherwise nothing stages and
         # prepare_epoch blocks until its timeout (the deminf64 stage-all hang).
-        if self.mode != "valid" and self._is_filler_rank:
+        if (
+            self._background_filler
+            and self.mode != "valid"
+            and self._is_filler_rank
+        ):
             registry_key = str(self.cache_dir.resolve())
             with _FILLER_REGISTRY_LOCK:
                 existing = _FILLER_REGISTRY.get(registry_key)
@@ -489,10 +495,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         if self._filler is not None:
             self._filler.advance_training_cursor(epoch * self.episodes_per_epoch)
 
-        # Evict episodes outside the current+lookahead window. Train mode
-        # makes room for the filler to stage future episodes; valid mode
-        # makes room for the synchronous extract below.
-        if self._is_filler_rank:
+        # Evict episodes outside the current+lookahead window. Skipped when the
+        # background filler is off — the whole split stays on NVMe once staged.
+        if self._background_filler and self._is_filler_rank:
             freed = self._pool.evict_outside(keep_hashes)
             if freed:
                 logger.info(
@@ -500,9 +505,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     gen_label, freed / 1e9,
                 )
 
-        # Valid mode has no background filler; extract the window inline.
-        # Cheap because validation runs rarely (check_val_every_n_epoch=200).
-        if self.mode == "valid" and self._is_filler_rank:
+        # Without a background filler, extract the window synchronously on rank 0
+        # (valid always; train/train_viz when stage-all-first is configured).
+        if (self.mode == "valid" or not self._background_filler) and self._is_filler_rank:
             self._extract_window_sync(window_eps)
 
         # Drop stale ZarrDataset handles (episodes that left the window).
