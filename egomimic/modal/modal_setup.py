@@ -221,6 +221,7 @@ image = (
         "geomloss",
         "tslearn",
         "scipy",
+        "scikit-learn",
         "hydra-submitit-launcher==1.2.0",
         "submitit",
         "opencv-python-headless",

@@ -1,0 +1,72 @@
+# Latent t-SNE export for ANY data config — no curation run required.
+#
+#   python egomimic/modal/latentVizModal.py data=<data config> name=<run> description=<desc> \
+#       [+modal_gpu=L40S +modal_cpu=32 +modal_memory_gb=128]
+#
+# Resolves the data config's episodes (resolver + filters + eps_to_use lists),
+# embeds every frame (DINOv3/ResNet image state + Gaussian/random-projection
+# action), and writes per-group tsne3d_<group>.json files + raw latents to the
+# egoverse-training-outputs volume under latent_viz/<name>/<description>_<ts>/.
+# Serve the result with egomimic/modal/latent_viz_app.py (no scores needed).
+
+defaults:
+  - model: deminf_default
+  - data: ???
+  - _self_
+
+name: latent_viz
+description: viz
+seed: 42
+
+# Episode grouping — one t-SNE embedding (and one viewer "task" entry) per group:
+#   task    — episode-table task names (SQL lookup; falls back to dataset)
+#   dataset — one group per train_datasets / valid_datasets entry
+#   none    — everything in a single group called "all"
+group_by: task
+
+# t-SNE frame subsampling: stride within each episode, and a cap on total
+# points per group (the stride is raised automatically to stay under the cap —
+# sklearn t-SNE slows sharply past ~50k points).
+every_n: 10
+max_points_per_group: 30000
+
+# Also write the static PNG t-SNE plots next to the JSONs.
+write_pngs: true
+
+# Re-instantiate any resolver in the data config as a ModalEpisodeResolver
+# rooted at the mounted zarr volume (mecka_data_v2), carrying over key_map /
+# transform_list / eps_to_use / eps_to_ignore / pause_removal_epsilon / debug.
+# This is what lets zip- and S3-based training data configs run here without
+# mounting their own volumes; episodes missing from the zarr volume are
+# skipped with a warning. Set false to instantiate resolvers as declared.
+force_modal_resolver: true
+
+# Action norm stats for the Gaussian action embedder:
+#   path set  → load that norm_stats.json (offline_norm_stats output, volume-relative)
+#   path null → fit mean/std from a sample of the resolved episodes' actions
+model:
+  precomputed_norm_stats:
+    path: null
+    embodiment_id: "9"
+
+# Episodes sampled for on-the-fly action stats (path: null above). Actions-only
+# zarr reads — no JPEG decode — so this pass is cheap.
+norm_sample_episodes: 64
+
+# After export, spawn MP4 renders for every episode on the deployed
+# egoverse-episode-preview app so the viewer's video previews work.
+render_videos: false
+
+# Episode-loading / GPU-batching knobs (same meaning as data.curation_loader.*
+# in deminf configs; a curation_loader block in the data config wins if present).
+loader:
+  episode_workers: 6
+  pass2_image_decode_workers: 12
+  frame_queue_maxsize: 12
+  global_frame_batch_size: 3072
+
+hydra:
+  run:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
