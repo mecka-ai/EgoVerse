@@ -179,7 +179,7 @@ document.getElementById('runInput').addEventListener('keydown', e => {{ if (e.ke
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
     cpu=4.0,
     memory=8192,
-    min_containers=0,
+    min_containers=1,
     scaledown_window=600,
 )
 @modal.concurrent(max_inputs=50)

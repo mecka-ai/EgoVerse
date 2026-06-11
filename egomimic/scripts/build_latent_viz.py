@@ -443,6 +443,12 @@ function renderTsne(task,preserveToggles){
       showFrame(task,hash,frame,tpct/100);
       crossHighlight(task,epIdx,frame);
     });
+    el.on("plotly_hover",ev=>{
+      const p=ev.points[0];
+      if(!p||p.curveNumber!==0)return;
+      const[,,,epIdx]=p.customdata;
+      _preload(DATA[task].episodes[epIdx]);
+    });
     el.on("plotly_relayout",ev=>{
       if(!document.getElementById("syncCam").checked||camLock)return;
       if(ev["scene.camera"]){
@@ -547,15 +553,26 @@ function resetTools(){
 }
 
 /* frame preview */
-let pvHash=null,pvFrame=0,pvTfrac=null;
+let pvHash=null,pvFrame=0,pvTfrac=null,_preloadEl=null;
+
+function _preload(hash){
+  if(!_preloadEl){
+    _preloadEl=document.createElement("video");
+    _preloadEl.muted=true;_preloadEl.preload="auto";_preloadEl.style.display="none";
+    document.body.appendChild(_preloadEl);
+  }
+  if(_preloadEl.dataset.h!==hash){_preloadEl.dataset.h=hash;_preloadEl.src=VIDEO_BASE+hash;_preloadEl.load();}
+}
 
 function showFrame(task,hash,frame,tfrac){
   pvFrame=frame;pvTfrac=tfrac;
   const v=document.getElementById("pv-video");
   document.getElementById("preview").style.display="block";
   const seek=()=>{v.pause();v.currentTime=pvFrame/FPS;};
-  if(pvHash!==hash){pvHash=hash;v.src=VIDEO_BASE+hash;v.onloadedmetadata=seek;}
-  else seek();
+  if(pvHash!==hash){
+    pvHash=hash;v.src=VIDEO_BASE+hash;
+    if(v.readyState>=1)seek();else v.onloadedmetadata=seek;
+  }else seek();
   updateCap();
 }
 
