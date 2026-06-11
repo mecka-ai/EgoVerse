@@ -27,6 +27,18 @@ Usage:
         -- mecka_all_zarr [--n_shards 300] [--samples_per_shard 700]
                           [--exclude_hashes_file /path/to/failures.jsonl]
 
+    # Restrict to the train split declared in a Hydra data config (resolver.eps_to_use):
+    modal run --detach --env robotics egomimic/modal/offline_norm_stats.py \\
+        -- mecka_d64_top60_zarr_viz
+
+    # Or pass an episode-hash JSON directly:
+    modal run --detach --env robotics egomimic/modal/offline_norm_stats.py \\
+        -- mecka_d64_top60 --eps_json egomimic/hydra_configs/data/extra/mecka_d64_top60_train.json
+
+    # Ignore eps_to_use in the config and use every episode on the zarr volume (legacy):
+    modal run --detach --env robotics egomimic/modal/offline_norm_stats.py \\
+        -- mecka_d64_top60 --all_volume
+
 In training, point at the result with:
     norm_stats.precomputed_norm_path=precomputed_norm_stats/<data_config>
 """
@@ -459,6 +471,83 @@ def _merge_tdigests(all_td_dicts: list[dict]):
     return merged
 
 
+def _resolve_eps_json_path(
+    repo_dir: str | Path,
+    data_config: str,
+    eps_json: str | None,
+    all_volume: bool = False,
+) -> tuple[list[str], str | None]:
+    """Return (episode_hashes, source_label) for the train split to sample.
+
+    Priority: ``--all_volume`` → explicit ``--eps_json`` → ``train_datasets.*.resolver.eps_to_use``
+    in the hydra data config → no filter (all SQL/volume episodes).
+    """
+    import json
+
+    from omegaconf import OmegaConf
+
+    if all_volume:
+        print("[NormStats] --all_volume: using every episode on the zarr volume (ignoring eps_to_use)")
+        return [], None
+
+    repo_dir = Path(repo_dir)
+
+    if eps_json:
+        json_path = Path(eps_json)
+        if not json_path.is_file():
+            json_path = repo_dir / eps_json
+        if not json_path.is_file():
+            raise FileNotFoundError(f"eps_json not found: {eps_json}")
+        hashes = json.loads(json_path.read_text())
+        if not isinstance(hashes, list):
+            raise ValueError(f"eps_json must be a JSON list of episode hashes: {json_path}")
+        return [str(h) for h in hashes], str(json_path.relative_to(repo_dir))
+
+    cfg_path = repo_dir / "egomimic" / "hydra_configs" / "data" / f"{data_config}.yaml"
+    if not cfg_path.is_file():
+        return [], None
+
+    cfg = OmegaConf.load(cfg_path)
+    train_datasets = OmegaConf.select(cfg, "train_datasets", default=None)
+    if not train_datasets:
+        return [], None
+
+    eps_paths: list[str] = []
+    for ds_name, ds_cfg in train_datasets.items():
+        eps_path = OmegaConf.select(ds_cfg, "resolver.eps_to_use", default=None)
+        if eps_path is None:
+            eps_path = OmegaConf.select(ds_cfg, "eps_to_use", default=None)
+        if eps_path:
+            eps_paths.append(str(eps_path))
+
+    if not eps_paths:
+        return [], None
+
+    # Union hashes when multiple train datasets declare eps_to_use.
+    merged: list[str] = []
+    seen: set[str] = set()
+    rel_sources: list[str] = []
+    for rel in eps_paths:
+        json_path = repo_dir / rel
+        if not json_path.is_file():
+            raise FileNotFoundError(
+                f"train split JSON from {data_config} not found: {rel}"
+            )
+        rel_sources.append(rel)
+        for h in json.loads(json_path.read_text()):
+            h = str(h)
+            if h not in seen:
+                seen.add(h)
+                merged.append(h)
+
+    source = ", ".join(rel_sources)
+    print(
+        f"[NormStats] Loaded {len(merged)} train hashes from {data_config} "
+        f"({source})"
+    )
+    return merged, source
+
+
 # ---------------------------------------------------------------------------
 # Coordinator
 # ---------------------------------------------------------------------------
@@ -481,6 +570,8 @@ def run_norm_stats(
     n_shards: int = 300,
     samples_per_shard: int = 700,
     exclude_hashes: list[str] | None = None,
+    eps_json: str | None = None,
+    all_volume: bool = False,
 ) -> str:
     """Fan out to shard workers, merge results, write norm_stats.json.
 
@@ -503,6 +594,10 @@ def run_norm_stats(
 
     load_env()
 
+    train_hashes, eps_source = _resolve_eps_json_path(
+        CFG.remote_repo_dir, data_config, eps_json, all_volume=all_volume
+    )
+
     out_path = (
         Path(CFG.output_mount_path) / _NORM_SUBDIR / data_config / "norm_stats.json"
     )
@@ -516,6 +611,16 @@ def run_norm_stats(
     if df.empty:
         raise ValueError("SQL episode table is empty")
     df = df[df["is_deleted"] != True]  # noqa: E712
+    if train_hashes:
+        allow = set(train_hashes)
+        df = df[df["episode_hash"].isin(allow)]
+        missing_from_sql = allow - set(df["episode_hash"])
+        if missing_from_sql:
+            print(
+                f"[NormStats] Warning: {len(missing_from_sql)} train hashes "
+                f"not in SQL table (skipped)"
+            )
+        print(f"[NormStats] Restricted to train split: {len(df)} SQL rows")
     if exclude_hashes:
         df = df[~df["episode_hash"].isin(set(exclude_hashes))]
         print(
@@ -551,8 +656,17 @@ def run_norm_stats(
 
     print(f"[NormStats] {len(episodes)} episodes found locally, {n_missing} missing")
 
+    if train_hashes:
+        found = {ep["episode_hash"] for ep in episodes}
+        missing_on_vol = set(train_hashes) - found
+        if missing_on_vol:
+            print(
+                f"[NormStats] Warning: {len(missing_on_vol)}/{len(train_hashes)} "
+                f"train-split hashes missing on zarr volume"
+            )
+
     if not episodes:
-        raise ValueError("No episodes found on local volume.")
+        raise ValueError("No episodes found on local volume for the requested split.")
 
     # ---- Split into shards ----
     actual_shards = min(n_shards, len(episodes))
@@ -668,6 +782,12 @@ def run_norm_stats(
         "loading_time": None,
         "computing_time": elapsed,
         "frames": sum(merged[k]["n"] for k in tracked_keys if merged[k]["n"] > 0),
+        "norm_run_metadata": {
+            "data_config": data_config,
+            "eps_to_use": eps_source,
+            "n_train_hashes_requested": len(train_hashes) if train_hashes else None,
+            "n_episodes_sampled": len(episodes),
+        },
     }
 
     with open(out_path, "w") as f:
@@ -735,6 +855,20 @@ def main(*args: str) -> None:
         default=None,
         help="JSONL file with episode_hash fields to exclude",
     )
+    parser.add_argument(
+        "--eps_json",
+        type=str,
+        default=None,
+        help=(
+            "Episode-hash JSON list for the train split. "
+            "Default: read train_datasets.*.resolver.eps_to_use from the data config YAML."
+        ),
+    )
+    parser.add_argument(
+        "--all_volume",
+        action="store_true",
+        help="Ignore eps_to_use in the data config and sample all zarr episodes on the volume.",
+    )
     parsed = parser.parse_args(list(args))
 
     exclude_hashes: list[str] = []
@@ -753,8 +887,14 @@ def main(*args: str) -> None:
         )
 
     total_frames = parsed.n_shards * parsed.samples_per_shard
+    split_hint = (
+        "all volume episodes"
+        if parsed.all_volume
+        else (parsed.eps_json or f"train split from {parsed.data_config}.yaml")
+    )
     print(
         f"Submitting norm-stats job: data={parsed.data_config!r} "
+        f"train_split={split_hint} "
         f"n_shards={parsed.n_shards} samples_per_shard={parsed.samples_per_shard} "
         f"→ ~{total_frames:,} total frames sampled"
         + (f"  exclude_hashes={len(exclude_hashes)}" if exclude_hashes else "")
@@ -772,6 +912,8 @@ def main(*args: str) -> None:
         n_shards=parsed.n_shards,
         samples_per_shard=parsed.samples_per_shard,
         exclude_hashes=exclude_hashes or None,
+        eps_json=parsed.eps_json,
+        all_volume=parsed.all_volume,
     )
 
     print(f"\nDone. Volume path: {out_path}")
