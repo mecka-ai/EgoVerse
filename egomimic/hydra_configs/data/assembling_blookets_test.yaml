@@ -120,7 +120,7 @@ train_viz_datasets:
 
 train_dataloader_params:
   mecka_bimanual:
-    batch_size: 32            # per-device; 2×H200 → 64 global batch
+    batch_size: 64          # per-device; 2×H200 → 64 global batch
     num_workers: 16
     persistent_workers: false
     prefetch_factor: 6
@@ -128,7 +128,7 @@ train_dataloader_params:
 
 valid_dataloader_params:
   mecka_bimanual:
-    batch_size: 32
+    batch_size: 64
     num_workers: 4
     persistent_workers: false
     prefetch_factor: 2
@@ -136,7 +136,7 @@ valid_dataloader_params:
 
 train_viz_dataloader_params:
   mecka_bimanual:
-    batch_size: 32           # capped at 32 to avoid OOM; 80 viz samples/task span multiple batches
+    batch_size: 64           # capped at 64 to avoid OOM; 80 viz samples/task span multiple batches
     num_workers: 1
     persistent_workers: false
     prefetch_factor: 2
