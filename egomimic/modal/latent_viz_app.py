@@ -32,6 +32,7 @@ _VAL_JSON = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.j
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("ffmpeg")
     .pip_install("fastapi[standard]")
     .add_local_file(_BUILDER, remote_path="/root/build_latent_viz.py", copy=True)
     .add_local_file(_VAL_JSON, remote_path="/root/mecka_d64_val.json", copy=True)
@@ -195,6 +196,7 @@ def viewer():
 
     web = FastAPI(title="EgoVerse Viewer")
     html_cache: dict[str, str] = {}
+    frame_cache: dict[str, bytes] = {}
     val_list = json.load(open("/root/mecka_d64_val.json"))
 
     def _reload_volumes() -> None:
@@ -218,7 +220,7 @@ def viewer():
             raise HTTPException(404, f"scores_by_task.json not found under {run!r}")
 
         scores = json.load(open(scores_path))
-        body = build_html(tsne_dir, scores, val_list, video_base="/video/", run_label=run)
+        body = build_html(tsne_dir, scores, val_list, video_base="/video/", frame_base="/frame/", run_label=run)
         html_cache[run] = body
         print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run}")
         return body
@@ -290,5 +292,32 @@ def viewer():
         if not path.exists():
             return PlainTextResponse("not found", status_code=404)
         return FileResponse(str(path), media_type="video/mp4")
+
+    @web.get("/frame/{episode_hash}/{frame_num}")
+    def frame(episode_hash: str, frame_num: int):
+        import subprocess
+        from fastapi.responses import Response
+
+        safe = Path(episode_hash).name
+        cache_key = f"{safe}_{frame_num}"
+        if cache_key in frame_cache:
+            return Response(frame_cache[cache_key], media_type="image/jpeg")
+
+        path = Path(PREVIEW_MOUNT) / f"{safe}.mp4"
+        if not path.exists():
+            _reload_volumes()
+        if not path.exists():
+            return PlainTextResponse("not found", status_code=404)
+
+        result = subprocess.run(
+            ["ffmpeg", "-ss", str(frame_num / 30.0), "-i", str(path),
+             "-vframes", "1", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return PlainTextResponse("frame extraction failed", status_code=500)
+
+        frame_cache[cache_key] = result.stdout
+        return Response(result.stdout, media_type="image/jpeg")
 
     return web

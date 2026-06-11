@@ -40,6 +40,7 @@ from pathlib import Path
 # Default MP4 base URL for locally-built HTML. The unified Modal viewer
 # (egomimic/modal/latent_viz_app.py) passes video_base="/video/" instead.
 VIDEO_BASE = "https://mecka-robotics--egoverse-viewer-viewer.modal.run/video/"
+FRAME_BASE = "https://mecka-robotics--egoverse-viewer-viewer.modal.run/frame/"
 # Encode rate used by episode_preview.py (frame index / FPS = seek time).
 FPS = 30
 
@@ -140,7 +141,7 @@ _TEMPLATE = """<!DOCTYPE html>
   #preview { position:fixed; right:14px; bottom:14px; width:400px; background:#17181d;
              border:1px solid #34363f; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.7);
              display:none; z-index:50; overflow:hidden; }
-  #preview video { width:100%; display:block; background:#000; }
+  #preview img { width:100%; display:block; background:#000; }
   #pv-cap { font-size:12px; padding:6px 10px; color:#ccc; display:flex; gap:6px;
             align-items:center; flex-wrap:wrap; }
   #pv-cap b { color:#7fd4ff; }
@@ -224,7 +225,7 @@ _TEMPLATE = """<!DOCTYPE html>
 
 <div id="preview">
   <div id="pv-close" onclick="hidePreview()">✕</div>
-  <video id="pv-video" muted playsinline preload="metadata"></video>
+  <img id="pv-img" alt="">
   <div id="pv-cap"></div>
 </div>
 
@@ -233,6 +234,7 @@ const DATA = __DATA__;
 const SCORES = __SCORES__;
 const VAL = new Set(__VAL__);
 const VIDEO_BASE = "__VIDEO_BASE__";
+const FRAME_BASE = "__FRAME_BASE__";
 const FPS = __FPS__;
 const DIM = "rgba(110,110,120,0.05)";
 const HIDDEN = "rgba(0,0,0,0)";
@@ -443,12 +445,6 @@ function renderTsne(task,preserveToggles){
       showFrame(task,hash,frame,tpct/100);
       crossHighlight(task,epIdx,frame);
     });
-    el.on("plotly_hover",ev=>{
-      const p=ev.points[0];
-      if(!p||p.curveNumber!==0)return;
-      const[,,,epIdx]=p.customdata;
-      _preload(DATA[task].episodes[epIdx]);
-    });
     el.on("plotly_relayout",ev=>{
       if(!document.getElementById("syncCam").checked||camLock)return;
       if(ev["scene.camera"]){
@@ -553,26 +549,12 @@ function resetTools(){
 }
 
 /* frame preview */
-let pvHash=null,pvFrame=0,pvTfrac=null,_preloadEl=null;
-
-function _preload(hash){
-  if(!_preloadEl){
-    _preloadEl=document.createElement("video");
-    _preloadEl.muted=true;_preloadEl.preload="auto";_preloadEl.style.display="none";
-    document.body.appendChild(_preloadEl);
-  }
-  if(_preloadEl.dataset.h!==hash){_preloadEl.dataset.h=hash;_preloadEl.src=VIDEO_BASE+hash;_preloadEl.load();}
-}
+let pvHash=null,pvFrame=0,pvTfrac=null;
 
 function showFrame(task,hash,frame,tfrac){
-  pvFrame=frame;pvTfrac=tfrac;
-  const v=document.getElementById("pv-video");
+  pvHash=hash;pvFrame=frame;pvTfrac=tfrac;
   document.getElementById("preview").style.display="block";
-  const seek=()=>{v.pause();v.currentTime=pvFrame/FPS;};
-  if(pvHash!==hash){
-    pvHash=hash;v.src=VIDEO_BASE+hash;
-    if(v.readyState>=1)seek();else v.onloadedmetadata=seek;
-  }else seek();
+  document.getElementById("pv-img").src=FRAME_BASE+hash+"/"+frame;
   updateCap();
 }
 
@@ -582,24 +564,16 @@ function updateCap(){
     (pvTfrac!=null?` (${Math.round(pvTfrac*100)})%`:"")+
     ` <button onclick="stepFrame(-1)">−1f</button>`+
     ` <button onclick="stepFrame(1)">+1f</button>`+
-    ` <button onclick="togglePlay()">▶/⏸</button>`+
     ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open↗</a>`;
 }
 
 function stepFrame(d){
-  const v=document.getElementById("pv-video");
   pvFrame=Math.max(0,pvFrame+d);pvTfrac=null;
-  v.pause();v.currentTime=pvFrame/FPS;updateCap();
-}
-
-function togglePlay(){
-  const v=document.getElementById("pv-video");
-  if(v.paused)v.play();
-  else{v.pause();pvFrame=Math.round(v.currentTime*FPS);pvTfrac=null;updateCap();}
+  document.getElementById("pv-img").src=FRAME_BASE+pvHash+"/"+pvFrame;
+  updateCap();
 }
 
 function hidePreview(){
-  document.getElementById("pv-video").pause();
   document.getElementById("preview").style.display="none";
 }
 
@@ -716,10 +690,12 @@ def build_html(
     val: list,
     *,
     video_base: str | None = None,
+    frame_base: str | None = None,
     run_label: str = "",
 ) -> str:
     """Assemble the viewer HTML from a local tsne3d dir + raw scores dict."""
     vb = video_base if video_base is not None else VIDEO_BASE
+    fb = frame_base if frame_base is not None else FRAME_BASE
     data: dict = {}
     for f in sorted(Path(tsne_dir).glob("tsne3d_*.json")):
         d = json.load(open(f))
@@ -745,6 +721,7 @@ def build_html(
         .replace("__SCORES__", json.dumps(scores, separators=(",", ":")))
         .replace("__VAL__", json.dumps(val, separators=(",", ":")))
         .replace("__VIDEO_BASE__", vb)
+        .replace("__FRAME_BASE__", fb)
         .replace("__FPS__", str(FPS))
         .replace("__RUN_LABEL__", run_nav)
     )
