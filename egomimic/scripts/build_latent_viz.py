@@ -488,23 +488,33 @@ function buildLegend(task){
            `<span class="lg-dot" style="background:${c}"></span>${h.slice(0,10)}</div>`;
   }).join("");
   document.getElementById("legend").innerHTML=
-    `<div class="lg-head">episodes</div>` +
+    `<div class="lg-head">episodes <span style="color:#666;font-weight:400">(click to multi-select)</span></div>` +
     `<div class="lg-row" id="lg_all" onclick="legendClick('all')">` +
     `<span class="lg-dot" style="background:#888"></span>show all</div>`+rows;
   markLegend();
 }
 
 function legendClick(i){
-  const sel=document.getElementById("epSel");
-  sel.value=(String(i)===sel.value)?"all":String(i);
-  applyStyle();markLegend();
+  if(i==="all"){selectedEps.clear();}
+  else if(selectedEps.has(i)){selectedEps.delete(i);}
+  else selectedEps.add(i);
+  updateEpDisplay();applyStyle();markLegend();
+}
+
+function clearEpSel(){selectedEps.clear();updateEpDisplay();applyStyle();markLegend();}
+
+function updateEpDisplay(){
+  const el=document.getElementById("epCount");
+  if(el)el.textContent=selectedEps.size===0?"all":selectedEps.size+" selected";
 }
 
 function markLegend(){
-  const cur=document.getElementById("epSel").value;
   document.querySelectorAll("#legend .lg-row").forEach(r=>r.classList.remove("active"));
-  const el=document.getElementById(cur==="all"?"lg_all":`lg_${cur}`);
-  if(el)el.classList.add("active");
+  if(selectedEps.size===0){
+    const el=document.getElementById("lg_all");if(el)el.classList.add("active");
+  }else{
+    selectedEps.forEach(i=>{const el=document.getElementById("lg_"+i);if(el)el.classList.add("active");});
+  }
 }
 
 function crossHighlight(task,epIdx,frame){
@@ -524,7 +534,7 @@ function hlChanged(){document.getElementById("hlOn").checked=true;applyStyle();}
 
 function resetTools(){
   document.getElementById("colorMode").value="episode";
-  document.getElementById("epSel").value="all";
+  selectedEps.clear();updateEpDisplay();
   document.getElementById("hlOn").checked=false;
   document.getElementById("hlFrame").value=0;
   document.getElementById("hlWin").value=15;
