@@ -87,15 +87,18 @@ _TEMPLATE = """<!DOCTYPE html>
   #modToggles { display:flex; gap:7px; align-items:center; flex-wrap:wrap; }
   #modToggles label.lang-mod { color:#c9b8ff; }
   #plots { flex:1; min-height:0; display:flex; overflow:hidden; }
-  #plotGrid { flex:1; min-height:0; overflow-y:auto; display:flex; flex-wrap:wrap; align-content:flex-start; }
-  .panel-wrap { flex:1 1 calc(50% - 1px); min-width:360px; display:flex; flex-direction:column;
-                border-right:1px solid var(--line); border-bottom:1px solid var(--line); box-sizing:border-box; }
-  .panel-wrap.solo { flex:1 1 100%; }
+  #plotGrid { flex:1; min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+  .panel-row { flex:1; min-height:0; display:flex; overflow:hidden;
+               border-bottom:1px solid var(--line); }
+  .panel-row:last-child { border-bottom:none; }
+  .panel-wrap { flex:1; min-width:0; display:flex; flex-direction:column;
+                border-right:1px solid var(--line); overflow:hidden; }
+  .panel-wrap:last-child { border-right:none; }
   .panel-title { flex-shrink:0; font-size:11px; color:#9aa; padding:3px 8px; background:#14151a;
                  border-bottom:1px solid var(--line); font-weight:600; letter-spacing:.4px;
                  display:flex; align-items:center; gap:6px; }
   .pt-badge { font-size:10px; padding:1px 5px; border-radius:4px; background:#1e3a5f; color:#7fd4ff; }
-  .panel { flex:1; min-height:280px; }
+  .panel { flex:1; min-height:0; overflow:hidden; }
   #legend { flex-shrink:0; width:170px; overflow-y:auto; background:#14151a;
             border-left:1px solid var(--line); font-size:12px; }
   #legend .lg-head { padding:6px 10px; color:#9aa; position:sticky; top:0; background:#14151a;
@@ -356,14 +359,6 @@ const LAYOUT=title=>({
 
 let camLock=false;
 
-function setPanelHeights(mods){
-  if(!mods.length)return;
-  const rows=Math.ceil(mods.length/2);
-  const avail=(document.getElementById("plots")||{clientHeight:window.innerHeight-130}).clientHeight;
-  const h=Math.max(280,Math.floor(avail/rows)-22);
-  document.querySelectorAll(".panel").forEach(p=>{p.style.height=h+"px";});
-}
-
 function buildModToggles(task){
   const allMods=modalitiesForTask(task);
   const container=document.getElementById("modToggles");
@@ -387,16 +382,20 @@ function toggleMod(mod,visible){
 
 function ensurePanels(mods){
   const grid=document.getElementById("plotGrid");
-  grid.innerHTML=mods.map(mod=>{
-    const isLang=MOD_LANG_ONLY.has(mod);
-    const badge=isLang?'<span class="pt-badge">language</span>':"";
-    const solo=mods.length===1?' solo':"";
-    return `<div class="panel-wrap${solo}">` +
-           `<div class="panel-title">${MOD_LABELS[mod]||mod.toUpperCase()} ${badge}</div>` +
-           `<div id="panel_${mod}" class="panel"></div></div>`;
-  }).join("");
-  // defer height so DOM is laid out
-  requestAnimationFrame(()=>setPanelHeights(mods));
+  // Group into rows of 2 so each row stretches to fill available height via flex.
+  const rows=[];
+  for(let i=0;i<mods.length;i+=2) rows.push(mods.slice(i,i+2));
+  grid.innerHTML=rows.map(rowMods=>
+    '<div class="panel-row">'+rowMods.map(mod=>{
+      const isLang=MOD_LANG_ONLY.has(mod);
+      const badge=isLang?'<span class="pt-badge">language</span>':"";
+      return `<div class="panel-wrap">` +
+             `<div class="panel-title">${MOD_LABELS[mod]||mod.toUpperCase()} ${badge}</div>` +
+             `<div id="panel_${mod}" class="panel"></div></div>`;
+    }).join("")+'</div>'
+  ).join("");
+  // Force synchronous layout so Plotly reads non-zero flex-computed heights.
+  grid.getBoundingClientRect();
 }
 
 function renderTsne(task,preserveToggles){
@@ -672,7 +671,8 @@ function render(){
 }
 
 window.addEventListener("resize",()=>{
-  if(curTask&&page==="tsne")setPanelHeights(activeMods);
+  if(curTask&&page==="tsne")
+    activeMods.forEach(m=>{ const el=document.getElementById("panel_"+m); if(el) Plotly.relayout(el,{autosize:true}); });
 });
 
 const sel=document.getElementById("task");
@@ -692,6 +692,7 @@ def build_html(
     val: list,
     *,
     video_base: str | None = None,
+    run_label: str = "",
 ) -> str:
     """Assemble the viewer HTML from a local tsne3d dir + raw scores dict."""
     vb = video_base if video_base is not None else VIDEO_BASE
@@ -706,6 +707,14 @@ def build_html(
         )
         for t, v in scores_raw.items()
     }
+    run_nav = ""
+    if run_label:
+        rl = _html.escape(run_label)
+        run_nav = (
+            f'<span style="color:#9aa">{rl}</span>'
+            f' · <a href="/">change run</a>'
+            f' · <a href="/episodes">episodes</a>'
+        )
     return (
         _TEMPLATE
         .replace("__DATA__", json.dumps(data, separators=(",", ":")))
@@ -713,6 +722,7 @@ def build_html(
         .replace("__VAL__", json.dumps(val, separators=(",", ":")))
         .replace("__VIDEO_BASE__", vb)
         .replace("__FPS__", str(FPS))
+        .replace("__RUN_LABEL__", run_nav)
     )
 
 

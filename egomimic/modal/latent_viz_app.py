@@ -58,44 +58,120 @@ def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
     import html
 
     safe_default = html.escape(default_run, quote=True)
+    n_runs = len(runs)
     options = "\n".join(
         f'<option value="{html.escape(r, quote=True)}"'
         f'{" selected" if r == default_run else ""}>{html.escape(r)}</option>'
         for r in runs[:80]
     )
-    err = f'<p style="color:#f88">{error}</p>' if error else ""
+    err = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    # Parse timestamp suffix from run name for display (format: …_YYYY-MM-DD_HH-MM-SS)
+    def _run_date(r: str) -> str:
+        parts = r.replace("_", "-").split("-")
+        for i in range(len(parts) - 5):
+            try:
+                return f"{parts[i+0]}-{parts[i+1]}-{parts[i+2]}"
+            except Exception:
+                pass
+        return ""
+
+    run_rows = "\n".join(
+        f'<div class="run-row" onclick="pick(\'{html.escape(r, quote=True)}\')">'
+        f'<span class="run-name">{html.escape(r)}</span>'
+        f'<span class="run-date">{_run_date(r)}</span>'
+        f'</div>'
+        for r in runs[:60]
+    )
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>EgoVerse Viewer</title>
 <style>
-  body {{ background:#101014; color:#e8e8ea; font-family:system-ui,sans-serif; margin:0; padding:32px; }}
-  h1 {{ font-size:20px; margin:0 0 8px; }}
-  p {{ color:#9aa; max-width:720px; line-height:1.5; }}
-  form {{ margin:24px 0; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
-  input, select, button {{ font-size:14px; padding:8px 12px; border-radius:8px; border:1px solid #333; }}
-  input[type=text] {{ flex:1; min-width:320px; background:#1a1b21; color:#eee; }}
-  select {{ background:#1a1b21; color:#eee; max-width:480px; }}
-  button {{ background:#3b82f6; color:#fff; border:none; cursor:pointer; font-weight:600; }}
-  button:hover {{ background:#2563eb; }}
-  .links {{ margin-top:28px; font-size:13px; }}
-  a {{ color:#7fd4ff; }}
-</style></head><body>
-<h1>EgoVerse latent + episode viewer</h1>
-<p>Pick a curation run on the <code>egoverse-training-outputs</code> volume
-(path relative to volume root, e.g. <code>deminf32/resnet_k10-20_all14_…</code>).</p>
-{err}
-<form action="/view" method="get">
-  <select name="run" onchange="document.getElementById('runInput').value=this.value">
-    <option value="">— recent runs —</option>
-    {options}
-  </select>
-  <input id="runInput" type="text" name="run" value="{safe_default}" placeholder="name/description_timestamp" required />
-  <button type="submit">Load viewer</button>
-</form>
-<div class="links">
-  <a href="/episodes">Episode MP4 grid</a> ·
-  <a href="/api/runs">/api/runs</a> ·
-  <a href="/health">health</a>
+  :root{{--bg:#101014;--bar:#1a1b21;--line:#2b2d36;--acc:#3b82f6;--txt:#e8e8ea;}}
+  html,body{{height:100%;margin:0;background:var(--bg);color:var(--txt);font-family:-apple-system,Helvetica,Arial,sans-serif;}}
+  body{{display:flex;flex-direction:column;overflow:hidden;}}
+  #topbar{{padding:10px 18px;background:var(--bar);border-bottom:1px solid var(--line);
+           display:flex;align-items:center;gap:14px;}}
+  #topbar h1{{margin:0;font-size:15px;font-weight:700;}}
+  #topbar .sub{{font-size:13px;color:#9aa;}}
+  #topbar .links{{margin-left:auto;font-size:13px;display:flex;gap:14px;}}
+  #topbar .links a{{color:#9ecbff;text-decoration:none;}}
+  #topbar .links a:hover{{color:#7fd4ff;}}
+  #main{{flex:1;min-height:0;display:flex;overflow:hidden;}}
+  #sidebar{{width:420px;flex-shrink:0;display:flex;flex-direction:column;border-right:1px solid var(--line);overflow:hidden;}}
+  #search-area{{padding:12px 14px;border-bottom:1px solid var(--line);}}
+  #search-area input{{width:100%;box-sizing:border-box;font-size:13px;padding:7px 10px;
+                       background:#26272f;color:var(--txt);border:1px solid var(--line);border-radius:6px;}}
+  #run-list{{flex:1;overflow-y:auto;}}
+  .run-row{{padding:8px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;
+            border-bottom:1px solid var(--line);font-size:13px;}}
+  .run-row:hover{{background:#1f2027;}}
+  .run-row.selected{{background:#1a2d4a;}}
+  .run-name{{font-family:ui-monospace,monospace;color:#cdd;font-size:12px;}}
+  .run-date{{font-size:11px;color:#777;flex-shrink:0;margin-left:8px;}}
+  #detail{{flex:1;padding:24px;display:flex;flex-direction:column;gap:16px;overflow-y:auto;}}
+  #detail h2{{margin:0;font-size:14px;color:#9aa;font-weight:600;}}
+  #detail .run-path{{font-family:ui-monospace,monospace;font-size:13px;color:#9ecbff;word-break:break-all;}}
+  #runInput{{width:100%;box-sizing:border-box;font-size:13px;padding:8px 10px;
+              background:#26272f;color:var(--txt);border:1px solid var(--line);border-radius:6px;margin-top:4px;}}
+  .load-btn{{padding:10px 24px;background:var(--acc);color:#fff;border:none;border-radius:8px;
+              cursor:pointer;font-size:14px;font-weight:600;width:100%;margin-top:4px;}}
+  .load-btn:hover{{background:#2563eb;}}
+  .err{{background:#4d1d1d;color:#ff9d9d;padding:8px 12px;border-radius:6px;font-size:13px;}}
+  .empty{{padding:24px;color:#666;font-size:13px;}}
+</style></head>
+<body>
+<div id="topbar">
+  <h1>EgoVerse viewer</h1>
+  <span class="sub">{n_runs} curation run{'' if n_runs == 1 else 's'} on <code>egoverse-training-outputs</code></span>
+  <div class="links">
+    <a href="/episodes">Episodes</a>
+    <a href="/api/runs">API</a>
+    <a href="/health">Health</a>
+  </div>
 </div>
+<div id="main">
+  <div id="sidebar">
+    <div id="search-area">
+      <input id="search" type="text" placeholder="Filter runs…" oninput="filterRuns()" autofocus />
+    </div>
+    <div id="run-list">
+      {'<div class="empty">No curation runs found yet.</div>' if not runs else run_rows}
+    </div>
+  </div>
+  <div id="detail">
+    <div>{err}</div>
+    <div>
+      <h2>Selected run</h2>
+      <div id="selected-label" class="run-path" style="color:#666">— none selected —</div>
+    </div>
+    <div>
+      <h2>Or enter path manually</h2>
+      <input id="runInput" type="text" value="{safe_default}" placeholder="name/description_timestamp" />
+    </div>
+    <button class="load-btn" onclick="load()">Load viewer →</button>
+  </div>
+</div>
+<script>
+const ALL_ROWS = Array.from(document.querySelectorAll('.run-row'));
+function filterRuns() {{
+  const q = document.getElementById('search').value.toLowerCase();
+  ALL_ROWS.forEach(r => {{
+    r.style.display = r.querySelector('.run-name').textContent.toLowerCase().includes(q) ? '' : 'none';
+  }});
+}}
+function pick(run) {{
+  ALL_ROWS.forEach(r => r.classList.remove('selected'));
+  const row = ALL_ROWS.find(r => r.querySelector('.run-name').textContent === run);
+  if (row) row.classList.add('selected');
+  document.getElementById('runInput').value = run;
+  document.getElementById('selected-label').textContent = run;
+  document.getElementById('selected-label').style.color = '#9ecbff';
+}}
+function load() {{
+  const run = document.getElementById('runInput').value.trim();
+  if (run) window.location.href = '/view?run=' + encodeURIComponent(run);
+}}
+document.getElementById('runInput').addEventListener('keydown', e => {{ if (e.key === 'Enter') load(); }});
+</script>
 </body></html>"""
 
 
@@ -142,19 +218,10 @@ def viewer():
             raise HTTPException(404, f"scores_by_task.json not found under {run!r}")
 
         scores = json.load(open(scores_path))
-        body = build_html(tsne_dir, scores, val_list, video_base="/video/")
-        bar = (
-            f'<div style="position:fixed;top:0;left:0;right:0;z-index:9999;padding:6px 14px;'
-            f'background:#1a1b21;border-bottom:1px solid #333;font:13px system-ui;color:#ccc">'
-            f'<b style="color:#7fd4ff">run</b> {run} · '
-            f'<a href="/" style="color:#9ecbff">change run</a> · '
-            f'<a href="/episodes" style="color:#9ecbff">episodes</a></div>'
-            f'<div style="height:36px"></div>'
-        )
-        html = bar + body
-        html_cache[run] = html
-        print(f"viewer: built {len(html)/1e6:.1f} MB HTML for run={run}")
-        return html
+        body = build_html(tsne_dir, scores, val_list, video_base="/video/", run_label=run)
+        html_cache[run] = body
+        print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run}")
+        return body
 
     @web.get("/")
     def index(
