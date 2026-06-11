@@ -14,7 +14,12 @@ import numpy as np
 from tqdm import tqdm
 
 from egomimic.curation.config import CurationLoaderSettings, EmbedderSettings
-from egomimic.curation.embedders import ActionEmbedder, StateEmbedder
+from egomimic.curation.embedders import (
+    ActionEmbedder,
+    CheckpointActionEmbedder,
+    OATActionEmbedder,
+    StateEmbedder,
+)
 
 if TYPE_CHECKING:
     from egomimic.rldb.zarr.zarr_dataset_multi import ZarrDataset
@@ -34,15 +39,69 @@ def build_embedders(
     seed: int,
     *,
     global_frame_batch_size: int = 512,
-) -> tuple[ActionEmbedder, StateEmbedder]:
-    """Construct fitted action and image embedders from precomputed norm stats."""
-    action_embedder = ActionEmbedder(
-        latent_dim=embed_cfg.latent_dim,
-        seed=seed,
-        norm_min_std=embed_cfg.norm_min_std,
-    )
-    action_embedder.set_precomputed_stats(action_mean, action_std)
-    action_embedder.fit([])
+) -> tuple[ActionEmbedder | OATActionEmbedder | CheckpointActionEmbedder, StateEmbedder]:
+    """Construct fitted action and image embedders from config and precomputed norm stats.
+
+    Three action embedder types are supported (``embed_cfg.action_embedder.type``):
+
+    ``gaussian`` (default):
+        Gaussian normalisation with precomputed mean/std + random orthogonal projection.
+
+    ``oat``:
+        Loads a trained OAT tokenizer checkpoint and uses the encoder to produce
+        continuous pre-quantization latents for KSG mutual information estimation.
+        Requires ``action_embedder.checkpoint_path`` and the OAT architecture
+        config blocks (``oat_encoder_cfg``, ``oat_decoder_cfg``, ``oat_quantizer_cfg``).
+
+    ``checkpoint`` (legacy):
+        General model checkpoint with a configurable encode method.
+    """
+    ae_cfg = getattr(embed_cfg, "action_embedder", None)
+    ae_type = ae_cfg.type.lower() if ae_cfg is not None else "gaussian"
+
+    if ae_type == "oat":
+        if ae_cfg is None or not ae_cfg.checkpoint_path:
+            raise ValueError(
+                "action_embedder.type=oat requires action_embedder.checkpoint_path to be set"
+            )
+        if not ae_cfg.oat_encoder_cfg or not ae_cfg.oat_decoder_cfg or not ae_cfg.oat_quantizer_cfg:
+            raise ValueError(
+                "action_embedder.type=oat requires oat_encoder_cfg, oat_decoder_cfg, "
+                "and oat_quantizer_cfg to be set in the curation model config."
+            )
+        action_embedder: ActionEmbedder | OATActionEmbedder = OATActionEmbedder(
+            checkpoint_path=ae_cfg.checkpoint_path,
+            encoder_cfg=ae_cfg.oat_encoder_cfg,
+            decoder_cfg=ae_cfg.oat_decoder_cfg,
+            quantizer_cfg=ae_cfg.oat_quantizer_cfg,
+            device=device,
+            latent_dim=embed_cfg.latent_dim,
+            action_chunk_size=ae_cfg.oat_action_chunk_size,
+            action_dim=ae_cfg.oat_action_dim,
+            seed=seed,
+        )
+        action_embedder.fit([])
+    elif ae_type == "checkpoint":
+        if ae_cfg is None or not ae_cfg.checkpoint_path:
+            raise ValueError(
+                "action_embedder.type=checkpoint requires action_embedder.checkpoint_path to be set"
+            )
+        action_embedder = CheckpointActionEmbedder(
+            checkpoint_path=ae_cfg.checkpoint_path,
+            device=device,
+            latent_dim=embed_cfg.latent_dim,
+            encode_method=ae_cfg.encode_method,
+        )
+        action_embedder.fit([])
+    else:
+        # Default: gaussian Gaussian normalisation + random projection
+        action_embedder = ActionEmbedder(
+            latent_dim=embed_cfg.latent_dim,
+            seed=seed,
+            norm_min_std=embed_cfg.norm_min_std,
+        )
+        action_embedder.set_precomputed_stats(action_mean, action_std)
+        action_embedder.fit([])
 
     img = embed_cfg.state_image
     state_embedder = StateEmbedder(
@@ -96,7 +155,7 @@ def run_pass2_embed_episodes(
     action_key: str,
     image_key: str,
     loader: CurationLoaderSettings,
-    action_embedder: ActionEmbedder,
+    action_embedder: ActionEmbedder | OATActionEmbedder,
     state_embedder: StateEmbedder,
     *,
     progress: str | None = None,
