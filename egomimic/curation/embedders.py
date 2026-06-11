@@ -368,6 +368,192 @@ class StateEmbedder:
         return np.concatenate(outputs, axis=0)
 
 
+def _last_token_pool(
+    last_hidden_states: torch.Tensor, attention_mask: torch.Tensor
+) -> torch.Tensor:
+    """Last-token pooling (Qwen3 recipe), robust to left/right padding."""
+    left_padded = bool((attention_mask[:, -1].sum() == attention_mask.shape[0]).item())
+    if left_padded:
+        return last_hidden_states[:, -1]
+    seq_lens = attention_mask.sum(dim=1) - 1
+    batch_idx = torch.arange(
+        last_hidden_states.size(0), device=last_hidden_states.device
+    )
+    return last_hidden_states[batch_idx, seq_lens]
+
+
+class LanguageEmbedder:
+    """
+    Frozen text embedder for language-conditioned DemInf curation.
+
+    Supports live Qwen3 embedding from instruction strings or pass-through /
+    projection of precomputed per-frame embeddings stored in zarr.
+
+    Args:
+        source: ``qwen3`` (embed strings) or ``precomputed`` (project float arrays).
+        latent_dim: Output dimensionality (random projection when raw dim is larger).
+        model_name: HuggingFace id for ``source=qwen3``.
+        max_length: Tokenizer truncation for Qwen3.
+        batch_size: Max strings per forward call.
+        dtype: Inference dtype for Qwen3.
+        seed: RNG seed for optional random projection.
+    """
+
+    _QWEN3_DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+
+    def __init__(
+        self,
+        source: str = "qwen3",
+        latent_dim: int = 32,
+        device: str | torch.device = "cpu",
+        model_name: str = _QWEN3_DEFAULT_MODEL,
+        max_length: int = 512,
+        batch_size: int = 64,
+        dtype: str = "float16",
+        seed: int = 42,
+    ) -> None:
+        self.source = source.lower().strip()
+        if self.source not in ("qwen3", "precomputed"):
+            raise ValueError(
+                f"Unknown language source {source!r}; expected 'qwen3' or 'precomputed'"
+            )
+        self.latent_dim = latent_dim
+        self.device = torch.device(device)
+        self.model_name = model_name
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.dtype_name = dtype
+        self._seed = seed
+        self._fitted = False
+        self._proj: np.ndarray | None = None
+        self._raw_dim: int | None = None
+        self._tokenizer: Any | None = None
+        self._model: nn.Module | None = None
+
+    def fit(self, episodes: list | None = None) -> None:
+        """Load Qwen3 (if needed) and build optional random projection."""
+        if self.source == "qwen3":
+            try:
+                from transformers import AutoModel, AutoTokenizer
+            except ImportError as exc:
+                raise ImportError(
+                    "transformers is required for language source=qwen3"
+                ) from exc
+
+            dtype = _parse_torch_dtype(self.dtype_name)
+            logger.info("LanguageEmbedder: loading Qwen3 %s", self.model_name)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model_name, padding_side="left"
+            )
+            self._model = AutoModel.from_pretrained(
+                self.model_name, torch_dtype=dtype
+            )
+            self._model.to(self.device).eval()
+            for p in self._model.parameters():
+                p.requires_grad_(False)
+            self._raw_dim = int(self._model.config.hidden_size)
+        else:
+            self._raw_dim = None
+            self._proj = None
+
+        if self.source == "qwen3":
+            assert self._raw_dim is not None
+            out_dim = min(self._raw_dim, self.latent_dim)
+            self._proj = _build_random_projection(
+                self._raw_dim, self.latent_dim, seed=self._seed
+            )
+            logger.info(
+                "LanguageEmbedder (qwen3): raw_dim=%d → latent_dim=%d (proj=%s)",
+                self._raw_dim,
+                out_dim,
+                self._proj is not None,
+            )
+        else:
+            logger.info(
+                "LanguageEmbedder (precomputed): projection built on first embed()"
+            )
+        self._fitted = True
+
+    def embed(self, data: np.ndarray | list[str]) -> np.ndarray:
+        """
+        Embed language inputs.
+
+        Args:
+            data: For ``qwen3``: length-N list of instruction strings (or (N,) object
+                array). For ``precomputed``: (N, D) float32 array.
+
+        Returns:
+            (N, latent_dim) float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        if self.source == "qwen3":
+            if isinstance(data, np.ndarray):
+                texts = [str(x) for x in data.reshape(-1)]
+            else:
+                texts = [str(x) for x in data]
+            if not texts:
+                return np.empty((0, self.latent_dim), dtype=np.float32)
+            return self._embed_texts(texts)
+        return self._embed_precomputed(np.asarray(data, dtype=np.float32))
+
+    @torch.no_grad()
+    def _embed_texts(self, texts: list[str]) -> np.ndarray:
+        assert self._model is not None and self._tokenizer is not None
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            tokens = self._tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            ).to(self.device)
+            hidden = self._model(**tokens).last_hidden_state
+            pooled = _last_token_pool(hidden, tokens["attention_mask"])
+            pooled = torch.nn.functional.normalize(pooled.float(), p=2, dim=1)
+            emb = pooled.cpu().numpy()
+            if self._proj is not None:
+                emb = emb @ self._proj
+            outputs.append(emb.astype(np.float32))
+        elapsed = time.perf_counter() - t0
+        result = np.concatenate(outputs, axis=0)
+        logger.info(
+            "[language] Qwen3 embed: %d strings in %.2fs (%.0f/s)",
+            len(texts),
+            elapsed,
+            len(texts) / elapsed if elapsed > 0 else 0,
+        )
+        return result
+
+    def _embed_precomputed(self, data: np.ndarray) -> np.ndarray:
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        if len(data) == 0:
+            return np.empty((0, self.latent_dim), dtype=np.float32)
+        in_dim = data.shape[1]
+        if self._raw_dim is None:
+            self._raw_dim = in_dim
+            self._proj = _build_random_projection(
+                in_dim, self.latent_dim, seed=self._seed
+            )
+            logger.info(
+                "LanguageEmbedder (precomputed): in_dim=%d → latent_dim=%d (proj=%s)",
+                in_dim,
+                min(in_dim, self.latent_dim),
+                self._proj is not None,
+            )
+        elif in_dim != self._raw_dim:
+            raise ValueError(
+                f"precomputed language dim {in_dim} != expected {self._raw_dim}"
+            )
+        if self._proj is not None:
+            return (data @ self._proj).astype(np.float32)
+        return data[:, : self.latent_dim].astype(np.float32)
+
+
 class OATActionEmbedder:
     """Action embedder backed by a trained OAT tokenizer checkpoint.
 

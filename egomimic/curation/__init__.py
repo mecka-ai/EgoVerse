@@ -3,18 +3,21 @@
 from egomimic.curation.config import (
     CurationLoaderSettings,
     EmbedderSettings,
+    LanguageConditioningSettings,
     StateImageSettings,
     apply_curation_seed,
     load_action_norm_stats,
     select_curation_loader,
     select_embedder_settings,
+    select_language_conditioning_settings,
     select_seed,
     select_state_image_settings,
     select_tensor_keys,
 )
-from egomimic.curation.embedders import ActionEmbedder, StateEmbedder
+from egomimic.curation.embedders import ActionEmbedder, LanguageEmbedder, StateEmbedder
 from egomimic.curation.episode_pipeline import (
     build_embedders,
+    build_language_embedder,
     run_pass2_embed_episodes,
 )
 from egomimic.curation.ksg import ksg_mi, ksg_mi_averaged
@@ -28,18 +31,22 @@ __all__ = [
     "ActionEmbedder",
     "CurationLoaderSettings",
     "EmbedderSettings",
+    "LanguageConditioningSettings",
+    "LanguageEmbedder",
     "StateImageSettings",
     "apply_curation_seed",
     "StateEmbedder",
     "TrajectoryScorer",
     "aggregate_scores",
     "build_embedders",
+    "build_language_embedder",
     "ksg_mi",
     "ksg_mi_averaged",
     "load_action_norm_stats",
     "run_pass2_embed_episodes",
     "select_curation_loader",
     "select_embedder_settings",
+    "select_language_conditioning_settings",
     "select_seed",
     "select_state_image_settings",
     "select_tensor_keys",

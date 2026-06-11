@@ -74,6 +74,30 @@ class ActionEmbedderSettings:
 
 
 @dataclass(frozen=True)
+class LanguageConditioningSettings:
+    """
+    Language-conditioned DemInf scoring (``model.language_conditioning``).
+
+    When ``enabled=false``, curation uses I(S; A) as before.
+
+    When enabled, ``mode`` selects the estimator:
+      ``concat``     — I(S, L; A): concatenate state + language latents, one KSG pass.
+      ``stratified`` — I(S; A | L): partition timesteps by instruction text, KSG
+                       within each language cluster, then assign per-sample MI.
+    """
+
+    enabled: bool = False
+    mode: str = "concat"
+    source: str = "qwen3"
+    language_key: str = "annotations"
+    model_name: str = "Qwen/Qwen3-Embedding-0.6B"
+    max_length: int = 512
+    batch_size: int = 64
+    dtype: str = "float16"
+    stratified_min_cluster_size: int = 10
+
+
+@dataclass(frozen=True)
 class EmbedderSettings:
     """Model embedder settings (``model.*``)."""
 
@@ -83,6 +107,9 @@ class EmbedderSettings:
     state_image: StateImageSettings = field(default_factory=StateImageSettings)
     action_embedder: ActionEmbedderSettings = field(
         default_factory=ActionEmbedderSettings
+    )
+    language_conditioning: LanguageConditioningSettings = field(
+        default_factory=LanguageConditioningSettings
     )
 
 
@@ -200,6 +227,40 @@ def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
     )
 
 
+def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSettings:
+    """Read ``model.language_conditioning``; disabled when block is absent."""
+    block = OmegaConf.select(cfg, "model.language_conditioning", default=None)
+    if block is None:
+        return LanguageConditioningSettings()
+    enabled = bool(block.get("enabled", False))
+    mode = str(block.get("mode", "concat")).lower().strip()
+    if mode not in ("concat", "stratified"):
+        raise ValueError(
+            f"model.language_conditioning.mode must be 'concat' or 'stratified', got {mode!r}"
+        )
+    source = str(block.get("source", "qwen3")).lower().strip()
+    if source not in ("qwen3", "precomputed"):
+        raise ValueError(
+            f"model.language_conditioning.source must be 'qwen3' or 'precomputed', "
+            f"got {source!r}"
+        )
+    qwen3 = block.get("qwen3", {}) or {}
+    defaults = LanguageConditioningSettings()
+    return LanguageConditioningSettings(
+        enabled=enabled,
+        mode=mode,
+        source=source,
+        language_key=str(block.get("language_key", defaults.language_key)),
+        model_name=str(qwen3.get("model_name", block.get("model_name", defaults.model_name))),
+        max_length=int(qwen3.get("max_length", block.get("max_length", defaults.max_length))),
+        batch_size=int(qwen3.get("batch_size", block.get("batch_size", defaults.batch_size))),
+        dtype=str(qwen3.get("dtype", block.get("dtype", defaults.dtype))),
+        stratified_min_cluster_size=int(
+            block.get("stratified_min_cluster_size", defaults.stratified_min_cluster_size)
+        ),
+    )
+
+
 def select_embedder_settings(cfg: Any) -> EmbedderSettings:
     """Read embedder settings from ``model`` config."""
     return EmbedderSettings(
@@ -210,6 +271,7 @@ def select_embedder_settings(cfg: Any) -> EmbedderSettings:
         ),
         state_image=select_state_image_settings(cfg),
         action_embedder=select_action_embedder_settings(cfg),
+        language_conditioning=select_language_conditioning_settings(cfg),
     )
 
 

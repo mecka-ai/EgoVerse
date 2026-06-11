@@ -16,7 +16,10 @@ from scipy.special import digamma
 
 from omegaconf import OmegaConf
 
-from egomimic.curation.config import select_seed
+from egomimic.curation.config import (
+    select_language_conditioning_settings,
+    select_seed,
+)
 from egomimic.curation.ksg import ksg_mi_averaged
 
 logger = logging.getLogger(__name__)
@@ -49,6 +52,7 @@ def aggregate_scores(
 def trajectory_scorer_from_cfg(cfg: Any) -> "TrajectoryScorer":
     """Build a TrajectoryScorer from a composed Hydra ``curate`` config."""
     ksg = OmegaConf.select(cfg, "model.ksg", default={}) or {}
+    lang = select_language_conditioning_settings(cfg)
     return TrajectoryScorer(
         k_range=tuple(int(k) for k in ksg.get("k_range", [3, 7])),
         n_threads=int(ksg.get("n_threads", 12)),
@@ -56,16 +60,42 @@ def trajectory_scorer_from_cfg(cfg: Any) -> "TrajectoryScorer":
         chunked_max_points=_optional_ksg_int(ksg.get("chunked_max_points")),
         batch_size=int(ksg.get("batch_size", 10_000)),
         seed=select_seed(cfg),
+        language_enabled=lang.enabled,
+        language_mode=lang.mode,
+        stratified_min_cluster_size=lang.stratified_min_cluster_size,
     )
+
+
+def _flatten_language_labels(
+    language_texts_by_episode: list[list[str]] | None,
+    language_latents_by_episode: list[np.ndarray] | None,
+) -> list[str]:
+    """Build one label per timestep for stratified KSG."""
+    if language_texts_by_episode:
+        labels: list[str] = []
+        for texts in language_texts_by_episode:
+            labels.extend(texts)
+        return labels
+    if language_latents_by_episode:
+        labels = []
+        for lat in language_latents_by_episode:
+            for row in lat:
+                labels.append(row.tobytes())
+        return labels
+    return []
 
 
 class TrajectoryScorer:
     """
     KSG mutual-information scoring over pre-embedded (state, action) latents.
 
+    With ``language_enabled``, estimates either I(S, L; A) (``language_mode=concat``)
+    or I(S; A | L) (``language_mode=stratified``).
+
     When ``chunked_threshold`` and ``chunked_max_points`` are both set, uses
     approximate subsampled KSG above the threshold. When either is ``null``,
-    always uses exact KSG on all points.
+    always uses exact KSG on all points. Chunked mode is disabled when language
+    conditioning is enabled.
     """
 
     def __init__(
@@ -77,6 +107,9 @@ class TrajectoryScorer:
         batch_size: int = 10_000,
         seed: int = 42,
         noise_scale: float = 1e-10,
+        language_enabled: bool = False,
+        language_mode: str = "concat",
+        stratified_min_cluster_size: int = 10,
     ) -> None:
         self.k_range = k_range
         self.n_threads = n_threads
@@ -85,6 +118,9 @@ class TrajectoryScorer:
         self.batch_size = batch_size
         self.seed = seed
         self.noise_scale = noise_scale
+        self.language_enabled = language_enabled
+        self.language_mode = language_mode
+        self.stratified_min_cluster_size = stratified_min_cluster_size
 
     def score_latents(
         self,
@@ -92,9 +128,16 @@ class TrajectoryScorer:
         action_latents: np.ndarray,
         episode_hashes: list[str],
         lengths: list[int],
+        language_latents: np.ndarray | None = None,
+        language_texts_by_episode: list[list[str]] | None = None,
+        language_latents_by_episode: list[np.ndarray] | None = None,
     ) -> dict[str, float]:
         """
         Score episodes from stacked (T, latent_dim) state/action embeddings.
+
+        When ``language_enabled``, pass ``language_latents`` with the same leading
+        dimension as ``state_latents``. For ``language_mode=stratified``, also pass
+        per-episode instruction strings (or per-episode language latent arrays).
 
         Returns:
             ``{episode_hash: mean_mi}`` per episode.
@@ -105,16 +148,33 @@ class TrajectoryScorer:
         n_episodes = len(episode_hashes)
 
         logger.info(
-            "score_latents: %d episodes, %d total timesteps, state_dim=%d, action_dim=%d",
-            n_episodes, n_total, s_all.shape[1], a_all.shape[1],
+            "score_latents: %d episodes, %d total timesteps, state_dim=%d, action_dim=%d, "
+            "language=%s",
+            n_episodes,
+            n_total,
+            s_all.shape[1],
+            a_all.shape[1],
+            self.language_mode if self.language_enabled else "off",
         )
 
         if n_total < 2:
             logger.warning("score_latents: not enough timesteps (%d) — returning nan", n_total)
             return {h: float("nan") for h in episode_hashes}
 
+        if self.language_enabled:
+            if language_latents is None:
+                raise ValueError(
+                    "language_latents required when model.language_conditioning.enabled=true"
+                )
+            l_all = np.asarray(language_latents, dtype=np.float64)
+            if l_all.shape[0] != n_total:
+                raise ValueError(
+                    f"language_latents length {l_all.shape[0]} != state length {n_total}"
+                )
+
         use_chunked = (
-            self.chunked_threshold is not None
+            not self.language_enabled
+            and self.chunked_threshold is not None
             and self.chunked_max_points is not None
             and n_total > self.chunked_threshold
         )
@@ -125,24 +185,87 @@ class TrajectoryScorer:
         )
 
         t0 = time.perf_counter()
-        if use_chunked:
+        if self.language_enabled:
+            assert language_latents is not None
+            l_all = np.asarray(language_latents, dtype=np.float64)
+            if self.language_mode == "concat":
+                x_all = np.hstack([s_all, l_all])
+                mi = self._ksg_exact(x_all, a_all)
+            else:
+                labels = _flatten_language_labels(
+                    language_texts_by_episode, language_latents_by_episode
+                )
+                if len(labels) != n_total:
+                    raise ValueError(
+                        f"stratified language labels length {len(labels)} != {n_total}"
+                    )
+                mi = self._mi_stratified(s_all, a_all, labels)
+        elif use_chunked:
             mi = self._mi_chunked(s_all, a_all)
         else:
-            mi = ksg_mi_averaged(
-                s_all,
-                a_all,
-                k_range=self.k_range,
-                noise_scale=self.noise_scale,
-                n_workers=self.n_threads,
-                batch_threshold=self.batch_size,
-                batch_size=self.batch_size,
-                seed=self.seed,
-            )
+            mi = self._ksg_exact(s_all, a_all)
         logger.info("KSG scoring took %.2fs for %d timesteps", time.perf_counter() - t0, n_total)
 
         scores = aggregate_scores(mi, episode_hashes, lengths)
         _log_score_stats(scores)
         return scores
+
+    def _ksg_exact(self, x_all: np.ndarray, a_all: np.ndarray) -> np.ndarray:
+        return ksg_mi_averaged(
+            x_all,
+            a_all,
+            k_range=self.k_range,
+            noise_scale=self.noise_scale,
+            n_workers=self.n_threads,
+            batch_threshold=self.batch_size,
+            batch_size=self.batch_size,
+            seed=self.seed,
+        )
+
+    def _mi_stratified(
+        self,
+        s_all: np.ndarray,
+        a_all: np.ndarray,
+        labels: list[str] | list[bytes],
+    ) -> np.ndarray:
+        """I(S; A | L): KSG within each language cluster, NaN for small clusters."""
+        n_total = len(s_all)
+        mi = np.full(n_total, np.nan, dtype=np.float64)
+        k_max = self.k_range[1]
+        min_size = max(self.stratified_min_cluster_size, k_max + 1)
+
+        clusters: dict[str | bytes, list[int]] = {}
+        for idx, label in enumerate(labels):
+            clusters.setdefault(label, []).append(idx)
+
+        logger.info(
+            "Stratified KSG: %d language clusters (min_cluster_size=%d)",
+            len(clusters),
+            min_size,
+        )
+
+        n_scored = 0
+        for label, indices in clusters.items():
+            if len(indices) < min_size:
+                logger.debug(
+                    "Skipping language cluster size=%d (< %d): %r",
+                    len(indices),
+                    min_size,
+                    label[:80] if isinstance(label, str) else label,
+                )
+                continue
+            idx = np.asarray(indices, dtype=np.int64)
+            cluster_mi = self._ksg_exact(s_all[idx], a_all[idx])
+            mi[idx] = cluster_mi
+            n_scored += len(indices)
+
+        logger.info(
+            "Stratified KSG: scored %d / %d timesteps across %d clusters",
+            n_scored,
+            n_total,
+            sum(1 for idx in clusters.values() if len(idx) >= min_size),
+        )
+        return mi
 
     def _mi_chunked(self, s_all: np.ndarray, a_all: np.ndarray) -> np.ndarray:
         """Approximate KSG via a subsampled reference set (large N)."""

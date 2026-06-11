@@ -101,33 +101,86 @@ def build_embedders(
     return action_embedder, state_embedder
 
 
+def build_language_embedder(
+    embed_cfg: EmbedderSettings,
+    device: Any,
+    seed: int,
+) -> LanguageEmbedder | None:
+    """Construct a fitted language embedder when conditioning is enabled."""
+    lang_cfg = embed_cfg.language_conditioning
+    if not lang_cfg.enabled:
+        return None
+    language_embedder = LanguageEmbedder(
+        source=lang_cfg.source,
+        latent_dim=embed_cfg.latent_dim,
+        device=device,
+        model_name=lang_cfg.model_name,
+        max_length=lang_cfg.max_length,
+        batch_size=lang_cfg.batch_size,
+        dtype=lang_cfg.dtype,
+        seed=seed,
+    )
+    language_embedder.fit([])
+    return language_embedder
+
+
+def _concat_language_batch(
+    parts: list[np.ndarray | list[str]],
+) -> np.ndarray | list[str]:
+    if not parts:
+        raise ValueError("empty language batch")
+    if isinstance(parts[0], str) or (
+        isinstance(parts[0], np.ndarray) and parts[0].dtype == object
+    ):
+        out: list[str] = []
+        for part in parts:
+            if isinstance(part, list):
+                out.extend(part)
+            else:
+                out.extend(str(x) for x in part.reshape(-1))
+        return out
+    return np.concatenate([np.asarray(p, dtype=np.float32) for p in parts], axis=0)
+
+
 def _load_episode(
-    item: tuple[str, "ZarrDataset", str, str, int],
-) -> tuple[str, np.ndarray | None, np.ndarray | None]:
+    item: tuple[str, "ZarrDataset", str, str, int, str | None, bool],
+) -> tuple[str, np.ndarray | None, np.ndarray | None, np.ndarray | list[str] | None]:
     """Load and decode one episode (CPU-only, runs in thread pool)."""
-    episode_hash, zarr_ds, action_key, image_key, image_decode_workers = item
+    (
+        episode_hash,
+        zarr_ds,
+        action_key,
+        image_key,
+        image_decode_workers,
+        language_key,
+        language_precomputed,
+    ) = item
     t0 = time.perf_counter()
     try:
-        actions, images = zarr_ds.collect_curation_episode(
+        actions, images, language = zarr_ds.collect_curation_episode(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
+            language_key=language_key,
+            language_precomputed=language_precomputed,
         )
         if actions is None or images is None:
             logger.debug("episode %s: skip (None data returned)", episode_hash[:8])
-            return episode_hash, None, None
+            return episode_hash, None, None, None
         t = actions.shape[0]
         flat_actions = actions.reshape(t, -1).astype(np.float32)
         img_f32 = images.astype(np.float32)
         elapsed = time.perf_counter() - t0
         logger.debug(
-            "episode %s loaded in %.2fs: images %s dtype=%s | actions %s dtype=%s",
-            episode_hash[:8], elapsed,
-            img_f32.shape, img_f32.dtype,
-            flat_actions.shape, flat_actions.dtype,
+            "episode %s loaded in %.2fs: images %s | actions %s | language=%s",
+            episode_hash[:8],
+            elapsed,
+            img_f32.shape,
+            flat_actions.shape,
+            type(language).__name__ if language is not None else None,
         )
         del actions, images
-        return episode_hash, flat_actions, img_f32
+        return episode_hash, flat_actions, img_f32, language
     finally:
         _release_episode_cache(zarr_ds)
 
@@ -140,9 +193,18 @@ def run_pass2_embed_episodes(
     loader: CurationLoaderSettings,
     action_embedder: ActionEmbedder | OATActionEmbedder,
     state_embedder: StateEmbedder,
+    language_embedder: LanguageEmbedder | None = None,
+    language_cfg: LanguageConditioningSettings | None = None,
     *,
     progress: str | None = None,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[int]]:
+) -> tuple[
+    list[np.ndarray],
+    list[np.ndarray],
+    list[str],
+    list[int],
+    list[np.ndarray],
+    list[list[str]],
+]:
     """
     Pass 2: producer-consumer pipeline.
 
@@ -159,10 +221,27 @@ def run_pass2_embed_episodes(
         the buffer. Loading and embedding run concurrently — the GPU never waits
         for a full episode chunk to finish loading.
 
-    Returns ``(state_latents, action_latents, episode_hashes, ep_lengths)``.
+    Returns
+    -------
+    state_latents, action_latents, episode_hashes, ep_lengths,
+    language_latents, language_texts
+
+    ``language_latents`` / ``language_texts`` (per-episode instruction strings) are
+    empty when conditioning is off.
     """
+    use_language = language_embedder is not None and language_cfg is not None
+    lang_key = language_cfg.language_key if use_language else None
+    lang_precomputed = bool(use_language and language_cfg.source == "precomputed")
     items = [
-        (h, episodes[h], action_key, image_key, loader.pass2_image_decode_workers)
+        (
+            h,
+            episodes[h],
+            action_key,
+            image_key,
+            loader.pass2_image_decode_workers,
+            lang_key,
+            lang_precomputed,
+        )
         for h in episodes
         if h in scored_hashes
     ]
@@ -206,6 +285,8 @@ def run_pass2_embed_episodes(
     # ------------------------------------------------------------------
     state_latents: list[np.ndarray] = []
     action_latents: list[np.ndarray] = []
+    language_latents: list[np.ndarray] = []
+    language_texts: list[list[str]] = []
     hashes: list[str] = []
     ep_lengths: list[int] = []
     n_skipped = 0
@@ -214,7 +295,8 @@ def run_pass2_embed_episodes(
     # Frame buffer: whole episodes queued here before embedding
     buf_imgs: list[np.ndarray] = []
     buf_acts: list[np.ndarray] = []
-    buf_ep_meta: list[tuple[str, int]] = []  # (hash, n_frames) in order
+    buf_lang: list[np.ndarray | list[str]] = []
+    buf_ep_meta: list[tuple[str, int, list[str] | None]] = []  # (hash, n_frames, texts)
     buf_n_frames = 0
 
     def _flush() -> None:
@@ -224,19 +306,26 @@ def run_pass2_embed_episodes(
 
         all_images = np.concatenate(buf_imgs, axis=0)
         all_actions = np.concatenate(buf_acts, axis=0)
+        all_language = _concat_language_batch(buf_lang) if use_language else None
         n = all_images.shape[0]
         n_batches = math.ceil(n / global_bs)
         t_flush = time.perf_counter()
 
         logger.info(
             "flush: %d frames from %d episodes → %d frame-batch(es) of %d "
-            "| [images] %s | [actions] %s",
-            n, len(buf_ep_meta), n_batches, global_bs,
-            all_images.shape, all_actions.shape,
+            "| [images] %s | [actions] %s | [language] %s",
+            n,
+            len(buf_ep_meta),
+            n_batches,
+            global_bs,
+            all_images.shape,
+            all_actions.shape,
+            len(all_language) if isinstance(all_language, list) else getattr(all_language, "shape", None),
         )
 
         s_parts: list[np.ndarray] = []
         a_parts: list[np.ndarray] = []
+        l_parts: list[np.ndarray] = []
         for batch_idx, start in enumerate(range(0, n, global_bs)):
             end = min(start + global_bs, n)
             img_batch = all_images[start:end]
@@ -255,10 +344,20 @@ def run_pass2_embed_episodes(
             logger.info("    [actions] → %s in %.2fs", a.shape, t_act - t_img)
             s_parts.append(s)
             a_parts.append(a)
+            if use_language and language_embedder is not None and all_language is not None:
+                if isinstance(all_language, list):
+                    lang_batch = all_language[start:end]
+                else:
+                    lang_batch = all_language[start:end]
+                l = language_embedder.embed(lang_batch)
+                t_lang = time.perf_counter()
+                logger.info("    [language] → %s in %.2fs", l.shape, t_lang - t_act)
+                l_parts.append(l)
 
         del all_images, all_actions
         s_all = np.concatenate(s_parts, axis=0)
         a_all = np.concatenate(a_parts, axis=0)
+        l_all = np.concatenate(l_parts, axis=0) if l_parts else None
 
         elapsed_flush = time.perf_counter() - t_flush
         logger.info(
@@ -268,15 +367,20 @@ def run_pass2_embed_episodes(
 
         # Scatter latents back to per-episode slices
         offset = 0
-        for h, ep_n in buf_ep_meta:
+        for h, ep_n, ep_texts in buf_ep_meta:
             state_latents.append(s_all[offset : offset + ep_n])
             action_latents.append(a_all[offset : offset + ep_n])
+            if l_all is not None:
+                language_latents.append(l_all[offset : offset + ep_n])
+            if ep_texts is not None:
+                language_texts.append(ep_texts)
             hashes.append(h)
             ep_lengths.append(ep_n)
             offset += ep_n
 
         buf_imgs.clear()
         buf_acts.clear()
+        buf_lang.clear()
         buf_ep_meta.clear()
         buf_n_frames = 0
 
@@ -291,7 +395,7 @@ def run_pass2_embed_episodes(
         if item is None:  # sentinel: producer finished
             break
 
-        ep_hash, flat_actions, img_f32 = item
+        ep_hash, flat_actions, img_f32, language = item
         if pbar is not None:
             pbar.update(1)
 
@@ -299,11 +403,20 @@ def run_pass2_embed_episodes(
             n_skipped += 1
             logger.debug("episode %s: skipped", ep_hash[:8])
             continue
+        if use_language and language is None:
+            n_skipped += 1
+            logger.debug("episode %s: skipped (missing language)", ep_hash[:8])
+            continue
 
         n_ep = img_f32.shape[0]
         buf_imgs.append(img_f32)
         buf_acts.append(flat_actions)
-        buf_ep_meta.append((ep_hash, n_ep))
+        ep_texts: list[str] | None = None
+        if use_language and language is not None:
+            buf_lang.append(language)
+            if isinstance(language, list):
+                ep_texts = list(language)
+        buf_ep_meta.append((ep_hash, n_ep, ep_texts))
         buf_n_frames += n_ep
         logger.debug(
             "received episode %s: %d frames (buffer: %d frames, %d eps)",
@@ -329,4 +442,4 @@ def run_pass2_embed_episodes(
         n_frames_total / elapsed if elapsed > 0 else 0,
     )
 
-    return state_latents, action_latents, hashes, ep_lengths
+    return state_latents, action_latents, hashes, ep_lengths, language_latents, language_texts

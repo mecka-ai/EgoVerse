@@ -23,6 +23,9 @@
 #   data.curation_loader.mecka_bimanual.global_frame_batch_size=256
 #   model.ksg.chunked_threshold=100000 model.ksg.chunked_max_points=100000
 #   max_episodes_per_shard=200
+#   model.language_conditioning.enabled=true
+#   model.language_conditioning.mode=concat      # I(S,L;A)
+#   model.language_conditioning.mode=stratified  # I(S;A|L)
 
 defaults:
   - model: deminf_default

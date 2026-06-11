@@ -32,6 +32,23 @@ precomputed_norm_stats:
   path: precomputed_norm_stats/mecka_all_zarr
   embodiment_id: "9"
 
+# Language-conditioned DemInf (optional). When enabled=false, scores I(S; A).
+# mode=concat:     I(S, L; A) — concatenate state + language latents for KSG.
+# mode=stratified: I(S; A | L) — KSG within each instruction cluster.
+# source=qwen3:       embed annotation text live with Qwen3-Embedding-0.6B.
+# source=precomputed: read per-frame embeddings from language_key in zarr.
+language_conditioning:
+  enabled: false
+  mode: concat  # concat | stratified
+  source: qwen3  # qwen3 | precomputed
+  language_key: annotations
+  stratified_min_cluster_size: 10
+  qwen3:
+    model_name: Qwen/Qwen3-Embedding-0.6B
+    max_length: 512
+    batch_size: 64
+    dtype: float16
+
 # Pass 3: KSG on concatenated episode latents (CPU).
 ksg:
   n_threads: 12

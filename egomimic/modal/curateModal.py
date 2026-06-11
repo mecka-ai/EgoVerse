@@ -149,7 +149,7 @@ def _embed_task_shard(
     git_commit: str,
     hydra_args: tuple[str, ...],
     hf_token: str = "",
-) -> tuple[int, list, list, list[str], list[int]]:
+) -> tuple[int, list, list, list, list[str], list[int], list[list[str]]]:
     """
     GPU embed worker for one shard of ≤ max_episodes_per_shard episodes.
 
@@ -158,7 +158,7 @@ def _embed_task_shard(
 
     Returns
     -------
-    (shard_idx, state_latents, action_latents, hashes, ep_lengths)
+    (shard_idx, state_latents, action_latents, language_latents, hashes, ep_lengths, language_texts)
     where state_latents / action_latents are lists of per-episode (T, D) arrays.
     """
     import shutil
@@ -218,7 +218,7 @@ def _embed_task_shard(
     if not all_episodes:
         print(f"{tag} No episodes loaded — returning empty shard")
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        return shard_idx, [], [], [], []
+        return shard_idx, [], [], [], [], [], []
 
     from egomimic.curation.config import (
         apply_curation_seed,
@@ -227,7 +227,11 @@ def _embed_task_shard(
         select_seed,
         select_tensor_keys,
     )
-    from egomimic.curation.episode_pipeline import build_embedders, run_pass2_embed_episodes
+    from egomimic.curation.episode_pipeline import (
+        build_embedders,
+        build_language_embedder,
+        run_pass2_embed_episodes,
+    )
 
     apply_curation_seed(select_seed(cfg))
     embed_cfg = select_embedder_settings(cfg)
@@ -244,15 +248,27 @@ def _embed_task_shard(
         select_seed(cfg),
         global_frame_batch_size=loader_cfg.global_frame_batch_size,
     )
+    language_embedder = build_language_embedder(
+        embed_cfg, device, select_seed(cfg)
+    )
+    lang_cfg = embed_cfg.language_conditioning
     print(
         f"{tag} Embedders ready in {_time.perf_counter() - t_embed_build:.2f}s — "
         f"backbone={embed_cfg.state_image.backbone}, device={device}, "
-        f"global_frame_batch={loader_cfg.global_frame_batch_size}"
+        f"global_frame_batch={loader_cfg.global_frame_batch_size}, "
+        f"language={lang_cfg.mode if lang_cfg.enabled else 'off'}"
     )
 
     t_pass2 = _time.perf_counter()
     try:
-        state_latents, action_latents, hashes, ep_lengths = run_pass2_embed_episodes(
+        (
+            state_latents,
+            action_latents,
+            hashes,
+            ep_lengths,
+            language_latents,
+            language_texts,
+        ) = run_pass2_embed_episodes(
             all_episodes,
             set(all_episodes.keys()),
             action_key,
@@ -260,6 +276,8 @@ def _embed_task_shard(
             loader_cfg,
             action_embedder,
             state_embedder,
+            language_embedder=language_embedder,
+            language_cfg=lang_cfg if lang_cfg.enabled else None,
             progress=f"{tag} embed",
         )
     finally:
@@ -271,7 +289,15 @@ def _embed_task_shard(
         f"{len(hashes)} episodes, {n_frames} frames"
     )
     print(f"{tag} Shard total: {_time.perf_counter() - t_shard_start:.2f}s")
-    return shard_idx, state_latents, action_latents, hashes, ep_lengths
+    return (
+        shard_idx,
+        state_latents,
+        action_latents,
+        language_latents,
+        hashes,
+        ep_lengths,
+        language_texts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -388,10 +414,10 @@ def _score_task_split(
     for shard_idx, handle in handles:
         t_shard = _time.perf_counter()
         try:
-            idx, s_lats, a_lats, hashes, lengths = handle.get(
+            idx, s_lats, a_lats, l_lats, hashes, lengths, lang_texts = handle.get(
                 timeout=CFG.timeout_seconds
             )
-            results_by_idx[idx] = (s_lats, a_lats, hashes, lengths)
+            results_by_idx[idx] = (s_lats, a_lats, l_lats, hashes, lengths, lang_texts)
             print(
                 f"{tag}[shard {shard_idx}] collected: {len(hashes)} episodes, "
                 f"{sum(lengths)} frames in {_time.perf_counter() - t_shard:.2f}s"
@@ -404,12 +430,16 @@ def _score_task_split(
 
     state_latents: list = []
     action_latents: list = []
+    language_latents: list = []
+    language_texts: list[list[str]] = []
     scored_hashes: list[str] = []
     ep_lengths: list[int] = []
     for idx in sorted(results_by_idx):
-        s_lats, a_lats, hashes, lengths = results_by_idx[idx]
+        s_lats, a_lats, l_lats, hashes, lengths, lang_texts = results_by_idx[idx]
         state_latents.extend(s_lats)
         action_latents.extend(a_lats)
+        language_latents.extend(l_lats)
+        language_texts.extend(lang_texts)
         scored_hashes.extend(hashes)
         ep_lengths.extend(lengths)
 
@@ -485,16 +515,27 @@ def _score_task_split(
     t_concat = _time.perf_counter()
     s_all = _np.concatenate(state_latents, axis=0)
     a_all = _np.concatenate(action_latents, axis=0)
-    del state_latents, action_latents
+    language_latents_by_ep = list(language_latents) if language_latents else None
+    l_all = _np.concatenate(language_latents, axis=0) if language_latents else None
+    del state_latents, action_latents, language_latents
     print(
         f"{tag} Latent concat: state={s_all.shape}, action={a_all.shape}, "
+        f"language={None if l_all is None else l_all.shape}, "
         f"{_time.perf_counter() - t_concat:.2f}s"
     )
 
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
-    scores = scorer.score_latents(s_all, a_all, scored_hashes, ep_lengths)
-    del s_all, a_all
+    scores = scorer.score_latents(
+        s_all,
+        a_all,
+        scored_hashes,
+        ep_lengths,
+        language_latents=l_all,
+        language_texts_by_episode=language_texts or None,
+        language_latents_by_episode=language_latents_by_ep,
+    )
+    del s_all, a_all, l_all
     print(
         f"{tag} KSG done in {_time.perf_counter() - t_ksg:.2f}s — "
         f"scored {len(scores)} episodes ({n_total} timesteps)"

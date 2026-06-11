@@ -2105,6 +2105,46 @@ class ZarrDataset(torch.utils.data.Dataset):
                 return key
         return next(iter(self.key_map))
 
+    def _ensure_zarr_key_cached(self, zarr_key: str) -> None:
+        """Load one zarr array into ``_zarr_bulk_cache`` if not already present."""
+        if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
+            return
+        self._ensure_episode_reader()
+        store = self.episode_reader._store
+        if zarr_key not in store:
+            return
+        arr = np.asarray(store[zarr_key][:])
+        if self._zarr_bulk_cache is None:
+            self._zarr_bulk_cache = {}
+        self._zarr_bulk_cache[zarr_key] = arr
+
+    def _curation_language_for_indices(
+        self,
+        logical_valid: np.ndarray,
+        language_key: str,
+        *,
+        precomputed: bool,
+    ) -> np.ndarray | list[str]:
+        """Per-valid-frame language: instruction strings or precomputed (T, D) embeddings."""
+        if precomputed:
+            self._ensure_zarr_key_cached(language_key)
+            if self._zarr_bulk_cache is None or language_key not in self._zarr_bulk_cache:
+                raise KeyError(
+                    f"precomputed language key {language_key!r} missing in episode "
+                    f"{Path(self.episode_path).name}"
+                )
+            arr = self._zarr_bulk_cache[language_key]
+            if self.keep_indices is not None:
+                arr = arr[self.keep_indices]
+            return np.asarray(arr[logical_valid], dtype=np.float32)
+
+        texts: list[str] = []
+        for logical_idx in logical_valid:
+            real_idx = self._logical_to_real_index(int(logical_idx))
+            ann_texts = self._annotation_text_for_frame(real_idx)
+            texts.append(ann_texts[0] if ann_texts else "")
+        return texts
+
     def _collect_curation_batched(
         self,
         action_key: str,
@@ -2112,9 +2152,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         image_decode_workers: int,
         *,
         load_images: bool,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        language_key: str | None = None,
+        language_precomputed: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | list[str] | None]:
         if load_images and image_key not in self.key_map:
-            return None, None
+            return None, None, None
 
         if self.pause_removal_epsilon is not None and self.keep_indices is None:
             self.precompute_pause_filter()
@@ -2122,7 +2164,7 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         n_logical = len(self)
         if n_logical == 0:
-            return None, None
+            return None, None, None
 
         logical_valid = self._curation_valid_logical_indices()
         n_skipped_pose = n_logical - len(logical_valid)
@@ -2134,12 +2176,12 @@ class ZarrDataset(torch.utils.data.Dataset):
                 n_logical,
             )
         if len(logical_valid) == 0:
-            return None, None
+            return None, None, None
 
         batched_in = self._build_batched_transform_batch(logical_valid)
         batched_out, ok_pos = self._apply_transform_list_batched(batched_in)
         if batched_out is None or action_key not in batched_out:
-            return None, None
+            return None, None, None
 
         if len(ok_pos) < len(logical_valid):
             logger.info(
@@ -2152,14 +2194,30 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         actions = np.asarray(batched_out[action_key], dtype=np.float32)
         if actions.ndim < 2:
-            return None, None
+            return None, None, None
+
+        language_data: np.ndarray | list[str] | None = None
+        if language_key is not None:
+            try:
+                language_data = self._curation_language_for_indices(
+                    logical_valid,
+                    language_key,
+                    precomputed=language_precomputed,
+                )
+            except KeyError as exc:
+                logger.warning(
+                    "curation ep=%s: language load failed (%s) — skipping episode",
+                    Path(self.episode_path).name,
+                    exc,
+                )
+                return None, None, None
 
         if not load_images:
-            return actions, None
+            return actions, None, language_data
 
         img_zarr_key = self.key_map[image_key]["zarr_key"]
         if self._zarr_bulk_cache is None or img_zarr_key not in self._zarr_bulk_cache:
-            return None, None
+            return None, None, None
 
         jpeg_frames = self._zarr_bulk_cache[img_zarr_key]
         if self.keep_indices is not None:
@@ -2186,7 +2244,12 @@ class ZarrDataset(torch.utils.data.Dataset):
                 f"action/image length mismatch ep={self.episode_path.name}: "
                 f"{len(actions)} vs {len(images)}"
             )
-        return actions, images
+        if language_data is not None and len(language_data) != len(actions):
+            raise RuntimeError(
+                f"action/language length mismatch ep={self.episode_path.name}: "
+                f"{len(actions)} vs {len(language_data)}"
+            )
+        return actions, images, language_data
 
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
@@ -2212,7 +2275,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         action_key: str = "actions_cartesian",
         image_key: str = "observations.images.front_img_1",
         image_decode_workers: int = 8,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        language_key: str | None = None,
+        language_precomputed: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | list[str] | None]:
         """
         DemInf Pass 2 per episode: bulk zarr read, batched transforms, aligned decode.
 
@@ -2220,16 +2285,21 @@ class ZarrDataset(torch.utils.data.Dataset):
         2. Filter timesteps with invalid/zero quaternions (pose cut rows).
         3. Stack valid rows → run ``transform_list`` in batch (no random fallback).
         4. Decode JPEGs only for surviving logical indices.
+        5. Optionally resolve per-frame language (annotation text or precomputed embed).
 
         Returns:
-            ``(actions, images)`` as ``(T, chunk, D)`` and ``(T, C, H, W)``, or
-            ``(None, None)`` if empty / keys missing.
+            ``(actions, images, language)`` as ``(T, chunk, D)``, ``(T, C, H, W)``, and
+            either a length-T list of instruction strings or ``(T, D)`` precomputed
+            embeddings. Language is ``None`` when ``language_key`` is not set.
+            Returns ``(None, None, None)`` if empty / keys missing.
         """
         return self._collect_curation_batched(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             load_images=True,
+            language_key=language_key,
+            language_precomputed=language_precomputed,
         )
 
     def precompute_pause_filter(self) -> tuple[int, int]:
