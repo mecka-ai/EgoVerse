@@ -43,6 +43,8 @@ class ZipEpisodeResolver(EpisodeResolver):
         debug: int | None = None,
         min_frames: int | None = None,
         seed: int = 42,
+        eps_to_use: str | None = None,
+        eps_to_ignore: str | None = None,
     ):
         super().__init__(
             Path(zip_dir),
@@ -56,6 +58,24 @@ class ZipEpisodeResolver(EpisodeResolver):
         self.debug = debug
         self.min_frames = min_frames
         self.seed = seed
+        # Episode allowlist/denylist: paths to JSON files holding flat lists of
+        # episode hashes (e.g. egomimic/hydra_configs/data/extra/*.json).
+        self.include_hashes: set[str] | None = None
+        if eps_to_use:
+            with open(eps_to_use) as f:
+                self.include_hashes = set(json.load(f))
+            logger.info(
+                "ZipEpisodeResolver: eps_to_use — %d hashes from %s",
+                len(self.include_hashes), eps_to_use,
+            )
+        self.exclude_hashes: set[str] = set()
+        if eps_to_ignore:
+            with open(eps_to_ignore) as f:
+                self.exclude_hashes = set(json.load(f))
+            logger.info(
+                "ZipEpisodeResolver: eps_to_ignore — %d hashes from %s",
+                len(self.exclude_hashes), eps_to_ignore,
+            )
         self._catalog: list[EpisodeCatalogEntry] | None = None
 
     def load_catalog(self) -> list[EpisodeCatalogEntry]:
@@ -92,6 +112,23 @@ class ZipEpisodeResolver(EpisodeResolver):
             logger.warning(
                 "ZipEpisodeResolver: %d catalog entries missing from zip volume (skipped)",
                 n_missing,
+            )
+
+        # Allow/deny lists apply BEFORE debug/min_frames caps, so a capped run
+        # still draws from the pinned subset.
+        if self.include_hashes is not None:
+            before = len(entries)
+            entries = [e for e in entries if e.episode_hash in self.include_hashes]
+            logger.info(
+                "ZipEpisodeResolver: eps_to_use — kept %d/%d episodes (%d allowlisted)",
+                len(entries), before, len(self.include_hashes),
+            )
+        if self.exclude_hashes:
+            before = len(entries)
+            entries = [e for e in entries if e.episode_hash not in self.exclude_hashes]
+            logger.info(
+                "ZipEpisodeResolver: eps_to_ignore — kept %d/%d episodes",
+                len(entries), before,
             )
 
         if self.debug:

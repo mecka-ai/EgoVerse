@@ -1973,7 +1973,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         image_decode_workers: int,
         *,
         load_images: bool,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        proprio_key: str | None = None,
+        frame_stride: int = 1,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict | None]:
         if load_images and image_key not in self.key_map:
             return None, None, None
 
@@ -1994,6 +1996,8 @@ class ZarrDataset(torch.utils.data.Dataset):
                 n_skipped_pose,
                 n_logical,
             )
+        if frame_stride > 1:
+            logical_valid = logical_valid[::frame_stride]
         if len(logical_valid) == 0:
             return None, None, None
 
@@ -2017,14 +2021,31 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         # Raw video-frame index of each surviving row (before pause/pose
         # filtering) — viewers seek the raw MP4 by frame, so exports must use
-        # these rather than positions in the filtered sequence.
+        # these rather than positions in the filtered sequence. The logical
+        # (post pause-filter) indices are kept alongside for consumers that
+        # index back into the filtered sequence (k-NN grading).
         if self.keep_indices is not None:
             raw_frame_idx = np.asarray(self.keep_indices, dtype=np.int64)[logical_valid]
         else:
             raw_frame_idx = np.asarray(logical_valid, dtype=np.int64)
 
+        info: dict = {
+            "frame_idx": np.asarray(logical_valid, dtype=np.int64),
+            "raw_frame_idx": raw_frame_idx,
+            "n_logical": int(n_logical),
+        }
+        if proprio_key is not None:
+            if proprio_key not in batched_out:
+                logger.warning(
+                    "curation ep=%s: proprio key %r missing from transform outputs",
+                    Path(self.episode_path).name,
+                    proprio_key,
+                )
+                return None, None, None
+            info["proprio"] = np.asarray(batched_out[proprio_key], dtype=np.float32)
+
         if not load_images:
-            return actions, None, raw_frame_idx
+            return actions, None, info
 
         img_zarr_key = self.key_map[image_key]["zarr_key"]
         if self._zarr_bulk_cache is None or img_zarr_key not in self._zarr_bulk_cache:
@@ -2055,7 +2076,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 f"action/image length mismatch ep={self.episode_path.name}: "
                 f"{len(actions)} vs {len(images)}"
             )
-        return actions, images, raw_frame_idx
+        return actions, images, info
 
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
@@ -2089,13 +2110,54 @@ class ZarrDataset(torch.utils.data.Dataset):
             video-frame indices (pre pause/pose filtering) is appended — use it
             whenever a row must be mapped back to a video frame.
         """
-        out = self._collect_curation_batched(
+        actions, images, info = self._collect_curation_batched(
             action_key=action_key,
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             load_images=True,
         )
-        return out if return_frame_indices else out[:2]
+        if not return_frame_indices:
+            return actions, images
+        return actions, images, (None if info is None else info["raw_frame_idx"])
+
+    def collect_grading_episode(
+        self,
+        action_key: str = "actions_cartesian",
+        image_key: str = "observations.images.front_img_1",
+        proprio_key: str = "observations.state.ee_pose",
+        image_decode_workers: int = 8,
+        frame_stride: int = 1,
+    ) -> dict | None:
+        """
+        k-NN grading featurise pass: like ``collect_curation_episode`` but also
+        returns proprio and supports frame striding (only every ``frame_stride``-th
+        valid timestep is transformed/decoded; action chunks stay full-rate since
+        chunk windows are gathered from the raw arrays per timestep).
+
+        Returns ``None`` or a dict with:
+            ``actions``   (T, chunk, D) float32
+            ``proprio``   (T, D_prop) float32
+            ``images``    (T, C, H, W) float32
+            ``frame_idx`` (T,) int64 — logical (post pause-filter) indices
+            ``n_logical`` int — logical episode length the indices refer to
+        """
+        actions, images, info = self._collect_curation_batched(
+            action_key=action_key,
+            image_key=image_key,
+            image_decode_workers=image_decode_workers,
+            load_images=True,
+            proprio_key=proprio_key,
+            frame_stride=max(1, int(frame_stride)),
+        )
+        if actions is None or images is None or info is None:
+            return None
+        return {
+            "actions": actions,
+            "proprio": info["proprio"],
+            "images": images,
+            "frame_idx": info["frame_idx"],
+            "n_logical": info["n_logical"],
+        }
 
     def precompute_pause_filter(self) -> tuple[int, int]:
         """Build the per-episode pause keep-mask from raw obs_ee_pose deltas.
@@ -2408,14 +2470,22 @@ class ZarrEpisode:
             ... })
         """
         result = {}
-        for key, (start, end) in keys_with_ranges.items():
+        for key, idx_or_range in keys_with_ranges.items():
             arr = self._store[key]
-            if end is not None:
-                data = arr[start:end]
+            if isinstance(idx_or_range, np.ndarray):
+                # Fancy-index path: an explicit array of frame indices (a fully
+                # pause-filtered action chunk, where __getitem__ gathers
+                # keep_indices directly instead of a contiguous slice).
+                data = arr[idx_or_range]
             else:
-                # Single frame read - use slicing to avoid 0D array issues with VariableLengthBytes
-                # arr[start:start+1] gives us a 1D array, then [0] extracts the actual object
-                data = arr[start : start + 1][0]
+                start, end = idx_or_range
+                if end is not None:
+                    data = arr[start:end]
+                else:
+                    # Single frame read - use slicing to avoid 0D array issues with
+                    # VariableLengthBytes. arr[start:start+1] gives a 1D array, then
+                    # [0] extracts the actual object.
+                    data = arr[start : start + 1][0]
             result[key] = data
         return result
 

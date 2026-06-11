@@ -1,0 +1,88 @@
+# Cross-episode k-NN action-consistency grading on Modal.
+#
+#   python egomimic/modal/knnGradeModal.py name=<run> description=<desc>
+#
+# Pipeline (per task):
+#   Featurize — episodes missing from the npz cache are sharded into chunks of
+#               ≤ max_episodes_per_shard and embedded in parallel GPU containers
+#               (frame stride, pooled DINOv3 features, action chunks, proprio).
+#               Cache: knn_grading/features/<feature_version>/<task>/<hash>.npz
+#   Grade     — CPU per-task scorer: PCA-whitened retrieval keys, leave-one-
+#               episode-out k-NN, coverage gating, spatial/velocity disagreement
+#               z-scores, ambiguity. See egomimic/curation/knn_grading.py.
+#
+# Reads:    higher primary_score = larger fraction of states where this episode
+#           disagrees with what other episodes did in the same situation
+#           (worst-first in knn_scores_by_task.json / review CSVs).
+# Caution:  spot-check grids/<task>/*.jpg before trusting scores — bad
+#           retrieval fails silently. Calibrate thresholds with
+#           egomimic/scripts/knn_grading/review_tools.py.
+#
+# Iterating on knn.* parameters reuses the feature cache (CPU-only re-runs).
+# Bump feature_version when changing featurize.* (stride, keys, backbone).
+#
+# Per-task Modal worker compute (orchestrator is fixed lightweight CPU):
+#   +modal_gpu=L40S:1 +modal_cpu=32 +modal_memory_gb=128
+
+defaults:
+  - data: deminf_ironing_10h
+  - _self_
+
+name: knn_grade
+description: knn_consistency
+seed: 42
+
+# Max episodes per GPU featurize shard.
+max_episodes_per_shard: 100
+
+# Feature-cache key — bump when featurize settings change.
+feature_version: v1
+
+featurize:
+  stride: 6                                  # 30 fps → 5 Hz query states
+  image_key: observations.images.front_img_1
+  action_key: actions_cartesian
+  proprio_key: observations.state.ee_pose
+  state_image:
+    backbone: dinov3
+    dinov3:
+      model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+      dtype: float16
+
+knn:
+  k: 15                       # neighbors per query state (other episodes only)
+  min_neighbors: 5            # below this → task skipped
+  pca_dim: 128                # whitened image-feature dims in the retrieval key
+  image_weight: 1.0           # retrieval-key block weights
+  proprio_weight: 1.0
+  phase_weight: 0.5
+  max_neighbors_per_episode: 3  # cap per source episode (0 = uncapped) — stops one near-duplicate episode filling the neighbor set
+  coverage_mad_multiplier: 2.0  # 1-NN dist > median + mult×MAD → no-coverage (5.0 never fired: fold/ironing 10h had 100% coverage)
+  z_threshold: 2.0            # disagreement z above this → state flagged
+  n_resample: 20              # arc-length resample points per chunk path
+  n_speed_bins: 10            # time bins for velocity profiles
+  gripper_weight: 0.25        # only used when action_layout.gripper_dims set
+  spread_floor: 0.005         # metres — spatial z denominator floor
+  speed_floor: 0.005          # metres/bin — velocity z denominator floor
+  min_episodes: 8             # tasks with fewer episodes are skipped
+  max_debug_states_per_episode: 3
+  debug_neighbors: 5
+  query_block: 256
+  # Position indices in the action vector. Mecka cartesian (12-d):
+  # [left xyzypr(6), right xyzypr(6)], no grippers.
+  action_layout:
+    left_pos: [0, 1, 2]
+    right_pos: [6, 7, 8]
+    gripper_dims: []
+
+# Visual spot-checks: query + neighbor frames for the worst-z states per task.
+grids:
+  enabled: true
+  per_task: 24
+  neighbors_shown: 6
+
+hydra:
+  run:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}

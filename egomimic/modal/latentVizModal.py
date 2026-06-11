@@ -288,6 +288,7 @@ def run_latent_viz(
             group_by = "dataset"
 
     groups: dict[str, list[str]] = {}
+    group_raw_names: dict[str, set] = {}
     for ep_hash in datasets:
         if group_by == "task":
             group = str(hash_to_task.get(ep_hash) or "unknown")
@@ -297,7 +298,13 @@ def run_latent_viz(
             group = ds_of_hash[ep_hash]
         else:
             group = "all"
-        groups.setdefault(_safe_group_name(group), []).append(ep_hash)
+        safe = _safe_group_name(group)
+        groups.setdefault(safe, []).append(ep_hash)
+        group_raw_names.setdefault(safe, set()).add(str(group))
+
+    for safe, raws in group_raw_names.items():
+        if len(raws) > 1:
+            print(f"WARNING: groups {sorted(raws)} collide into '{safe}' after sanitization — merged")
 
     print(
         f"Episode partition ({group_by}): {len(datasets)} episodes across "
@@ -305,6 +312,79 @@ def run_latent_viz(
         + ", ".join(f"{g}:{len(h)}" for g, h in sorted(groups.items())[:8])
         + ("…" if len(groups) > 8 else "")
     )
+
+    # Full per-group episode universe with RAW frame counts (SQL num_frames —
+    # the repo's hours convention is raw frames @ 30 fps). The viewer's prune
+    # math and exported keep-lists must cover every RESOLVED episode, not just
+    # the ones that survive embedding, so this is persisted before any
+    # embed/skip can shrink the set.
+    group_universe = {
+        g: {h: int(getattr(datasets[h], "total_frames", 0) or 0) for h in hs}
+        for g, hs in groups.items()
+    }
+    with open(run_dir / "group_universe.json", "w") as f:
+        json.dump(group_universe, f)
+
+    # ── 2b. Optional: pair scores from a prior grading run (scores_from) ──────
+    # Re-keyed by EPISODE HASH (not task name): grading task names are raw SQL
+    # strings while viewer groups are sanitized and may use group_by=dataset or
+    # none — hash bucketing by this run's own groups is the only robust join.
+    scores_from = OmegaConf.select(cfg, "scores_from", default=None)
+    if scores_from:
+        src_dir = Path(CFG.output_mount_path) / str(scores_from)
+        src_scores = None
+        for cand in ("scores_by_task.json", "knn_scores_by_task.json"):
+            if (src_dir / cand).is_file():
+                with open(src_dir / cand) as f:
+                    src_scores = json.load(f)
+                break
+        if src_scores is None:
+            raise FileNotFoundError(
+                f"scores_from={scores_from}: no scores_by_task.json / "
+                f"knn_scores_by_task.json under {src_dir}"
+            )
+        flat_scores: dict[str, float] = {}
+        for task_name, sc in src_scores.items():
+            for h, v in sc.items():
+                if h in flat_scores:
+                    print(f"WARNING: scores_from — hash {h} scored in multiple tasks; keeping first")
+                else:
+                    flat_scores[h] = v
+        scores_by_group = {
+            g: {h: flat_scores[h] for h in hs if h in flat_scores}
+            for g, hs in groups.items()
+        }
+        scores_by_group = {g: d for g, d in scores_by_group.items() if d}
+        n_matched = sum(len(d) for d in scores_by_group.values())
+        unmatched = sorted(set(flat_scores) - set(datasets))
+        if n_matched == 0:
+            raise ValueError(
+                f"scores_from={scores_from}: zero scored hashes overlap the "
+                f"{len(datasets)} resolved episodes — wrong grading run?"
+            )
+        with open(run_dir / "scores_by_task.json", "w") as f:
+            json.dump(scores_by_group, f, indent=2)
+        if unmatched:
+            with open(run_dir / "scores_unmatched.json", "w") as f:
+                json.dump(unmatched, f)
+        scores_meta: dict = {}
+        if (src_dir / "scores_meta.json").is_file():
+            with open(src_dir / "scores_meta.json") as f:
+                scores_meta = json.load(f)
+        scores_meta.setdefault("higher_is_worse", False)
+        scores_meta.update(
+            {
+                "scores_from": str(scores_from),
+                "n_matched": n_matched,
+                "n_unmatched": len(unmatched),
+            }
+        )
+        with open(run_dir / "scores_meta.json", "w") as f:
+            json.dump(scores_meta, f, indent=2)
+        print(
+            f"scores_from: matched {n_matched} scored episodes into "
+            f"{len(scores_by_group)} group(s); {len(unmatched)} scored hashes unmatched"
+        )
 
     # ── 3. Action norm stats ──────────────────────────────────────────────────
     embed_cfg = select_embedder_settings(cfg)
@@ -478,6 +558,7 @@ def run_latent_viz(
                 "state_backbone": embed_cfg.state_image.backbone,
                 "seed": seed,
                 "groups": manifest_groups,
+                "group_raw_names": {g: sorted(r) for g, r in group_raw_names.items()},
             },
             f,
             indent=2,

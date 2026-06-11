@@ -1,0 +1,45 @@
+# Curation/grading data — 10 h of ironing_clothes (374 eps, ~10 h @30fps).
+# For curateModal.py / knnGradeModal.py only (not the training DataLoader).
+#
+# Episode allowlist is mecka_ironing_10h.json — the same 374-episode subset the
+# ironing LR sweep trains on (re-shuffle of the 30h JSON, seed 42), so
+# 10h ⊂ 30h nesting holds and grading covers exactly the training subset.
+#
+#   python egomimic/modal/knnGradeModal.py name=<run> description=<desc> \
+#       data=deminf_ironing_10h
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_ignore: null
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_ironing_10h.json
+    filters:
+      _target_: egomimic.rldb.filters.DatasetFilter
+      filter_lambdas:
+        - "lambda row: row['task'] in ['ironing_clothes']"
+    mode: total
+
+# Sized for +modal_cpu=32 +modal_memory_gb=128 +modal_gpu=L40S:1 (per-task worker).
+# episode_workers: parallel episode loaders (CPU threads).
+# pass2_image_decode_workers: JPEG decode threads per episode.
+# frame_queue_maxsize: loaded episodes buffered between producers and GPU consumer.
+#   RAM budget: frame_queue_maxsize × ~180 MB/ep ≈ 5.4 GB at 30.
+#   Producers block when queue is full — GPU controls loading rate.
+# global_frame_batch_size: frames per GPU embed call.
+#   512 × (3×224×224) float32 ≈ 300 MB input — tune to fill VRAM.
+curation_loader:
+  mecka_bimanual:
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 3072

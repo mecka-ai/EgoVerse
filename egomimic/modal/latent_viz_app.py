@@ -108,17 +108,24 @@ def viewer():
     if not tsne_dir.is_dir():
         tsne_dir = run_dir  # run dir holds the tsne3d_*.json files directly
 
-    scores = None
-    scores_path = run_dir / "scores_by_task.json"
-    if scores_path.is_file():
-        scores = json.load(open(scores_path))
+    def _sidecar(name):
+        p = run_dir / name
+        return json.load(open(p)) if p.is_file() else None
 
-    val = None
-    val_path = run_dir / "val_episodes.json"
-    if val_path.is_file():
-        val = json.load(open(val_path))
+    # scores_by_task.json is the canonical name; knn grading runs also write
+    # knn_scores_by_task.json (older runs may have only that).
+    scores = _sidecar("scores_by_task.json") or _sidecar("knn_scores_by_task.json")
+    val = _sidecar("val_episodes.json")
+    scores_meta = _sidecar("scores_meta.json")
+    universe = _sidecar("group_universe.json")
+    manifest = _sidecar("viz_manifest.json")
 
-    html = build_html(tsne_dir, scores, val)
+    html = build_html(
+        tsne_dir, scores, val,
+        scores_meta=scores_meta,
+        universe=universe,
+        manifest=manifest,
+    )
     rel = run_dir.relative_to(OUTPUTS_MOUNT)
     run_mode = "pinned" if os.environ.get("LATENT_VIZ_RUN") else "auto-discovered"
     print(

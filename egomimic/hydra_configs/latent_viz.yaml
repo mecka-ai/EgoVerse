@@ -47,6 +47,12 @@ write_pngs: true
 # and their volume is not mounted here).
 force_modal_resolver: true
 
+# Pair per-episode scores from a prior grading run (volume-relative run dir,
+# e.g. knn_grading/knn_grade/ironing_10h_capfix_<ts>). Scores are re-keyed by
+# episode hash into THIS run's groups and written as scores_by_task.json +
+# scores_meta.json, so the viewer shows score coloring and prune ordering.
+scores_from: null
+
 # Action norm stats for the Gaussian action embedder:
 #   path set  → load that norm_stats.json (offline_norm_stats output, volume-relative)
 #   path null → fit mean/std from a sample of the resolved episodes' actions
