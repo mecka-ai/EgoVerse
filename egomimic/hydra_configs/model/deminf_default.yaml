@@ -49,6 +49,15 @@ language_conditioning:
     batch_size: 64
     dtype: float16
 
+# t-SNE exports (2-D PNG + 3-D JSON for build_latent_viz.py).
+# When language conditioning is on, also emits state_lang, language, state_by_lang.
+tsne:
+  every_n: 10
+  include_state_lang: true
+  include_language: true
+  include_state_by_lang: true
+  state_color_by: auto  # auto | episode | time | language
+
 # Pass 3: KSG on concatenated episode latents (CPU).
 ksg:
   n_threads: 12

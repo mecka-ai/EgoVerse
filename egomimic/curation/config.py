@@ -74,6 +74,17 @@ class ActionEmbedderSettings:
 
 
 @dataclass(frozen=True)
+class TsneVizConfig:
+    """t-SNE export settings (``model.tsne``)."""
+
+    include_state_lang: bool = True
+    include_language: bool = True
+    include_state_by_lang: bool = True
+    state_color_by: str = "auto"
+    every_n: int = 10
+
+
+@dataclass(frozen=True)
 class LanguageConditioningSettings:
     """
     Language-conditioned DemInf scoring (``model.language_conditioning``).
@@ -224,6 +235,23 @@ def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
         oat_encoder_cfg=_to_dict(oat_enc),
         oat_decoder_cfg=_to_dict(oat_dec),
         oat_quantizer_cfg=_to_dict(oat_qtz),
+    )
+
+
+def select_tsne_viz_config(cfg: Any) -> TsneVizConfig:
+    """Read ``model.tsne`` visualization settings."""
+    block = OmegaConf.select(cfg, "model.tsne", default=None)
+    if block is None:
+        return TsneVizConfig()
+    defaults = TsneVizConfig()
+    return TsneVizConfig(
+        include_state_lang=bool(block.get("include_state_lang", defaults.include_state_lang)),
+        include_language=bool(block.get("include_language", defaults.include_language)),
+        include_state_by_lang=bool(
+            block.get("include_state_by_lang", defaults.include_state_by_lang)
+        ),
+        state_color_by=str(block.get("state_color_by", defaults.state_color_by)),
+        every_n=int(block.get("every_n", defaults.every_n)),
     )
 
 

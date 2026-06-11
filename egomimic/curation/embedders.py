@@ -445,9 +445,7 @@ class LanguageEmbedder:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name, padding_side="left"
             )
-            self._model = AutoModel.from_pretrained(
-                self.model_name, torch_dtype=dtype
-            )
+            self._model = AutoModel.from_pretrained(self.model_name, dtype=dtype)
             self._model.to(self.device).eval()
             for p in self._model.parameters():
                 p.requires_grad_(False)

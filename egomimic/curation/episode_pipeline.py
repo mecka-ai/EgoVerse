@@ -124,20 +124,30 @@ def build_language_embedder(
     return language_embedder
 
 
+def _is_text_language_batch(parts: list[np.ndarray | list[str]]) -> bool:
+    """True when language parts are per-frame instruction strings (qwen3 source)."""
+    first = parts[0]
+    if isinstance(first, list):
+        return not first or isinstance(first[0], str)
+    if isinstance(first, np.ndarray):
+        return first.dtype == object or first.dtype.kind in ("U", "S", "O")
+    return isinstance(first, str)
+
+
 def _concat_language_batch(
     parts: list[np.ndarray | list[str]],
 ) -> np.ndarray | list[str]:
     if not parts:
         raise ValueError("empty language batch")
-    if isinstance(parts[0], str) or (
-        isinstance(parts[0], np.ndarray) and parts[0].dtype == object
-    ):
+    if _is_text_language_batch(parts):
         out: list[str] = []
         for part in parts:
             if isinstance(part, list):
-                out.extend(part)
-            else:
+                out.extend(str(x) for x in part)
+            elif isinstance(part, np.ndarray):
                 out.extend(str(x) for x in part.reshape(-1))
+            else:
+                out.append(str(part))
         return out
     return np.concatenate([np.asarray(p, dtype=np.float32) for p in parts], axis=0)
 
@@ -272,7 +282,7 @@ def run_pass2_embed_episodes(
                         result = future.result()
                     except Exception as exc:
                         logger.error("episode %s load failed: %s", ep_hash[:8], exc)
-                        result = (ep_hash, None, None)
+                        result = (ep_hash, None, None, None)
                     ep_queue.put(result)  # blocks when queue full → backpressure
         finally:
             ep_queue.put(None)  # sentinel: all episodes submitted

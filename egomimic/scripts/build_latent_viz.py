@@ -5,13 +5,12 @@ Build a self-contained interactive latent + episode-video viewer.
 Two pages in one HTML file (works as a local file or served by the Modal web
 app ``egomimic/modal/latent_viz_app.py``):
 
-  * **t-SNE 3-D** — per-task 3-D scatters of state/action latents from
-    ``tsne3d_<task>.json``. Fast single-trace WebGL engine: per-task color
-    tables (episode / time / MI score) are precomputed once and every control
-    change is an in-place restyle (no scene rebuild). Tools: frame-number
-    highlight (±window) across BOTH panels, time-range filter, episode
-    isolate, point size, synced cameras, click → frame-seek video preview +
-    gold cross-highlight of the same (episode, frame) in the other panel.
+  * **t-SNE 3-D** — per-task 3-D scatters from ``tsne3d_<task>.json``.
+    Modalities: ``state``, ``action``, and when language curation was enabled
+    ``state_lang`` ([state∥language]), ``language``, ``state_by_lang`` (state
+    geometry with instruction metadata). Color modes: episode, time, MI score,
+    language (instruction cluster). Dynamic multi-panel grid, synced cameras,
+    cross-highlight, frame-seek video preview.
   * **Video grid** — per-task grid of every scored episode (from
     ``scores_by_task.json``): sort/filter/search, rank/score/percentile,
     TOP-60%/BOT-40%/VAL badges, score histogram, Load-all / Play-all /
@@ -37,9 +36,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Self-hosted Modal MP4 viewer (egomimic/modal/episode_preview.py) — serves
-# raw H.264 MP4s with range support, so the grid embeds native <video> players.
-VIDEO_BASE = "https://mecka-robotics--egoverse-episode-preview-viewer.modal.run/video/"
+# Default MP4 base URL for locally-built HTML. The unified Modal viewer
+# (egomimic/modal/latent_viz_app.py) passes video_base="/video/" instead.
+VIDEO_BASE = "https://mecka-robotics--egoverse-viewer-viewer.modal.run/video/"
 # Encode rate used by episode_preview.py (frame index / FPS = seek time).
 FPS = 30
 
@@ -67,7 +66,12 @@ _TEMPLATE = """<!DOCTYPE html>
   .tool { display: flex; gap: 7px; align-items: center; }
   .tool label { color:#9aa; }
   #plots { display: flex; }
-  .panel { width: calc((100vw - 180px) / 2); height: calc(100vh - 104px); }
+  #plotGrid { display: flex; flex-wrap: wrap; flex: 1; align-content: flex-start; overflow-y: auto;
+              max-height: calc(100vh - 104px); }
+  .panel { flex: 1 1 calc(50% - 10px); min-width: 380px; height: calc((100vh - 120px) / 2);
+           min-height: 320px; }
+  .panel-title { font-size: 11px; color: #9aa; padding: 4px 8px; background: #14151a;
+                 border-bottom: 1px solid var(--line); font-weight: 600; letter-spacing: .4px; }
   #legend { width: 180px; height: calc(100vh - 104px); overflow-y: auto; background: #14151a;
             border-left: 1px solid var(--line); font-size: 12px; }
   #legend .lg-head { padding: 8px 10px; color: #9aa; position: sticky; top: 0; background: #14151a; }
@@ -130,10 +134,11 @@ _TEMPLATE = """<!DOCTYPE html>
 <div id="tsnepage">
   <div id="tools">
     <span class="tool"><label>Color</label>
-      <select id="colorMode" onchange="applyStyle()">
+      <select id="colorMode" onchange="applyStyle(); buildLegend(curTask)">
         <option value="episode">episode</option>
         <option value="time">time (light→dark)</option>
         <option value="score">MI score (red→green)</option>
+        <option value="language">language (instruction)</option>
       </select></span>
     <span class="tool"><label>Episode</label>
       <select id="epSel" onchange="applyStyle(); markLegend()"><option value="all">all</option></select></span>
@@ -150,8 +155,7 @@ _TEMPLATE = """<!DOCTYPE html>
     <span id="tstats" style="color:#777"></span>
   </div>
   <div id="plots">
-    <div id="state" class="panel"></div>
-    <div id="action" class="panel"></div>
+    <div id="plotGrid"></div>
     <div id="legend"></div>
   </div>
 </div>
@@ -216,33 +220,52 @@ function scoreNorm(task) {
   return out;
 }
 
-/* ---------------- t-SNE fast engine ----------------
-   One trace per panel. Per (task, mode) color tables are computed ONCE and
-   cached; every control change only re-picks colors[k] = cached[k] | DIM and
-   restyles in place — no scene/trace rebuild, no camera reset.            */
-const CACHE = {};   // task -> {mods: {state:{d, tables:{episode,time,score}}, action:{...}}}
+/* ---------------- t-SNE fast engine ---------------- */
+const MOD_ORDER = ["state", "state_by_lang", "state_lang", "language", "action"];
+const MOD_LABELS = {
+  state: "STATE (image)",
+  state_by_lang: "STATE · colored by lang",
+  state_lang: "STATE ∥ LANGUAGE",
+  language: "LANGUAGE",
+  action: "ACTION",
+};
+const CACHE = {};
 let curTask = null;
+let activeMods = [];
+
+function modalitiesForTask(task) {
+  const d = DATA[task] || {};
+  return MOD_ORDER.filter(m => d[m] && d[m].x && d[m].x.length);
+}
+
+function langColor(langId, nLabels) {
+  return rgb(hsv2rgb((langId || 0) / Math.max(1, nLabels), 0.8, 0.9));
+}
 
 function buildCache(task) {
   const eps = DATA[task].episodes, nEp = eps.length;
   const sn = scoreNorm(task);
+  const langLabels = DATA[task].language_labels || [];
+  const nLang = Math.max(1, langLabels.length);
   const mods = {};
-  for (const mod of ["state", "action"]) {
-    const d = (DATA[task] || {})[mod];
-    if (!d) continue;
+  for (const mod of modalitiesForTask(task)) {
+    const d = DATA[task][mod];
     const N = d.x.length;
-    const tables = {episode: new Array(N), time: new Array(N), score: new Array(N)};
+    const tables = {episode: new Array(N), time: new Array(N), score: new Array(N), language: new Array(N)};
     const custom = new Array(N);
     for (let k = 0; k < N; k++) {
       const e = d.ep[k], tf = d.t[k];
       tables.episode[k] = rgb(hsv2rgb(e / Math.max(1, nEp), 0.85, 1.0 - 0.65 * tf));
       tables.time[k]    = rgb(lerp3([170,215,255], [10,40,90], tf));
       tables.score[k]   = rgb(redGreen(sn[eps[e]] ?? 0.5));
-      custom[k] = [d.frame[k], Math.round(tf * 100), eps[e].slice(0, 10), e];
+      const lid = (d.lang_id && d.lang_id[k] != null) ? d.lang_id[k] : 0;
+      tables.language[k] = langColor(lid, nLang);
+      const langTxt = (d.lang && d.lang[k]) ? String(d.lang[k]).slice(0, 40) : "";
+      custom[k] = [d.frame[k], Math.round(tf * 100), eps[e].slice(0, 10), e, langTxt];
     }
     mods[mod] = {d, tables, custom};
   }
-  return {mods};
+  return {mods, langLabels};
 }
 
 function uiState() {
@@ -258,17 +281,23 @@ function uiState() {
   };
 }
 
+function colorTableForMod(m, mode) {
+  if (mode === "language" && m.d.lang_id) return m.tables.language;
+  if (mode === "language") return m.tables.episode;
+  return m.tables[mode] || m.tables.episode;
+}
+
 function applyStyle() {
   if (!curTask || !CACHE[curTask]) return;
   const u = uiState();
-  for (const mod of ["state", "action"]) {
+  for (const mod of activeMods) {
     const m = CACHE[curTask].mods[mod];
     if (!m) continue;
     const {d, tables} = m;
-    const base = tables[u.mode];
+    const base = colorTableForMod(m, u.mode);
     const N = d.x.length;
     const colors = new Array(N);
-    let sizes = u.size;                          // scalar unless highlighting
+    let sizes = u.size;
     if (u.hlOn) sizes = new Array(N);
     for (let k = 0; k < N; k++) {
       const on = d.t[k] >= u.t0 && d.t[k] <= u.t1
@@ -277,7 +306,7 @@ function applyStyle() {
       colors[k] = on ? base[k] : DIM;
       if (u.hlOn) sizes[k] = on ? u.size * 2.2 : u.size;
     }
-    Plotly.restyle(mod, {"marker.color": [colors], "marker.size": Array.isArray(sizes) ? [sizes] : sizes}, [0]);
+    Plotly.restyle("panel_" + mod, {"marker.color": [colors], "marker.size": Array.isArray(sizes) ? [sizes] : sizes}, [0]);
   }
 }
 
@@ -290,46 +319,56 @@ const LAYOUT = (title) => ({
 });
 
 let camLock = false;
+function ensurePanels(mods) {
+  const grid = document.getElementById("plotGrid");
+  grid.innerHTML = mods.map(mod =>
+    `<div class="panel-wrap" style="display:flex;flex-direction:column;flex:1 1 calc(50% - 10px);min-width:380px">
+       <div class="panel-title">${MOD_LABELS[mod] || mod.toUpperCase()}</div>
+       <div id="panel_${mod}" class="panel"></div>
+     </div>`).join("");
+}
+
 function renderTsne(task) {
   if (!CACHE[task]) CACHE[task] = buildCache(task);
   curTask = task;
+  activeMods = modalitiesForTask(task);
   const u = uiState();
-  // episode dropdown
   const epSel = document.getElementById("epSel");
   const eps = DATA[task] ? DATA[task].episodes : [];
   epSel.innerHTML = '<option value="all">all</option>' +
     eps.map((h, i) => `<option value="${i}">${h.slice(0,10)}</option>`).join("");
 
-  for (const mod of ["state", "action"]) {
+  ensurePanels(activeMods);
+
+  for (const mod of activeMods) {
     const m = CACHE[task].mods[mod];
-    const el = document.getElementById(mod);
-    if (!m) { Plotly.purge(el); el.innerHTML = ""; continue; }
+    const el = document.getElementById("panel_" + mod);
+    if (!m || !el) continue;
     const {d, tables, custom} = m;
-    Plotly.newPlot(mod, [
+    const colors = colorTableForMod(m, u.mode);
+    Plotly.newPlot(el, [
       { type: "scatter3d", mode: "markers",
         x: d.x, y: d.y, z: d.z, customdata: custom,
-        marker: {size: u.size, color: tables[u.mode], line: {width: 0}},   // solid, no stroke
-        hovertemplate: "ep %{customdata[2]} · frame %{customdata[0]} (t=%{customdata[1]}%)<extra></extra>" },
+        marker: {size: u.size, color: colors, line: {width: 0}},
+        hovertemplate: "ep %{customdata[2]} · f %{customdata[0]} (%{customdata[1]}%)<br>%{customdata[4]}<extra></extra>" },
       { type: "scatter3d", mode: "markers", name: "selected",
         x: [], y: [], z: [], hoverinfo: "skip",
         marker: {size: 13, color: "rgba(255,200,0,0.95)", symbol: "diamond", line: {width: 0}} },
-    ], LAYOUT((mod === "state" ? "STATE — " : "ACTION — ") + task), {responsive: true});
+    ], LAYOUT((MOD_LABELS[mod] || mod) + " — " + task), {responsive: true});
 
     el.removeAllListeners && el.removeAllListeners("plotly_click");
-    // Plotly 3-D fires plotly_click when a rotate-drag happens to end on a
-    // point. Track pointer travel and only accept near-stationary clicks, so
-    // the video preview never loads mid-orbit.
     el.onpointerdown = e => { el._px = e.clientX; el._py = e.clientY; };
     el.onpointerup   = e => { el._drag = Math.hypot(e.clientX - (el._px ?? e.clientX),
                                                     e.clientY - (el._py ?? e.clientY)) > 5; };
     el.on("plotly_click", ev => {
-      if (el._drag) return;                       // rotation release, not a click
+      if (el._drag) return;
       const p = ev.points[0];
       if (p.curveNumber !== 0) return;
-      const [frame, tpct, , epIdx] = p.customdata;
+      const [frame, tpct, , epIdx, langTxt] = p.customdata;
       const hash = DATA[task].episodes[epIdx];
+      const langLine = langTxt ? ` · <span style="color:#c9f">${langTxt}</span>` : "";
       document.getElementById("info").innerHTML =
-        `<b>${mod.toUpperCase()}</b> · <b>${hash}</b> · frame <b>${frame}</b> (${tpct}%) · ` +
+        `<b>${MOD_LABELS[mod]||mod}</b> · <b>${hash}</b> · frame <b>${frame}</b> (${tpct}%)${langLine} · ` +
         `<a href="${VIDEO_BASE}${hash}" target="_blank" style="color:#7fd4ff">video ↗</a>`;
       document.getElementById("hlFrame").value = frame;
       showFrame(task, hash, frame, tpct / 100);
@@ -339,23 +378,38 @@ function renderTsne(task) {
       if (!document.getElementById("syncCam").checked || camLock) return;
       if (ev["scene.camera"]) {
         camLock = true;
-        const other = mod === "state" ? "action" : "state";
-        Plotly.relayout(other, {"scene.camera": ev["scene.camera"]}).then(() => camLock = false);
+        const cam = ev["scene.camera"];
+        Promise.all(activeMods.filter(x => x !== mod).map(other =>
+          Plotly.relayout("panel_" + other, {"scene.camera": cam})
+        )).then(() => camLock = false);
       }
     });
   }
   const d = DATA[task] || {};
-  const nPts = ["state","action"].reduce((a,m) => a + ((d[m]||{}).x||[]).length, 0);
+  const nPts = activeMods.reduce((a,m) => a + ((d[m]||{}).x||[]).length, 0);
+  const langNote = d.language_enabled ? ` · lang=${d.language_mode||"on"}` : "";
   document.getElementById("tstats").textContent =
-    `${(d.episodes||[]).length} episodes · ${nPts.toLocaleString()} points · every ${d.every_n||10}th frame`;
+    `${(d.episodes||[]).length} eps · ${nPts.toLocaleString()} pts · every ${d.every_n||10}f` +
+    ` · panels: ${activeMods.join(", ")}${langNote}`;
   buildLegend(task);
   applyStyle();
 }
 
-/* episode color legend sidebar — swatch = episode hue; click isolates */
 function buildLegend(task) {
+  const mode = document.getElementById("colorMode").value;
+  const cache = CACHE[task] || {langLabels: []};
+  if (mode === "language" && cache.langLabels && cache.langLabels.length) {
+    const rows = cache.langLabels.map((label, i) => {
+      const c = langColor(i, cache.langLabels.length);
+      return `<div class="lg-row" title="${label.replace(/"/g, "&quot;")}">` +
+             `<span class="lg-dot" style="background:${c}"></span>` +
+             `${String(label).slice(0, 28)}${label.length > 28 ? "…" : ""}</div>`;
+    }).join("");
+    document.getElementById("legend").innerHTML =
+      `<div class="lg-head">instructions (${cache.langLabels.length})</div>` + rows;
+    return;
+  }
   const eps = DATA[task] ? DATA[task].episodes : [];
-  const sn = scoreNorm(task);
   const rows = eps.map((h, i) => {
     const c = rgb(hsv2rgb(i / Math.max(1, eps.length), 0.85, 0.85));
     const sc = SCORES[task] ? (SCORES[task].find(e => e[0] === h) || [0, NaN])[1] : NaN;
@@ -383,7 +437,7 @@ function markLegend() {
 }
 
 function crossHighlight(task, epIdx, frame) {
-  for (const mod of ["state", "action"]) {
+  for (const mod of activeMods) {
     const m = (CACHE[task] || {mods:{}}).mods[mod];
     if (!m) continue;
     const d = m.d;
@@ -391,7 +445,7 @@ function crossHighlight(task, epIdx, frame) {
     for (let k = 0; k < d.x.length; k++) {
       if (d.ep[k] === epIdx && d.frame[k] === frame) { xs.push(d.x[k]); ys.push(d.y[k]); zs.push(d.z[k]); break; }
     }
-    Plotly.restyle(mod, {x: [xs], y: [ys], z: [zs]}, [1]);
+    Plotly.restyle("panel_" + mod, {x: [xs], y: [ys], z: [zs]}, [1]);
   }
 }
 
@@ -566,8 +620,15 @@ render();
 """
 
 
-def build_html(tsne_dir: Path, scores_raw: dict, val: list) -> str:
+def build_html(
+    tsne_dir: Path,
+    scores_raw: dict,
+    val: list,
+    *,
+    video_base: str | None = None,
+) -> str:
     """Assemble the viewer HTML from a local tsne3d dir + raw scores dict."""
+    vb = video_base if video_base is not None else VIDEO_BASE
     data: dict = {}
     for f in sorted(Path(tsne_dir).glob("tsne3d_*.json")):
         d = json.load(open(f))
@@ -584,7 +645,7 @@ def build_html(tsne_dir: Path, scores_raw: dict, val: list) -> str:
         .replace("__DATA__", json.dumps(data, separators=(",", ":")))
         .replace("__SCORES__", json.dumps(scores, separators=(",", ":")))
         .replace("__VAL__", json.dumps(val, separators=(",", ":")))
-        .replace("__VIDEO_BASE__", VIDEO_BASE)
+        .replace("__VIDEO_BASE__", vb)
         .replace("__FPS__", str(FPS))
     )
 

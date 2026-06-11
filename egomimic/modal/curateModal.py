@@ -359,6 +359,7 @@ def _score_task_split(
         select_embedder_settings,
         select_seed,
         select_tensor_keys,
+        select_tsne_viz_config,
     )
 
     apply_curation_seed(select_seed(cfg))
@@ -463,45 +464,66 @@ def _score_task_split(
     if run_output_dir:
         t_viz = _time.perf_counter()
         try:
-            from egomimic.curation.tsne_viz import make_task_tsne_plots
+            from egomimic.curation.tsne_viz import (
+                TsneVizSettings,
+                export_task_tsne3d,
+                make_task_tsne_plots,
+            )
 
-            from egomimic.curation.tsne_viz import export_task_tsne3d
+            lang_cfg = embed_cfg.language_conditioning
+            tsne_cfg = select_tsne_viz_config(cfg)
+            viz_settings = TsneVizSettings(
+                every_n=tsne_cfg.every_n,
+                seed=select_seed(cfg),
+                include_state_lang=tsne_cfg.include_state_lang,
+                include_language=tsne_cfg.include_language,
+                include_state_by_lang=tsne_cfg.include_state_by_lang,
+                state_color_by=tsne_cfg.state_color_by,
+            )
+            lang_lats = language_latents if language_latents else None
+            lang_texts = language_texts if language_texts else None
+            lang_mode = lang_cfg.mode if lang_cfg.enabled else None
 
             tsne_dir = Path(run_output_dir) / "tsne"
-            s_png, a_png = make_task_tsne_plots(
+            png_paths = make_task_tsne_plots(
                 task_name,
                 state_latents,
                 action_latents,
                 tsne_dir,
-                every_n=10,
-                seed=select_seed(cfg),
+                language_latents=lang_lats,
+                language_texts_by_episode=lang_texts,
+                language_mode=lang_mode,
+                settings=viz_settings,
             )
-            # 3-D coords + (episode, frame) metadata for the interactive viewer
-            # (egomimic/scripts/build_latent_viz.py).
             tsne3d_json = export_task_tsne3d(
                 task_name,
                 state_latents,
                 action_latents,
                 scored_hashes,
                 Path(run_output_dir) / "tsne3d",
-                every_n=10,
-                seed=select_seed(cfg),
+                language_latents=lang_lats,
+                language_texts_by_episode=lang_texts,
+                language_mode=lang_mode,
+                settings=viz_settings,
             )
-            # Raw latents: re-project later (different t-SNE params / UMAP / 2-D
-            # vs 3-D) without re-running the GPU embed pass.
             lat_dir = Path(run_output_dir) / "latents"
             lat_dir.mkdir(parents=True, exist_ok=True)
-            _np.savez_compressed(
-                lat_dir / f"latents_{task_name}.npz",
+            npz_kwargs: dict = dict(
                 state=_np.concatenate(state_latents, axis=0),
                 action=_np.concatenate(action_latents, axis=0),
                 lengths=_np.asarray(ep_lengths, dtype=_np.int64),
                 hashes=_np.asarray(scored_hashes),
             )
+            if lang_lats:
+                npz_kwargs["language"] = _np.concatenate(lang_lats, axis=0)
+            if lang_texts:
+                flat_texts = [t for ep in lang_texts for t in ep]
+                npz_kwargs["language_texts"] = _np.asarray(flat_texts, dtype=object)
+            _np.savez_compressed(lat_dir / f"latents_{task_name}.npz", **npz_kwargs)
             training_outputs_volume.commit()
             print(
                 f"{tag} t-SNE viz written in {_time.perf_counter() - t_viz:.1f}s "
-                f"— state={s_png}, action={a_png}, tsne3d={tsne3d_json}"
+                f"— pngs={list(png_paths.keys())}, tsne3d={tsne3d_json}"
             )
         except Exception as exc:
             import traceback

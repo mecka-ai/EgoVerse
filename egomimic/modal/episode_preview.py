@@ -18,9 +18,9 @@ MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_a
 # Render a custom hash list / single episode:
 MODAL_ENVIRONMENT=robotics modal run egomimic/modal/episode_preview.py::render_all --hashes 69b0a081db7a56404d0f5517
 
-# 2) Deploy the viewer (persistent URL):
-MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/episode_preview.py
-#    → open the printed https URL; it lists every rendered episode and plays it.
+# 2) Deploy the unified viewer (latent t-SNE + MP4 streaming):
+MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/latent_viz_app.py
+#    → open / to pick a curation run; /episodes for the MP4 grid.
 """
 
 import json
@@ -49,7 +49,7 @@ image = (
     )
 )
 
-app = modal.App("egoverse-episode-preview", image=image)
+app = modal.App("egoverse-episode-preview-render", image=image)
 
 # Source episodes (read-only) and a dedicated previews volume (read/write).
 zarr_volume = modal.Volume.from_name("mecka_data_v2")
@@ -188,64 +188,4 @@ def render_all(hashes: str = "", force: bool = False) -> None:
             failed += 1
             print(f"  ! {r['hash']}: {st}")
     print(f"\nDone: {ok} rendered, {skipped} already present, {failed} failed.")
-    print("Deploy the viewer:  modal deploy egomimic/modal/episode_preview.py")
-
-
-# ---------------------------------------------------------------------------
-# Web viewer: index page + MP4 streaming
-# ---------------------------------------------------------------------------
-
-
-@app.function(
-    volumes={PREVIEW_MOUNT: previews_volume},
-    cpu=4.0,
-    memory=8192,
-    min_containers=0,
-    scaledown_window=600,
-)
-@modal.concurrent(max_inputs=50)
-@modal.asgi_app()
-def viewer():
-    from fastapi import FastAPI
-    from fastapi.responses import FileResponse, HTMLResponse, Response
-
-    web = FastAPI(title="EgoVerse Episode Viewer")
-
-    def _episodes() -> list[str]:
-        previews_volume.reload()
-        return sorted(p.stem for p in Path(PREVIEW_MOUNT).glob("*.mp4"))
-
-    @web.get("/", response_class=HTMLResponse)
-    def index():
-        eps = _episodes()
-        cards = "\n".join(
-            f'<div class="card"><div class="h">{h}</div>'
-            f'<video controls preload="metadata" src="/video/{h}"></video></div>'
-            for h in eps
-        )
-        return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>EgoVerse Episodes ({len(eps)})</title>
-<style>
- body{{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:0;padding:16px}}
- h1{{font-size:16px;font-weight:600}}
- .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}}
- .card{{background:#1c1c1c;border-radius:8px;padding:8px}}
- .card video{{width:100%;border-radius:4px;background:#000}}
- .h{{font:12px ui-monospace,monospace;color:#9ad;margin-bottom:6px;word-break:break-all}}
-</style></head><body>
-<h1>EgoVerse episode previews — {len(eps)} episodes (images.front_1)</h1>
-<div class="grid">{cards or '<p>No MP4s yet — run <code>modal run ...::render_all</code>.</p>'}</div>
-</body></html>"""
-
-    @web.get("/video/{episode_hash}")
-    def video(episode_hash: str):
-        # Basename guard: no path traversal.
-        safe = Path(episode_hash).name
-        path = Path(PREVIEW_MOUNT) / f"{safe}.mp4"
-        if not path.exists():
-            previews_volume.reload()
-        if not path.exists():
-            return Response(status_code=404)
-        return FileResponse(str(path), media_type="video/mp4")
-
-    return web
+    print("Deploy the viewer:  modal deploy egomimic/modal/latent_viz_app.py")

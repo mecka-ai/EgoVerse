@@ -26,6 +26,7 @@
 #   model.language_conditioning.enabled=true
 #   model.language_conditioning.mode=concat      # I(S,L;A)
 #   model.language_conditioning.mode=stratified  # I(S;A|L)
+#   model.tsne.include_state_lang=false  # disable joint [state|lang] t-SNE panel
 
 defaults:
   - model: deminf_default
