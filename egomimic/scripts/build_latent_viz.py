@@ -508,9 +508,10 @@ function resetTools() {
 }
 
 /* ---------------- click-to-frame preview ---------------- */
-let pvHash = null, pvFrame = 0, pvTfrac = null;
+let pvHash = null, pvFrame = 0, pvTfrac = null, pvTask = null;
 
 function showFrame(task, hash, frame, tfrac) {
+  pvTask = task;                 // pin: overrides must hit the clicked task
   pvFrame = frame; pvTfrac = tfrac;
   const v = document.getElementById("pv-video");
   document.getElementById("preview").style.display = "block";
@@ -524,7 +525,7 @@ function showFrame(task, hash, frame, tfrac) {
 }
 
 function updateCap() {
-  const st = curTask ? CL[curTask] : null;
+  const st = pvTask ? CL[pvTask] : null;
   const ovr = st && pvHash ? st.override[pvHash] : null;
   document.getElementById("pv-cap").innerHTML =
     `<b>${pvHash ? pvHash.slice(0,12) : ""}</b> · frame <b>${pvFrame}</b>` +
@@ -534,8 +535,8 @@ function updateCap() {
     ` <button onclick="stepFrame(1)">+1f</button>` +
     ` <button onclick="togglePlay()">▶/⏸</button>` +
     `<span class="ovr-btns">` +
-    ` <button class="${ovr === "keep" ? "on" : ""}" onclick="setOverride(curTask, pvHash, 'keep'); updateCap()" title="always keep">K</button>` +
-    ` <button class="bad ${ovr === "drop" ? "on" : ""}" onclick="setOverride(curTask, pvHash, 'drop'); updateCap()" title="always drop">D</button></span>` +
+    ` <button class="${ovr === "keep" ? "on" : ""}" onclick="setOverride(pvTask, pvHash, 'keep'); updateCap()" title="always keep">K</button>` +
+    ` <button class="bad ${ovr === "drop" ? "on" : ""}" onclick="setOverride(pvTask, pvHash, 'drop'); updateCap()" title="always drop">D</button></span>` +
     ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open ↗</a>`;
 }
 
@@ -576,6 +577,7 @@ function histoSVG(scores) {
 }
 
 function renderGrid(task) {
+  _gridTask = task;
   const scored = hasScores(task);
   const st = CL[task];
   const gn = scoreNorm(task);
@@ -653,7 +655,7 @@ function renderGrid(task) {
       (removed ? ' <span class="badge b-rm">REMOVED</span>' : '') +
       (!dEps.has(hash) ? ' <span class="badge b-noemb">NOT EMBEDDED</span>' : '') +
       (ovr ? ` <span class="badge b-ovr">${ovr === "keep" ? "FORCE-KEEP" : "FORCE-DROP"}</span>` : '');
-    const cid = `v_${task}_${i}`;
+    const cid = `v_${i}`;   // rank-unique; task names may contain quotes
     const g = gn[hash];
     const pct = scored && Number.isFinite(g) ? g : null;
     return `<div class="card">
@@ -669,10 +671,10 @@ function renderGrid(task) {
         <a href="${VIDEO_BASE}${hash}" target="_blank">open ↗</a>
         ${scored ? `<span style="color:#666">rank ${i+1}/${n}</span>` : ""}
         <span class="ovr-btns" style="margin-left:auto">
-          <button class="${ovr === "keep" ? "on" : ""}" onclick="setOverride('${task}','${hash}','keep')" title="always keep">K</button>
-          <button class="bad ${ovr === "drop" ? "on" : ""}" onclick="setOverride('${task}','${hash}','drop')" title="always drop">D</button>
-          <button class="${lbl === "good" ? "on" : ""}" onclick="setLabel('${task}','${hash}','good')" title="label good (for calibrate)">✓</button>
-          <button class="bad ${lbl === "bad" ? "on" : ""}" onclick="setLabel('${task}','${hash}','bad')" title="label bad (for calibrate)">✗</button>
+          <button class="${ovr === "keep" ? "on" : ""}" onclick="setOverride(_gridTask,'${hash}','keep')" title="always keep">K</button>
+          <button class="bad ${ovr === "drop" ? "on" : ""}" onclick="setOverride(_gridTask,'${hash}','drop')" title="always drop">D</button>
+          <button class="${lbl === "good" ? "on" : ""}" onclick="setLabel(_gridTask,'${hash}','good')" title="label good (for calibrate)">✓</button>
+          <button class="bad ${lbl === "bad" ? "on" : ""}" onclick="setLabel(_gridTask,'${hash}','bad')" title="label bad (for calibrate)">✗</button>
         </span>
       </div>
     </div>`;
@@ -702,6 +704,10 @@ function setSpeed() {
    order, lowest-index ties). Removal order is a total order:
    (override, priority class, scored-before-unscored, worseness desc, hash). */
 const CL = {};
+// Inline onclick handlers reference these instead of embedding the task name:
+// old curation runs have RAW SQL task names (spaces/quotes) that would break
+// a quoted JS string literal.
+let _gridTask = null, _clTask = null;
 function clState(task) {
   if (!CL[task]) CL[task] = {
     k: 0, mod: null, assign: null, nPts: 0,
@@ -931,6 +937,7 @@ function allTaskNames() {
 }
 
 function clusterPanelHTML(task) {
+  _clTask = task;
   const st = CL[task];
   if (!st || !st.assign) return "";
   const sm = scoreMap(task);
@@ -954,7 +961,7 @@ function clusterPanelHTML(task) {
       `<span class="lg-dot" style="background:${st.clColors[c]}"></span>` +
       `c${c} · ${members.length} eps · ${fmtH(frames)}` +
       (med != null ? ` · med ${med.toFixed(3)} p90 ${p90.toFixed(3)}` : "") + warn +
-      `<select onchange="setClusterPrio('${task}', ${c}, this.value)">` +
+      `<select onchange="setClusterPrio(_clTask, ${c}, this.value)">` +
         `<option value="prune" ${prio === "prune" ? "selected" : ""}>prune-first</option>` +
         `<option value="normal" ${prio === "normal" ? "selected" : ""}>normal</option>` +
         `<option value="protect" ${prio === "protect" ? "selected" : ""}>protect</option>` +

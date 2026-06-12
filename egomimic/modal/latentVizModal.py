@@ -319,7 +319,9 @@ def run_latent_viz(
     # the ones that survive embedding, so this is persisted before any
     # embed/skip can shrink the set.
     group_universe = {
-        g: {h: int(getattr(datasets[h], "total_frames", 0) or 0) for h in hs}
+        # max(0, …): SQL num_frames uses -1 as an unknown sentinel — a negative
+        # count would poison the viewer's frame/hours totals.
+        g: {h: max(0, int(getattr(datasets[h], "total_frames", 0) or 0)) for h in hs}
         for g, hs in groups.items()
     }
     with open(run_dir / "group_universe.json", "w") as f:
