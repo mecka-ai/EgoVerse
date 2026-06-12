@@ -1,10 +1,14 @@
 defaults:
-  - pi0.5_bc_mecka_scratch
+  - pi0.5_bc_mecka
   - _self_
 
 # LR-sweep point 1/3 for the ironing_clothes 30h dataset
-# (data=mecka_zip_h200_ironing_30h). pi0.5 from scratch + pretrained PaliGemma
-# backbone (pass model.robomimic_model.config.paligemma_weight_path at launch).
+# (data=mecka_zip_h200_ironing_30h). Loads the pretrained pi0.5 base
+# (pi0.5_bc_mecka → pi05_base_pytorch). On Modal pass
+# model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch
+# at launch — the YAML default is a SLURM-only absolute path, and trainModal only
+# rewrites relative CLI overrides to the outputs volume. Swap the defaults base
+# to pi0.5_bc_mecka_scratch to train from scratch.
 #
 # Cosine-schedule T_max (num_training_steps) = ONE pass over 30h of data:
 #   30h × 3600 s/h × 30 fps = 3,240,000 samples ÷ global batch 256 = 12,656 steps.
