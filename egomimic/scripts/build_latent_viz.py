@@ -131,6 +131,9 @@ _TEMPLATE = """<!DOCTYPE html>
   .pct > div { height:100%; background:linear-gradient(90deg,#e05555,#e0c14f,#54c46c); }
   .vid { position:relative; aspect-ratio:16/10; background:#0a0a0c; }
   .vid video { width:100%; height:100%; object-fit:contain; background:#000; }
+  .ann { position:absolute; bottom:0; left:0; right:0; padding:4px 8px;
+         background:rgba(0,0,0,0.68); color:#e8e8ea; font-size:12px; line-height:1.4;
+         pointer-events:none; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .vid .ph { position:absolute; inset:0; display:flex; flex-direction:column; gap:6px;
              align-items:center; justify-content:center; cursor:pointer; color:#777; }
   .vid .ph:hover { color:#fff; background:rgba(0,0,0,.4); }
@@ -577,10 +580,46 @@ function hidePreview(){
   document.getElementById("preview").style.display="none";
 }
 
+/* build per-episode frame→annotation lookup from t-SNE data */
+const LANG_MAP={};
+(()=>{
+  for(const task of Object.keys(DATA)){
+    const d=DATA[task];
+    const eps=d.episodes||[];
+    const byHash={};
+    for(const mod of ['state','state_lang','language','state_by_lang','action']){
+      const md=d[mod];
+      if(!md||!md.lang||!md.lang.length)continue;
+      for(let k=0;k<md.ep.length;k++){
+        const text=md.lang[k];
+        if(!text)continue;
+        const hash=eps[md.ep[k]];
+        if(!byHash[hash])byHash[hash]=[];
+        byHash[hash].push([md.frame[k],text]);
+      }
+      break;
+    }
+    for(const h of Object.keys(byHash))byHash[h].sort((a,b)=>a[0]-b[0]);
+    LANG_MAP[task]=byHash;
+  }
+})();
+
 /* video grid */
-function loadVideo(cellId,hash){
-  document.getElementById(cellId).innerHTML=
-    `<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata"></video>`;
+function loadVideo(cellId,hash,task){
+  const el=document.getElementById(cellId);
+  const anns=(LANG_MAP[task]||{})[hash]||[];
+  el.innerHTML=`<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata"></video>`+
+    (anns.length?`<div class="ann" id="${cellId}_ann"></div>`:'');
+  if(anns.length){
+    const vid=el.querySelector('video');
+    const annEl=document.getElementById(cellId+'_ann');
+    vid.addEventListener('timeupdate',()=>{
+      const f=Math.floor(vid.currentTime*FPS);
+      let lo=0,hi=anns.length-1,best=-1;
+      while(lo<=hi){const mid=(lo+hi)>>1;if(anns[mid][0]<=f){best=mid;lo=mid+1;}else hi=mid-1;}
+      annEl.textContent=best>=0?anns[best][1]:'';
+    });
+  }
 }
 
 function histoSVG(scores){
@@ -632,7 +671,7 @@ function renderGrid(task){
         <span class="score">${score.toFixed(4)}</span></div>
       <div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>
       <div class="vid" id="${cid}">
-        <div class="ph" onclick="loadVideo('${cid}','${hash}')">
+        <div class="ph" onclick="loadVideo('${cid}','${hash}','${task}')">
           <div class="play">▶</div><div style="font-size:12px">load video</div></div>
       </div>
       <div class="clinks">
