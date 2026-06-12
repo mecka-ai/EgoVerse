@@ -2094,6 +2094,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         image_key: str = "observations.images.front_img_1",
         image_decode_workers: int = 8,
         return_frame_indices: bool = False,
+        frame_stride: int = 1,
     ) -> tuple:
         """
         DemInf Pass 2 per episode: bulk zarr read, batched transforms, aligned decode.
@@ -2102,6 +2103,10 @@ class ZarrDataset(torch.utils.data.Dataset):
         2. Filter timesteps with invalid/zero quaternions (pose cut rows).
         3. Stack valid rows → run ``transform_list`` in batch (no random fallback).
         4. Decode JPEGs only for surviving logical indices.
+
+        ``frame_stride > 1`` keeps every Nth valid timestep BEFORE transform and
+        decode — both memory and compute scale down by the stride. Action
+        chunks stay full-rate (windows are gathered per kept timestep).
 
         Returns:
             ``(actions, images)`` as ``(T, chunk, D)`` and ``(T, C, H, W)``, or
@@ -2115,6 +2120,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             load_images=True,
+            frame_stride=max(1, int(frame_stride)),
         )
         if not return_frame_indices:
             return actions, images

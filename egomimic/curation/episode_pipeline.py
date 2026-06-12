@@ -119,10 +119,10 @@ def build_embedders(
 
 
 def _load_episode(
-    item: tuple[str, "ZarrDataset", str, str, int],
+    item: tuple[str, "ZarrDataset", str, str, int, int],
 ) -> tuple[str, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Load and decode one episode (CPU-only, runs in thread pool)."""
-    episode_hash, zarr_ds, action_key, image_key, image_decode_workers = item
+    episode_hash, zarr_ds, action_key, image_key, image_decode_workers, frame_stride = item
     t0 = time.perf_counter()
     try:
         actions, images, frame_idx = zarr_ds.collect_curation_episode(
@@ -130,6 +130,7 @@ def _load_episode(
             image_key=image_key,
             image_decode_workers=image_decode_workers,
             return_frame_indices=True,
+            frame_stride=frame_stride,
         )
         if actions is None or images is None:
             logger.debug("episode %s: skip (None data returned)", episode_hash[:8])
@@ -160,6 +161,7 @@ def run_pass2_embed_episodes(
     state_embedder: StateEmbedder,
     *,
     progress: str | None = None,
+    frame_stride: int = 1,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[str], list[int], list[np.ndarray]]:
     """
     Pass 2: producer-consumer pipeline.
@@ -181,9 +183,14 @@ def run_pass2_embed_episodes(
     raw_frame_indices)`` — the last is one ``(T,)`` int64 array per episode of
     RAW video-frame indices (pre pause/pose filtering), row-aligned with that
     episode's latents.
+
+    ``frame_stride > 1`` embeds every Nth valid frame only (decode + GPU work
+    and peak RAM all scale down by the stride). Curation/KSG callers need the
+    full rate and keep the default 1.
     """
+    frame_stride = max(1, int(frame_stride))
     items = [
-        (h, episodes[h], action_key, image_key, loader.pass2_image_decode_workers)
+        (h, episodes[h], action_key, image_key, loader.pass2_image_decode_workers, frame_stride)
         for h in episodes
         if h in scored_hashes
     ]

@@ -30,6 +30,13 @@ group_by: task
 every_n: 10
 max_points_per_group: 30000
 
+# Frame stride applied at LOAD time (decode + embed every Nth valid frame).
+# null → use every_n, which is what the t-SNE keeps anyway: embedding the
+# full rate costs ~every_n× more peak RAM (full-rate float32 episodes are GB
+# each) and GPU time for points that get thrown away. Set 1 to embed
+# full-rate, e.g. when the latents/*.npz will be re-used beyond visualization.
+embed_stride: null
+
 # Also write the static PNG t-SNE plots next to the JSONs.
 write_pngs: true
 
@@ -71,11 +78,17 @@ render_videos: false
 
 # Episode-loading / GPU-batching knobs (same meaning as data.curation_loader.*
 # in deminf configs; a curation_loader block in the data config wins if present).
+# Peak RAM ≈ (frame_queue_maxsize + episode_workers) × strided-rows-per-episode
+# × bytes-per-frame (float32 CHW at native res ≈ 4–11 MB) + 2 × global batch
+# (the flush path concatenates a copy). With embed_stride=10 and ~3k-frame
+# episodes these defaults stay well under 128 GB; raise them only with
+# embed_stride in mind — at embed_stride=1 the queue alone is whole full-rate
+# episodes (tens of GB each for long tasks).
 loader:
-  episode_workers: 6
+  episode_workers: 4
   pass2_image_decode_workers: 12
-  frame_queue_maxsize: 12
-  global_frame_batch_size: 3072
+  frame_queue_maxsize: 4
+  global_frame_batch_size: 2048
 
 hydra:
   run:

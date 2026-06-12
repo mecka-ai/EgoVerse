@@ -471,6 +471,15 @@ def run_latent_viz(
     every_n_base = int(OmegaConf.select(cfg, "every_n", default=10))
     max_points = int(OmegaConf.select(cfg, "max_points_per_group", default=30000))
     write_pngs = bool(OmegaConf.select(cfg, "write_pngs", default=True))
+    # The t-SNE only keeps every_n-th frame, so decoding + embedding the full
+    # rate is ~every_n× wasted RAM and GPU time (full-rate float32 episodes are
+    # GB each — long-episode tasks blow past container memory). Stride at LOAD
+    # time instead; raw frame indices stay correct for MP4 seeking. Set
+    # embed_stride=1 to embed full-rate (e.g. to reuse the latents .npz).
+    embed_stride = OmegaConf.select(cfg, "embed_stride", default=None)
+    embed_stride = int(embed_stride) if embed_stride else every_n_base
+    if embed_stride > 1:
+        print(f"embed_stride={embed_stride}: embedding every {embed_stride}th valid frame")
     manifest_groups: dict = {}
     for group in sorted(groups):
         hashes = groups[group]
@@ -484,17 +493,20 @@ def run_latent_viz(
             action_embedder,
             state_embedder,
             progress=group,
+            frame_stride=embed_stride,
         )
         if not done_hashes:
             print(f"[{group}] no episodes embedded — skipped")
             continue
 
+        # ep_lengths are already strided rows — the residual t-SNE subsample
+        # only enforces the per-group point cap on top of the load stride.
         total_frames = sum(ep_lengths)
-        every_n = max(every_n_base, -(-total_frames // max_points))
-        if every_n > every_n_base:
+        every_n = max(max(1, every_n_base // embed_stride), -(-total_frames // max_points))
+        if total_frames > max_points:
             print(
-                f"[{group}] every_n {every_n_base} → {every_n} "
-                f"({total_frames} frames, cap {max_points} points)"
+                f"[{group}] residual every_n → {every_n} "
+                f"({total_frames} strided rows, cap {max_points} points)"
             )
 
         tsne3d_json = export_task_tsne3d(
@@ -538,8 +550,9 @@ def run_latent_viz(
             continue
         manifest_groups[group] = {
             "episodes": len(done_hashes),
-            "frames": total_frames,
-            "every_n": every_n,
+            "frames": total_frames,         # embedded latent rows (strided)
+            "embed_stride": embed_stride,
+            "every_n": every_n,             # residual t-SNE subsample over rows
         }
         print(
             f"[{group}] {len(done_hashes)} episodes, {total_frames} frames "
