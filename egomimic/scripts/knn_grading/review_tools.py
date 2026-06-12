@@ -360,6 +360,11 @@ def cmd_pair(args: argparse.Namespace) -> None:
 
     meta_path = _fetch(args.knn_run, "scores_meta.json")
     meta = json.load(open(meta_path)) if meta_path else {}
+    if not meta and scores_path.name == "knn_scores_by_task.json":
+        # Pre-refactor grading run: no meta file, but the knn filename tells
+        # us the direction (primary_score is worst-first).
+        meta = {"source": "knn_grading", "metric": "primary_score", "higher_is_worse": True}
+        print("pair: no scores_meta.json — inferred higher_is_worse=true from knn_scores_by_task.json")
     meta.setdefault("higher_is_worse", False)
     meta.update({"scores_from": args.knn_run, "n_matched": n_matched, "n_unmatched": len(unmatched),
                  "paired_at": datetime.now(timezone.utc).isoformat()})

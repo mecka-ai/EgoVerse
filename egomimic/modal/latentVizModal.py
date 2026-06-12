@@ -335,10 +335,12 @@ def run_latent_viz(
     if scores_from:
         src_dir = Path(CFG.output_mount_path) / str(scores_from)
         src_scores = None
+        src_scores_name = None
         for cand in ("scores_by_task.json", "knn_scores_by_task.json"):
             if (src_dir / cand).is_file():
                 with open(src_dir / cand) as f:
                     src_scores = json.load(f)
+                src_scores_name = cand
                 break
         if src_scores is None:
             raise FileNotFoundError(
@@ -373,6 +375,13 @@ def run_latent_viz(
         if (src_dir / "scores_meta.json").is_file():
             with open(src_dir / "scores_meta.json") as f:
                 scores_meta = json.load(f)
+        elif src_scores_name == "knn_scores_by_task.json":
+            # Pre-refactor grading run: no meta file, but the knn filename
+            # tells us the direction (primary_score is worst-first).
+            scores_meta = {"source": "knn_grading", "metric": "primary_score",
+                           "higher_is_worse": True}
+            print("scores_from: no scores_meta.json — inferred higher_is_worse=true "
+                  "from knn_scores_by_task.json")
         scores_meta.setdefault("higher_is_worse", False)
         scores_meta.update(
             {
