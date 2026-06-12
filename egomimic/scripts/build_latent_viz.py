@@ -334,20 +334,48 @@ function uiState() {
   };
 }
 
+// Whether a panel's trace 0 currently holds prune-filtered (subset) data —
+// when the selection clears, one full-data restyle restores it.
+let _plotFiltered = {state: false, action: false};
+
 function applyStyle() {
   if (!curTask || !CACHE[curTask]) return;
   const u = uiState();
   const st = CL[curTask];
   const rmEp = st && st.removedEp;               // Uint8Array per episode index
+  const hide = !!(rmEp && st.removedSet.size);
   for (const mod of ["state", "action"]) {
     const m = CACHE[curTask].mods[mod];
     if (!m) continue;
-    const {d, tables} = m;
+    const {d, tables, custom} = m;
     let base = tables[u.mode];
     if (u.mode === "cluster") {
       base = (st && st.clTable && st.clTable[mod]) || tables.episode;
     }
     const N = d.x.length;
+    if (hide || _plotFiltered[mod]) {
+      // Prune preview drops removed episodes' points from the trace entirely
+      // (a color ghost is unreadable at 30k points). Full-data restyle —
+      // heavier than the color-only path, but only runs while a selection
+      // exists (and once more to restore when it clears).
+      const xs = [], ys = [], zs = [], cs = [], cd = [];
+      const szs = u.hlOn ? [] : null;
+      for (let k = 0; k < N; k++) {
+        if (hide && rmEp[d.ep[k]]) continue;
+        const on = d.t[k] >= u.t0 && d.t[k] <= u.t1
+          && (u.ep === "all" || d.ep[k] === +u.ep)
+          && (!u.hlOn || Math.abs(d.frame[k] - u.hlF) <= u.hlW);
+        xs.push(d.x[k]); ys.push(d.y[k]); zs.push(d.z[k]); cd.push(custom[k]);
+        cs.push(on ? base[k] : DIM);
+        if (szs) szs.push(on ? u.size * 2.2 : u.size);
+      }
+      Plotly.restyle(mod, {
+        x: [xs], y: [ys], z: [zs], customdata: [cd],
+        "marker.color": [cs], "marker.size": szs ? [szs] : u.size,
+      }, [0]);
+      _plotFiltered[mod] = hide;
+      continue;
+    }
     const colors = new Array(N);
     let sizes = u.size;                          // scalar unless highlighting
     if (u.hlOn) sizes = new Array(N);
@@ -355,9 +383,7 @@ function applyStyle() {
       const on = d.t[k] >= u.t0 && d.t[k] <= u.t1
         && (u.ep === "all" || d.ep[k] === +u.ep)
         && (!u.hlOn || Math.abs(d.frame[k] - u.hlF) <= u.hlW);
-      // Filters narrow the view (DIM); the prune preview shows WITHIN the
-      // view which episodes the current cut would drop (red ghost).
-      colors[k] = !on ? DIM : (rmEp && rmEp[d.ep[k]] ? REMOVED_COLOR : base[k]);
+      colors[k] = on ? base[k] : DIM;
       if (u.hlOn) sizes[k] = on ? u.size * 2.2 : u.size;
     }
     Plotly.restyle(mod, {"marker.color": [colors], "marker.size": Array.isArray(sizes) ? [sizes] : sizes}, [0]);
@@ -395,6 +421,8 @@ function renderTsne(task) {
   for (const mod of ["state", "action"]) {
     const m = CACHE[task].mods[mod];
     const el = document.getElementById(mod);
+    _xhl[mod] = null;            // newPlot wipes trace 1's diamond
+    _plotFiltered[mod] = false;  // ...and rebuilds trace 0 with full data
     if (!m) { Plotly.purge(el); el.innerHTML = ""; continue; }
     const {d, tables, custom} = m;
     Plotly.newPlot(mod, [
@@ -425,7 +453,7 @@ function renderTsne(task) {
         `<a href="${VIDEO_BASE}${hash}" target="_blank" style="color:#7fd4ff">video ↗</a>`;
       document.getElementById("hlFrame").value = frame;
       showFrame(task, hash, frame, tpct / 100);
-      crossHighlight(task, epIdx, frame);
+      crossHighlight(task, epIdx, frame, mod);
     });
     el.on("plotly_relayout", ev => {
       if (!document.getElementById("syncCam").checked || camLock) return;
@@ -480,16 +508,26 @@ function markLegend() {
   if (el) el.classList.add("active");
 }
 
-function crossHighlight(task, epIdx, frame) {
+// Last diamond key per panel — every gl3d restyle re-renders the whole scene
+// (~the dominant per-click cost at 30k points), so only touch a panel when
+// its diamond actually changes, and never the clicked panel (the point there
+// is already under the cursor).
+let _xhl = {state: null, action: null};
+function crossHighlight(task, epIdx, frame, clickedMod) {
   for (const mod of ["state", "action"]) {
     const m = (CACHE[task] || {mods:{}}).mods[mod];
     if (!m) continue;
-    const d = m.d;
+    const key = mod === clickedMod ? null : `${task}|${epIdx}|${frame}`;
+    if (_xhl[mod] === key) continue;
     let xs = [], ys = [], zs = [];
-    for (let k = 0; k < d.x.length; k++) {
-      if (d.ep[k] === epIdx && d.frame[k] === frame) { xs.push(d.x[k]); ys.push(d.y[k]); zs.push(d.z[k]); break; }
+    if (key !== null) {
+      const d = m.d;
+      for (let k = 0; k < d.x.length; k++) {
+        if (d.ep[k] === epIdx && d.frame[k] === frame) { xs.push(d.x[k]); ys.push(d.y[k]); zs.push(d.z[k]); break; }
+      }
     }
     Plotly.restyle(mod, {x: [xs], y: [ys], z: [zs]}, [1]);
+    _xhl[mod] = key;
   }
 }
 
@@ -520,6 +558,12 @@ function showFrame(task, hash, frame, tfrac) {
     pvHash = hash;
     v.src = VIDEO_BASE + hash;
     v.onloadedmetadata = seek;
+    v.onerror = () => {
+      document.getElementById("pv-cap").innerHTML =
+        `<b>${hash.slice(0,12)}</b> · <span style="color:#ff9b7b">video unavailable</span> — ` +
+        `episode-preview app stopped or episode not rendered ` +
+        `(modal deploy egomimic/modal/episode_preview.py, then render_all this run's episode_hashes.json)`;
+    };
   } else { seek(); }
   updateCap();
 }
@@ -561,7 +605,16 @@ function hidePreview() {
 /* ---------------- video grid page ---------------- */
 function loadVideo(cellId, hash) {
   const cell = document.getElementById(cellId);
-  cell.innerHTML = `<video src="${VIDEO_BASE}${hash}" controls loop muted playsinline preload="metadata"></video>`;
+  const v = document.createElement("video");
+  v.src = VIDEO_BASE + hash;
+  v.controls = true; v.loop = true; v.muted = true; v.preload = "metadata";
+  v.setAttribute("playsinline", "");
+  v.onerror = () => {
+    cell.innerHTML = '<div class="ph" style="cursor:default">⚠ video unavailable<br>' +
+      '<span style="font-size:11px">episode-preview app stopped or episode not rendered</span></div>';
+  };
+  cell.innerHTML = "";
+  cell.appendChild(v);
 }
 
 function histoSVG(scores) {
