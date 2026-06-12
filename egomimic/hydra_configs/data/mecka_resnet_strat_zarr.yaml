@@ -1,15 +1,16 @@
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 # resnet_k10-20_lang_stratified — TOP-60% — zarr volume (ModalEpisodeResolver)
+# Source: resnet_k10-20_lang_stratified/14-task resnet language stratified_2026-06-11_22-13-50
 #
 # SHARED ACROSS ALL 4 LANG-CURATION ARMS:
-#   valid     → mecka_lang4runs_val_3ep.json   (3 eps: assembling_booklets, washing_bowls, folding_socks)
-#   train_viz → mecka_lang4runs_train_viz.json (same 3 eps, identical to val_3ep)
+#   valid     → mecka_lang4runs_v2_val.json      (3 eps: assembling_booklets, washing_bowls, folding_socks)
+#   train_viz → mecka_lang4runs_v2_train_viz.json (same 3 eps, identical to val)
 #
 # ARM-SPECIFIC:
-#   train = 237 eps (mecka_resnet_strat_top60_train.json)
+#   train = 237 eps (mecka_resnet_strat_v2_train.json)
 #
-# Invariants: val ∩ train = ∅  |  train_viz = val_3ep  |  no cross-arm contamination
+# Invariants: val ∩ train = ∅  |  train_viz = val  |  no cross-arm contamination
 
 train_datasets:
   mecka_bimanual:
@@ -23,7 +24,7 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      eps_to_use: egomimic/hydra_configs/data/extra/mecka_resnet_strat_top60_train.json
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_resnet_strat_v2_train.json
     mode: total
 
 valid_datasets:
@@ -38,7 +39,7 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      eps_to_use: egomimic/hydra_configs/data/extra/mecka_lang4runs_val_3ep.json
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_lang4runs_v2_val.json
     mode: total
 
 train_viz_datasets:
@@ -53,7 +54,7 @@ train_viz_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      eps_to_use: egomimic/hydra_configs/data/extra/mecka_lang4runs_train_viz.json
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_lang4runs_v2_train_viz.json
     mode: total
 
 train_dataloader_params:
