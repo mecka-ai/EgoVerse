@@ -48,9 +48,10 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         actual frame count per epoch is ``sum(ep.n_frames for ep in window)``;
         Lightning's ``limit_train_batches`` truncates as needed.
     epoch_frames:
-        Optional target frame count (used only for ``__len__`` so
-        ``DistributedSampler`` partitions consistently across ranks). When
-        ``None`` the real index_map length is used after ``prepare_epoch``.
+        Optional target frame count hint used to compute a default
+        ``episodes_per_epoch``. ``__len__`` now returns the real total frame
+        count so Lightning's ``limit_train_batches`` truncates a fully-shuffled
+        pool (same behaviour as zarr's ``MultiDataset``).
     pool_size_gb:
         Hard NVMe ceiling for the episode pool. Sized so that
         current + lookahead episodes always fit with headroom.
@@ -102,6 +103,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             raise RuntimeError(f"Resolver returned 0 episodes for mode={mode}")
 
         total_frames = sum(e.n_frames for e in self._episodes)
+        self._total_frames = total_frames
         avg_frames_per_ep = max(1, total_frames // len(self._episodes))
 
         # Default episodes_per_epoch: enough episodes to cover epoch_frames
@@ -242,8 +244,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
+        # Return the real total frame count so PyTorch's RandomSampler shuffles
+        # the full pool and Lightning's limit_train_batches truncates it —
+        # identical to zarr MultiDataset behaviour.
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        return self.epoch_frames * world_size
+        return self._total_frames * world_size
 
     def __getitem__(self, idx: int) -> dict:
         # In worker context, check the epoch file and rebuild the local
