@@ -12,8 +12,8 @@ defaults:
 #    global batch, so the divisor is 256, not the per-device 64.)
 # Warmup set to 1000 steps (~8% of T_max). num_cycles 0.5 → decay to 0 at T_max.
 optimizer:
-  lr: 3e-5
+  lr: 5e-6
 
 scheduler:
   num_warmup_steps: 1000
-  num_training_steps: 12226
+  num_training_steps: 50000
