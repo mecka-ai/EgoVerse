@@ -1,0 +1,9 @@
+{
+  "control_for": "ironing_knn_prune70.json",
+  "rule": "seed-42 shuffle of the full 372-episode universe, prefix until cumulative raw frames >= 252580",
+  "universe": "latent_viz/ironing_10h/knn_tune_2026-06-12_16-11-16/group_universe.json",
+  "n_episodes": 112,
+  "frames": 254827,
+  "hours": 2.36,
+  "overlap_note": "overlap with the knn keep set is expected and fine - the control matches hours, not membership"
+}
