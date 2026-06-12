@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-06-12T22:23:18.754510+00:00",
+  "sources": [
+    {
+      "file": "egomimic/hydra_configs/data/extra/selections/ironing_knn_prune70_selection.json",
+      "sha256": "406081afc75ec3e1bf9f9c42952432575aec39bf78d883e82e62d4b652c75619",
+      "created_at": "2026-06-12T22:14:43.792Z",
+      "tasks": {
+        "ironing_clothes": {
+          "kept": 111,
+          "removed": 261
+        }
+      }
+    }
+  ],
+  "universe": "/tmp/uni.json",
+  "n_kept": 111,
+  "n_default_kept": 0,
+  "allowlist_sha256": "7b2034037b932539b6392972599db48f6c3e94542bc261b51bce3af8ec18b742"
+}
