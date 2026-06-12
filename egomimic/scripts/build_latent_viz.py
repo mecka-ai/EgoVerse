@@ -524,12 +524,18 @@ function showFrame(task, hash, frame, tfrac) {
 }
 
 function updateCap() {
+  const st = curTask ? CL[curTask] : null;
+  const ovr = st && pvHash ? st.override[pvHash] : null;
   document.getElementById("pv-cap").innerHTML =
     `<b>${pvHash ? pvHash.slice(0,12) : ""}</b> · frame <b>${pvFrame}</b>` +
     (pvTfrac != null ? ` (${Math.round(pvTfrac*100)}%)` : "") +
+    (st && st.removedSet.has(pvHash) ? ' <span class="badge b-rm">REMOVED</span>' : "") +
     ` <button onclick="stepFrame(-1)">−1f</button>` +
     ` <button onclick="stepFrame(1)">+1f</button>` +
     ` <button onclick="togglePlay()">▶/⏸</button>` +
+    `<span class="ovr-btns">` +
+    ` <button class="${ovr === "keep" ? "on" : ""}" onclick="setOverride(curTask, pvHash, 'keep'); updateCap()" title="always keep">K</button>` +
+    ` <button class="bad ${ovr === "drop" ? "on" : ""}" onclick="setOverride(curTask, pvHash, 'drop'); updateCap()" title="always drop">D</button></span>` +
     ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open ↗</a>`;
 }
 
@@ -878,7 +884,9 @@ function computeRemoval(task) {
     (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
   const total = items.reduce((a, x) => a + x.frames, 0);
   const maxCls = st.allowProt ? 3 : 2;
-  const target = st.pct / 100 * total;
+  // Frame-rounded target so an hours-derived pct doesn't overshoot a whole
+  // episode on float error (frames are integral).
+  const target = Math.round(st.pct / 100 * total);
   const removed = [];
   let removedFrames = 0;
   let removable = 0;
@@ -1007,7 +1015,7 @@ function targetHours() {
   const keepH = +document.getElementById("targetH").value;
   if (!total || !(keepH >= 0)) return;
   const pct = Math.max(0, Math.min(100, 100 * (1 - keepH * 3600 * FPS / total)));
-  st.pct = Math.round(pct * 2) / 2;
+  st.pct = pct;   // full precision — quantizing here can cost a whole episode
   st.allowProt = document.getElementById("allowProt").checked;
   refreshSelection(curTask);
 }
