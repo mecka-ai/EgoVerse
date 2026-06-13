@@ -1,0 +1,12 @@
+{
+  "universe": "latent_viz/ironing_10h/knn_tune_2026-06-12_16-11-16/group_universe.json",
+  "scores": "knn_grading/knn_grade/ironing_10h_capfix_2026-06-11_15-46-34/knn_scores_by_task.json",
+  "fps": 30,
+  "universe_episodes": 372,
+  "universe_frames": 843974,
+  "role": "shared held-out eval for BOTH A/B arms",
+  "rule": "seed-7 random shuffle of all 372 ironing episodes, first 10% by count",
+  "episodes": 37,
+  "frames": 80815,
+  "hours": 0.748
+}
