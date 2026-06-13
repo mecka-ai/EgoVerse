@@ -1,0 +1,13 @@
+{
+  "universe": "latent_viz/ironing_10h/knn_tune_2026-06-12_16-11-16/group_universe.json",
+  "scores": "knn_grading/knn_grade/ironing_10h_capfix_2026-06-11_15-46-34/knn_scores_by_task.json",
+  "fps": 30,
+  "universe_episodes": 372,
+  "universe_frames": 843974,
+  "role": "A/B arm: knn-pruned train set (eval-excluded)",
+  "rule": "best-knn-score-first prefix of (372 - eval) until cumulative frames >= 252580",
+  "eval_excluded": "ironing_ab_eval.json",
+  "episodes": 114,
+  "frames": 254825,
+  "hours": 2.359
+}
