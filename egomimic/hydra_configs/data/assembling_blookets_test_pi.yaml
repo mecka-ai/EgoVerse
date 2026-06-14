@@ -1,0 +1,84 @@
+# ASSEMBLING_BLOOKETS (booklet assembly) — TEST SUBSET, pi0.5 variant.
+#
+# pi0.5 counterpart of assembling_blookets_test.yaml: same 35-episode local
+# zarr subset (LocalEpisodeResolver + JSON allowlist off /workspace/zarr_episodes),
+# but wired for the PI algo — annotations are read from zarr and tokenized into
+# PaliGemma prompts (use_tokenizer + build_tokenized_collate), mirroring the
+# pruned eva_pi / cotrain_pi_base data module params.
+#
+# Launch (single H200, pi0.5):
+#   python egomimic/trainHydra.py --config-name=train_zarr_cartesian_pi \
+#     data=assembling_blookets_test_pi model=pi0.5_bc_mecka \
+#     model.robomimic_model.config.pytorch_weight_path=/workspace/EgoVerse/egomimic/algo/pi_checkpoints/pi05_base_pytorch \
+#     name=blookets_pi description=pi05_local
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/zarr_episodes
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/zarr_episodes
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+# --- pi0.5 tokenizer / prompt wiring (from cotrain_pi_base) ---
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: "random"
+annotation_key: "annotations"
+default_prompt: ""
+proprio: false
+embodiment_label: true
+state_num_bins: 256
+control_mode: null
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 32
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 8
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false
