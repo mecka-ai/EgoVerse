@@ -1,0 +1,79 @@
+# ASSEMBLING_BLOOKETS (booklet assembly) — TEST SUBSET, LOCAL / single-H100.
+#
+# Ported from the original 2×H200 PrefetchedMapDataset + ZipEpisodeResolver
+# config (origin/pi-training-configs) to the *default* path:
+# MultiDataset._from_resolver + LocalEpisodeResolver. Reads the staged zarr
+# episodes directly off the network volume at /workspace/zarr_episodes (all 35
+# booklet-subset hashes are present there) instead of extracting zips into a
+# local NVMe pool.
+#
+#   task: assembling booklets   subset = 35 eps (allowlisted via JSON)
+#   split: MultiDataset splits by episode via valid_ratio (0.2) -> ~28 train / 7 valid
+#
+# The allowlist is loaded from the same JSON the zip resolver used
+# (assembling_blookets_test.json), so the episode set is identical.
+#
+# Launch (single H100, regular HPT model, 48 dataloader workers):
+#   python egomimic/trainHydra.py --config-name=train_zarr_cartesian \
+#     data=assembling_blookets_test model=hpt_bc_flow_mecka logger=debug \
+#     name=blookets_local description=hpt_local_48w
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/zarr_episodes
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/zarr_episodes
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/assembling_blookets_test.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 48
+    persistent_workers: true
+    # Deeper per-worker prefetch buffer absorbs latency spikes (outlier-rejection
+    # resamples, NFS chunk misses) that otherwise starve the GPU mid-epoch.
+    prefetch_factor: 8
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 8
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false
