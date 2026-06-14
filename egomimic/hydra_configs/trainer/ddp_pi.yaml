@@ -7,5 +7,11 @@ accelerator: gpu
 devices: ${eval:'${launch_params.gpus_per_node} * ${launch_params.nodes}'}
 num_nodes: ${launch_params.nodes}
 sync_batchnorm: True
-check_val_every_n_epoch: 10
+# Step-based validation: with limit_train_batches=null an epoch is thousands of
+# batches, so gate validation on global step count instead of epochs. Lightning
+# allows val_check_interval (int) to exceed the per-epoch batch count only when
+# check_val_every_n_epoch is null -> validate every 2000 train steps regardless
+# of epoch boundaries (matches the step-based checkpoint cadence).
+check_val_every_n_epoch: null
+val_check_interval: 2000
 num_sanity_val_steps: 0
