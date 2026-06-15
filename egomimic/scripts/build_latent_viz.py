@@ -140,6 +140,11 @@ _TEMPLATE = """<!DOCTYPE html>
   .ph .play { font-size:28px; }
   .clinks { padding:6px 10px; font-size:11px; display:flex; gap:10px; }
   .clinks a { color:#7fd4ff; text-decoration:none; }
+  .meta { padding:4px 10px 5px; font-size:11px; color:#777; line-height:1.6;
+          border-top:1px solid var(--line); }
+  .meta-op { color:#7fd4ff; }
+  .meta-dt { color:#b494ff; }
+  .meta-sc { color:#aaa; }
   /* frame preview */
   #preview { position:fixed; right:14px; bottom:14px; width:400px; background:#17181d;
              border:1px solid #34363f; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.7);
@@ -686,6 +691,25 @@ const LANG_MAP={};
 })();
 
 /* video grid */
+function metaLine(hash){
+  const m=METADATA[hash];
+  if(!m)return'';
+  const esc=s=>s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):'';
+  const row=[];
+  if(m.operator)row.push(`<span class="meta-op">${esc(m.operator)}</span>`);
+  if(m.data_type)row.push(`<span class="meta-dt">${esc(m.data_type)}</span>`);
+  if(m.scene)row.push(`<span class="meta-sc">${esc(m.scene)}</span>`);
+  const objs=Array.isArray(m.objects)?m.objects:(m.objects?[m.objects]:[]);
+  if(objs.length)row.push(`<span class="meta-sc">${objs.slice(0,5).map(esc).join(', ')}</span>`);
+  if(!row.length)return'';
+  let html=`<div class="meta">${row.join(' · ')}`;
+  if(m.task_description){
+    const td=String(m.task_description);
+    html+=`<br><span style="color:#5a6a7a;font-style:italic">${esc(td.length>80?td.slice(0,80)+'…':td)}</span>`;
+  }
+  return html+'</div>';
+}
+
 function loadVideo(cellId,hash,task){
   const el=document.getElementById(cellId);
   const anns=(LANG_MAP[task]||{})[hash]||[];
@@ -752,6 +776,7 @@ function renderGrid(task){
         <span class="hash">${hash.slice(0,16)}…</span>${badge}${valb}
         <span class="score">${score.toFixed(4)}</span></div>
       <div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>
+      ${metaLine(hash)}
       <div class="vid" id="${cid}">
         <div class="ph" onclick="loadVideo('${cid}','${hash}','${task}')">
           <div class="play">▶</div><div style="font-size:12px">load video</div></div>
