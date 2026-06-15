@@ -73,12 +73,7 @@ from modal_setup import (  # noqa: E402
     wds_volume,
     zarr_volume,
 )
-from shard_zarr_to_tar import (  # noqa: E402
-    EPISODES_PER_SHARD,
-    _task_shard_dir,
-    _write_task_indexes_remote,
-    convert_shard,
-)
+EPISODES_PER_SHARD = 200  # matches shard_zarr_to_tar.EPISODES_PER_SHARD
 
 # GPU embed-shard workers — override at launch via +modal_gpu / +modal_cpu / +modal_memory_gb.
 TASK_COMPUTE = ModalCompute.from_environ(
@@ -610,6 +605,14 @@ def run_curate(
         init_submodules=init_submodules,
     )
     _sys.path.insert(0, CFG.remote_repo_dir)
+    _modal_dir = str(Path(CFG.remote_repo_dir) / "egomimic" / "modal")
+    if _modal_dir not in _sys.path:
+        _sys.path.insert(0, _modal_dir)
+    from shard_zarr_to_tar import (  # noqa: E402
+        _task_shard_dir,
+        _write_task_indexes_remote,
+        convert_shard,
+    )
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
     os.environ.setdefault("HYDRA_FULL_ERROR", "1")
