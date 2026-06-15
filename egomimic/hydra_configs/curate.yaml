@@ -39,7 +39,7 @@ seed: 42
 
 # Max episodes per GPU shard (Pass 2). Tasks with more episodes are split
 # into multiple containers; KSG runs on all shards combined (Pass 3).
-max_episodes_per_shard: 100
+max_episodes_per_shard: 30
 
 hydra:
   run:
