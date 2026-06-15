@@ -30,6 +30,7 @@ INPUT_MOUNT = CFG.volume_mount_path
 
 _IO_BUFFER = 64 * 1024 * 1024
 _DEFAULT_MAX_CONTAINERS = 3500
+EPISODES_PER_SHARD = 200
 
 wds_volume = modal.Volume.from_name(
     WDS_VOLUME_NAME,
