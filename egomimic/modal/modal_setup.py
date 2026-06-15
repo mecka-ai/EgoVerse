@@ -198,6 +198,11 @@ image = (
     .add_local_file(
         Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
     )
+    .add_local_file(
+        Path(__file__).resolve().parent / "shard_zarr_to_tar.py",
+        remote_path="/root/shard_zarr_to_tar.py",
+        copy=True,
+    )
     .pip_install(
         "lightning",
         "hydra-core",
