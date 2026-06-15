@@ -888,7 +888,10 @@ def submit_curate(*hydra_args: str) -> None:
 if __name__ == "__main__":
     modal_env = os.environ.copy()
     hydra_args: list[str] = []
+    _MODAL_FLAGS = {"--detach", "--env"}
     for arg in sys.argv[1:]:
+        if arg in _MODAL_FLAGS:
+            continue
         key, sep, val = arg.lstrip("+").partition("=")
         if sep and key in MODAL_COMPUTE_ARG_MAP:
             modal_env[MODAL_COMPUTE_ARG_MAP[key]] = val
