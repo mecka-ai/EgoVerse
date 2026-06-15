@@ -34,7 +34,6 @@ _DEFAULT_MAX_CONTAINERS = 3500
 wds_volume = modal.Volume.from_name(
     WDS_VOLUME_NAME,
     create_if_missing=True,
-    version=pb.VOLUME_FS_VERSION_V2,
 )
 
 
