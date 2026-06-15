@@ -388,6 +388,9 @@ def _write_task_indexes_remote(task_results: dict[str, list[dict]]) -> None:
                 ep_hash = ep_name[:-5] if ep_name.endswith(".zarr") else ep_name
                 index[ep_hash] = r["shard_name"]
 
+        if not index:
+            print(f"  [{_task_shard_dir(task_name)}] no successful shards — skipping index write")
+            continue
         (task_dir / "shard_index.json").write_text(json.dumps(index, indent=2))
         meta = {
             "task": task_name,
@@ -509,9 +512,40 @@ def _rebuild_shard_index_remote() -> int:
     return len(index)
 
 
+@app.function(
+    image=image,
+    volumes={WDS_MOUNT: wds_volume},
+    cpu=1,
+    memory=512,
+    timeout=120,
+)
+def _delete_task_shard_dir(task_name: str) -> str:
+    """Remove the per-task shard directory from the WDS volume."""
+    import shutil
+    task_dir = Path(WDS_MOUNT) / _task_shard_dir(task_name)
+    if task_dir.exists():
+        shutil.rmtree(task_dir)
+        wds_volume.commit()
+        return f"deleted {task_dir}"
+    return f"not found: {task_dir}"
+
+
 # ---------------------------------------------------------------------------
 # Local entrypoints
 # ---------------------------------------------------------------------------
+
+@app.local_entrypoint()
+def delete_task_shards(task: str = "") -> None:
+    """Delete a task's per-task shard directory from the WDS volume.
+
+    Usage:
+        modal run --env robotics egomimic/modal/shard_zarr_to_tar.py::delete_task_shards -- --task dishwashing
+    """
+    if not task:
+        raise ValueError("Pass --task <task_name>")
+    result = _delete_task_shard_dir.remote(task)
+    print(result)
+
 
 @app.local_entrypoint()
 def rebuild_shard_index() -> None:

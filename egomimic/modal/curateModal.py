@@ -676,11 +676,19 @@ def run_curate(
         return ""
 
     # ── 3. Ensure per-task tar shards exist on WDS volume ────────────────────
+    def _shard_index_valid(task_name: str) -> bool:
+        import json as _json
+        p = Path(WDS_MOUNT_PATH) / _task_shard_dir(task_name) / "shard_index.json"
+        if not p.exists():
+            return False
+        try:
+            return bool(_json.loads(p.read_text()))
+        except Exception:
+            return False
+
     tasks_needing_shards = [
         task_name for task_name in by_task
-        if not (
-            Path(WDS_MOUNT_PATH) / _task_shard_dir(task_name) / "shard_index.json"
-        ).exists()
+        if not _shard_index_valid(task_name)
     ]
 
     if tasks_needing_shards:
