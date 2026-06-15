@@ -33,7 +33,7 @@ _VAL_JSON = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.j
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .pip_install("fastapi[standard]")
+    .pip_install("fastapi[standard]", "sqlalchemy", "psycopg2-binary")
     .add_local_file(_BUILDER, remote_path="/root/build_latent_viz.py", copy=True)
     .add_local_file(_VAL_JSON, remote_path="/root/mecka_d64_val.json", copy=True)
 )
@@ -84,7 +84,7 @@ def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
         for r in runs[:60]
     )
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>EgoVerse Viewer</title>
+<html><head><meta charset="utf-8"><title>Meckaverse</title>
 <style>
   :root{{--bg:#101014;--bar:#1a1b21;--line:#2b2d36;--acc:#3b82f6;--txt:#e8e8ea;}}
   html,body{{height:100%;margin:0;background:var(--bg);color:var(--txt);font-family:-apple-system,Helvetica,Arial,sans-serif;}}
@@ -121,7 +121,7 @@ def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
 </style></head>
 <body>
 <div id="topbar">
-  <h1>EgoVerse viewer</h1>
+  <h1>Meckaverse</h1>
   <span class="sub">{n_runs} curation run{'' if n_runs == 1 else 's'} on <code>egoverse-training-outputs</code></span>
   <div class="links">
     <a href="/episodes">Episodes</a>
@@ -176,8 +176,53 @@ document.getElementById('runInput').addEventListener('keydown', e => {{ if (e.ke
 </body></html>"""
 
 
+def _fetch_episode_metadata(hashes: list[str]) -> dict:
+    """Query app.episodes for the given hashes via the egoverse-sql secret."""
+    if not hashes:
+        return {}
+    try:
+        import os
+        from urllib.parse import quote_plus
+        from sqlalchemy import create_engine, text as sql_text
+
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url:
+            database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        else:
+            user = os.environ["PG_USER"]
+            password = quote_plus(os.environ["PG_PASSWORD"])
+            host = os.environ["PG_HOST"]
+            port = os.environ.get("PG_PORT", "5432")
+            database = os.environ.get("PG_DATABASE", "defaultdb")
+            database_url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}?sslmode=require"
+
+        engine = create_engine(database_url, pool_pre_ping=True)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sql_text(
+                    "SELECT episode_hash, operator, task_description, scene, objects, data_type"
+                    " FROM app.episodes WHERE episode_hash = ANY(:hashes)"
+                ),
+                {"hashes": hashes},
+            ).fetchall()
+        return {
+            row[0]: {
+                "operator": row[1],
+                "task_description": row[2],
+                "scene": row[3],
+                "objects": row[4],
+                "data_type": row[5],
+            }
+            for row in rows
+        }
+    except Exception as exc:
+        print(f"[viewer] metadata fetch failed: {exc}")
+        return {}
+
+
 @app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
+    secrets=[modal.Secret.from_name("egoverse-sql")],
     cpu=4.0,
     memory=8192,
     min_containers=1,
@@ -194,7 +239,7 @@ def viewer():
     sys.path.insert(0, "/root")
     from build_latent_viz import build_html
 
-    web = FastAPI(title="EgoVerse Viewer")
+    web = FastAPI(title="Meckaverse")
     html_cache: dict[str, str] = {}
     frame_cache: dict[str, bytes] = {}
     val_list = json.load(open("/root/mecka_d64_val.json"))
@@ -220,9 +265,18 @@ def viewer():
             raise HTTPException(404, f"scores_by_task.json not found under {run!r}")
 
         scores = json.load(open(scores_path))
-        body = build_html(tsne_dir, scores, val_list, video_base="/video/", frame_base="/frame/", run_label=run)
+
+        all_hashes: set[str] = set()
+        for f in sorted(tsne_dir.glob("tsne3d_*.json")):
+            d = json.load(open(f))
+            all_hashes.update(d.get("episodes", []))
+        for task_scores in scores.values():
+            all_hashes.update(task_scores.keys())
+        metadata = _fetch_episode_metadata(list(all_hashes))
+
+        body = build_html(tsne_dir, scores, val_list, video_base="/video/", frame_base="/frame/", run_label=run, metadata=metadata)
         html_cache[run] = body
-        print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run}")
+        print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run} ({len(metadata)} metadata entries)")
         return body
 
     @web.get("/")
@@ -268,7 +322,7 @@ def viewer():
             for h in eps
         )
         return f"""<!doctype html><html><head><meta charset=utf-8>
-<title>EgoVerse Episodes ({len(eps)})</title>
+<title>Meckaverse Episodes ({len(eps)})</title>
 <style>
  body{{background:#111;color:#eee;font-family:system-ui,sans-serif;margin:0;padding:16px}}
  h1{{font-size:16px;font-weight:600}}
@@ -279,7 +333,7 @@ def viewer():
  a{{color:#7fd4ff}}
 </style></head><body>
 <p><a href="/">← latent viewer</a></p>
-<h1>EgoVerse episode previews — {len(eps)} episodes</h1>
+<h1>Meckaverse episode previews — {len(eps)} episodes</h1>
 <div class="grid">{cards or '<p>No MP4s yet — run episode_preview.py::render_all.</p>'}</div>
 </body></html>"""
 

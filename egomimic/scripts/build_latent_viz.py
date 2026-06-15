@@ -48,7 +48,7 @@ _TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>EgoVerse latent viewer</title>
+<title>Meckaverse</title>
 <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
 <style>
   :root { --bg:#101014; --bar:#1a1b21; --card:#1c1d24; --line:#2b2d36; --acc:#3b82f6; --txt:#e8e8ea; }
@@ -153,17 +153,34 @@ _TEMPLATE = """<!DOCTYPE html>
               background:rgba(0,0,0,.6); border-radius:50%; width:20px; height:20px;
               text-align:center; line-height:20px; }
   #pv-close:hover { color:#fff; }
+  /* metadata filter bar */
+  #metabar { flex-shrink:0; padding:4px 14px; display:none; gap:10px; align-items:center; flex-wrap:wrap;
+             background:#13141a; border-bottom:1px solid var(--line); font-size:13px; }
 </style>
 </head>
 <body>
 <div id="bar">
-  <h3>EgoVerse</h3>
+  <h3>Meckaverse</h3>
   <span class="tab active" id="tab-tsne" onclick="showPage('tsne')">t-SNE 3-D</span>
   <span class="tab" id="tab-grid" onclick="showPage('grid')">Video grid</span>
   <label class="tool" style="margin-left:4px">Task
     <select id="task"></select></label>
   <div id="info">Click a point to inspect</div>
   <div class="run-nav" id="runNav">__RUN_LABEL__</div>
+</div>
+
+<div id="metabar">
+  <span style="color:#9aa;font-size:13px">Meta:</span>
+  <span class="tool"><label>Operator</label>
+    <select id="fOp" onchange="onMetaFilter()"><option value="">all</option></select></span>
+  <span class="tool"><label>Type</label>
+    <select id="fType" onchange="onMetaFilter()"><option value="">all</option></select></span>
+  <span class="tool"><label>Scene</label>
+    <select id="fScene" onchange="onMetaFilter()"><option value="">all</option></select></span>
+  <span class="tool"><label>Objects</label>
+    <input type="text" id="fObj" placeholder="any…" oninput="onMetaFilter()" style="width:90px"></span>
+  <button onclick="clearMetaFilters()">clear</button>
+  <span id="metaCount" style="font-size:11px;color:#777"></span>
 </div>
 
 <div id="tsnepage">
@@ -239,9 +256,63 @@ const VAL = new Set(__VAL__);
 const VIDEO_BASE = "__VIDEO_BASE__";
 const FRAME_BASE = "__FRAME_BASE__";
 const FPS = __FPS__;
+const METADATA = __METADATA__;
 const DIM = "rgba(110,110,120,0.05)";
 const HIDDEN = "rgba(0,0,0,0)";
 let selectedEps = new Set();
+
+/* metadata filters */
+function rebuildMetaOpts(task){
+  if(!Object.keys(METADATA).length)return;
+  document.getElementById("metabar").style.display="flex";
+  const hashes=new Set();
+  (DATA[task]?DATA[task].episodes||[]:[]).forEach(h=>hashes.add(h));
+  (SCORES[task]||[]).forEach(([h])=>hashes.add(h));
+  const ops=new Set(),types=new Set(),scenes=new Set();
+  for(const h of hashes){
+    const m=METADATA[h];if(!m)continue;
+    if(m.operator)ops.add(m.operator);
+    if(m.data_type)types.add(m.data_type);
+    if(m.scene)scenes.add(m.scene);
+  }
+  const rebuild=(id,vals)=>{
+    const sel=document.getElementById(id);
+    const prev=sel.value;
+    sel.innerHTML='<option value="">all</option>';
+    [...vals].sort().forEach(v=>{const o=document.createElement("option");o.value=o.textContent=v;if(v===prev)o.selected=true;sel.appendChild(o);});
+  };
+  rebuild("fOp",ops);rebuild("fType",types);rebuild("fScene",scenes);
+}
+
+function metaMatch(hash){
+  const m=METADATA[hash];
+  if(!m)return true;
+  const op=document.getElementById("fOp").value;
+  const tp=document.getElementById("fType").value;
+  const sc=document.getElementById("fScene").value;
+  const ob=document.getElementById("fObj").value.trim().toLowerCase();
+  if(op&&m.operator!==op)return false;
+  if(tp&&m.data_type!==tp)return false;
+  if(sc&&m.scene!==sc)return false;
+  if(ob&&!(JSON.stringify(m.objects||[]).toLowerCase().includes(ob)))return false;
+  return true;
+}
+
+function onMetaFilter(){
+  applyStyle();
+  if(page==="grid")render();
+  const total=Object.keys(METADATA).length;
+  if(!total)return;
+  const n=Object.keys(METADATA).filter(h=>metaMatch(h)).length;
+  const el=document.getElementById("metaCount");
+  if(el)el.textContent=n<total?`${n}/${total} eps`:"";
+}
+
+function clearMetaFilters(){
+  ["fOp","fType","fScene"].forEach(id=>document.getElementById(id).value="");
+  document.getElementById("fObj").value="";
+  onMetaFilter();
+}
 
 /* color helpers */
 function hsv2rgb(h,s,v){
@@ -342,14 +413,22 @@ function applyStyle(){
     const base=colorTableForMod(m,u.mode);
     const N=d.x.length;
     const colors=new Array(N);
-    let sizes=u.size;
-    if(u.hlOn)sizes=new Array(N);
+    const needSizeArr=u.hlOn||selectedEps.size>0;
+    let sizes=needSizeArr?new Array(N):u.size;
     for(let k=0;k<N;k++){
-      const on=d.t[k]>=u.t0&&d.t[k]<=u.t1
-        &&(selectedEps.size===0||selectedEps.has(d.ep[k]))
-        &&(!u.hlOn||Math.abs(d.frame[k]-u.hlF)<=u.hlW);
-      colors[k]=on?base[k]:(selectedEps.size>0?HIDDEN:DIM);
-      if(u.hlOn)sizes[k]=on?u.size*2.2:u.size;
+      const passEp=selectedEps.size===0||selectedEps.has(d.ep[k]);
+      const passMeta=metaMatch(DATA[curTask].episodes[d.ep[k]]);
+      const on=d.t[k]>=u.t0&&d.t[k]<=u.t1&&passEp&&(!u.hlOn||Math.abs(d.frame[k]-u.hlF)<=u.hlW)&&passMeta;
+      if(on){
+        colors[k]=base[k];
+        if(needSizeArr)sizes[k]=u.hlOn?u.size*2.2:u.size;
+      }else if(!passEp||!passMeta){
+        colors[k]=HIDDEN;
+        if(needSizeArr)sizes[k]=0;
+      }else{
+        colors[k]=DIM;
+        if(needSizeArr)sizes[k]=u.size;
+      }
     }
     Plotly.restyle("panel_"+mod,{"marker.color":[colors],"marker.size":Array.isArray(sizes)?[sizes]:sizes},[0]);
   }
@@ -547,6 +626,8 @@ function resetTools(){
   document.getElementById("t1").value=100;
   document.getElementById("psize").value=3;
   hiddenMods.clear();
+  ["fOp","fType","fScene"].forEach(id=>{const el=document.getElementById(id);if(el)el.value="";});
+  const fo=document.getElementById("fObj");if(fo)fo.value="";
   if(curTask){buildModToggles(curTask);renderTsne(curTask);}
   else applyStyle();
 }
@@ -651,6 +732,7 @@ function renderGrid(task){
     if(!isTop&&!fBot)return false;
     if(fVal&&!VAL.has(h))return false;
     if(q&&!h.toLowerCase().startsWith(q))return false;
+    if(!metaMatch(h))return false;
     return true;
   });
   if(document.getElementById("gsort").value==="asc")entries.reverse();
@@ -704,6 +786,7 @@ function showPage(p){
 
 function render(){
   const task=document.getElementById("task").value;
+  rebuildMetaOpts(task);
   if(page==="tsne")renderTsne(task);else renderGrid(task);
 }
 
@@ -731,6 +814,7 @@ def build_html(
     video_base: str | None = None,
     frame_base: str | None = None,
     run_label: str = "",
+    metadata: dict | None = None,
 ) -> str:
     """Assemble the viewer HTML from a local tsne3d dir + raw scores dict."""
     vb = video_base if video_base is not None else VIDEO_BASE
@@ -762,6 +846,7 @@ def build_html(
         .replace("__VIDEO_BASE__", vb)
         .replace("__FRAME_BASE__", fb)
         .replace("__FPS__", str(FPS))
+        .replace("__METADATA__", json.dumps(metadata or {}, separators=(",", ":")))
         .replace("__RUN_LABEL__", run_nav)
     )
 
