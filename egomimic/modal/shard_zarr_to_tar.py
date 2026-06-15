@@ -108,6 +108,7 @@ def convert_shard(episode_dirs: list[str], output_subdir: str = "") -> dict:
         out_dir = Path(WDS_MOUNT)
     tmp_path = Path("/tmp") / shard_name
     out_path = out_dir / shard_name
+    done_path = out_dir / (shard_name + ".done")
 
     # Already fully completed.
     if done_path.exists():
