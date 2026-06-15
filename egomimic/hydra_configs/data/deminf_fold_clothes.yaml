@@ -1,0 +1,31 @@
+# DemInf curation data config for fold_clothes episodes.
+# Episode whitelist loaded from egomimic/data/episode_lists/fold_clothes_all.json (461 episodes).
+# Usage: python egomimic/modal/curateModal.py data=deminf_fold_clothes ...
+
+defaults:
+  - _self_
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
+      allowed_episode_ids_json_path: egomimic/data/episode_lists/fold_clothes_all.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_ignore: null
+    filters: null
+    mode: total
+
+curation_loader:
+  mecka_bimanual:
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 3072

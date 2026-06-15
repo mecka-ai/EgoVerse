@@ -787,6 +787,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         norm_stats: dict | None = None,
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
+        allowed_episode_ids_json_path: str | None = None,
         pause_removal_epsilon: float | None = None,
     ):
         super().__init__(
@@ -797,9 +798,12 @@ class LocalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
         )
         self.debug = debug
-        self.allowed_episode_ids = (
-            set(allowed_episode_ids) if allowed_episode_ids else None
-        )
+        ids: list[str] | None = allowed_episode_ids
+        if allowed_episode_ids_json_path is not None:
+            import json as _json
+            extra = _json.loads(open(allowed_episode_ids_json_path).read())
+            ids = list(set(extra) | set(ids or []))
+        self.allowed_episode_ids = set(ids) if ids else None
 
     @staticmethod
     def _local_filters_match(
