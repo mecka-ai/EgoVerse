@@ -203,6 +203,11 @@ image = (
         remote_path="/root/shard_zarr_to_tar.py",
         copy=True,
     )
+    .add_local_file(
+        Path(__file__).resolve().parent / "curateModal.py",
+        remote_path="/root/curateModal.py",
+        copy=True,
+    )
     .pip_install(
         "lightning",
         "hydra-core",
