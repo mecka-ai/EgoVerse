@@ -17,4 +17,4 @@ check_val_every_n_epoch: 200
 
 # set True to to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds
-deterministic: "warn"
+deterministic: False

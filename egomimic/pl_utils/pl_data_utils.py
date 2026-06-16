@@ -267,8 +267,7 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
             p = dict(p)
             bs = int(p["batch_size"])
             num_workers = int(p.get("num_workers", 0))
-            seed = getattr(ds, "seed", 42)
-            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers, seed_offset=seed)
+            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers)
             # parallel_shard_iters flows through get_train_dataset's **kwargs to the webdataset
             # factory; only pass it when set so we keep Energon's training default (16) otherwise.
             extra = {}
@@ -286,10 +285,10 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
                 **extra,
             )
             logger.info(
-                "[energon] %s: rank=%d/%d num_workers=%d bs=%d buffer=%d msps=%s psi=%s soe=%s seed=%d dir=%s",
+                "[energon] %s: rank=%d/%d num_workers=%d bs=%d buffer=%d msps=%s psi=%s soe=%s dir=%s",
                 name, rank, world_size, num_workers, bs, ds.shuffle_buffer_size,
                 ds.max_samples_per_sequence, extra.get("parallel_shard_iters", "default"),
-                getattr(ds, "shuffle_over_epochs_multiplier", 1), seed, ds.shard_dir,
+                getattr(ds, "shuffle_over_epochs_multiplier", 1), ds.shard_dir,
             )
             # NOTE: swap get_loader -> get_savable_loader in the resume follow-up PR; that exposes
             # save_state_global / restore_state_global for exact mid-epoch resume (see PR notes).
