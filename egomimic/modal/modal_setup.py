@@ -194,7 +194,11 @@ CURATE_ORCHESTRATOR = ModalCompute(gpu=None, cpu=4.0, memory_mb=8192)
 
 image = (
     modal.Image.from_registry(
-        "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime",
+        # torch 2.7.1 / CUDA 12.8 ships sm_100 (Blackwell) kernels, so the image
+        # runs on B200 as well as H200/H100 (sm_90). The previous torch 2.6 /
+        # cu124 base had no Blackwell kernels → B200 died at the first CUDA op
+        # with "no kernel image is available for execution on the device".
+        "pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime",
         add_python="3.10",
     )
     .apt_install("git")
@@ -254,17 +258,18 @@ image = (
         "scaleapi",
         "openai",
         "pyzmq",
-        "torchvision==0.21.0",
+        "torchvision==0.22.1",  # matches base torch 2.7.1
         "s5cmd",
     )
     # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
     # JAX-first: even its pytorch model path imports jax/flax at module load
     # (openpi.models.pi0_config, openpi.shared.image_tools). We add the jax/flax
     # side here (flax pulls optax/orbax/msgpack/tensorstore transitively) and put
-    # external/openpi/src on PYTHONPATH at runtime — without disturbing the
-    # image's pinned torch 2.6.0 / transformers (openpi would otherwise pin
-    # torch==2.7.1, transformers==4.53.2). CPU jaxlib is fine: compute runs on
-    # the torch path; jax is only needed to import.
+    # external/openpi/src on PYTHONPATH at runtime. The base torch 2.7.1 now
+    # matches openpi's preferred pin; transformers is still managed separately
+    # (downgraded to 4.53.2 + the transformers_replace overlay at runtime, for
+    # pi runs only). CPU jaxlib is fine: compute runs on the torch path; jax is
+    # only needed to import.
     .pip_install(
         "jax==0.5.3",
         "jaxlib==0.5.3",
