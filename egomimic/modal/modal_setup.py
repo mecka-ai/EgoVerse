@@ -534,7 +534,6 @@ def _prepare_repo(
                 "submodule",
                 "update",
                 "--init",
-                "--no-recurse-submodules",
                 "external/openpi",
             ],
             check=True,
