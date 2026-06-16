@@ -81,7 +81,6 @@ class ColdReadDataset:
                 raw = store[zarr_key][local_idx:local_idx + 1][0]
             data[k] = raw
 
-        store.close()
         return idx  # we only care about timing, not the actual values
 
 
