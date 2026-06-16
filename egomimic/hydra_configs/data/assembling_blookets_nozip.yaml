@@ -74,8 +74,8 @@ train_viz_datasets:
 
 train_dataloader_params:
   mecka_bimanual:
-    batch_size: 128
-    num_workers: 12
+    batch_size: 64        # per-device; 4×H200 → global batch 256
+    num_workers: 32
     persistent_workers: true
 
 valid_dataloader_params:
