@@ -488,5 +488,5 @@ curation_loader:
     episode_workers: 6
     pass2_image_decode_workers: 12
     frame_queue_maxsize: 12
-    global_frame_batch_size: 3072
+    global_frame_batch_size: 256
 
