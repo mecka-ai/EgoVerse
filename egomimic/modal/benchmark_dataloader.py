@@ -79,6 +79,7 @@ def run_benchmark() -> None:
         folder_path=Path(VOLUME_MOUNT),
         key_map=key_map,
         transform_list=transform_list,
+        debug=20000,
     )
     console.print("Resolving episodes from volume...")
     dataset = MultiDataset._from_resolver(resolver, mode="train")
