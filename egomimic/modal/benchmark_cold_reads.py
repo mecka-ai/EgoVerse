@@ -1,12 +1,13 @@
 """
-Benchmark DataLoader __getitem__ throughput on the Modal zarr volume.
+Cold-read benchmark: measures true zarr volume throughput with zero caching.
 
-Sweeps num_workers = [8, 12, 16, 24, 32, 64] using the exact same
-LocalEpisodeResolver → MultiDataset pipeline as training (Mecka cartesian
-key_map + transforms), so the numbers reflect real training data throughput.
+Every __getitem__ opens the zarr store fresh (no handle cache) and drops the
+OS pagecache before each worker-count config. This reflects what training at
+200K episodes with random sampling actually hits — every read is a cold network
+fetch from the Modal FUSE volume.
 
 Usage:
-    modal run --env robotics egomimic/modal/benchmark_dataloader.py
+    modal run --env robotics egomimic/modal/benchmark_cold_reads.py
 """
 
 from __future__ import annotations
@@ -26,13 +27,12 @@ os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 from modal_setup import app, image, zarr_volume  # noqa: E402
 
 VOLUME_MOUNT = "/mnt/zarr-data"
-WORKER_COUNTS = [8, 12, 16, 24, 32, 64]
-WARMUP_SEC = 10
+WORKER_COUNTS = [8, 16, 32, 64]
+WARMUP_SEC = 5
 MEASURE_SEC = 30
-MAX_EPISODES = 300
+# Use a large pool so workers never revisit the same episode within the window
+EPISODE_POOL = 500
 
-# Bake the egomimic package into the image so LocalEpisodeResolver is importable
-# without a repo clone. modal_setup.image already has all runtime deps.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 bench_image = image.add_local_dir(
     str(REPO_ROOT / "egomimic"),
@@ -40,13 +40,49 @@ bench_image = image.add_local_dir(
     copy=True,
     ignore=["**/__pycache__", "**/*.pyc", "**/*.pyo"],
 ).run_commands(
-    # Register the package on sys.path via a .pth file (same trick as _prepare_repo)
     "python3 -c \""
     "import sysconfig, os; "
     "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_egomimic.pth'); "
     "open(p, 'w').write('/root/EgoVerse')"
     "\""
 )
+
+
+class ColdReadDataset:
+    """
+    Wraps a MultiDataset but opens a fresh zarr store on every __getitem__,
+    bypassing the per-worker handle cache entirely. Simulates 200K-episode
+    random access where every read is a cold FUSE fetch.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getitem__(self, idx: int):
+        import zarr
+
+        dataset_name, local_idx = self.inner.index_map[idx]
+        ds = self.inner.datasets[dataset_name]
+
+        # Force a fresh zarr open — no cached handle
+        store = zarr.open_group(str(ds.episode_path), mode="r")
+
+        data = {}
+        for k, spec in ds.key_map.items():
+            zarr_key = spec["zarr_key"]
+            horizon = spec.get("horizon")
+            if horizon:
+                end = min(local_idx + horizon, ds.total_frames)
+                raw = store[zarr_key][local_idx:end]
+            else:
+                raw = store[zarr_key][local_idx:local_idx + 1][0]
+            data[k] = raw
+
+        store.close()
+        return idx  # we only care about timing, not the actual values
 
 
 @app.function(
@@ -56,12 +92,11 @@ bench_image = image.add_local_dir(
     timeout=3600,
     volumes={VOLUME_MOUNT: zarr_volume},
 )
-def run_benchmark() -> None:
+def run_cold_benchmark() -> None:
+    import subprocess
     import time
 
-    import torch
     from torch.utils.data import DataLoader
-
     from rich.console import Console
     from rich.table import Table
 
@@ -69,46 +104,49 @@ def run_benchmark() -> None:
     from egomimic.rldb.embodiment.human import Mecka
 
     console = Console()
-    console.rule("[bold cyan]EgoVerse Volume DataLoader Benchmark")
+    console.rule("[bold red]Cold-Read Benchmark (no caching)")
+    console.print(
+        "Every __getitem__ opens a fresh zarr store.\n"
+        "Pagecache is dropped between configs.\n"
+        "This is the floor for 200K-episode random-sampling training.\n"
+    )
 
     key_map = Mecka.get_keymap(mode="cartesian")
     transform_list = Mecka.get_transform_list(mode="cartesian")
-    console.print(f"key_map keys: {list(key_map.keys())}")
-    console.print(f"transforms:   {[type(t).__name__ for t in transform_list]}\n")
 
     resolver = LocalEpisodeResolver(
         folder_path=Path(VOLUME_MOUNT),
         key_map=key_map,
         transform_list=transform_list,
-        debug=1000,
+        debug=EPISODE_POOL,
     )
-    console.print("Resolving episodes from volume...")
-    dataset = MultiDataset._from_resolver(resolver, mode="train")
+    console.print(f"Resolving up to {EPISODE_POOL} episodes...")
+    inner = MultiDataset._from_resolver(resolver, mode="train")
+    dataset = ColdReadDataset(inner)
+    console.print(f"Dataset: {len(dataset):,} frames from {len(inner.datasets)} episodes\n")
 
-    # Cap to MAX_EPISODES so each run is consistent
-    all_keys = list(dataset.datasets.keys())[:MAX_EPISODES]
-    dataset._build_index_map_from_datasets(
-        {k: dataset.datasets[k] for k in all_keys}
-    )
-
-    console.print(
-        f"Dataset: [bold]{len(dataset):,}[/bold] frames from {len(dataset.datasets)} episodes\n"
-        f"Warmup: {WARMUP_SEC}s  |  Measure: {MEASURE_SEC}s  per config\n"
-    )
+    def drop_caches():
+        try:
+            subprocess.run(["sync"], check=True)
+            Path("/proc/sys/vm/drop_caches").write_text("3")
+            console.print("  [dim]pagecache dropped[/dim]")
+        except Exception as e:
+            console.print(f"  [dim]drop_caches skipped ({e})[/dim]")
 
     results: list[dict] = []
 
     for nw in WORKER_COUNTS:
         console.rule(f"[yellow]num_workers = {nw}")
+        drop_caches()
 
         loader = DataLoader(
             dataset,
             batch_size=1,
             num_workers=nw,
             shuffle=True,
-            collate_fn=lambda x: x,  # skip collation — just raw __getitem__ output
-            prefetch_factor=4,
-            persistent_workers=True,
+            collate_fn=lambda x: x,
+            prefetch_factor=2,
+            persistent_workers=False,  # don't persist — each iter is a fresh cold start
             pin_memory=False,
         )
         it = iter(loader)
@@ -147,24 +185,23 @@ def run_benchmark() -> None:
         p99 = lats[int(len(lats) * 0.99)] * 1000 if lats else 0
 
         console.print(
-            f"  [bold green]{ips:,.0f} idx/s[/bold green]  "
-            f"count={count:,}  p50={p50:.1f}ms  p95={p95:.1f}ms  p99={p99:.1f}ms"
+            f"  [bold red]{ips:,.1f} idx/s[/bold red]  "
+            f"count={count:,}  p50={p50:.0f}ms  p95={p95:.0f}ms  p99={p99:.0f}ms"
         )
         results.append(dict(workers=nw, ips=ips, count=count, p50=p50, p95=p95, p99=p99))
         del loader, it
 
-    # Summary table
     console.rule("[bold cyan]Summary")
-    table = Table(title="DataLoader __getitem__ Throughput vs Workers")
+    table = Table(title="Cold-Read Throughput (zero cache, 200K-episode simulation)")
     table.add_column("Workers", style="bold yellow", justify="right")
-    table.add_column("idx/sec", style="bold green", justify="right")
+    table.add_column("idx/sec", style="bold red", justify="right")
     table.add_column("delta", justify="right")
     table.add_column("p50 ms", justify="right")
     table.add_column("p95 ms", justify="right")
     table.add_column("p99 ms", justify="right")
 
-    peak = max(results, key=lambda r: r["ips"])
     prev_ips = None
+    peak = max(results, key=lambda r: r["ips"])
     for r in results:
         delta = ""
         if prev_ips is not None:
@@ -172,35 +209,18 @@ def run_benchmark() -> None:
             delta = f"[green]+{pct:.0f}%[/green]" if pct >= 1 else f"[red]{pct:.0f}%[/red]"
         table.add_row(
             str(r["workers"]),
-            f"{r['ips']:,.0f}" + (" ★" if r["workers"] == peak["workers"] else ""),
+            f"{r['ips']:.1f}" + (" ★" if r["workers"] == peak["workers"] else ""),
             delta,
-            f"{r['p50']:.1f}",
-            f"{r['p95']:.1f}",
-            f"{r['p99']:.1f}",
+            f"{r['p50']:.0f}",
+            f"{r['p95']:.0f}",
+            f"{r['p99']:.0f}",
             style="bold" if r["workers"] == peak["workers"] else "",
         )
         prev_ips = r["ips"]
-
     console.print(table)
-    console.print(
-        f"\n[bold]Peak:[/bold] [bold green]{peak['ips']:,.0f} idx/s[/bold green] "
-        f"at [bold yellow]{peak['workers']} workers[/bold yellow]"
-    )
-
-    # Contention = first step where marginal gain < 5%
-    for i in range(1, len(results)):
-        gain = (results[i]["ips"] - results[i - 1]["ips"]) / results[i - 1]["ips"]
-        if gain < 0.05:
-            console.print(
-                f"[bold]Contention detected at[/bold] [bold red]{results[i]['workers']} workers[/bold red]"
-                f" (only +{gain*100:.0f}% gain over {results[i-1]['workers']})"
-            )
-            break
-    else:
-        console.print("[bold]No contention — throughput scaled across all worker counts.[/bold]")
 
 
 @app.local_entrypoint()
 def main():
-    print("Launching dataloader benchmark on Modal (robotics env)...")
-    run_benchmark.remote()
+    print("Launching cold-read benchmark...")
+    run_cold_benchmark.remote()
