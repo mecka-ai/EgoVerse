@@ -936,7 +936,7 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
     timeout=3600,
     memory=8192,
     cpu=2,
-    max_containers=4000,
+    max_containers=300,
     retries=modal.Retries(max_retries=2, initial_delay=5.0, backoff_coefficient=2.0),
 )
 def convert_episode(episode_hash: str, task_type: str, subset_name: str) -> dict:
