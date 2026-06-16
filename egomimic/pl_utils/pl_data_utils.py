@@ -268,7 +268,7 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
             bs = int(p["batch_size"])
             num_workers = int(p.get("num_workers", 0))
             seed = getattr(ds, "seed", 42)
-            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers, seed=seed)
+            wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers, seed_offset=seed)
             # parallel_shard_iters flows through get_train_dataset's **kwargs to the webdataset
             # factory; only pass it when set so we keep Energon's training default (16) otherwise.
             extra = {}
