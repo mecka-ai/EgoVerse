@@ -218,6 +218,11 @@ def run_hydra_train(
     env["MKL_NUM_THREADS"] = "1"
     env["NUMEXPR_NUM_THREADS"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    # Let the CUDA caching allocator grow/reclaim segments instead of pinning
+    # them, so large-batch runs don't OOM on reserved-but-unallocated fragments.
+    # Safe on all GPUs; lets bs112 fit on a B200 where ~11 GiB was stuck in
+    # fragmentation (the true allocation need was well under capacity).
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     if wandb_api_key:
         env["WANDB_API_KEY"] = wandb_api_key
 
