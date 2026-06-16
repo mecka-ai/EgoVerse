@@ -27,7 +27,7 @@ class HPTEvalVideo(EvalVideo):
             embodiment_name = get_embodiment(embodiment_id).lower()
             ac_key = algo.ac_keys[embodiment_id]
 
-            if f"{embodiment_name}_{ac_key}" in preds and ac_key != algo.shared_ac_key:
+            if f"{embodiment_name}_{ac_key}" in preds and ac_key != getattr(algo, "shared_ac_key", None):
                 metrics[f"Valid/{embodiment_name}_{ac_key}_paired_mse_avg"] = mse(
                     preds[f"{embodiment_name}_{ac_key}"].cpu(), _batch[ac_key].cpu()
                 )
@@ -48,8 +48,8 @@ class HPTEvalVideo(EvalVideo):
                     fd.max().item()
                 )
 
-            if embodiment_name in algo.auxiliary_ac_keys:
-                for aux_key in algo.auxiliary_ac_keys[embodiment_name]:
+            if embodiment_name in getattr(algo, "auxiliary_ac_keys", {}):
+                for aux_key in getattr(algo, "auxiliary_ac_keys", {})[embodiment_name]:
                     pred_key = f"{embodiment_name}_{aux_key}"
                     if pred_key in preds:
                         metrics[f"Valid/{pred_key}_paired_mse_avg"] = mse(
@@ -67,26 +67,29 @@ class HPTEvalVideo(EvalVideo):
                         metrics[f"Valid/{pred_key}_frechet_gauss_min"] = fd.min().item()
                         metrics[f"Valid/{pred_key}_frechet_gauss_max"] = fd.max().item()
 
+            _shared_ac_key = getattr(algo, "shared_ac_key", None)
             if (
-                algo.shared_ac_key
-                and f"{embodiment_name}_{algo.shared_ac_key}" in preds
+                _shared_ac_key
+                and f"{embodiment_name}_{_shared_ac_key}" in preds
             ):
-                pred_key = f"{embodiment_name}_{algo.shared_ac_key}"
+                pred_key = f"{embodiment_name}_{_shared_ac_key}"
                 metrics[f"Valid/{pred_key}_paired_mse_avg"] = mse(
-                    preds[pred_key].cpu(), _batch[algo.shared_ac_key].cpu()
+                    preds[pred_key].cpu(), _batch[_shared_ac_key].cpu()
                 )
                 metrics[f"Valid/{pred_key}_final_mse_avg"] = mse(
                     preds[pred_key][:, -1].cpu(),
-                    _batch[algo.shared_ac_key][:, -1].cpu(),
+                    _batch[_shared_ac_key][:, -1].cpu(),
                 )
                 fd = frechet_gaussian_over_time(
-                    preds[pred_key], _batch[algo.shared_ac_key]
+                    preds[pred_key], _batch[_shared_ac_key]
                 )
                 metrics[f"Valid/{pred_key}_frechet_gauss_avg"] = fd.mean().item()
                 metrics[f"Valid/{pred_key}_frechet_gauss_min"] = fd.min().item()
                 metrics[f"Valid/{pred_key}_frechet_gauss_max"] = fd.max().item()
 
-            if algo.rkl_samples and algo.rkl_samples > 1:
+            _rkl_samples = getattr(algo, "rkl_samples", None)
+            _aux_ac_keys = getattr(algo, "auxiliary_ac_keys", {})
+            if _rkl_samples and _rkl_samples > 1:
                 hpt_batch = {
                     "domain": embodiment_name,
                     "data": algo._robomimic_to_hpt_data(
@@ -95,14 +98,14 @@ class HPTEvalVideo(EvalVideo):
                         algo.proprio_keys[embodiment_id],
                         algo.lang_keys[embodiment_id],
                         ac_key,
-                        algo.auxiliary_ac_keys.get(embodiment_name, []),
+                        _aux_ac_keys.get(embodiment_name, []),
                     ),
                 }
                 rkl_targets = []
 
                 if (
                     f"{embodiment_name}_{ac_key}" in preds
-                    and ac_key != algo.shared_ac_key
+                    and ac_key != _shared_ac_key
                 ):
                     rkl_targets.append(
                         (
@@ -112,8 +115,8 @@ class HPTEvalVideo(EvalVideo):
                         )
                     )
 
-                if embodiment_name in algo.auxiliary_ac_keys:
-                    for aux_key in algo.auxiliary_ac_keys[embodiment_name]:
+                if embodiment_name in _aux_ac_keys:
+                    for aux_key in _aux_ac_keys[embodiment_name]:
                         aux_pred_key = f"{embodiment_name}_{aux_key}"
                         if aux_pred_key in preds:
                             rkl_targets.append(
@@ -124,18 +127,18 @@ class HPTEvalVideo(EvalVideo):
                                 )
                             )
 
-                if algo.shared_ac_key:
-                    shared_pred_key = f"{embodiment_name}_{algo.shared_ac_key}"
+                if _shared_ac_key:
+                    shared_pred_key = f"{embodiment_name}_{_shared_ac_key}"
                     if shared_pred_key in preds:
                         rkl_targets.append(
                             (
                                 shared_pred_key,
-                                _batch[algo.shared_ac_key].to(algo.device),
+                                _batch[_shared_ac_key].to(algo.device),
                                 "shared",
                             )
                         )
 
-                M = int(algo.rkl_samples)
+                M = int(_rkl_samples)
                 for pred_key_name, gt_tensor, head_key in rkl_targets:
                     samples = self._collect_policy_samples(
                         hpt_batch, ref=gt_tensor, key_name=head_key, M=M
