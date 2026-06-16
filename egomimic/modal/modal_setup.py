@@ -475,6 +475,7 @@ def _prepare_repo(
     git_commit: str,
     *,
     init_submodules: bool = True,
+    init_openpi: bool = False,
 ) -> None:
     """Clone (or update) the repo and check out the exact commit."""
     clone_url = _ssh_to_https(git_remote)
@@ -553,7 +554,27 @@ def _prepare_repo(
     # processes, which re-exec the script and do NOT reliably inherit PYTHONPATH.
     # A .pth file in site-packages is read at interpreter startup, so it works
     # for the main process and all re-execed ranks alike.
-    if init_submodules:
+    #
+    # init_openpi=True: shallow-clone just external/openpi (--no-recurse-submodules
+    # skips aloha/libero sub-submodules so this is fast, ~seconds not minutes).
+    # init_submodules=True (legacy OAT path): honour the old behaviour — write the
+    # .pth if the dir already exists, but do NOT re-clone (oat init path).
+    _do_openpi = init_openpi or init_submodules
+    if init_openpi:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                CFG.remote_repo_dir,
+                "submodule",
+                "update",
+                "--init",
+                "--no-recurse-submodules",
+                "external/openpi",
+            ],
+            check=True,
+        )
+    if _do_openpi:
         openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
         if Path(openpi_src).is_dir():
             subprocess.run(
@@ -570,10 +591,6 @@ def _prepare_repo(
             )
             # openpi's pi0.5 pytorch model requires transformers==4.53.2 + its
             # transformers_replace overlay (pi0_pytorch asserts the version).
-            # Apply it here — in the baked modal_setup, which always runs — so it
-            # is in effect for trainHydra and every re-execed DDP rank. Presence
-            # of the openpi submodule (init_submodules=true) marks a pi-capable
-            # run; HPT runs use init_submodules=false and keep transformers 4.57.3.
             _install_pi_transformers()
 
 
