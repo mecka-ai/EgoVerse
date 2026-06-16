@@ -22,7 +22,6 @@ train_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
         annotations: true
-        pi_mode: true
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -39,7 +38,6 @@ valid_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
         annotations: true
-        pi_mode: true
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
@@ -56,7 +54,6 @@ train_viz_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
         mode: cartesian
         annotations: true
-        pi_mode: true
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian

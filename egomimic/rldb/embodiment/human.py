@@ -343,14 +343,10 @@ class Mecka(Human):
         mode: Literal["cartesian", "keypoints"],
         annotations: bool = False,
         norm_mode: bool = False,
-        pi_mode: bool = False,
     ):
-        # Pi runs use "base_0_rgb" so _fill_missing_images can find it and
-        # duplicate into the missing wrist slots openpi expects.
-        cam_key = "base_0_rgb" if pi_mode else cls.VIZ_IMAGE_KEY
         if mode == "cartesian":
             key_map = {
-                cam_key: {
+                cls.VIZ_IMAGE_KEY: {
                     "key_type": "camera_keys",
                     "zarr_key": "images.front_1",
                 },
@@ -379,7 +375,7 @@ class Mecka(Human):
             }
         elif mode == "keypoints":
             key_map = {
-                cam_key: {
+                cls.VIZ_IMAGE_KEY: {
                     "key_type": "camera_keys",
                     "zarr_key": "images.front_1",
                 },

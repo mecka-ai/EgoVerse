@@ -450,9 +450,18 @@ class PI(Algo):
         converter = self.action_registry.get(emb_id, ac_key)
         action32 = converter.to32(action)
 
-        # OpenPI expects a fixed camera tuple. Human datasets only provide
-        # `base_0_rgb`, so duplicate that view into the missing wrist slots and
-        # mark those synthesized views as masked out below.
+        # OpenPI expects a fixed camera tuple (base_0_rgb / wrist slots). When
+        # the DataSchematic remaps the batch to a different keyname (e.g.
+        # "front_img_1" for Mecka), none of the pi_cam_keys will be present.
+        # Bridge: copy the first available batch camera tensor into every missing
+        # pi_cam_key slot so _fill_missing_images can find a seed image.
+        if not any(k in batch and isinstance(batch[k], torch.Tensor) and batch[k].ndim == 4 for k in required_cam_keys):
+            for src in cam_keys:
+                if src in batch and isinstance(batch[src], torch.Tensor) and batch[src].ndim == 4:
+                    for pi_key in required_cam_keys:
+                        if pi_key not in batch:
+                            batch[pi_key] = batch[src]
+                    break
         raw_images = _fill_missing_images(batch, required_cam_keys, device)
 
         # ---- Images (dict[str, Tensor]) ----
