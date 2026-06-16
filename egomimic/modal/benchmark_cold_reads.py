@@ -27,7 +27,7 @@ os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 from modal_setup import app, image, zarr_volume  # noqa: E402
 
 VOLUME_MOUNT = "/mnt/zarr-data"
-WORKER_COUNTS = [8, 16, 32, 64]
+WORKER_COUNTS = [8, 16, 32, 64, 72]
 WARMUP_SEC = 5
 MEASURE_SEC = 30
 # Use a large pool so workers never revisit the same episode within the window
@@ -48,42 +48,6 @@ bench_image = image.add_local_dir(
 )
 
 
-class ColdReadDataset:
-    """
-    Wraps a MultiDataset but opens a fresh zarr store on every __getitem__,
-    bypassing the per-worker handle cache entirely. Simulates 200K-episode
-    random access where every read is a cold FUSE fetch.
-    """
-
-    def __init__(self, inner):
-        self.inner = inner
-
-    def __len__(self):
-        return len(self.inner)
-
-    def __getitem__(self, idx: int):
-        import zarr
-
-        dataset_name, local_idx = self.inner.index_map[idx]
-        ds = self.inner.datasets[dataset_name]
-
-        # Force a fresh zarr open — no cached handle
-        store = zarr.open_group(str(ds.episode_path), mode="r")
-
-        data = {}
-        for k, spec in ds.key_map.items():
-            zarr_key = spec["zarr_key"]
-            horizon = spec.get("horizon")
-            if horizon:
-                end = min(local_idx + horizon, ds.total_frames)
-                raw = store[zarr_key][local_idx:end]
-            else:
-                raw = store[zarr_key][local_idx:local_idx + 1][0]
-            data[k] = raw
-
-        return idx  # we only care about timing, not the actual values
-
-
 @app.function(
     image=bench_image,
     cpu=32.0,
@@ -92,10 +56,10 @@ class ColdReadDataset:
     volumes={VOLUME_MOUNT: zarr_volume},
 )
 def run_cold_benchmark() -> None:
-    import subprocess
+    import random
     import time
 
-    from torch.utils.data import DataLoader
+    import zarr
     from rich.console import Console
     from rich.table import Table
 
@@ -103,95 +67,107 @@ def run_cold_benchmark() -> None:
     from egomimic.rldb.embodiment.human import Mecka
 
     console = Console()
-    console.rule("[bold red]Cold-Read Benchmark (no caching)")
+    console.rule("[bold red]Cold-Read Benchmark — raw zarr latency, no prefetch")
     console.print(
-        "Every __getitem__ opens a fresh zarr store.\n"
-        "Pagecache is dropped between configs.\n"
-        "This is the floor for 200K-episode random-sampling training.\n"
+        "Measures each zarr open+read directly in the main process.\n"
+        "No DataLoader prefetch queue, no handle cache.\n"
+        "Each read hits a different episode → true cold FUSE latency.\n"
     )
 
     key_map = Mecka.get_keymap(mode="cartesian")
-    transform_list = Mecka.get_transform_list(mode="cartesian")
 
     resolver = LocalEpisodeResolver(
         folder_path=Path(VOLUME_MOUNT),
         key_map=key_map,
-        transform_list=transform_list,
         debug=EPISODE_POOL,
     )
     console.print(f"Resolving up to {EPISODE_POOL} episodes...")
     inner = MultiDataset._from_resolver(resolver, mode="train")
-    dataset = ColdReadDataset(inner)
-    console.print(f"Dataset: {len(dataset):,} frames from {len(inner.datasets)} episodes\n")
+    episodes = list(inner.datasets.values())
+    console.print(f"Loaded {len(episodes)} episodes\n")
 
-    def drop_caches():
-        try:
-            subprocess.run(["sync"], check=True)
-            Path("/proc/sys/vm/drop_caches").write_text("3")
-            console.print("  [dim]pagecache dropped[/dim]")
-        except Exception as e:
-            console.print(f"  [dim]drop_caches skipped ({e})[/dim]")
+    # Build a shuffled list of (episode, frame_idx) pairs — each accessed at most once
+    all_pairs = [(ds, i) for ds in episodes for i in range(min(ds.total_frames, 50))]
+    random.shuffle(all_pairs)
+    console.print(f"Unique (episode, frame) pairs to draw from: {len(all_pairs):,}\n")
 
-    results: list[dict] = []
+    # --- Single-threaded cold read: one zarr open per read, sequential ---
+    console.rule("[yellow]Single-threaded cold reads")
+    lats = []
+    N_SINGLE = min(200, len(all_pairs))
+    for ds, frame_idx in all_pairs[:N_SINGLE]:
+        t0 = time.perf_counter()
+        store = zarr.open_group(str(ds.episode_path), mode="r")
+        for k, spec in key_map.items():
+            zarr_key = spec["zarr_key"]
+            horizon = spec.get("horizon")
+            if horizon:
+                end = min(frame_idx + horizon, ds.total_frames)
+                _ = store[zarr_key][frame_idx:end]
+            else:
+                _ = store[zarr_key][frame_idx:frame_idx + 1][0]
+        lats.append(time.perf_counter() - t0)
+
+    lats.sort()
+    mean_ms = sum(lats) / len(lats) * 1000
+    p50_ms = lats[len(lats) // 2] * 1000
+    p95_ms = lats[int(len(lats) * 0.95)] * 1000
+    p99_ms = lats[int(len(lats) * 0.99)] * 1000
+    single_ips = 1000 / mean_ms
+
+    console.print(f"  N={N_SINGLE} reads")
+    console.print(f"  mean={mean_ms:.0f}ms  p50={p50_ms:.0f}ms  p95={p95_ms:.0f}ms  p99={p99_ms:.0f}ms")
+    console.print(f"  [bold]Single-threaded: {single_ips:.1f} idx/s[/bold]")
+    console.print(f"  [bold]Theoretical ceiling with N workers (mean latency / N):[/bold]")
+    for nw in WORKER_COUNTS:
+        theoretical = single_ips * nw
+        console.print(f"    {nw:>3} workers → {theoretical:,.0f} idx/s  (if perfectly parallel)")
+
+    # --- Parallel cold reads: concurrent.futures to simulate N workers ---
+    console.rule("[yellow]Parallel cold reads (concurrent.futures)")
+    results = []
+    from concurrent.futures import ThreadPoolExecutor
+
+    def cold_read(pair):
+        ds, frame_idx = pair
+        t0 = time.perf_counter()
+        store = zarr.open_group(str(ds.episode_path), mode="r")
+        for k, spec in key_map.items():
+            zarr_key = spec["zarr_key"]
+            horizon = spec.get("horizon")
+            if horizon:
+                end = min(frame_idx + horizon, ds.total_frames)
+                _ = store[zarr_key][frame_idx:end]
+            else:
+                _ = store[zarr_key][frame_idx:frame_idx + 1][0]
+        return time.perf_counter() - t0
+
+    pair_pool = all_pairs[N_SINGLE:]  # use fresh pairs not touched by single-threaded run
 
     for nw in WORKER_COUNTS:
-        console.rule(f"[yellow]num_workers = {nw}")
-        drop_caches()
+        n_reads = min(nw * 20, len(pair_pool))  # enough reads to measure steadily
+        pairs = pair_pool[:n_reads]
+        pair_pool = pair_pool[n_reads:]
 
-        loader = DataLoader(
-            dataset,
-            batch_size=1,
-            num_workers=nw,
-            shuffle=True,
-            collate_fn=lambda x: x,
-            prefetch_factor=2,
-            persistent_workers=False,  # don't persist — each iter is a fresh cold start
-            pin_memory=False,
-        )
-        it = iter(loader)
-
-        # warmup
-        t_end = time.perf_counter() + WARMUP_SEC
-        warmup = 0
-        while time.perf_counter() < t_end:
-            try:
-                next(it)
-                warmup += 1
-            except StopIteration:
-                it = iter(loader)
-        console.print(f"  warmup: {warmup} frames discarded")
-
-        # measure
         t0 = time.perf_counter()
-        t_end = t0 + MEASURE_SEC
-        count = 0
-        lats: list[float] = []
-        while time.perf_counter() < t_end:
-            ts = time.perf_counter()
-            try:
-                next(it)
-            except StopIteration:
-                it = iter(loader)
-                continue
-            lats.append(time.perf_counter() - ts)
-            count += 1
-
+        with ThreadPoolExecutor(max_workers=nw) as ex:
+            read_lats = list(ex.map(cold_read, pairs))
         elapsed = time.perf_counter() - t0
-        ips = count / elapsed
-        lats.sort()
-        p50 = lats[len(lats) // 2] * 1000 if lats else 0
-        p95 = lats[int(len(lats) * 0.95)] * 1000 if lats else 0
-        p99 = lats[int(len(lats) * 0.99)] * 1000 if lats else 0
+
+        ips = len(pairs) / elapsed
+        read_lats.sort()
+        p50 = read_lats[len(read_lats) // 2] * 1000
+        p95 = read_lats[int(len(read_lats) * 0.95)] * 1000
+        p99 = read_lats[int(len(read_lats) * 0.99)] * 1000
 
         console.print(
-            f"  [bold red]{ips:,.1f} idx/s[/bold red]  "
-            f"count={count:,}  p50={p50:.0f}ms  p95={p95:.0f}ms  p99={p99:.0f}ms"
+            f"  {nw:>3} workers | [bold red]{ips:,.0f} idx/s[/bold red] | "
+            f"p50={p50:.0f}ms  p95={p95:.0f}ms  p99={p99:.0f}ms  (n={len(pairs)})"
         )
-        results.append(dict(workers=nw, ips=ips, count=count, p50=p50, p95=p95, p99=p99))
-        del loader, it
+        results.append(dict(workers=nw, ips=ips, p50=p50, p95=p95, p99=p99))
 
     console.rule("[bold cyan]Summary")
-    table = Table(title="Cold-Read Throughput (zero cache, 200K-episode simulation)")
+    table = Table(title="True Cold-Read Throughput (fresh zarr open per read)")
     table.add_column("Workers", style="bold yellow", justify="right")
     table.add_column("idx/sec", style="bold red", justify="right")
     table.add_column("delta", justify="right")
@@ -208,7 +184,7 @@ def run_cold_benchmark() -> None:
             delta = f"[green]+{pct:.0f}%[/green]" if pct >= 1 else f"[red]{pct:.0f}%[/red]"
         table.add_row(
             str(r["workers"]),
-            f"{r['ips']:.1f}" + (" ★" if r["workers"] == peak["workers"] else ""),
+            f"{r['ips']:,.0f}" + (" ★" if r["workers"] == peak["workers"] else ""),
             delta,
             f"{r['p50']:.0f}",
             f"{r['p95']:.0f}",
@@ -217,6 +193,7 @@ def run_cold_benchmark() -> None:
         )
         prev_ips = r["ips"]
     console.print(table)
+    console.print(f"\n[bold]Single-thread cold read: mean={mean_ms:.0f}ms → {single_ips:.1f} idx/s[/bold]")
 
 
 @app.local_entrypoint()
