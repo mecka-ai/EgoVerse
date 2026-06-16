@@ -19,13 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 def set_global_seed(seed: int = 42):
-    random.seed(seed)  # Python RNG
-    np.random.seed(seed)  # NumPy RNG
-    torch.manual_seed(seed)  # PyTorch CPU
-    torch.cuda.manual_seed(seed)  # PyTorch GPU
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class DataSchematic(object):

@@ -41,6 +41,7 @@ train_datasets:
     max_samples_per_sequence: 64    # consecutive samples per shard before switching (null = whole shard)
     parallel_shard_iters: 64        # shards open per worker, shuffled between (null = Energon default 16)
     shuffle_over_epochs_multiplier: 2  # shuffle shard-slice order over N epochs (>=1)
+    seed: ${seed}                   # matches global seed → deterministic WorkerConfig per run
 
 valid_datasets:
   mecka_bimanual:
@@ -52,6 +53,7 @@ valid_datasets:
     max_samples_per_sequence: 64
     parallel_shard_iters: 64
     shuffle_over_epochs_multiplier: 2
+    seed: ${seed}
 
 train_dataloader_params:
   mecka_bimanual:

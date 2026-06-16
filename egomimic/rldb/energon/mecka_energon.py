@@ -171,6 +171,7 @@ class EnergonShardDataset:
         max_samples_per_sequence: int | None = None,
         parallel_shard_iters: int | None = None,
         shuffle_over_epochs_multiplier: int = 1,
+        seed: int = 42,
     ):
         self.shard_dir = shard_dir
         self.split_part = split_part
@@ -179,6 +180,7 @@ class EnergonShardDataset:
         self.max_samples_per_sequence = max_samples_per_sequence
         self.parallel_shard_iters = parallel_shard_iters
         self.shuffle_over_epochs_multiplier = shuffle_over_epochs_multiplier
+        self.seed = seed
         self.embodiment_id = get_embodiment_id(embodiment_name)
         self.data_schematic = None
         self._epoch = 0
