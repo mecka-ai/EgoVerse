@@ -43,6 +43,8 @@ from modal_setup import (  # noqa: E402
     app_name_from_hydra_args,
     launch_detached,
     pop_init_submodules,
+    ENERGON_MOUNT_PATH,
+    energon_volume,
     training_outputs_volume,
     zarr_volume,
 )
@@ -125,6 +127,7 @@ def _build_volumes() -> dict:
     return {
         mount_path: vol_obj,
         CFG.output_mount_path: training_outputs_volume,
+        ENERGON_MOUNT_PATH: energon_volume,
     }
 
 

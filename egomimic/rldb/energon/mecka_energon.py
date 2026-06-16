@@ -152,7 +152,14 @@ class EnergonShardDataset:
         split_part: Energon split name (``train``/``val``); built once by ``energon prepare``.
         shuffle_buffer_size: reservoir size (samples) for Energon's ``ShuffleBufferDataset``.
         embodiment_name: embodiment for ``get_embodiment_id``.
-        max_samples_per_sequence: passed to Energon (None = no cap; whole-shard interleave).
+        max_samples_per_sequence: max consecutive samples drawn from one shard before switching
+            (None = drain the whole shard contiguously). A finite value interleaves across shards,
+            which is what makes per-batch episode diversity independent of shard size — set it for
+            large multi-episode shards so a worker doesn't emit a long correlated run from one shard.
+        parallel_shard_iters: number of shards each worker opens simultaneously and shuffles between
+            (None = Energon default, 16 in training). Higher = more distinct shards feeding the
+            shuffle buffer = better mixing at a given buffer, at the cost of more open file handles.
+        shuffle_over_epochs_multiplier: shuffle the shard-slice order over this many epochs (>=1).
     """
 
     def __init__(
@@ -162,12 +169,16 @@ class EnergonShardDataset:
         shuffle_buffer_size: int = 10000,
         embodiment_name: str = EMBODIMENT_NAME,
         max_samples_per_sequence: int | None = None,
+        parallel_shard_iters: int | None = None,
+        shuffle_over_epochs_multiplier: int = 1,
     ):
         self.shard_dir = shard_dir
         self.split_part = split_part
         self.shuffle_buffer_size = shuffle_buffer_size
         self.embodiment_name = embodiment_name
         self.max_samples_per_sequence = max_samples_per_sequence
+        self.parallel_shard_iters = parallel_shard_iters
+        self.shuffle_over_epochs_multiplier = shuffle_over_epochs_multiplier
         self.embodiment_id = get_embodiment_id(embodiment_name)
         self.data_schematic = None
         self._epoch = 0

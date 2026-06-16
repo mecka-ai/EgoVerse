@@ -1,0 +1,52 @@
+# Small-scale Energon test config — validates the full pipeline on a single GPU with
+# minimal memory and a short materialization run.
+#
+# Step 1 — materialize a small shard collection (~50 episodes, 128 MiB shards):
+#   modal run egomimic/modal/build_sb_shards.py::main \
+#     --n-episodes 50 --target-shard-mb 128
+#   # prints: {"cid": "128mib-<hex>", ...}  ← copy the cid
+#
+# Step 2 — write .nv-meta sidecar (once per collection):
+#   modal run egomimic/modal/build_sb_shards.py::main --do prepare --cid <cid>
+#
+# Step 3 — launch test training run:
+#   python egomimic/trainHydra.py \
+#     name=energon-test description=pipeline-smoke \
+#     data=mecka_energon_test model=hpt_bc_flow_mecka trainer=ddp_modal \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false \
+#     data.train_datasets.mecka_bimanual.shard_dir=/mnt/shards/materialized/<cid> \
+#     data.valid_datasets.mecka_bimanual.shard_dir=/mnt/shards/materialized/<cid>
+#
+# With 50 episodes (~800k samples) and target_shard_mb=128 you get ~12 shards —
+# enough to satisfy world_size(1) × num_workers(2) = 2 minimum shard requirement.
+
+_target_: egomimic.pl_utils.pl_data_utils.EnergonMultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
+    shard_dir: /mnt/shards/materialized/FILL_IN_CID
+    split_part: train
+    shuffle_buffer_size: 500        # small: 500 × 2.7 MB × 1 GPU × 2 workers ≈ 2.7 GB
+    embodiment_name: mecka_bimanual
+    max_samples_per_sequence: null
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
+    shard_dir: /mnt/shards/materialized/FILL_IN_CID
+    split_part: train
+    shuffle_buffer_size: 200
+    embodiment_name: mecka_bimanual
+    max_samples_per_sequence: null
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 16
+    num_workers: 2
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 16
+    num_workers: 2

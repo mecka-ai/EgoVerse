@@ -268,6 +268,11 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
             bs = int(p["batch_size"])
             num_workers = int(p.get("num_workers", 0))
             wc = WorkerConfig(rank=rank, world_size=world_size, num_workers=num_workers)
+            # parallel_shard_iters flows through get_train_dataset's **kwargs to the webdataset
+            # factory; only pass it when set so we keep Energon's training default (16) otherwise.
+            extra = {}
+            if getattr(ds, "parallel_shard_iters", None) is not None:
+                extra["parallel_shard_iters"] = ds.parallel_shard_iters
             eds = get_train_dataset(
                 ds.shard_dir,
                 split_part=ds.split_part,
@@ -275,11 +280,15 @@ class EnergonMultiDataModuleWrapper(MultiDataModuleWrapper):
                 batch_size=bs,
                 shuffle_buffer_size=ds.shuffle_buffer_size,
                 max_samples_per_sequence=ds.max_samples_per_sequence,
+                shuffle_over_epochs_multiplier=getattr(ds, "shuffle_over_epochs_multiplier", 1),
                 task_encoder=ds.encoder(),
+                **extra,
             )
             logger.info(
-                "[energon] %s: rank=%d/%d num_workers=%d bs=%d buffer=%d dir=%s",
-                name, rank, world_size, num_workers, bs, ds.shuffle_buffer_size, ds.shard_dir,
+                "[energon] %s: rank=%d/%d num_workers=%d bs=%d buffer=%d msps=%s psi=%s soe=%s dir=%s",
+                name, rank, world_size, num_workers, bs, ds.shuffle_buffer_size,
+                ds.max_samples_per_sequence, extra.get("parallel_shard_iters", "default"),
+                getattr(ds, "shuffle_over_epochs_multiplier", 1), ds.shard_dir,
             )
             # NOTE: swap get_loader -> get_savable_loader in the resume follow-up PR; that exposes
             # save_state_global / restore_state_global for exact mid-epoch resume (see PR notes).

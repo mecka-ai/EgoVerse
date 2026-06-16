@@ -2,15 +2,17 @@
 # data=mecka_all_sb, streamed by Energon's SavableDataLoader (byte-range reads, reservoir shuffle,
 # cross-shard interleave, rank×worker sharding, exact deterministic resume; NVIDIA-maintained).
 #
+# Shards live in the mecka-energon Modal volume, mounted at /mnt/shards in every training container.
+#
 # One-time prep per shard collection (writes a .nv-meta sidecar beside the tars):
-#   energon prepare <shard_dir> --non-interactive --split-ratio "1.0,0,0" \
-#       --sample-type CrudeWebdataset
+#   modal run egomimic/modal/build_sb_shards.py::main --do prepare --cid <cid>
 #
 # Launch (norm stats are precomputed → norm pass is skipped):
-#   python -m egomimic.trainHydra model=hpt_bc_flow_mecka data=mecka_all_energon trainer=ddp \
+#   python egomimic/trainHydra.py model=hpt_bc_flow_mecka data=mecka_all_energon trainer=ddp_modal \
 #     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
-#     data.train_datasets.mecka_bimanual.shard_dir=/shards/materialized/1gib-e1c6c3f9 \
-#     data.valid_datasets.mecka_bimanual.shard_dir=/shards/materialized/1gib-e1c6c3f9
+#     init_submodules=false \
+#     data.train_datasets.mecka_bimanual.shard_dir=/mnt/shards/materialized/<cid> \
+#     data.valid_datasets.mecka_bimanual.shard_dir=/mnt/shards/materialized/<cid>
 #
 # Energon shards across world_size × num_workers consumers; requires #shards ≥ that product.
 
@@ -19,7 +21,7 @@ _target_: egomimic.pl_utils.pl_data_utils.EnergonMultiDataModuleWrapper
 train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
-    shard_dir: /shards/materialized/1gib-e1c6c3f9
+    shard_dir: /mnt/shards/materialized/FILL_IN_CID
     split_part: train
     # Reservoir size in samples, held PER worker as DECODED samples. Container RAM ≈
     #   shuffle_buffer_size × decoded_sample_bytes (~2.7 MB f32 image) × (world_size × num_workers).
@@ -28,16 +30,28 @@ train_datasets:
     # (see mixing table in the PR). 10k × H100:8 would need ~1.7 TB and OOM the box.
     shuffle_buffer_size: 4000
     embodiment_name: mecka_bimanual
-    max_samples_per_sequence: null  # null → whole-shard cross-shard interleave
+    # --- shuffle / interleave knobs ---------------------------------------------------------------
+    # These three (not the buffer alone) drive per-batch episode diversity. With them OFF
+    # (max_samples_per_sequence=null) a worker drains an entire shard contiguously, so multi-episode
+    # shards (e.g. 1 GiB) emit long same-episode runs → poor mixing unless the buffer is huge. With
+    # them ON, mixing is shard-size-independent: 1 GiB shards mix as well as episode==shard shards at
+    # a small 4k buffer (see mixing_knobs_on_vs_off.png / mixing table). Trade-off: a finite
+    # max_samples_per_sequence makes workers switch shards more often (more, smaller reads) — confirm
+    # throughput on your storage before lowering it further.
+    max_samples_per_sequence: 64    # consecutive samples per shard before switching (null = whole shard)
+    parallel_shard_iters: 64        # shards open per worker, shuffled between (null = Energon default 16)
+    shuffle_over_epochs_multiplier: 2  # shuffle shard-slice order over N epochs (>=1)
 
 valid_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.energon.mecka_energon.EnergonShardDataset
-    shard_dir: /shards/materialized/1gib-e1c6c3f9
+    shard_dir: /mnt/shards/materialized/FILL_IN_CID
     split_part: train              # prepared with split-ratio 1.0,0,0; val unused (limit_val_batches=0)
     shuffle_buffer_size: 4000
     embodiment_name: mecka_bimanual
-    max_samples_per_sequence: null
+    max_samples_per_sequence: 64
+    parallel_shard_iters: 64
+    shuffle_over_epochs_multiplier: 2
 
 train_dataloader_params:
   mecka_bimanual:

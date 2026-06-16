@@ -25,15 +25,19 @@ data=mecka_all_energon (see egomimic/rldb/energon/mecka_energon.py).
 
 from __future__ import annotations
 
+import os
+
 import modal
+
+os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 
 # ============================ CONFIG — edit for your workspace ============================
 APP_NAME = "egoverse-sb-shards"
 
 # Modal volumes (created if missing).
-DATA_VOLUME = "egoverse-mecka-flagship-v2"   # source: one <episode>.zarr directory per episode
+DATA_VOLUME = "mecka_data_v2"                # source: one <episode>.zarr directory per episode
 INDEX_VOLUME = "egoverse-mecka-index"        # manifest.json, norm_stats.json, plans/<cid>/
-SHARDS_VOLUME = "egoverse-mecka-shards-v2"   # output: materialized/<cid>/<shard>.tar
+SHARDS_VOLUME = "mecka-energon"              # output: materialized/<cid>/<shard>.tar
 DATA_MOUNT, INDEX_MOUNT, SHARDS_MOUNT = "/mnt/zarr-data", "/index", "/mnt/shards"
 
 # Dataset schema — the raw zarr keys baked into each record. MUST match the loader's decode()
@@ -179,6 +183,7 @@ def pipeline(
     n_episodes: int = 0,
     seed: int = 42,
     force_index: bool = False,
+    one_per_episode: bool = False,
 ) -> dict:
     """The whole job, server-side (so the local caller can disconnect): ensure the manifest
     exists (idempotent — only scans if missing/force), partition it into this collection's
@@ -206,35 +211,45 @@ def pipeline(
         random.Random(seed).shuffle(pool)
         if n_episodes:                       # subset collection (e.g. shard-size sweep): cap the
             pool = pool[:n_episodes]         # planned episodes so the same N land in every size
-        target = max(1, int(target_shard_mb * 1024 * 1024 / BYTES_PER_SAMPLE))
-        plans, cur, cur_n = [], [], 0
-        for ep, valid in pool:
-            cur.append({"episode": ep, "valid_anchors": valid})
-            cur_n += len(valid)
-            if cur_n >= target:
-                plans.append(cur)
-                cur, cur_n = [], 0
-        if cur:
-            plans.append(cur)
         os.makedirs(pdir, exist_ok=True)
-        for sid, episodes in enumerate(plans):
-            with open(f"{pdir}/{sid:05d}.json.tmp", "w") as f:
-                json.dump({"horizon": H, "episodes": episodes}, f)
-            os.replace(f"{pdir}/{sid:05d}.json.tmp", f"{pdir}/{sid:05d}.json")
+        if one_per_episode:
+            # One tar per episode, named after the episode (stem without .zarr).
+            for ep, valid in pool:
+                name = ep[:-5] if ep.endswith(".zarr") else ep
+                with open(f"{pdir}/{name}.json.tmp", "w") as f:
+                    json.dump({"horizon": H, "episodes": [{"episode": ep, "valid_anchors": valid}]}, f)
+                os.replace(f"{pdir}/{name}.json.tmp", f"{pdir}/{name}.json")
+        else:
+            target = max(1, int(target_shard_mb * 1024 * 1024 / BYTES_PER_SAMPLE))
+            plans, cur, cur_n = [], [], 0
+            for ep, valid in pool:
+                cur.append({"episode": ep, "valid_anchors": valid})
+                cur_n += len(valid)
+                if cur_n >= target:
+                    plans.append(cur)
+                    cur, cur_n = [], 0
+            if cur:
+                plans.append(cur)
+            for sid, episodes in enumerate(plans):
+                with open(f"{pdir}/{sid:05d}.json.tmp", "w") as f:
+                    json.dump({"horizon": H, "episodes": episodes}, f)
+                os.replace(f"{pdir}/{sid:05d}.json.tmp", f"{pdir}/{sid:05d}.json")
         index.commit()
 
-    ids = sorted(int(os.path.basename(p)[:5]) for p in glob.glob(f"{pdir}/*.json"))
+    names = sorted(
+        os.path.splitext(os.path.basename(p))[0] for p in glob.glob(f"{pdir}/*.json")
+    )
     # Fan out one container per shard and BLOCK here. `pipeline` is itself spawned (server-side),
     # so this .map runs under it — it survives the local caller disconnecting, and keeping pipeline
     # alive until the shards finish is what stops the app (and the children) from being torn down.
     ok = [
         r
-        for r in materialize_shard.map([cid] * len(ids), ids)
+        for r in materialize_shard.map([cid] * len(names), names)
         if r.get("status") == "ok"
     ]
     return {
         "cid": cid,
-        "n_shards": len(ids),
+        "n_shards": len(names),
         "materialized": len(ok),
         "GB": round(sum(r.get("MB", 0) for r in ok) / 1024, 1),
     }
@@ -249,7 +264,7 @@ def pipeline(
     retries=2,
     max_containers=MAX_SHARD_CONTAINERS,
 )
-def materialize_shard(cid: str, shard_id: int) -> dict:
+def materialize_shard(cid: str, shard_name: str) -> dict:
     import io
     import json
     import os
@@ -261,12 +276,12 @@ def materialize_shard(cid: str, shard_id: int) -> dict:
     import numpy as np
     import zarr
 
-    tar_path = f"{SHARDS}/materialized/{cid}/{shard_id:05d}.tar"
+    tar_path = f"{SHARDS}/materialized/{cid}/{shard_name}.tar"
     if os.path.exists(tar_path):  # resume within a collection
-        return {"shard_id": shard_id, "status": "skip"}
+        return {"shard_id": shard_name, "status": "skip"}
     os.makedirs(os.path.dirname(tar_path), exist_ok=True)
     index.reload()
-    plan = json.load(open(f"{INDEX}/plans/{cid}/{shard_id:05d}.json"))
+    plan = json.load(open(f"{INDEX}/plans/{cid}/{shard_name}.json"))
     H, t0 = plan["horizon"], time.time()
 
     def pull(ep):  # bulk-copy ONE episode to local NVMe
@@ -333,7 +348,7 @@ def materialize_shard(cid: str, shard_id: int) -> dict:
     os.replace(tmp, tar_path)
     shards.commit()
     return {
-        "shard_id": shard_id,
+        "shard_id": shard_name,
         "status": "ok",
         "samples": n,
         "MB": round(os.path.getsize(tar_path) / 1e6, 1),
@@ -351,6 +366,40 @@ def status(cid: str) -> dict:
     planned = len(glob.glob(f"{INDEX}/plans/{cid}/*.json"))
     done = len(glob.glob(f"{SHARDS}/materialized/{cid}/*.tar"))
     return {"collection": cid, "planned": planned, "materialized": done}
+
+
+@app.function(
+    image=image.pip_install("megatron-energon"),
+    volumes=VOLUMES,
+    cpu=4.0,
+    memory=8192,
+    timeout=1800,
+)
+def energon_prepare(cid: str) -> dict:
+    """Write the .nv-meta sidecar beside a materialized shard collection (one-time step).
+
+    Must be run once per collection before data=mecka_all_energon can read it.
+    Equivalent to: energon prepare <shard_dir> --non-interactive --split-ratio 1.0,0,0
+                                   --sample-type CrudeWebdataset
+    """
+    import subprocess
+
+    shards.reload()
+    shard_dir = f"{SHARDS}/materialized/{cid}"
+    result = subprocess.run(
+        [
+            "energon", "prepare", shard_dir,
+            "--non-interactive",
+            "--split-ratio", "1.0,0,0",
+            "--sample-type", "CrudeWebdataset",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"energon prepare failed:\n{result.stderr}")
+    shards.commit()
+    return {"cid": cid, "shard_dir": shard_dir, "stdout": result.stdout[:500]}
 
 
 @app.function(image=image, volumes=VOLUMES, timeout=900)
@@ -377,28 +426,38 @@ def main(
     cid: str = "",
     n_episodes: int = 0,
     force: bool = False,
+    one_per_episode: bool = False,
 ):
     """One entrypoint. Examples:
-        modal run egomimic/modal/build_sb_shards.py::main                         # build + 1 GiB collection
-        modal run egomimic/modal/build_sb_shards.py::main --target-shard-mb 512   # different shard size
+        modal run egomimic/modal/build_sb_shards.py::main                               # build + 1 GiB collection
+        modal run egomimic/modal/build_sb_shards.py::main --target-shard-mb 512         # different shard size
+        modal run egomimic/modal/build_sb_shards.py::main --one-per-episode --n-episodes 1000  # 1 ep/shard
         modal run egomimic/modal/build_sb_shards.py::main --do make --cid 1gib-abc123   # resume
+        modal run egomimic/modal/build_sb_shards.py::main --do prepare --cid 1gib-abc123  # write .nv-meta
         modal run egomimic/modal/build_sb_shards.py::main --do status --cid 1gib-abc123
         modal run egomimic/modal/build_sb_shards.py::main --do wipe   --cid all
     Spawns a server-side function and waits on the handle, so a local disconnect doesn't cancel it."""
     import uuid
 
     if do == "make":
-        cid = cid or f"{target_shard_mb / 1024:g}gib-{uuid.uuid4().hex[:8]}"
+        prefix = "1ep" if one_per_episode else f"{target_shard_mb / 1024:g}gib"
+        cid = cid or f"{prefix}-{uuid.uuid4().hex[:8]}"
         fc = pipeline.spawn(
             cid,
             target_shard_mb=target_shard_mb,
             n_episodes=n_episodes,
             force_index=force,
+            one_per_episode=one_per_episode,
         )
         print(fc.get())
+    elif do == "prepare":
+        if not cid:
+            print("--cid required for prepare")
+            return
+        print(energon_prepare.remote(cid))
     elif do == "status":
         print(status.spawn(cid).get())
     elif do == "wipe":
         print(wipe.spawn(cid or "all").get())
     else:
-        print(f"unknown do={do!r}; use make | status | wipe")
+        print(f"unknown do={do!r}; use make | prepare | status | wipe")

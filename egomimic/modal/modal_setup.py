@@ -249,6 +249,7 @@ image = (
         "pyzmq",
         "torchvision==0.21.0",
         "s5cmd",
+        "megatron-energon",
     )
     # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
     # JAX-first: even its pytorch model path imports jax/flax at module load
@@ -277,7 +278,9 @@ zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True, ve
 zip_fold_clothes_volume = modal.Volume.from_name(
     "mecka_data_zip_fold_clothes", create_if_missing=True, version=2
 )
+energon_volume = modal.Volume.from_name("mecka-energon", create_if_missing=True, version=2)
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
+ENERGON_MOUNT_PATH = "/mnt/shards"
 
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
