@@ -166,11 +166,10 @@ def run_hydra_train(
         git_remote=git_remote,
         git_commit=git_commit,
         init_submodules=init_submodules,
-        init_openpi=_uses_pi_model(hydra_args),
     )
 
     # (openpi's patched transformers==4.53.2 for pi0.5 is applied inside
-    # _prepare_repo when init_openpi=True.)
+    # _prepare_repo when the openpi submodule is present.)
     hydra_args = _resolve_volume_paths(hydra_args)
     cmd = _build_train_cmd(hydra_args)
     env = os.environ.copy()
