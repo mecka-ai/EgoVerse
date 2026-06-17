@@ -23,27 +23,33 @@ class ModalAutoRestartCallback(Callback):
     Enabled automatically when MODAL_IS_REMOTE=1 and MODAL_TIMEOUT_SECONDS are
     set. trainModal.py injects these env vars into the container via run_hydra_train.
 
+    The callback writes a restart-request file; the parent run_hydra_train reads
+    it after the subprocess exits and self-spawns the continuation.
+
     Required env vars (set by trainModal.py::run_hydra_train):
-        MODAL_TIMEOUT_SECONDS   container timeout in seconds (e.g. 86400)
-        MODAL_START_TIME        unix timestamp when the container started
-        MODAL_HYDRA_ARGS        JSON-encoded list of the original hydra overrides
-        MODAL_GIT_REMOTE        remote URL used to clone the repo
-        MODAL_GIT_COMMIT        git SHA checked out in the container
+        MODAL_TIMEOUT_SECONDS     container timeout in seconds (e.g. 86400)
+        MODAL_RESTART_MARGIN_SEC  save + restart this many sec before timeout
+        MODAL_START_TIME          unix timestamp when the container started
+        MODAL_HYDRA_ARGS          JSON-encoded list of the original hydra overrides
+        MODAL_RESTART_REQUEST_FILE path the parent polls for the continuation args
     """
 
-    _RESTART_MARGIN_SEC = 1800  # save + spawn 30 min before timeout
+    _RESTART_MARGIN_SEC = 1800  # default: save + restart 30 min before timeout
 
     def __init__(self) -> None:
         super().__init__()
         self._triggered = False
         self._start = float(os.environ.get("MODAL_START_TIME", time.time()))
         self._timeout = int(os.environ.get("MODAL_TIMEOUT_SECONDS", 86400))
+        self._margin = int(
+            os.environ.get("MODAL_RESTART_MARGIN_SEC", self._RESTART_MARGIN_SEC)
+        )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self._triggered:
             return
         remaining = self._timeout - (time.time() - self._start)
-        if remaining < self._RESTART_MARGIN_SEC:
+        if remaining < self._margin:
             self._triggered = True
             self._auto_restart(trainer)
 
@@ -54,20 +60,7 @@ class ModalAutoRestartCallback(Callback):
         trainer.save_checkpoint(ckpt_path)
         log.info(f"[ModalAutoRestart] Checkpoint saved → {ckpt_path}")
 
-        # Persist the checkpoint to the outputs volume BEFORE spawning the
-        # continuation. run_hydra_train only commits after trainer.fit() unwinds,
-        # which is after this callback returns — so without an explicit commit
-        # here the continuation can start reading ckpt_path before it exists on
-        # the volume. Commit once, on rank zero (the mount is shared).
-        if trainer.is_global_zero:
-            try:
-                import modal as _modal
-
-                _modal.Volume.from_name("egoverse-training-outputs").commit()
-                log.info("[ModalAutoRestart] Committed checkpoint to outputs volume")
-            except Exception as exc:
-                log.error(f"[ModalAutoRestart] Volume commit failed: {exc}")
-
+        # Parent run_hydra_train commits the outputs volume before spawning.
         wandb_run_id = None
         for lgr in trainer.loggers:
             if hasattr(lgr, "experiment") and hasattr(lgr.experiment, "id"):
@@ -83,28 +76,34 @@ class ModalAutoRestartCallback(Callback):
         if wandb_run_id:
             new_args.append(f"wandb_run_id={wandb_run_id}")
 
-        git_remote = os.environ.get("MODAL_GIT_REMOTE", "")
-        git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
-        wandb_api_key = os.environ.get("WANDB_API_KEY", "")
-
-        if trainer.is_global_zero:
+        # Hand continuation args to the parent (it self-spawns the next job).
+        restart_file = os.environ.get("MODAL_RESTART_REQUEST_FILE")
+        if trainer.is_global_zero and restart_file:
             try:
-                import modal as _modal
-
-                fn = _modal.Function.from_name(
-                    "egomimic-training",
-                    "run_hydra_train",
-                    environment_name="robotics",
-                )
-                handle = fn.spawn(
-                    tuple(new_args), git_remote, git_commit, wandb_api_key
-                )
-                log.info(f"[ModalAutoRestart] Spawned continuation: {handle.object_id}")
+                with open(restart_file, "w") as f:
+                    json.dump({"hydra_args": new_args}, f)
+                log.info(f"[ModalAutoRestart] Wrote restart request → {restart_file}")
             except Exception as exc:
-                log.error(f"[ModalAutoRestart] Failed to spawn continuation: {exc}")
+                log.error(f"[ModalAutoRestart] Failed to write restart request: {exc}")
+        elif not restart_file:
+            log.error(
+                "[ModalAutoRestart] MODAL_RESTART_REQUEST_FILE unset — "
+                "continuation will NOT be spawned"
+            )
+
+        # Clear min_epochs/min_steps (default config sets min_epochs=2000) so
+        # should_stop is honored now instead of at the hard timeout.
+        fit_loop = getattr(trainer, "fit_loop", None)
+        epoch_loop = getattr(fit_loop, "epoch_loop", None)
+        for obj, attr in ((fit_loop, "min_epochs"), (epoch_loop, "min_steps")):
+            if obj is not None and hasattr(obj, attr):
+                try:
+                    setattr(obj, attr, 0)
+                except AttributeError:
+                    log.warning("[ModalAutoRestart] could not clear %s", attr)
 
         trainer.should_stop = True
-        log.info("[ModalAutoRestart] Stopping current run — continuation job is running")
+        log.info("[ModalAutoRestart] Stopping current run — parent will spawn continuation")
 
 
 class PrefetchEpochCallback(Callback):
