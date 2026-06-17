@@ -38,9 +38,9 @@ train_datasets:
     # a small 4k buffer (see mixing_knobs_on_vs_off.png / mixing table). Trade-off: a finite
     # max_samples_per_sequence makes workers switch shards more often (more, smaller reads) — confirm
     # throughput on your storage before lowering it further.
-    max_samples_per_sequence: 64    # consecutive samples per shard before switching (null = whole shard)
+    max_samples_per_sequence: 256   # consecutive samples per shard before switching (null = whole shard)
     parallel_shard_iters: 64        # shards open per worker, shuffled between (null = Energon default 16)
-    shuffle_over_epochs_multiplier: 2  # shuffle shard-slice order over N epochs (>=1)
+    shuffle_over_epochs_multiplier: 1  # shuffle shard-slice order over N epochs (>=1)
 
 valid_datasets:
   mecka_bimanual:
@@ -49,9 +49,9 @@ valid_datasets:
     split_part: train              # prepared with split-ratio 1.0,0,0; val unused (limit_val_batches=0)
     shuffle_buffer_size: 4000
     embodiment_name: mecka_bimanual
-    max_samples_per_sequence: 64
+    max_samples_per_sequence: 256
     parallel_shard_iters: 64
-    shuffle_over_epochs_multiplier: 2
+    shuffle_over_epochs_multiplier: 1
 
 train_dataloader_params:
   mecka_bimanual:
