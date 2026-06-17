@@ -7,12 +7,149 @@ import torch
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from termcolor import cprint
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader, Sampler, default_collate
 from transformers import AutoTokenizer
 
 from egomimic.utils.dataloader_ipc import apply_ipc_dataloader_params
 
 logger = logging.getLogger(__name__)
+
+
+class EpisodeLocalityBatchSampler(Sampler[list[int]]):
+    """Yield batches from one underlying episode shard when possible."""
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        *,
+        mode: str = "random",
+        block_size: int = 16,
+        drop_last: bool = False,
+        seed: int = 42,
+    ):
+        if not (
+            hasattr(dataset, "_global_indices_by_dataset")
+            or hasattr(dataset, "_index_map")
+        ):
+            raise TypeError(
+                "episode locality sampling requires a dataset with either "
+                "_global_indices_by_dataset or _index_map"
+            )
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.mode = mode
+        self.block_size = max(1, int(block_size))
+        self.drop_last = bool(drop_last)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.static_groups = (
+            [
+                list(indices)
+                for _, indices in sorted(dataset._global_indices_by_dataset.items())
+                if indices
+            ]
+            if hasattr(dataset, "_global_indices_by_dataset")
+            else None
+        )
+        self.total = (
+            sum(len(g) for g in self.static_groups)
+            if self.static_groups is not None
+            else len(dataset)
+        )
+
+    def __len__(self):
+        if self.drop_last:
+            return self.total // self.batch_size
+        return (self.total + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        groups = self._groups()
+        rng.shuffle(groups)
+        for group in groups:
+            indices = self._order_group(group, rng)
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i : i + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    yield batch
+
+    def _order_group(self, group: list[int], rng: random.Random) -> list[int]:
+        if self.mode == "random":
+            rng.shuffle(group)
+            return group
+        if self.mode == "sequential":
+            return group
+        if self.mode == "block":
+            blocks = [
+                group[i : i + self.block_size]
+                for i in range(0, len(group), self.block_size)
+            ]
+            rng.shuffle(blocks)
+            return [idx for block in blocks for idx in block]
+        raise ValueError(
+            "episode_locality_mode must be one of: random, sequential, block"
+        )
+
+    def _groups(self) -> list[list[int]]:
+        if self.static_groups is not None:
+            return [list(g) for g in self.static_groups]
+
+        index_map = getattr(self.dataset, "_index_map", None)
+        if not index_map:
+            raise RuntimeError(
+                "episode locality sampling requires PrefetchedMapDataset."
+                "prepare_epoch() to run before DataLoader iteration."
+            )
+        groups_by_episode: dict[str, list[int]] = {}
+        for global_idx, (episode_path, _) in enumerate(index_map):
+            groups_by_episode.setdefault(str(episode_path), []).append(global_idx)
+        return [
+            groups_by_episode[episode_path]
+            for episode_path in sorted(groups_by_episode)
+            if groups_by_episode[episode_path]
+        ]
+
+
+def _build_train_loader_kwargs(dataset_name, dataset, dataset_params, shuffle):
+    episode_locality = bool(dataset_params.pop("episode_locality", False))
+    mode = dataset_params.pop("episode_locality_mode", "random")
+    block_size = int(dataset_params.pop("episode_locality_block_size", 16))
+    seed = int(dataset_params.pop("episode_locality_seed", 42))
+
+    if not episode_locality:
+        return {"shuffle": shuffle, **apply_ipc_dataloader_params(dataset_params)}
+
+    if shuffle is False:
+        logger.warning(
+            "Dataset '%s' has episode_locality=True with shuffle=False; "
+            "using episode-local batch order anyway.",
+            dataset_name,
+        )
+    if "batch_sampler" in dataset_params or "sampler" in dataset_params:
+        raise ValueError(
+            f"Dataset '{dataset_name}' cannot combine episode_locality with "
+            "sampler or batch_sampler."
+        )
+    if "batch_size" not in dataset_params:
+        raise ValueError(
+            f"Dataset '{dataset_name}' needs batch_size for episode_locality."
+        )
+    batch_size = int(dataset_params.pop("batch_size"))
+    drop_last = bool(dataset_params.pop("drop_last", False))
+    batch_sampler = EpisodeLocalityBatchSampler(
+        dataset,
+        batch_size=batch_size,
+        mode=mode,
+        block_size=block_size,
+        drop_last=drop_last,
+        seed=seed,
+    )
+    return {
+        "batch_sampler": batch_sampler,
+        **apply_ipc_dataloader_params(dataset_params),
+    }
 
 
 class RLDBModule(LightningDataModule):
@@ -173,11 +310,20 @@ class MultiDataModuleWrapper(LightningDataModule):
                     dataset_name,
                 )
                 shuffle = False
+            if is_iterable and dataset_params.get("episode_locality"):
+                raise ValueError(
+                    f"Dataset '{dataset_name}' is an IterableDataset and cannot "
+                    "use episode_locality."
+                )
             iterables[dataset_name] = DataLoader(
                 dataset,
-                shuffle=shuffle,
                 collate_fn=self.collate_fn,
-                **apply_ipc_dataloader_params(dataset_params),
+                **_build_train_loader_kwargs(
+                    dataset_name,
+                    dataset,
+                    dataset_params,
+                    shuffle,
+                ),
             )
 
         return CombinedLoader(iterables, "max_size_cycle")
@@ -227,7 +373,10 @@ class MultiDataModuleWrapper(LightningDataModule):
             dataset_params = dict(dataset_params)
             dataset_params.pop("shuffle", None)
             iterables[dataset_name] = DataLoader(
-                dataset, shuffle=False, collate_fn=self.collate_fn, **dataset_params
+                dataset,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                **apply_ipc_dataloader_params(dataset_params),
             )
         return CombinedLoader(iterables, "max_size_cycle")
 
