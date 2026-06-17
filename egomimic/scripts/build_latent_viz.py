@@ -570,11 +570,17 @@ function buildLegend(task){
     return;
   }
   const eps=DATA[task]?DATA[task].episodes:[];
-  const rows=eps.map((h,i)=>{
-    const c=rgb(hsv2rgb(i/Math.max(1,eps.length),0.85,0.85));
+  const sn=scoreNorm(task);
+  let epIdxs=eps.map((_,i)=>i);
+  if(mode==="score")epIdxs.sort((a,b)=>(sn[eps[b]]??0)-(sn[eps[a]]??0));
+  const rows=epIdxs.map(i=>{
+    const h=eps[i];
+    const c=mode==="score"?rgb(redGreen(sn[h]??0.5)):rgb(hsv2rgb(i/Math.max(1,eps.length),0.85,0.85));
     const sc=SCORES[task]?(SCORES[task].find(e=>e[0]===h)||[0,NaN])[1]:NaN;
+    const scoreLabel=mode==="score"&&!isNaN(sc)
+      ?` <span style="color:#888;font-size:10px">${sc.toFixed(3)}</span>`:"";
     return `<div class="lg-row" id="lg_${i}" onclick="legendClick(${i})" title="MI ${isNaN(sc)?"?":sc.toFixed(4)}">` +
-           `<span class="lg-dot" style="background:${c}"></span>${h.slice(0,10)}</div>`;
+           `<span class="lg-dot" style="background:${c}"></span>${h.slice(0,10)}${scoreLabel}</div>`;
   }).join("");
   document.getElementById("legend").innerHTML=
     `<div class="lg-head">episodes <span style="color:#666;font-weight:400">(click to multi-select)</span></div>` +
