@@ -2,7 +2,7 @@ defaults:
   - pi0.5_bc_mecka
   - _self_
 
-# LR point 3e-5 — same plain-cosine schedule as pi0.5_lr5e6/pi0.5_lr1e5 so runs
+# LR point 3e-5 — same linear-warmup schedule as pi0.5_lr1e5/pi0.5_lr5e5 so runs
 # in the sweep differ only in peak LR. Loads the pretrained pi0.5 base
 # (pi0.5_bc_mecka → pi05_base_pytorch). On Modal pass
 # model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch
@@ -10,14 +10,15 @@ defaults:
 # rewrites relative CLI overrides to the outputs volume. Swap the defaults base
 # to pi0.5_bc_mecka_scratch to train from scratch.
 #
-# Cosine-schedule T_max (num_training_steps) = ONE pass over 30h of data:
+# Linear-warmup schedule. T_max (num_training_steps) = ONE pass over 30h of data:
 #   30h × 3600 s/h × 30 fps = 3,240,000 samples ÷ global batch 256 = 12,656 steps.
 #   (global batch 256 = 4×H200 DDP × 64 per-device; the scheduler steps once per
 #    global batch, so the divisor is 256, not the per-device 64.)
-# Warmup set to 1000 steps (~8% of T_max). num_cycles 0.5 → decay to 0 at T_max.
+# Warmup set to 1000 steps (~8% of T_max); linear decay to 0 at num_training_steps.
 optimizer:
   lr: 3e-5
 
 scheduler:
+  _target_: transformers.optimization.get_linear_schedule_with_warmup
   num_warmup_steps: 1000
   num_training_steps: 50000
