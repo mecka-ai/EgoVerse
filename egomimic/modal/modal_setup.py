@@ -190,7 +190,7 @@ image = (
         "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime",
         add_python="3.10",
     )
-    .apt_install("git", "libgl1")
+    .apt_install("git", "libgl1", "libglib2.0-0")
     # Bake modal_setup.py into the image so curateModal.py / trainModal.py can
     # import it at module-load time (before the repo is cloned via _prepare_repo).
     # Path(__file__).parent resolves to /root/ in the container, so:
