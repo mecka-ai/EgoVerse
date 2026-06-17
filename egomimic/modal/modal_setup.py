@@ -88,7 +88,14 @@ class _Config:
             else int(os.environ.get("MODAL_MEMORY_MB", "65536"))
         )
     )
-    timeout_seconds: int = 86400  # 24 h (Modal max)
+    # 24 h (Modal max); override with +modal_timeout_seconds.
+    timeout_seconds: int = field(
+        default_factory=lambda: int(os.environ.get("MODAL_TIMEOUT_SECONDS", "86400"))
+    )
+    # Restart this many sec before timeout; override with +modal_restart_margin_sec.
+    restart_margin_sec: int = field(
+        default_factory=lambda: int(os.environ.get("MODAL_RESTART_MARGIN_SEC", "1800"))
+    )
 
     secret_names: list[str] = field(
         default_factory=lambda: [

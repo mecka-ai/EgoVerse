@@ -157,8 +157,13 @@ def run_hydra_train(
     git_commit: str,
     wandb_api_key: str = "",
     init_submodules: bool = True,
+    timeout_seconds: int = CFG.timeout_seconds,
+    restart_margin_sec: int = CFG.restart_margin_sec,
 ) -> str:
     """Clone the repo at *git_commit* and run trainHydra.py with *hydra_args*.
+
+    On Modal-timeout the auto-restart callback writes a restart-request file;
+    after the subprocess exits this function self-spawns the continuation.
 
     Returns the path relative to the output volume where artifacts were written.
     """
@@ -167,6 +172,11 @@ def run_hydra_train(
         git_commit=git_commit,
         init_submodules=init_submodules,
     )
+
+    # Local (non-volume) path the callback writes its continuation args to.
+    restart_file = f"{CFG.remote_repo_dir}/.modal_restart_request.json"
+    if os.path.exists(restart_file):
+        os.remove(restart_file)  # clear any stale request from a prior checkout
 
     # (openpi's patched transformers==4.53.2 for pi0.5 is applied inside
     # _prepare_repo when the openpi submodule is present.)
@@ -212,9 +222,11 @@ def run_hydra_train(
         env["WANDB_API_KEY"] = wandb_api_key
 
     env["MODAL_IS_REMOTE"] = "1"
-    env["MODAL_TIMEOUT_SECONDS"] = str(CFG.timeout_seconds)
+    env["MODAL_TIMEOUT_SECONDS"] = str(timeout_seconds)
+    env["MODAL_RESTART_MARGIN_SEC"] = str(restart_margin_sec)
     env["MODAL_START_TIME"] = str(_time.time())
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
+    env["MODAL_RESTART_REQUEST_FILE"] = restart_file
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
 
@@ -243,6 +255,25 @@ def run_hydra_train(
     if process.returncode != 0:
         raise RuntimeError(
             f"Training failed (exit {process.returncode}): {shlex.join(cmd)}"
+        )
+
+    # Auto-restart: self-spawn the continuation the callback requested.
+    if os.path.exists(restart_file):
+        with open(restart_file) as f:
+            new_args = tuple(_json.load(f)["hydra_args"])
+        os.remove(restart_file)
+        handle = run_hydra_train.spawn(
+            new_args,
+            git_remote,
+            git_commit,
+            wandb_api_key,
+            init_submodules=init_submodules,
+            timeout_seconds=timeout_seconds,
+            restart_margin_sec=restart_margin_sec,
+        )
+        print(
+            f"[ModalAutoRestart] Spawned continuation {handle.object_id} "
+            f"with {len(new_args)} hydra args"
         )
 
     return output_rel_path
@@ -380,6 +411,8 @@ def submit(*hydra_args: str) -> None:
         git_commit,
         _local_wandb_key(),
         init_submodules=init_submodules,
+        timeout_seconds=CFG.timeout_seconds,
+        restart_margin_sec=CFG.restart_margin_sec,
     )
     print(f"Submitted Modal job: {handle.object_id}")
     print("Monitor at: https://modal.com/apps/egomimic-training")
@@ -408,6 +441,8 @@ if __name__ == "__main__":
         "modal_memory_mb": "MODAL_MEMORY_MB",
         "modal_volume": "MODAL_VOLUME",
         "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",
+        "modal_timeout_seconds": "MODAL_TIMEOUT_SECONDS",
+        "modal_restart_margin_sec": "MODAL_RESTART_MARGIN_SEC",
     }
 
     modal_env = os.environ.copy()
