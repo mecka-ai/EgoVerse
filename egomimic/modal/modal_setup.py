@@ -262,6 +262,9 @@ image = (
         "s5cmd",
         "ultralytics",
     )
+    # ultralytics pulls in full opencv-python which requires system GL/gthread libs.
+    # Force-reinstall headless (bundled libs, no system deps) so cv2 works headless.
+    .run_commands("pip install --force-reinstall --no-deps opencv-python-headless")
     .add_local_file(
         "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt",
         remote_path="/root/wes_h_v3.0.pt",
