@@ -12,7 +12,7 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3"})
+_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3", "wes"})
 _DINOV3_DEFAULT_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
 
@@ -99,6 +99,7 @@ class StateEmbedder:
         dinov3_dtype: str = "float16",
         seed: int = 42,
         norm_min_std: float = 1e-6,
+        wes_checkpoint_path: str | None = None,
     ) -> None:
         self.mode = mode
         self.latent_dim = latent_dim
@@ -111,6 +112,7 @@ class StateEmbedder:
         self.dinov3_dtype = dinov3_dtype
         self._seed = seed
         self.norm_min_std = norm_min_std
+        self.wes_checkpoint_path = wes_checkpoint_path
         self._fitted = False
 
         self._mean: np.ndarray | None = None
@@ -154,6 +156,8 @@ class StateEmbedder:
                 )
             if self.image_backbone == "resnet18":
                 self._fit_resnet()
+            elif self.image_backbone == "wes":
+                self._fit_wes()
             else:
                 self._fit_dinov3()
         self._fitted = True
@@ -241,6 +245,91 @@ class StateEmbedder:
             resize_to, crop_h, crop_w,
         )
 
+    def _fit_wes(self) -> None:
+        """Load frozen WES (YOLO11-L-pose) backbone + Xavier projection (512 → latent_dim).
+
+        Only layers 0-10 (Conv/C3k2/SPPF/C2PSA backbone) are used for feature
+        extraction. All backbone layers in YOLO11 are sequential (f=-1), so they
+        can be run with a simple loop without tracking intermediate outputs.
+        """
+        if not self.wes_checkpoint_path:
+            raise ValueError(
+                "wes_checkpoint_path must be set when using backbone=wes"
+            )
+        ckpt = torch.load(self.wes_checkpoint_path, map_location="cpu", weights_only=False)
+        raw_model = ckpt["model"].float().eval()
+        for p in raw_model.parameters():
+            p.requires_grad_(False)
+        self._wes_model = raw_model.to(self.device)
+
+        # Probe backbone output shape with a dummy input.
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 640, 640, device=self.device)
+            feat = dummy
+            for i in range(11):
+                feat = self._wes_model.model[i](feat)
+        feat_dim = feat.shape[1]  # 512 for YOLO11-L
+
+        self._proj_layer = nn.Linear(feat_dim, self.latent_dim, bias=True).to(self.device)
+        nn.init.xavier_uniform_(self._proj_layer.weight)
+        nn.init.zeros_(self._proj_layer.bias)
+        for p in self._proj_layer.parameters():
+            p.requires_grad_(False)
+
+        logger.info(
+            "StateEmbedder (image/wes): backbone_dim=%d → %d (fixed random proj)",
+            feat_dim, self.latent_dim,
+        )
+
+    def _embed_image_wes(self, data: np.ndarray) -> np.ndarray:
+        """Batched WES backbone inference (YOLO11-L layers 0-10 → GAP → latent_dim).
+
+        Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1]. Resizes to
+        640×640 (YOLO's native resolution). No additional mean/std normalization —
+        YOLO models normalize only by dividing by 255.
+        """
+        import torch.nn.functional as F
+
+        n_total = data.shape[0]
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+
+        for start in range(0, n_total, self.image_batch_size):
+            chunk = data[start : start + self.image_batch_size]
+            tb = time.perf_counter()
+
+            if chunk.dtype == np.uint8:
+                tensor = torch.from_numpy(chunk).to(self.device, dtype=torch.float32, non_blocking=True)
+                tensor = tensor.div_(255.0)
+            else:
+                tensor = torch.from_numpy(chunk.astype(np.float32)).to(self.device, non_blocking=True)
+                tensor = tensor.clamp_(0.0, 1.0)
+
+            h, w = tensor.shape[-2], tensor.shape[-1]
+            if h != 640 or w != 640:
+                tensor = F.interpolate(tensor, size=(640, 640), mode="bilinear", align_corners=False)
+
+            with torch.no_grad():
+                feat = tensor
+                for i in range(11):
+                    feat = self._wes_model.model[i](feat)
+                # feat: (B, 512, 20, 20) — global average pool → (B, 512)
+                pooled = feat.mean(dim=[2, 3])
+                outputs.append(self._proj_layer(pooled).cpu().numpy())
+
+            logger.debug(
+                "WES batch [%d:%d] %.3fs (%.0f imgs/s)",
+                start, start + len(chunk), time.perf_counter() - tb,
+                len(chunk) / (time.perf_counter() - tb) if (time.perf_counter() - tb) > 0 else 0,
+            )
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "[images] WES embed: %d images in %.2fs (%.0f imgs/s)",
+            n_total, elapsed, n_total / elapsed if elapsed > 0 else 0,
+        )
+        return np.concatenate(outputs, axis=0)
+
     def embed(self, data: np.ndarray) -> np.ndarray:
         """
         Embed a batch of observations.
@@ -258,6 +347,8 @@ class StateEmbedder:
             return normalised @ self._proj if self._proj is not None else normalised
         if self.image_backbone == "resnet18":
             return self._embed_image_resnet(data)
+        if self.image_backbone == "wes":
+            return self._embed_image_wes(data)
         return self._embed_image_dinov3(data)
 
     def _embed_image_resnet(self, data: np.ndarray) -> np.ndarray:

@@ -40,6 +40,7 @@ class StateImageSettings:
     backbone: str = "resnet18"
     dinov3_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     dinov3_dtype: str = "float16"
+    wes_checkpoint_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -193,10 +194,18 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
         dinov3_model_name = str(dinov3.get("model_name", dinov3_model_name))
         dinov3_dtype = str(dinov3.get("dtype", dinov3_dtype))
 
+    wes_checkpoint_path: str | None = None
+    if backbone == "wes":
+        wes = OmegaConf.select(cfg, "model.state_image.wes", default={}) or {}
+        wes_checkpoint_path = wes.get("checkpoint_path", None)
+        if wes_checkpoint_path is not None:
+            wes_checkpoint_path = str(wes_checkpoint_path)
+
     return StateImageSettings(
         backbone=backbone,
         dinov3_model_name=dinov3_model_name,
         dinov3_dtype=dinov3_dtype,
+        wes_checkpoint_path=wes_checkpoint_path,
     )
 
 

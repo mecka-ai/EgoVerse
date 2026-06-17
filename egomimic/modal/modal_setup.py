@@ -260,6 +260,12 @@ image = (
         "pyzmq",
         "torchvision==0.21.0",
         "s5cmd",
+        "ultralytics",
+    )
+    .add_local_file(
+        "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt",
+        remote_path="/root/wes_h_v3.0.pt",
+        copy=True,
     )
     # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
     # JAX-first: even its pytorch model path imports jax/flax at module load

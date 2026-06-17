@@ -96,6 +96,7 @@ def build_embedders(
         dinov3_model_name=img.dinov3_model_name,
         dinov3_dtype=img.dinov3_dtype,
         seed=seed,
+        wes_checkpoint_path=img.wes_checkpoint_path,
     )
     state_embedder.fit([])
     return action_embedder, state_embedder
