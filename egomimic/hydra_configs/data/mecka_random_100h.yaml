@@ -51,6 +51,25 @@ valid_datasets:
       eps_to_use: egomimic/hydra_configs/data/extra/mecka_random_125h.json
     mode: valid
 
+# Small viz set (8 episodes from the pool) for evaluator@train_viz_evaluator=train_viz_pi
+# (dataloader_idx=1). Omit the train_viz evaluator at launch if you don't want it.
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/mecka_random_125h.json
+      debug: 8
+    mode: total
+
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 64        # per-device; 4×H200 → global batch 256
@@ -62,5 +81,12 @@ valid_dataloader_params:
   mecka_bimanual:
     batch_size: 64
     num_workers: 8
+    persistent_workers: true
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 4
     persistent_workers: true
     shuffle: false
