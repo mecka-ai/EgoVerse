@@ -133,16 +133,19 @@ train_dataloader_params:
   mecka_bimanual:
     batch_size: 64
     num_workers: 12
+    persistent_workers: true
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 64
     num_workers: 12
+    persistent_workers: true
 
 train_viz_dataloader_params:
   mecka_bimanual:
     batch_size: 8
     num_workers: 4
+    persistent_workers: true
 """
 
 
