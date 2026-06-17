@@ -6,7 +6,7 @@ Submit a training run (fully detached — survives local disconnects):
     python egomimic/modal/trainModal.py \\
         data=mecka_all_zarr trainer=ddp_modal logger=wandb model=hpt_bc_flow_mecka \\
         name=<run> description=<desc> [+modal_gpu=H100] [+modal_cpu=32] [+modal_memory_gb=128] \\
-        [init_submodules=false]
+        [init_submodules=oat|openpi|oat,openpi]   # default: no submodules
 
 Verify container health:
     modal run --env robotics egomimic/modal/trainModal.py::verify
@@ -41,6 +41,8 @@ from modal_setup import (  # noqa: E402
     _uses_pi_model,
     app,
     app_name_from_hydra_args,
+    decode_submodules,
+    encode_submodules,
     launch_detached,
     pop_init_submodules,
     training_outputs_volume,
@@ -156,7 +158,7 @@ def run_hydra_train(
     git_remote: str,
     git_commit: str,
     wandb_api_key: str = "",
-    init_submodules: bool = True,
+    submodules: frozenset = frozenset(),
 ) -> str:
     """Clone the repo at *git_commit* and run trainHydra.py with *hydra_args*.
 
@@ -165,7 +167,7 @@ def run_hydra_train(
     _prepare_repo(
         git_remote=git_remote,
         git_commit=git_commit,
-        init_submodules=init_submodules,
+        submodules=submodules,
     )
 
     # (openpi's patched transformers==4.53.2 for pi0.5 is applied inside
@@ -217,9 +219,9 @@ def run_hydra_train(
     env["MODAL_HYDRA_ARGS"] = _json.dumps(list(hydra_args))
     env["MODAL_GIT_REMOTE"] = git_remote
     env["MODAL_GIT_COMMIT"] = git_commit
-    # Carried into the ModalAutoRestart continuation spawn so a run launched
-    # with init_submodules=false doesn't re-init submodules after restarting.
-    env["MODAL_INIT_SUBMODULES"] = "1" if init_submodules else "0"
+    # Carried into the ModalAutoRestart continuation spawn so submodule choice
+    # is preserved across restarts (e.g. oat runs keep init_submodules=oat).
+    env["MODAL_INIT_SUBMODULES"] = encode_submodules(submodules)
 
     # openpi (used by egomimic.algo.pi for pi0.5 models) lives in the
     # external/openpi git submodule at external/openpi/src; put it on PYTHONPATH
@@ -295,8 +297,7 @@ def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
     transformers_replace check fires — so we validate the full pi path without a
     GPU. No PYTHONPATH: relies on the site-packages .pth (the DDP-child path).
     """
-    # _prepare_repo applies the pi transformers swap (openpi submodule present).
-    _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=True)
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=frozenset({"openpi"}))
 
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"
@@ -368,21 +369,20 @@ def verify_pi() -> None:
 @app.local_entrypoint()
 def submit(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a training job from already-pushed commit."""
-    hydra_args, init_submodules = pop_init_submodules(hydra_args)
+    hydra_args, submodules = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print(
             "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
         )
     print(f"Submitting commit {git_commit[:12]} from {git_remote}")
-    if not init_submodules:
-        print("Skipping git submodule init (init_submodules=false)")
+    print(f"Submodules: {sorted(submodules) if submodules else 'none'}")
     handle = run_hydra_train.spawn(
         tuple(hydra_args),
         git_remote,
         git_commit,
         _local_wandb_key(),
-        init_submodules=init_submodules,
+        submodules=submodules,
     )
     print(f"Submitted Modal job: {handle.object_id}")
     print("Monitor at: https://modal.com/apps/egomimic-training")

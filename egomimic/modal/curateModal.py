@@ -66,6 +66,8 @@ from modal_setup import (  # noqa: E402
     _prepare_repo_light,
     _resolve_git_state,
     app_name_from_hydra_args,
+    decode_submodules,
+    encode_submodules,
     launch_detached,
     pop_init_submodules,
     app,
@@ -594,7 +596,7 @@ def run_curate(
     hydra_args: tuple[str, ...],
     git_remote: str,
     git_commit: str,
-    init_submodules: bool = False,
+    submodules: frozenset = frozenset(),
     hf_token: str = "",
 ) -> str:
     """Orchestrator: SQL task grouping + per-task container fan-out."""
@@ -607,7 +609,7 @@ def run_curate(
     _prepare_repo(
         git_remote=git_remote,
         git_commit=git_commit,
-        init_submodules=init_submodules,
+        submodules=submodules,
     )
     _sys.path.insert(0, CFG.remote_repo_dir)
     os.chdir(CFG.remote_repo_dir)
@@ -865,7 +867,7 @@ def run_curate(
 @app.local_entrypoint()
 def submit_curate(*hydra_args: str) -> None:
     """Fire-and-forget: spawn a curation job from an already-pushed commit."""
-    hydra_args, init_submodules = pop_init_submodules(hydra_args)
+    hydra_args, submodules = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print(
@@ -873,11 +875,10 @@ def submit_curate(*hydra_args: str) -> None:
             "Modal will run the last committed state only."
         )
     print(f"Submitting curation at commit {git_commit[:12]} from {git_remote}")
-    if not init_submodules:
-        print("Skipping git submodule init (init_submodules=false)")
+    print(f"Submodules: {sorted(submodules) if submodules else 'none'}")
     handle = run_curate.spawn(
         tuple(hydra_args), git_remote, git_commit,
-        init_submodules=init_submodules,
+        submodules=submodules,
         hf_token=_local_hf_token(),
     )
     _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")

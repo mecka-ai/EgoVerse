@@ -417,19 +417,49 @@ def _git_output(args: list[str]) -> str:
     return subprocess.check_output(args, cwd=REPO_ROOT, text=True).strip()
 
 
+_KNOWN_SUBMODULES = {"oat", "openpi"}
+
+
 def pop_init_submodules(
     args: tuple[str, ...] | list[str],
-) -> tuple[tuple[str, ...], bool]:
-    """Strip ``init_submodules=…`` from launch args; return (remaining, init_submodules)."""
-    init_submodules = True
+) -> "tuple[tuple[str, ...], frozenset[str]]":
+    """Strip ``init_submodules=…`` from launch args; return (remaining, submodules).
+
+    Values for init_submodules=:
+      false / 0 / no / off  → frozenset()            (nothing — default)
+      oat                   → frozenset({"oat"})
+      openpi                → frozenset({"openpi"})
+      oat,openpi / true / all → frozenset({"oat", "openpi"})
+    """
+    submodules: frozenset[str] = frozenset()
     kept: list[str] = []
     for arg in args:
         key, sep, val = arg.lstrip("+").partition("=")
         if sep and key == "init_submodules":
-            init_submodules = val.strip().lower() not in ("false", "0", "no", "off")
+            v = val.strip().lower()
+            if v in ("false", "0", "no", "off", ""):
+                submodules = frozenset()
+            elif v in ("true", "all"):
+                submodules = frozenset(_KNOWN_SUBMODULES)
+            else:
+                submodules = frozenset(p.strip() for p in v.split(",") if p.strip())
         else:
             kept.append(arg)
-    return tuple(kept), init_submodules
+    return tuple(kept), submodules
+
+
+def encode_submodules(submodules: "frozenset[str]") -> str:
+    """Encode a submodule frozenset for the MODAL_INIT_SUBMODULES env var."""
+    return ",".join(sorted(submodules))
+
+
+def decode_submodules(value: str) -> "frozenset[str]":
+    """Decode MODAL_INIT_SUBMODULES env var back to a frozenset."""
+    if not value or value == "0":
+        return frozenset()
+    if value == "1":
+        return frozenset(_KNOWN_SUBMODULES)
+    return frozenset(p.strip() for p in value.split(",") if p.strip())
 
 
 def _resolve_git_state() -> tuple[str, str, bool]:
@@ -483,9 +513,16 @@ def _prepare_repo(
     git_remote: str,
     git_commit: str,
     *,
-    init_submodules: bool = True,
+    submodules: "frozenset[str]" = frozenset(),
 ) -> None:
-    """Clone (or update) the repo and check out the exact commit."""
+    """Clone (or update) the repo and check out the exact commit.
+
+    *submodules* selects which git submodules to initialize:
+      frozenset()           → nothing (default — HPT/ACT/curation runs)
+      frozenset({"oat"})    → external/oat only (OAT tokenizer runs)
+      frozenset({"openpi"}) → external/openpi only (Pi0.5 runs)
+      frozenset({"oat","openpi"}) → both
+    """
     clone_url = _ssh_to_https(git_remote)
     repo_dir = Path(CFG.remote_repo_dir)
 
@@ -505,64 +542,44 @@ def _prepare_repo(
             check=True,
         )
     else:
-        clone_cmd = ["git", "clone", clone_url, CFG.remote_repo_dir]
-        if not init_submodules:
-            clone_cmd = [
-                "git",
-                "clone",
-                "--no-recurse-submodules",
-                clone_url,
-                CFG.remote_repo_dir,
-            ]
-        subprocess.run(clone_cmd, check=True)
+        # Always clone without submodules; we init them selectively below.
+        subprocess.run(
+            ["git", "clone", "--no-recurse-submodules", clone_url, CFG.remote_repo_dir],
+            check=True,
+        )
 
     subprocess.run(
         ["git", "-C", CFG.remote_repo_dir, "checkout", git_commit], check=True
     )
-    # Always init external/oat — small (no sub-submodules), needed by
-    # egomimic.algo.oat_tokenizer on every OAT/tokenizer run. init_submodules
-    # only gates the heavy openpi tree (aloha/libero, ~13 min clone); oat is
-    # independent and fast.
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            CFG.remote_repo_dir,
-            "submodule",
-            "update",
-            "--init",
-            "external/oat",
-        ],
-        check=True,
-    )
-    oat_dir = f"{CFG.remote_repo_dir}/external/oat"
-    if Path(oat_dir).is_dir():
+
+    # --- selective submodule init ---
+    if "oat" in submodules:
+        # external/oat: small (no sub-submodules), needed by OATTokenizerTrainer.
         subprocess.run(
-            [
-                CFG.python_bin,
-                "-c",
-                "import sysconfig, os, sys; "
-                "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_oat.pth'); "
-                "open(p, 'w').write(sys.argv[1]); "
-                "print('registered oat path ->', sys.argv[1])",
-                oat_dir,
-            ],
+            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
+             "external/oat"],
             check=True,
         )
-    if init_submodules:
-        # Init external/openpi for Pi model runs (no OAT, no aloha/libero sub-submodules).
+        oat_dir = f"{CFG.remote_repo_dir}/external/oat"
+        if Path(oat_dir).is_dir():
+            subprocess.run(
+                [CFG.python_bin, "-c",
+                 "import sysconfig, os, sys; "
+                 "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_oat.pth'); "
+                 "open(p, 'w').write(sys.argv[1]); "
+                 "print('registered oat path ->', sys.argv[1])",
+                 oat_dir],
+                check=True,
+            )
+
+    if "openpi" in submodules:
+        # external/openpi: Pi0.5 model runs only. No aloha/libero sub-submodules.
         subprocess.run(
-            [
-                "git",
-                "-C",
-                CFG.remote_repo_dir,
-                "submodule",
-                "update",
-                "--init",
-                "external/openpi",
-            ],
+            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
+             "external/openpi"],
             check=True,
         )
+
     # Make egomimic importable WITHOUT `pip install -e .`. The editable install
     # runs setuptools' egg-info file walk over the repo root, which on Modal
     # contains `logs/` — a symlink to the ENTIRE egoverse-training-outputs volume
@@ -591,7 +608,7 @@ def _prepare_repo(
     # processes, which re-exec the script and do NOT reliably inherit PYTHONPATH.
     # A .pth file in site-packages is read at interpreter startup, so it works
     # for the main process and all re-execed ranks alike.
-    if init_submodules:
+    if "openpi" in submodules:
         openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
         if Path(openpi_src).is_dir():
             subprocess.run(
@@ -609,9 +626,8 @@ def _prepare_repo(
             # openpi's pi0.5 pytorch model requires transformers==4.53.2 + its
             # transformers_replace overlay (pi0_pytorch asserts the version).
             # Apply it here — in the baked modal_setup, which always runs — so it
-            # is in effect for trainHydra and every re-execed DDP rank. Presence
-            # of the openpi submodule (init_submodules=true) marks a pi-capable
-            # run; HPT runs use init_submodules=false and keep transformers 4.57.3.
+            # is in effect for trainHydra and every re-execed DDP rank.
+            # HPT/OAT runs use init_submodules=false and keep transformers 4.57.3.
             _install_pi_transformers()
 
 
@@ -665,7 +681,7 @@ def _prepare_repo_light(
     git_remote: str,
     git_commit: str,
     *,
-    init_submodules: bool = False,
+    submodules: "frozenset[str]" = frozenset(),
 ) -> None:
     """Shallow clone without submodules — faster setup for curation shard workers."""
     clone_url = _ssh_to_https(git_remote)
@@ -698,17 +714,9 @@ def _prepare_repo_light(
     subprocess.run(
         ["git", "-C", str(repo_dir), "checkout", "--detach", git_commit], check=True
     )
-    if init_submodules:
+    for sm in submodules:
         subprocess.run(
-            [
-                "git",
-                "-C",
-                str(repo_dir),
-                "submodule",
-                "update",
-                "--init",
-                "--recursive",
-            ],
+            ["git", "-C", str(repo_dir), "submodule", "update", "--init", f"external/{sm}"],
             check=True,
         )
     subprocess.run(

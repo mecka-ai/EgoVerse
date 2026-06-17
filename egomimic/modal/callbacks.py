@@ -86,7 +86,8 @@ class ModalAutoRestartCallback(Callback):
         git_remote = os.environ.get("MODAL_GIT_REMOTE", "")
         git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
         wandb_api_key = os.environ.get("WANDB_API_KEY", "")
-        init_submodules = os.environ.get("MODAL_INIT_SUBMODULES", "1") == "1"
+        from modal_setup import decode_submodules
+        submodules = decode_submodules(os.environ.get("MODAL_INIT_SUBMODULES", ""))
 
         if trainer.is_global_zero:
             try:
@@ -96,7 +97,7 @@ class ModalAutoRestartCallback(Callback):
                     git_remote,
                     git_commit,
                     wandb_api_key,
-                    init_submodules=init_submodules,
+                    submodules=submodules,
                 )
                 log.info(f"[ModalAutoRestart] Spawned continuation: {handle.object_id}")
             except Exception as exc:

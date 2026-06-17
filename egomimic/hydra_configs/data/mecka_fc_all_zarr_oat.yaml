@@ -18,7 +18,7 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 #     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
 #     +modal_volume=mecka_data_v2 \
 #     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
-#     init_submodules=false reject_outliers=false \
+#     init_submodules=oat reject_outliers=false \
 #     launch_params.gpus_per_node=1
 
 train_datasets:
