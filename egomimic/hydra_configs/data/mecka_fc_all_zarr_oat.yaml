@@ -1,0 +1,91 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# OAT tokenizer — ALL fold_clothes data (461 eps), zarr volume (mecka_data_v2).
+#
+# train     → fold_clothes_all.json       (461 eps — full dataset)
+# valid     → folding_clothes_op_val.json (5 eps, held-out operator 6943a1d1)
+# train_viz → folding_clothes_op_all_viz.json (3 in-distribution eps)
+#
+# val ∩ op_all_train = ∅; train_viz ⊆ train; val ⊆ train (ok for tokenizer).
+#
+# Launch (zarr volume, A100-40GB, val every 30 epochs):
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_fc_all_zarr_oat trainer=ddp_modal logger=wandb \
+#     model=oat_tokenizer evaluator=eval_tokenizer_video \
+#     evaluator@train_viz_evaluator=train_viz_tokenizer \
+#     name=oat_tok_fc_all description=fold_clothes_all461 \
+#     trainer.check_val_every_n_epoch=30 trainer.limit_val_batches=1.0 \
+#     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
+#     +modal_volume=mecka_data_v2 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false reject_outliers=false \
+#     launch_params.gpus_per_node=1
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/data/episode_lists/fold_clothes_all.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/folding_clothes_op_val.json
+    mode: total
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/folding_clothes_op_all_viz.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false

@@ -519,6 +519,36 @@ def _prepare_repo(
     subprocess.run(
         ["git", "-C", CFG.remote_repo_dir, "checkout", git_commit], check=True
     )
+    # Always init external/oat — small (no sub-submodules), needed by
+    # egomimic.algo.oat_tokenizer on every OAT/tokenizer run. init_submodules
+    # only gates the heavy openpi tree (aloha/libero, ~13 min clone); oat is
+    # independent and fast.
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            CFG.remote_repo_dir,
+            "submodule",
+            "update",
+            "--init",
+            "external/oat",
+        ],
+        check=True,
+    )
+    oat_dir = f"{CFG.remote_repo_dir}/external/oat"
+    if Path(oat_dir).is_dir():
+        subprocess.run(
+            [
+                CFG.python_bin,
+                "-c",
+                "import sysconfig, os, sys; "
+                "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_oat.pth'); "
+                "open(p, 'w').write(sys.argv[1]); "
+                "print('registered oat path ->', sys.argv[1])",
+                oat_dir,
+            ],
+            check=True,
+        )
     if init_submodules:
         # Init external/openpi for Pi model runs (no OAT, no aloha/libero sub-submodules).
         subprocess.run(
