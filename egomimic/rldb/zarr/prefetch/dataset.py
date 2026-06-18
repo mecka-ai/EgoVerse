@@ -228,6 +228,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "read_block_cache_blocks": getattr(
                 self.resolver, "read_block_cache_blocks", 2
             ),
+            "decode_images": getattr(self.resolver, "decode_images", True),
         }
 
     # ------------------------------------------------------------------
@@ -271,9 +272,14 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if self._probe_zarr_path is None:
                 self._probe_zarr_path = self._extract_probe()
             if not hasattr(self, "_probe_ds"):
+                probe_kwargs = self._zarr_dataset_kwargs()
+                # Schema inference samples dataset[0] before training starts.
+                # Keep that probe decoded so image shapes remain CHW tensors,
+                # even when training workers later return raw JPEG bytes.
+                probe_kwargs["decode_images"] = True
                 self._probe_ds = ZarrDataset(
                     self._probe_zarr_path,
-                    **self._zarr_dataset_kwargs(),
+                    **probe_kwargs,
                 )
             return self._probe_ds[idx % len(self._probe_ds)]
 

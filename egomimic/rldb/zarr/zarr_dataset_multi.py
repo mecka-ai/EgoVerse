@@ -253,6 +253,7 @@ class EpisodeResolver:
         pause_removal_epsilon: float | None = None,
         read_block_size: int = 1,
         read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
@@ -261,6 +262,7 @@ class EpisodeResolver:
         self.pause_removal_epsilon = pause_removal_epsilon
         self.read_block_size = max(1, int(read_block_size))
         self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+        self.decode_images = bool(decode_images)
 
     def _dataset_kwargs(self) -> dict:
         return {
@@ -270,6 +272,7 @@ class EpisodeResolver:
             "pause_removal_epsilon": self.pause_removal_epsilon,
             "read_block_size": self.read_block_size,
             "read_block_cache_blocks": self.read_block_cache_blocks,
+            "decode_images": self.decode_images,
         }
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
@@ -465,6 +468,7 @@ class S3EpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         read_block_size: int = 1,
         read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         self.bucket_name = bucket_name
         self.main_prefix = main_prefix
@@ -477,6 +481,7 @@ class S3EpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
             read_block_size=read_block_size,
             read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
 
     def resolve(
@@ -719,6 +724,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         pause_removal_epsilon: float | None = None,
         read_block_size: int = 1,
         read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         super().__init__(
             folder_path,
@@ -728,6 +734,7 @@ class LocalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
             read_block_size=read_block_size,
             read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
         self.debug = debug
         self.allowed_episode_ids = (
@@ -884,6 +891,7 @@ class ModalEpisodeResolver(EpisodeResolver):
         allowed_episode_ids: list[str] | None = None,
         read_block_size: int = 1,
         read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         super().__init__(
             folder_path,
@@ -893,6 +901,7 @@ class ModalEpisodeResolver(EpisodeResolver):
             pause_removal_epsilon=pause_removal_epsilon,
             read_block_size=read_block_size,
             read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
         self.debug = debug
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
@@ -1568,6 +1577,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         defer_open: bool = False,
         read_block_size: int = 1,
         read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         """
         Args:
@@ -1622,6 +1632,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
         self.read_block_size = max(1, int(read_block_size))
         self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+        self.decode_images = bool(decode_images)
         self._zarr_block_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
         super().__init__()
 
@@ -2111,6 +2122,20 @@ class ZarrDataset(torch.utils.data.Dataset):
         decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
         return np.transpose(decoded, (2, 0, 1)).astype(np.float32) / 255.0
 
+    @staticmethod
+    def _jpeg_entry_to_bytes(jpeg_bytes: object) -> bytes:
+        if isinstance(jpeg_bytes, np.ndarray):
+            jpeg_bytes = jpeg_bytes.item() if jpeg_bytes.ndim == 0 else jpeg_bytes[0]
+        if isinstance(jpeg_bytes, np.void):
+            jpeg_bytes = jpeg_bytes.item()
+        if isinstance(jpeg_bytes, memoryview):
+            jpeg_bytes = jpeg_bytes.tobytes()
+        if isinstance(jpeg_bytes, bytearray):
+            jpeg_bytes = bytes(jpeg_bytes)
+        if not isinstance(jpeg_bytes, bytes):
+            raise TypeError(f"Expected JPEG bytes, got {type(jpeg_bytes).__name__}")
+        return jpeg_bytes
+
     def collect_curation_episode(
         self,
         action_key: str = "actions_cartesian",
@@ -2278,6 +2303,9 @@ class ZarrDataset(torch.utils.data.Dataset):
 
             if zarr_key in self._image_keys:
                 jpeg_bytes = data[k]
+                if not self.decode_images:
+                    data[k] = self._jpeg_entry_to_bytes(jpeg_bytes)
+                    continue
                 try:
                     data[k] = self._decode_jpeg_to_chw(jpeg_bytes)
                 except Exception:
