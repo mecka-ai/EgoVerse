@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SEED = 42
+_JPEG_PACK_HIT_LOGGED = False
 
 PAUSE_DETECT_KEYS: tuple[str, str] = ("left.obs_ee_pose", "right.obs_ee_pose")
 PAUSE_DETECT_KEYPOINT_KEYS: tuple[str, str] = (
@@ -1646,7 +1647,6 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.decode_images = bool(decode_images)
         self._zarr_block_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
         self._logged_bulk_cache_hit = False
-        self._logged_jpeg_pack_hit = False
         super().__init__()
 
     def _ensure_episode_reader(self):
@@ -2012,12 +2012,13 @@ class ZarrDataset(torch.utils.data.Dataset):
         if zarr_key in (self._image_keys or set()):
             packed = self._read_jpeg_pack_slice(zarr_key, start, end)
             if packed is not None:
-                if not self._logged_jpeg_pack_hit:
+                global _JPEG_PACK_HIT_LOGGED
+                if not _JPEG_PACK_HIT_LOGGED:
                     logger.info(
                         "Serving camera reads from JPEG pack for %s",
                         Path(self.episode_path).name,
                     )
-                    self._logged_jpeg_pack_hit = True
+                    _JPEG_PACK_HIT_LOGGED = True
                 return packed
         if (
             end is None
