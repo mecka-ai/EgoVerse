@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import math
 import os
 import random
 import shutil
@@ -855,7 +856,16 @@ class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableD
         rank, world_size = self._distributed_rank_world()
         shard_count = max(1, world_size * num_workers)
         shard_id = rank * num_workers + worker_id
-        target_samples = max(1, self.epoch_frames)
+        # DataLoader/Lightning stop at ``__len__``/``limit_train_batches``, but
+        # multi-worker IterableDataset exhaustion is terminal if any real-world
+        # worker budget comes up short. Keep the published length exact while
+        # allowing workers to overproduce a bounded tail that is normally never
+        # consumed.
+        overfetch = max(
+            num_workers * self.index_map_block_size * 2,
+            math.ceil(self.epoch_frames * 0.25),
+        )
+        target_samples = max(1, self.epoch_frames + overfetch)
         worker_target = (target_samples + num_workers - 1 - worker_id) // num_workers
         if worker_target <= 0:
             return
@@ -868,6 +878,21 @@ class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableD
                 rank, worker_id, len(blocks), shard_count,
             )
             return
+
+        if worker_id == 0:
+            logger.info(
+                "PrefetchedIterableDataset rank=%d/%d worker=%d/%d target=%d "
+                "(epoch_frames=%d overfetch=%d blocks=%d shard_blocks=%d)",
+                rank,
+                world_size,
+                worker_id,
+                num_workers,
+                worker_target,
+                self.epoch_frames,
+                overfetch,
+                len(blocks),
+                len(shard_blocks),
+            )
 
         n_yielded = 0
         block_cursor = 0
