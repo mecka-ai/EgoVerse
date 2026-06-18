@@ -87,6 +87,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         index_map_order: str = "random",
         index_map_block_size: int = 128,
         preload_image_cache_gb: float = 0.0,
+        prewarm_page_cache_gb: float = 0.0,
     ):
         super().__init__()
         self.resolver = resolver
@@ -100,6 +101,10 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.preload_image_cache_bytes = max(
             0,
             int(float(preload_image_cache_gb) * 1_000_000_000),
+        )
+        self.prewarm_page_cache_bytes = max(
+            0,
+            int(float(prewarm_page_cache_gb) * 1_000_000_000),
         )
         # Max time prepare_epoch blocks waiting for the window to materialize.
         # Default 1h is plenty for a normal sliding window; raise it for
@@ -215,13 +220,15 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "PrefetchedMapDataset [%s]: %d episodes, %d total frames, "
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
             "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s), "
-            "index_map_order=%s, index_map_block_size=%d, preload_image_cache_gb=%.1f",
+            "index_map_order=%s, index_map_block_size=%d, "
+            "preload_image_cache_gb=%.1f, prewarm_page_cache_gb=%.1f",
             mode, len(self._episodes), total_frames,
             self.episodes_per_epoch, lookahead_epochs,
             pool_size_gb, cache_dir, self._rank,
             "yes" if self._is_filler_rank else "no",
             self.index_map_order, self.index_map_block_size,
             self.preload_image_cache_bytes / 1_000_000_000,
+            self.prewarm_page_cache_bytes / 1_000_000_000,
         )
 
     def _zarr_dataset_kwargs(self) -> dict:
@@ -690,6 +697,51 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
         )
 
+        if self.mode == "train" and self.prewarm_page_cache_bytes > 0:
+            t_warm = time.perf_counter()
+            warmed_bytes = 0
+            warmed_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    warmed_bytes > 0
+                    and estimated_bytes > 0
+                    and warmed_bytes + estimated_bytes > self.prewarm_page_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = self._warm_episode_page_cache(Path(ep_path))
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: page-cache warm failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                warmed_bytes += bytes_this
+                warmed_eps += 1
+                if warmed_bytes >= self.prewarm_page_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: warmed %.1f GB into page cache "
+                "from %d episodes in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                warmed_bytes / 1_000_000_000,
+                warmed_eps,
+                time.perf_counter() - t_warm,
+                self.prewarm_page_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
+
         if self.mode == "train" and self.preload_image_cache_bytes > 0:
             t_preload = time.perf_counter()
             loaded_bytes = 0
@@ -748,6 +800,20 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 os.replace(tmp, self._epoch_file)
             except OSError as e:
                 logger.warning("Failed to publish epoch file %s: %s", self._epoch_file, e)
+
+    @staticmethod
+    def _warm_episode_page_cache(ep_path: Path, read_size: int = 4 * 1024 * 1024) -> int:
+        """Sequentially read episode files so later zarr random reads hit page cache."""
+        total = 0
+        files = [p for p in ep_path.rglob("*") if p.is_file()]
+        for file_path in sorted(files):
+            with file_path.open("rb", buffering=0) as f:
+                while True:
+                    chunk = f.read(read_size)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+        return total
 
     # ------------------------------------------------------------------
     # Persistent-worker epoch sync
