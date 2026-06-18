@@ -8,6 +8,7 @@ loading instead of Lightning startup or GPU compute.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from typing import Any
 
@@ -61,6 +62,16 @@ def main(cfg: DictConfig) -> None:
     max_batches = int(OmegaConf.select(cfg, "bench.max_batches", default=50))
     warmup_batches = int(OmegaConf.select(cfg, "bench.warmup_batches", default=1))
     dataset_name = OmegaConf.select(cfg, "bench.dataset_name", default=None)
+    simulated_seek_ms = OmegaConf.select(
+        cfg, "bench.simulated_zarr_image_seek_ms", default=None
+    )
+    if simulated_seek_ms is not None:
+        os.environ["EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_MS"] = str(simulated_seek_ms)
+        print(
+            "DATALOADER_BENCH "
+            f"simulated_zarr_image_seek_ms={float(simulated_seek_ms):.3f}",
+            flush=True,
+        )
 
     data_schematic: DataSchematic = hydra.utils.instantiate(cfg.data_schematic)
     train_datasets = {

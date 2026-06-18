@@ -28,6 +28,7 @@ import subprocess
 import tempfile
 import hashlib
 import shutil
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
@@ -58,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 SEED = 42
 _JPEG_PACK_HIT_LOGGED = False
+_SIMULATED_IMAGE_SEEK_LOGGED = False
 
 PAUSE_DETECT_KEYS: tuple[str, str] = ("left.obs_ee_pose", "right.obs_ee_pose")
 PAUSE_DETECT_KEYPOINT_KEYS: tuple[str, str] = (
@@ -2020,6 +2022,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                     )
                     _JPEG_PACK_HIT_LOGGED = True
                 return packed
+            self._simulate_zarr_image_seek()
         if (
             end is None
             and self.read_block_size > 1
@@ -2029,6 +2032,24 @@ class ZarrDataset(torch.utils.data.Dataset):
             return self._read_single_from_block_cache(zarr_key, start)
         read_dict = {zarr_key: (start, end)}
         return self.episode_reader.read(read_dict)[zarr_key]
+
+    @staticmethod
+    def _simulate_zarr_image_seek() -> None:
+        """Optional benchmark-only delay for HDD-like zarr image random seeks."""
+        raw = os.environ.get("EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_MS", "")
+        if not raw:
+            return
+        try:
+            delay_s = max(0.0, float(raw) / 1000.0)
+        except ValueError:
+            return
+        if delay_s <= 0:
+            return
+        global _SIMULATED_IMAGE_SEEK_LOGGED
+        if not _SIMULATED_IMAGE_SEEK_LOGGED:
+            logger.info("Simulating %.3f ms zarr image seek latency", delay_s * 1000.0)
+            _SIMULATED_IMAGE_SEEK_LOGGED = True
+        time.sleep(delay_s)
 
     def _read_single_from_block_cache(self, zarr_key: str, start: int) -> np.ndarray:
         block_start = (int(start) // self.read_block_size) * self.read_block_size
