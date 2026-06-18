@@ -67,9 +67,17 @@ def main(cfg: DictConfig) -> None:
     )
     if simulated_seek_ms is not None:
         os.environ["EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_MS"] = str(simulated_seek_ms)
+        simulated_seek_serial = bool(
+            OmegaConf.select(
+                cfg, "bench.simulated_zarr_image_seek_serial", default=False
+            )
+        )
+        if simulated_seek_serial:
+            os.environ["EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_SERIAL"] = "1"
         print(
             "DATALOADER_BENCH "
-            f"simulated_zarr_image_seek_ms={float(simulated_seek_ms):.3f}",
+            f"simulated_zarr_image_seek_ms={float(simulated_seek_ms):.3f} "
+            f"simulated_zarr_image_seek_serial={simulated_seek_serial}",
             flush=True,
         )
 

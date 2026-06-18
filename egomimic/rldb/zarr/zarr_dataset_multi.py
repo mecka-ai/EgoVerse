@@ -29,6 +29,7 @@ import tempfile
 import hashlib
 import shutil
 import time
+import fcntl
 from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 SEED = 42
 _JPEG_PACK_HIT_LOGGED = False
 _SIMULATED_IMAGE_SEEK_LOGGED = False
+_SIMULATED_IMAGE_SEEK_LOCK_FD: int | None = None
 
 PAUSE_DETECT_KEYS: tuple[str, str] = ("left.obs_ee_pose", "right.obs_ee_pose")
 PAUSE_DETECT_KEYPOINT_KEYS: tuple[str, str] = (
@@ -2047,8 +2049,33 @@ class ZarrDataset(torch.utils.data.Dataset):
             return
         global _SIMULATED_IMAGE_SEEK_LOGGED
         if not _SIMULATED_IMAGE_SEEK_LOGGED:
-            logger.info("Simulating %.3f ms zarr image seek latency", delay_s * 1000.0)
+            serial = os.environ.get(
+                "EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_SERIAL", ""
+            ).lower() in {"1", "true", "yes", "on"}
+            logger.info(
+                "Simulating %.3f ms zarr image seek latency%s",
+                delay_s * 1000.0,
+                " with cross-worker serialization" if serial else "",
+            )
             _SIMULATED_IMAGE_SEEK_LOGGED = True
+        if os.environ.get(
+            "EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_SERIAL", ""
+        ).lower() in {"1", "true", "yes", "on"}:
+            global _SIMULATED_IMAGE_SEEK_LOCK_FD
+            if _SIMULATED_IMAGE_SEEK_LOCK_FD is None:
+                lock_path = os.environ.get(
+                    "EGOMIMIC_SIMULATED_ZARR_IMAGE_SEEK_LOCK",
+                    "/tmp/egomimic_simulated_zarr_image_seek.lock",
+                )
+                _SIMULATED_IMAGE_SEEK_LOCK_FD = os.open(
+                    lock_path, os.O_CREAT | os.O_RDWR, 0o666
+                )
+            fcntl.flock(_SIMULATED_IMAGE_SEEK_LOCK_FD, fcntl.LOCK_EX)
+            try:
+                time.sleep(delay_s)
+            finally:
+                fcntl.flock(_SIMULATED_IMAGE_SEEK_LOCK_FD, fcntl.LOCK_UN)
+            return
         time.sleep(delay_s)
 
     def _read_single_from_block_cache(self, zarr_key: str, start: int) -> np.ndarray:
