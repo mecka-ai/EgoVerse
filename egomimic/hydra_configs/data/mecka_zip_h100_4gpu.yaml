@@ -59,6 +59,7 @@ train_datasets:
     index_map_block_size: 128
     preload_image_cache_gb: 0.0
     prewarm_page_cache_gb: 0.0
+    jpeg_pack_cache_gb: 0.0
 
 valid_datasets:
   mecka_bimanual:

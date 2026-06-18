@@ -59,6 +59,7 @@ train_datasets:
     index_map_block_size: 128
     preload_image_cache_gb: 0.0
     prewarm_page_cache_gb: 0.0
+    jpeg_pack_cache_gb: 0.0
     prepare_timeout_s: 21600    # 6h — staging ~20k eps from the ~150 MB/s volume takes
                                 # ~3h, far over the 1h default; raise so prepare_epoch
                                 # waits out the full initial stage instead of crashing

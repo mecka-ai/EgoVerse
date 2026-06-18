@@ -88,6 +88,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         index_map_block_size: int = 128,
         preload_image_cache_gb: float = 0.0,
         prewarm_page_cache_gb: float = 0.0,
+        jpeg_pack_cache_gb: float = 0.0,
     ):
         super().__init__()
         self.resolver = resolver
@@ -105,6 +106,10 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.prewarm_page_cache_bytes = max(
             0,
             int(float(prewarm_page_cache_gb) * 1_000_000_000),
+        )
+        self.jpeg_pack_cache_bytes = max(
+            0,
+            int(float(jpeg_pack_cache_gb) * 1_000_000_000),
         )
         # Max time prepare_epoch blocks waiting for the window to materialize.
         # Default 1h is plenty for a normal sliding window; raise it for
@@ -221,7 +226,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
             "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s), "
             "index_map_order=%s, index_map_block_size=%d, "
-            "preload_image_cache_gb=%.1f, prewarm_page_cache_gb=%.1f",
+            "preload_image_cache_gb=%.1f, prewarm_page_cache_gb=%.1f, "
+            "jpeg_pack_cache_gb=%.1f",
             mode, len(self._episodes), total_frames,
             self.episodes_per_epoch, lookahead_epochs,
             pool_size_gb, cache_dir, self._rank,
@@ -229,6 +235,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             self.index_map_order, self.index_map_block_size,
             self.preload_image_cache_bytes / 1_000_000_000,
             self.prewarm_page_cache_bytes / 1_000_000_000,
+            self.jpeg_pack_cache_bytes / 1_000_000_000,
         )
 
     def _zarr_dataset_kwargs(self) -> dict:
@@ -696,6 +703,60 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "[Timing] prepare_epoch %d: pre-opened %d zarr stores in %.3fs",
             gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
         )
+
+        if self.mode == "train" and self.jpeg_pack_cache_bytes > 0:
+            t_pack = time.perf_counter()
+            packed_bytes = 0
+            packed_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                ds = self._zarr_cache.get(ep_path)
+                if ds is None:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    packed_bytes > 0
+                    and estimated_bytes > 0
+                    and packed_bytes + estimated_bytes > self.jpeg_pack_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = int(ds.build_jpeg_pack())
+                    ep_hash = Path(ep_path).name
+                    size_on_disk = sum(
+                        f.stat().st_size for f in Path(ep_path).rglob("*") if f.is_file()
+                    )
+                    self._pool.register(ep_hash, size_on_disk)
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: JPEG pack build failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                if bytes_this > 0:
+                    packed_bytes += bytes_this
+                    packed_eps += 1
+                if packed_bytes >= self.jpeg_pack_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: JPEG-packed %.1f GB from %d episodes "
+                "in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                packed_bytes / 1_000_000_000,
+                packed_eps,
+                time.perf_counter() - t_pack,
+                self.jpeg_pack_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
 
         if self.mode == "train" and self.prewarm_page_cache_bytes > 0:
             t_warm = time.perf_counter()
