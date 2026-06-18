@@ -792,9 +792,39 @@ class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableD
     """
 
     def __len__(self) -> int:
-        if self._index_map is not None:
-            return len(self._index_map)
-        return self._total_frames
+        return self.epoch_frames
+
+    @staticmethod
+    def _distributed_rank_world() -> tuple[int, int]:
+        """Return the actual DDP rank/world size for DataLoader workers.
+
+        Modal can expose unrelated ``WORLD_SIZE`` values in the container
+        environment. Once Lightning has initialized DDP, ``torch.distributed``
+        is the authoritative source and is inherited by forked workers.
+        """
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank()), int(dist.get_world_size())
+
+        if "LOCAL_WORLD_SIZE" in os.environ:
+            rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+            return rank, max(1, int(os.environ["LOCAL_WORLD_SIZE"]))
+
+        if "LOCAL_RANK" in os.environ:
+            local_rank = int(os.environ["LOCAL_RANK"])
+            env_world = int(os.environ.get("WORLD_SIZE", "1"))
+            try:
+                visible_gpus = int(torch.cuda.device_count())
+            except Exception:
+                visible_gpus = 0
+            if visible_gpus > 0 and env_world > visible_gpus:
+                return local_rank, visible_gpus
+            rank = int(os.environ.get("RANK", local_rank))
+            return rank, max(1, env_world)
+
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        return rank, max(1, world_size)
 
     def __iter__(self) -> Iterator[dict]:
         if torch.utils.data.get_worker_info() is not None:
@@ -822,24 +852,56 @@ class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableD
         worker = torch.utils.data.get_worker_info()
         worker_id = int(worker.id) if worker is not None else 0
         num_workers = int(worker.num_workers) if worker is not None else 1
-        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank, world_size = self._distributed_rank_world()
         shard_count = max(1, world_size * num_workers)
         shard_id = rank * num_workers + worker_id
+        target_samples = max(1, self.epoch_frames)
+        worker_target = (target_samples + num_workers - 1 - worker_id) // num_workers
+        if worker_target <= 0:
+            return
+
+        shard_blocks = blocks[shard_id::shard_count]
+        if not shard_blocks:
+            logger.warning(
+                "PrefetchedIterableDataset has no blocks for rank=%d worker=%d "
+                "(blocks=%d shard_count=%d).",
+                rank, worker_id, len(blocks), shard_count,
+            )
+            return
 
         n_yielded = 0
-        for block_pos in range(shard_id, len(blocks), shard_count):
-            start, stop = blocks[block_pos]
-            for index_pos in range(start, stop):
-                try:
-                    yield PrefetchedMapDataset.__getitem__(self, index_pos)
-                    n_yielded += 1
-                except Exception:
-                    logger.exception(
-                        "PrefetchedIterableDataset: failed at index_map[%d]",
-                        index_pos,
+        block_cursor = 0
+        full_passes_without_yield = 0
+        while n_yielded < worker_target:
+            yielded_at_pass_start = n_yielded
+            for _ in range(len(shard_blocks)):
+                start, stop = shard_blocks[block_cursor]
+                block_cursor = (block_cursor + 1) % len(shard_blocks)
+                for index_pos in range(start, stop):
+                    if n_yielded >= worker_target:
+                        break
+                    try:
+                        yield PrefetchedMapDataset.__getitem__(self, index_pos)
+                        n_yielded += 1
+                    except Exception:
+                        logger.exception(
+                            "PrefetchedIterableDataset: failed at index_map[%d]",
+                            index_pos,
+                        )
+                        continue
+                if n_yielded >= worker_target:
+                    break
+
+            if n_yielded == yielded_at_pass_start:
+                full_passes_without_yield += 1
+                if full_passes_without_yield >= 2:
+                    raise RuntimeError(
+                        "PrefetchedIterableDataset could not produce samples for "
+                        f"rank={rank} worker={worker_id} after scanning "
+                        f"{len(shard_blocks)} blocks"
                     )
-                    continue
+            else:
+                full_passes_without_yield = 0
 
         if n_yielded == 0:
             logger.warning(
