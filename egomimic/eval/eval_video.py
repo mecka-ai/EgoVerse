@@ -15,10 +15,13 @@ class EvalVideo(Eval):
     model-specific metrics and produce the frames to buffer.
     """
 
-    def __init__(self, limit_val_batches: int = 400):
+    def __init__(self, limit_val_batches: int = 400, viz_every_n_epochs: int = 1):
         super().__init__()
         self.trainer = None
         self.model = None
+        # Metrics are logged every validation pass; the (expensive) viz/video
+        # rendering is gated to every `viz_every_n_epochs` epochs via _should_viz.
+        self.viz_every_n_epochs = viz_every_n_epochs
         self.val_image_buffer = {}
         self.val_counter = {}
         self.override_dict = {
@@ -34,14 +37,27 @@ class EvalVideo(Eval):
     def video_dir(self):
         return os.path.join(self.root_dir(), "videos")
 
+    def _should_viz(self) -> bool:
+        """Whether to render visualization videos this validation pass.
+
+        Metrics are computed/logged on every validation pass; only the
+        expensive viz/video rendering is gated to every `viz_every_n_epochs`
+        epochs. A non-positive value disables viz entirely.
+        """
+        if not self.viz_every_n_epochs or self.viz_every_n_epochs <= 0:
+            return False
+        return (self.trainer.current_epoch % self.viz_every_n_epochs) == 0
+
     @abstractmethod
-    def compute_metrics_and_viz(self, batch):
+    def compute_metrics_and_viz(self, batch, do_viz=True):
         """
         Run the model's eval forward and compute metrics and visualization frames.
 
         Args:
             batch (dict): processed batch produced by the algo's
                 `process_batch_for_training`.
+            do_viz (bool): when False, skip the visualization rendering and
+                return an empty images_dict (metrics are still computed).
         Returns:
             metrics (dict[str, torch.Tensor | float])
             images_dict (dict[embodiment_id, np.ndarray (B, H, W, 3)])
@@ -49,13 +65,15 @@ class EvalVideo(Eval):
         raise NotImplementedError
 
     def on_validation_start(self):
-        if self.trainer.is_global_zero:
+        if self.trainer.is_global_zero and self._should_viz():
             os.makedirs(
                 os.path.join(self.video_dir(), f"epoch_{self.trainer.current_epoch}"),
                 exist_ok=True,
             )
 
     def on_validation_end(self):
+        if not self._should_viz():
+            return
         for key, buffer in self.val_image_buffer.items():
             os.makedirs(
                 os.path.join(
@@ -79,7 +97,8 @@ class EvalVideo(Eval):
             self.val_image_buffer[key] = []
 
     def on_validation_step(self, batch, batch_idx, dataloader_idx=0):
-        metrics, images_dict = self.compute_metrics_and_viz(batch)
+        do_viz = self._should_viz()
+        metrics, images_dict = self.compute_metrics_and_viz(batch, do_viz=do_viz)
 
         device = self.trainer.lightning_module.device
         metrics = {
@@ -88,29 +107,33 @@ class EvalVideo(Eval):
         }
 
         ## images is now a dict
-        for key, images in images_dict.items():
-            os.makedirs(
-                os.path.join(
-                    self.video_dir(),
-                    f"epoch_{self.trainer.current_epoch}",
-                    str(get_embodiment(key)),
-                ),
-                exist_ok=True,
-            )
-            if key not in self.val_image_buffer or self.val_image_buffer[key] is None:
-                self.val_image_buffer[key] = []
-                self.val_counter[key] = 0
-            self.val_image_buffer[key].extend(torch.from_numpy(images))
-            if len(self.val_image_buffer[key]) >= 1000:
-                frames = torch.stack(self.val_image_buffer[key])
-                path = os.path.join(
-                    self.video_dir(),
-                    f"epoch_{self.trainer.current_epoch}",
-                    str(get_embodiment(key)),
-                    f"validation_video_{self.val_counter[key]}.mp4",
+        if do_viz:
+            for key, images in images_dict.items():
+                os.makedirs(
+                    os.path.join(
+                        self.video_dir(),
+                        f"epoch_{self.trainer.current_epoch}",
+                        str(get_embodiment(key)),
+                    ),
+                    exist_ok=True,
                 )
-                tvio.write_video(path, frames, fps=30, video_codec="h264")
-                self.val_image_buffer[key].clear()
-                self.val_counter[key] += 1
+                if (
+                    key not in self.val_image_buffer
+                    or self.val_image_buffer[key] is None
+                ):
+                    self.val_image_buffer[key] = []
+                    self.val_counter[key] = 0
+                self.val_image_buffer[key].extend(torch.from_numpy(images))
+                if len(self.val_image_buffer[key]) >= 1000:
+                    frames = torch.stack(self.val_image_buffer[key])
+                    path = os.path.join(
+                        self.video_dir(),
+                        f"epoch_{self.trainer.current_epoch}",
+                        str(get_embodiment(key)),
+                        f"validation_video_{self.val_counter[key]}.mp4",
+                    )
+                    tvio.write_video(path, frames, fps=30, video_codec="h264")
+                    self.val_image_buffer[key].clear()
+                    self.val_counter[key] += 1
 
         self.trainer.lightning_module.log_dict(metrics, sync_dist=True)
