@@ -56,6 +56,14 @@ def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
     return [CFG.python_bin, CFG.train_script, *hydra_args]
 
 
+def _build_dataloader_bench_cmd(hydra_args: tuple[str, ...]) -> list[str]:
+    return [
+        CFG.python_bin,
+        f"{CFG.remote_repo_dir}/egomimic/modal/dataloader_bench.py",
+        *hydra_args,
+    ]
+
+
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
     _PATH_KEYS = {
@@ -280,6 +288,60 @@ def run_hydra_train(
 
 
 @app.function(
+    gpu=CFG.gpu,
+    cpu=CFG.cpu,
+    memory=CFG.memory_mb,
+    timeout=CFG.timeout_seconds,
+    ephemeral_disk=_ephemeral,
+    secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
+    volumes=_volumes,
+)
+def run_dataloader_bench(
+    hydra_args: tuple[str, ...],
+    git_remote: str,
+    git_commit: str,
+    init_submodules: bool = True,
+) -> int:
+    """Clone the repo and run the dataloader-only benchmark."""
+    _prepare_repo(
+        git_remote=git_remote,
+        git_commit=git_commit,
+        init_submodules=init_submodules,
+    )
+
+    hydra_args = _resolve_volume_paths(hydra_args)
+    cmd = _build_dataloader_bench_cmd(hydra_args)
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("HYDRA_FULL_ERROR", "1")
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    env["MODAL_IS_REMOTE"] = "1"
+    env["MODAL_GIT_REMOTE"] = git_remote
+    env["MODAL_GIT_COMMIT"] = git_commit
+
+    _torch_tmp = "/cache/torch_tmp"
+    os.makedirs(_torch_tmp, exist_ok=True)
+    env["TMPDIR"] = _torch_tmp
+
+    _openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+    env["PYTHONPATH"] = (
+        f"{_openpi_src}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _openpi_src
+    )
+
+    print(f"Running dataloader benchmark: {shlex.join(cmd)}")
+    process = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
+    zarr_volume.commit()
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Dataloader benchmark failed (exit {process.returncode}): {shlex.join(cmd)}"
+        )
+    return process.returncode
+
+
+@app.function(
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
     volumes={CFG.volume_mount_path: zarr_volume},
     timeout=120,
@@ -420,6 +482,28 @@ def submit(*hydra_args: str) -> None:
         "After completion, download artifacts:\n"
         "  modal volume get --env robotics egoverse-training-outputs <run-path> ./modal-outputs/"
     )
+
+
+@app.local_entrypoint()
+def bench(*hydra_args: str) -> None:
+    """Fire-and-forget dataloader-only benchmark from already-pushed commit."""
+    hydra_args, init_submodules = pop_init_submodules(hydra_args)
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print(
+            "Warning: local repo has uncommitted changes. Modal will run the last committed state only."
+        )
+    print(f"Submitting dataloader benchmark commit {git_commit[:12]} from {git_remote}")
+    if not init_submodules:
+        print("Skipping git submodule init (init_submodules=false)")
+    handle = run_dataloader_bench.spawn(
+        tuple(hydra_args),
+        git_remote,
+        git_commit,
+        init_submodules=init_submodules,
+    )
+    print(f"Submitted Modal dataloader benchmark: {handle.object_id}")
+    print("Monitor at: https://modal.com/apps/egomimic-training")
 
 
 if __name__ == "__main__":
