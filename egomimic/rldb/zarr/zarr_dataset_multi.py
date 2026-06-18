@@ -38,6 +38,7 @@ import zarr
 
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.filters import DatasetFilter
+from egomimic.rldb.zarr.shard_index_cache import install_zarr_shard_index_cache
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.aws.aws_sql import (
     create_default_engine,
@@ -1600,6 +1601,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             defer_open: if True, do not mmap the zarr store until the first ``__getitem__``
                 (used by PrefetchedIterableDataset workers).
         """
+        install_zarr_shard_index_cache()
         self.episode_path = Episode_path
         self.metadata = None
         self._image_keys = None
