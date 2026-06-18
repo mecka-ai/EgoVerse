@@ -21,6 +21,5 @@ optimizer:
 scheduler:
   # Full module path matches the other lr configs; transformers.optimization is
   # always importable (top-level re-exports vary across the pinned 4.53.2).
-  _target_: transformers.optimization.get_linear_schedule_with_warmup
+  _target_: transformers.optimization.get_constant_schedule_with_warmup
   num_warmup_steps: 2000
-  num_training_steps: 100000
