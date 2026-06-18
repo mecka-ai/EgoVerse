@@ -1,0 +1,56 @@
+# Per-episode MSE scoring with a pretrained pi / pi0.5 checkpoint — score_mse.py / scoreMseModal.py.
+#
+#   python egomimic/modal/scoreMseModal.py name=<run> description=<desc> \
+#       model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \
+#       norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#       +modal_gpu=L40S:1 +modal_cpu=24 +modal_memory_gb=128
+#
+# Runs the policy's forward_eval (diffusion sampling) over every episode resolved
+# from `data` (regular ModalEpisodeResolver) and writes the per-episode
+# unnormalized paired action MSE — the metric PIEvalVideo logs as
+# Valid/*_paired_mse_avg — grouped by task, for the MSE web viewer.
+#
+# Checkpoint sources (see CLAUDE.md):
+#   - Pretrained pi0.5 base: model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch
+#   - Fine-tuned Lightning ckpt: ckpt_path=<run>/checkpoints/last.ckpt  (layered on top; wins)
+# precomputed_norm_path is REQUIRED so the unnormalized MSE matches training stats.
+#
+# Cost lever: diffusion runs num_sampling_steps denoise passes per scored frame.
+# Use score.every_n>1 (frame stride) and/or score.max_frames to bound it, and
+# model.robomimic_model.config.num_sampling_steps to trade speed for fidelity.
+
+defaults:
+  - data_schematic: pi
+  - model: pi0.5_bc_mecka
+  - data: mecka_all_zarr
+  - _self_
+
+name: score_mse_test
+description: mse
+seed: 42
+
+# Fine-tuned Lightning checkpoint (optional). Relative paths are rewritten to the
+# outputs-volume mount by scoreMseModal. Leave null to score the pretrained base.
+ckpt_path: null
+
+norm_stats:
+  # REQUIRED: directory (or file) holding norm_stats.json — same as the training run.
+  precomputed_norm_path: null
+
+score:
+  # Dataset/dict key used to key the batch; must be an embodiment name.
+  # Defaults to the first key of data.train_datasets when null.
+  embodiment_name: null
+  batch_size: 16
+  every_n: 1            # frame stride (cost lever); 1 = score every frame
+  max_frames: null      # optional per-episode frame cap (cost lever)
+  autocast_dtype: bfloat16   # bfloat16 | float16 | float32 (autocast on CUDA)
+
+# Episodes per GPU shard. Tasks with more episodes are split across containers.
+max_episodes_per_shard: 200
+
+hydra:
+  run:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
