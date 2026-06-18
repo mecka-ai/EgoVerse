@@ -1636,6 +1636,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
         self.decode_images = bool(decode_images)
         self._zarr_block_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
+        self._logged_bulk_cache_hit = False
         super().__init__()
 
     def _ensure_episode_reader(self):
@@ -1817,6 +1818,15 @@ class ZarrDataset(torch.utils.data.Dataset):
         self, zarr_key: str, start: int, end: int | None
     ) -> np.ndarray:
         if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
+            if (
+                not self._logged_bulk_cache_hit
+                and zarr_key in (self._image_keys or set())
+            ):
+                logger.info(
+                    "Serving camera zarr reads from inherited bulk cache for %s",
+                    Path(self.episode_path).name,
+                )
+                self._logged_bulk_cache_hit = True
             arr = self._zarr_bulk_cache[zarr_key]
             if end is not None:
                 return arr[start:end]
