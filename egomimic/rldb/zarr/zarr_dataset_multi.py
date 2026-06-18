@@ -1646,6 +1646,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._jpeg_pack_manifest: dict | None | bool = None
         self._jpeg_pack_index_cache: dict[str, np.ndarray] = {}
         self._jpeg_pack_fds: dict[str, int] = {}
+        self._jpeg_pack_block_cache: OrderedDict[
+            tuple[str, int], tuple[int, np.ndarray, bytes]
+        ] = OrderedDict()
         self.read_block_size = max(1, int(read_block_size))
         self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
         self.decode_images = bool(decode_images)
@@ -1670,6 +1673,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             self.episode_reader = None
         self._zarr_bulk_cache = None
         self._zarr_block_cache.clear()
+        self._jpeg_pack_block_cache.clear()
         for fd in self._jpeg_pack_fds.values():
             try:
                 os.close(fd)
@@ -1849,7 +1853,6 @@ class ZarrDataset(torch.utils.data.Dataset):
             return 0
 
         pack_dir = self._jpeg_pack_dir()
-        manifest_path = pack_dir / self.JPEG_PACK_MANIFEST
         existing = self._read_jpeg_pack_manifest()
         if existing and self._jpeg_pack_has_keys(existing, image_keys):
             return self._jpeg_pack_size(pack_dir)
@@ -1896,6 +1899,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             os.replace(tmp_dir, pack_dir)
             self._jpeg_pack_manifest = manifest
             self._jpeg_pack_index_cache.clear()
+            self._jpeg_pack_block_cache.clear()
             for fd in self._jpeg_pack_fds.values():
                 try:
                     os.close(fd)
@@ -1967,6 +1971,46 @@ class ZarrDataset(torch.utils.data.Dataset):
         if fd is None:
             fd = os.open(str(self._jpeg_pack_dir() / bin_name), os.O_RDONLY)
             self._jpeg_pack_fds[bin_name] = fd
+
+        if (
+            self.read_block_size > 1
+            and self.read_block_cache_blocks > 0
+            and frame_stop - frame_start <= self.read_block_size
+        ):
+            block_start = (frame_start // self.read_block_size) * self.read_block_size
+            block_stop = min(len(idx) - 1, block_start + self.read_block_size)
+            if frame_stop <= block_stop:
+                cache_key = (zarr_key, block_start)
+                cached = self._jpeg_pack_block_cache.get(cache_key)
+                if cached is None:
+                    block_offsets = np.asarray(idx[block_start : block_stop + 1])
+                    block_base = int(block_offsets[0])
+                    block_span = int(block_offsets[-1]) - block_base
+                    block_blob = os.pread(fd, block_span, block_base)
+                    cached = (block_base, block_offsets, block_blob)
+                    self._jpeg_pack_block_cache[cache_key] = cached
+                    image_key_count = max(1, len(self._image_keys or ()))
+                    max_cached_blocks = max(self.read_block_cache_blocks, image_key_count)
+                    while len(self._jpeg_pack_block_cache) > max_cached_blocks:
+                        self._jpeg_pack_block_cache.popitem(last=False)
+                else:
+                    self._jpeg_pack_block_cache.move_to_end(cache_key)
+
+                block_base, block_offsets, block_blob = cached
+                rel_start = frame_start - block_start
+                rel_stop = frame_stop - block_start
+                offsets = block_offsets[rel_start : rel_stop + 1]
+                if end is None:
+                    return block_blob[
+                        int(offsets[0]) - block_base : int(offsets[1]) - block_base
+                    ]
+                values = [
+                    block_blob[
+                        int(offsets[i]) - block_base : int(offsets[i + 1]) - block_base
+                    ]
+                    for i in range(len(offsets) - 1)
+                ]
+                return np.asarray(values, dtype=object)
 
         offsets = idx[frame_start : frame_stop + 1]
         base = int(offsets[0])
