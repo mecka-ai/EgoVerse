@@ -2,23 +2,21 @@ defaults:
   - pi0.5_bc_mecka
   - _self_
 
-# LR point 3e-5 — same linear-warmup schedule as pi0.5_lr1e5/pi0.5_lr5e5 so runs
-# in the sweep differ only in peak LR. Loads the pretrained pi0.5 base
-# (pi0.5_bc_mecka → pi05_base_pytorch). On Modal pass
+# LR point 3e-5 with a FLAT (constant) LR after warmup. Loads the pretrained
+# pi0.5 base (pi0.5_bc_mecka → pi05_base_pytorch). On Modal pass
 # model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch
 # at launch — the YAML default is a SLURM-only absolute path, and trainModal only
 # rewrites relative CLI overrides to the outputs volume. Swap the defaults base
 # to pi0.5_bc_mecka_scratch to train from scratch.
 #
-# Linear-warmup schedule. T_max (num_training_steps) = ONE pass over 30h of data:
-#   30h × 3600 s/h × 30 fps = 3,240,000 samples ÷ global batch 256 = 12,656 steps.
-#   (global batch 256 = 4×H200 DDP × 64 per-device; the scheduler steps once per
-#    global batch, so the divisor is 256, not the per-device 64.)
-# Warmup set to 1000 steps (~8% of T_max); linear decay to 0 at num_training_steps.
+# Constant-with-warmup schedule: LR ramps 0 → peak (3e-5) over num_warmup_steps,
+# then holds flat for the rest of training (no decay). get_constant_schedule_with_warmup
+# takes only num_warmup_steps — there is no num_training_steps argument.
 optimizer:
   lr: 3e-5
 
 scheduler:
-  _target_: transformers.optimization.get_linear_schedule_with_warmup
-  num_warmup_steps: 1000
-  num_training_steps: 50000
+  # Full module path matches the other lr configs; transformers.optimization is
+  # always importable (top-level re-exports vary across the pinned 4.53.2).
+  _target_: transformers.optimization.get_constant_schedule_with_warmup
+  num_warmup_steps: 2000
