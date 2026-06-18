@@ -14,6 +14,7 @@ import random
 import shutil
 import time
 from pathlib import Path
+from typing import Iterator
 
 import torch
 import torch.utils.data
@@ -775,8 +776,100 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat alias
-# ---------------------------------------------------------------------------
+class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableDataset):
+    """Iterable variant that assigns contiguous frame blocks to each worker.
 
-PrefetchedIterableDataset = PrefetchedMapDataset
+    ``PrefetchedMapDataset`` can build an episode/block-local ``index_map``, but
+    PyTorch's map-style DataLoader still distributes integer indices to workers
+    in a strided pattern. With 12 workers, worker 0 reads indices
+    ``0, 12, 24, ...``. That destroys the sequential locality the index map was
+    trying to create.
+
+    This iterable path shards *blocks* instead. Each DDP rank/DataLoader worker
+    gets whole contiguous runs from one episode, so slow filesystems see long
+    sequential reads instead of many workers doing random seeks into many shard
+    files at once.
+    """
+
+    def __len__(self) -> int:
+        if self._index_map is not None:
+            return len(self._index_map)
+        return self._total_frames
+
+    def __iter__(self) -> Iterator[dict]:
+        if torch.utils.data.get_worker_info() is not None:
+            self._maybe_reload_worker_epoch()
+
+        if self._index_map is None:
+            # Shape/norm probing path before PrefetchEpochCallback has prepared
+            # the first epoch. Keep this finite so an accidental early iterator
+            # does not hang a training loop.
+            if self._probe_zarr_path is None:
+                self._probe_zarr_path = self._extract_probe()
+            if not hasattr(self, "_probe_ds"):
+                self._probe_ds = ZarrDataset(
+                    self._probe_zarr_path,
+                    **self._zarr_dataset_kwargs(),
+                )
+            for i in range(len(self._probe_ds)):
+                yield self._probe_ds[i]
+            return
+
+        blocks = self._contiguous_index_blocks()
+        if not blocks:
+            return
+
+        worker = torch.utils.data.get_worker_info()
+        worker_id = int(worker.id) if worker is not None else 0
+        num_workers = int(worker.num_workers) if worker is not None else 1
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        shard_count = max(1, world_size * num_workers)
+        shard_id = rank * num_workers + worker_id
+
+        n_yielded = 0
+        for block_pos in range(shard_id, len(blocks), shard_count):
+            start, stop = blocks[block_pos]
+            for index_pos in range(start, stop):
+                try:
+                    yield PrefetchedMapDataset.__getitem__(self, index_pos)
+                    n_yielded += 1
+                except Exception:
+                    logger.exception(
+                        "PrefetchedIterableDataset: failed at index_map[%d]",
+                        index_pos,
+                    )
+                    continue
+
+        if n_yielded == 0:
+            logger.warning(
+                "PrefetchedIterableDataset yielded 0 samples for rank=%d worker=%d "
+                "(blocks=%d shard_count=%d). Increase episodes_per_epoch or reduce "
+                "num_workers/world_size.",
+                rank, worker_id, len(blocks), shard_count,
+            )
+
+    def _contiguous_index_blocks(self) -> list[tuple[int, int]]:
+        """Return ``[start, stop)`` index-map spans with sequential frames.
+
+        The span boundary is cut when the episode changes, frame numbers stop
+        increasing by one, or ``index_map_block_size`` is reached. That keeps
+        the block size aligned with the existing config knob while preserving
+        sequential disk access inside each span.
+        """
+        if not self._index_map:
+            return []
+
+        max_block = max(1, self.index_map_block_size)
+        blocks: list[tuple[int, int]] = []
+        start = 0
+        prev_ep, prev_frame = self._index_map[0]
+        for i, (ep_path, frame_idx) in enumerate(self._index_map[1:], start=1):
+            reached_limit = (i - start) >= max_block
+            broke_sequence = ep_path != prev_ep or frame_idx != prev_frame + 1
+            if reached_limit or broke_sequence:
+                blocks.append((start, i))
+                start = i
+            prev_ep, prev_frame = ep_path, frame_idx
+        blocks.append((start, len(self._index_map)))
+        return blocks

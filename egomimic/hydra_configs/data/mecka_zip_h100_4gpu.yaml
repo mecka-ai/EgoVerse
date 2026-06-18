@@ -34,7 +34,7 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedIterableDataset
     resolver:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
