@@ -86,6 +86,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         prepare_timeout_s: float = 3600.0,
         index_map_order: str = "random",
         index_map_block_size: int = 128,
+        preload_image_cache_gb: float = 0.0,
     ):
         super().__init__()
         self.resolver = resolver
@@ -96,6 +97,10 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.seed = seed
         self.index_map_order = str(index_map_order)
         self.index_map_block_size = max(1, int(index_map_block_size))
+        self.preload_image_cache_bytes = max(
+            0,
+            int(float(preload_image_cache_gb) * 1_000_000_000),
+        )
         # Max time prepare_epoch blocks waiting for the window to materialize.
         # Default 1h is plenty for a normal sliding window; raise it for
         # stage-all-first configs where episodes_per_epoch == a large subset
@@ -210,12 +215,13 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "PrefetchedMapDataset [%s]: %d episodes, %d total frames, "
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
             "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s), "
-            "index_map_order=%s, index_map_block_size=%d",
+            "index_map_order=%s, index_map_block_size=%d, preload_image_cache_gb=%.1f",
             mode, len(self._episodes), total_frames,
             self.episodes_per_epoch, lookahead_epochs,
             pool_size_gb, cache_dir, self._rank,
             "yes" if self._is_filler_rank else "no",
             self.index_map_order, self.index_map_block_size,
+            self.preload_image_cache_bytes / 1_000_000_000,
         )
 
     def _zarr_dataset_kwargs(self) -> dict:
@@ -569,6 +575,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
 
         # Drop stale ZarrDataset handles (episodes that left the window).
         new_paths = {str(self._pool.episode_path(h)) for h in ep_hashes}
+        entry_by_path = {
+            str(self._pool.episode_path(e.episode_hash)): e for e in window_eps
+        }
         self._zarr_cache = {k: v for k, v in self._zarr_cache.items() if k in new_paths}
 
         # Block until every episode in this window is materialized. Episodes
@@ -680,6 +689,55 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             "[Timing] prepare_epoch %d: pre-opened %d zarr stores in %.3fs",
             gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
         )
+
+        if self.mode == "train" and self.preload_image_cache_bytes > 0:
+            t_preload = time.perf_counter()
+            loaded_bytes = 0
+            loaded_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                ds = self._zarr_cache.get(ep_path)
+                if ds is None:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    loaded_bytes > 0
+                    and estimated_bytes > 0
+                    and loaded_bytes + estimated_bytes > self.preload_image_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = int(ds.preload_image_arrays())
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: image preload failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                if bytes_this > 0:
+                    loaded_bytes += bytes_this
+                    loaded_eps += 1
+                if loaded_bytes >= self.preload_image_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: preloaded %.1f GB of camera JPEG arrays "
+                "from %d episodes in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                loaded_bytes / 1_000_000_000,
+                loaded_eps,
+                time.perf_counter() - t_preload,
+                self.preload_image_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
 
         # Publish the new epoch number atomically so persistent_workers can
         # refresh themselves on the next __getitem__. Atomic via os.replace.

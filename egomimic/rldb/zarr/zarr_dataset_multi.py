@@ -1770,6 +1770,49 @@ class ZarrDataset(torch.utils.data.Dataset):
         self._zarr_bulk_cache = cache
         self._zarr_block_cache.clear()
 
+    def preload_image_arrays(self) -> int:
+        """Load camera zarr arrays into the bulk cache and return payload bytes.
+
+        This is intended to run in the rank parent immediately before
+        DataLoader workers fork. The compressed JPEG arrays then live in
+        copy-on-write memory and workers can serve sample reads without
+        touching the zarr shard file for every frame.
+        """
+        self._ensure_episode_reader()
+        store = self.episode_reader._store
+        cache = self._zarr_bulk_cache if self._zarr_bulk_cache is not None else {}
+        bytes_loaded = 0
+        for spec in self.key_map.values():
+            zarr_key = spec.get("zarr_key")
+            if (
+                not zarr_key
+                or zarr_key in cache
+                or zarr_key not in (self._image_keys or set())
+            ):
+                continue
+            arr = np.asarray(store[zarr_key][:])
+            cache[zarr_key] = arr
+            bytes_loaded += self._estimate_cached_array_bytes(arr)
+        self._zarr_bulk_cache = cache
+        self._zarr_block_cache.clear()
+        return bytes_loaded
+
+    @staticmethod
+    def _estimate_cached_array_bytes(arr: np.ndarray) -> int:
+        if arr.dtype.hasobject:
+            total = int(arr.nbytes)
+            for item in arr.flat:
+                if isinstance(item, np.void):
+                    total += len(item.tobytes())
+                elif isinstance(item, memoryview):
+                    total += item.nbytes
+                elif isinstance(item, (bytes, bytearray)):
+                    total += len(item)
+            return total
+        if arr.dtype.kind == "V":
+            return int(arr.nbytes)
+        return int(arr.nbytes)
+
     def _read_key_slice(
         self, zarr_key: str, start: int, end: int | None
     ) -> np.ndarray:
