@@ -26,6 +26,7 @@ import os
 import random
 import subprocess
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
@@ -250,12 +251,26 @@ class EpisodeResolver:
         transform_list: list | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
         self.transform_list = transform_list
         self.norm_stats = norm_stats
         self.pause_removal_epsilon = pause_removal_epsilon
+        self.read_block_size = max(1, int(read_block_size))
+        self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+
+    def _dataset_kwargs(self) -> dict:
+        return {
+            "key_map": self.key_map,
+            "transform_list": self.transform_list,
+            "norm_stats": self.norm_stats,
+            "pause_removal_epsilon": self.pause_removal_epsilon,
+            "read_block_size": self.read_block_size,
+            "read_block_cache_blocks": self.read_block_cache_blocks,
+        }
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
         """
@@ -293,10 +308,7 @@ class EpisodeResolver:
             try:
                 ds_obj = dataset_class(
                     p,
-                    key_map=self.key_map,
-                    transform_list=self.transform_list,
-                    norm_stats=self.norm_stats,
-                    pause_removal_epsilon=self.pause_removal_epsilon,
+                    **self._dataset_kwargs(),
                 )
                 datasets[name] = ds_obj
             except Exception as e:
@@ -451,6 +463,8 @@ class S3EpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         self.bucket_name = bucket_name
         self.main_prefix = main_prefix
@@ -461,6 +475,8 @@ class S3EpisodeResolver(EpisodeResolver):
             transform_list=transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
         )
 
     def resolve(
@@ -701,6 +717,8 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         super().__init__(
             folder_path,
@@ -708,6 +726,8 @@ class LocalEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
         )
         self.debug = debug
         self.allowed_episode_ids = (
@@ -802,10 +822,7 @@ class LocalEpisodeResolver(EpisodeResolver):
                         try:
                             datasets[episode_hash] = dataset_class(
                                 candidate,
-                                key_map=self.key_map,
-                                transform_list=self.transform_list,
-                                norm_stats=self.norm_stats,
-                                pause_removal_epsilon=self.pause_removal_epsilon,
+                                **self._dataset_kwargs(),
                             )
                         except Exception as e:
                             logger.error(
@@ -865,6 +882,8 @@ class ModalEpisodeResolver(EpisodeResolver):
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
         allowed_episode_ids: list[str] | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         super().__init__(
             folder_path,
@@ -872,6 +891,8 @@ class ModalEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
         )
         self.debug = debug
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
@@ -966,10 +987,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                 continue
             datasets[episode_hash] = dataset_class(
                 local_path,
-                key_map=self.key_map,
-                transform_list=self.transform_list,
-                norm_stats=self.norm_stats,
-                pause_removal_epsilon=self.pause_removal_epsilon,
+                **self._dataset_kwargs(),
                 _total_frames=num_frames,
                 _embodiment=robot_name,
             )
@@ -1149,9 +1167,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                 try:
                     datasets[episode_hash] = dataset_class(
                         Path(path_str),
-                        key_map=self.key_map,
-                        transform_list=self.transform_list,
-                        norm_stats=self.norm_stats,
+                        **self._dataset_kwargs(),
                         precomputed_metadata=metadata,
                     )
                 except Exception as e:
@@ -1550,6 +1566,8 @@ class ZarrDataset(torch.utils.data.Dataset):
         _embodiment: str | None = None,
         precomputed_metadata: dict | None = None,
         defer_open: bool = False,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         """
         Args:
@@ -1602,6 +1620,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
+        self.read_block_size = max(1, int(read_block_size))
+        self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+        self._zarr_block_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
         super().__init__()
 
     def _ensure_episode_reader(self):
@@ -1620,6 +1641,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             self.episode_reader.close()
             self.episode_reader = None
         self._zarr_bulk_cache = None
+        self._zarr_block_cache.clear()
         self._annotations = None
 
     def _init_from_metadata(self, metadata: dict) -> None:
@@ -1719,6 +1741,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             if v.get("key_type") not in ("camera_keys", "annotation_keys")
         }
         view._zarr_bulk_cache = None
+        view._zarr_block_cache = OrderedDict()
         return view
 
     def preload_zarr_arrays(self) -> None:
@@ -1732,6 +1755,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
             cache[zarr_key] = np.asarray(store[zarr_key][:])
         self._zarr_bulk_cache = cache
+        self._zarr_block_cache.clear()
 
     def _read_key_slice(
         self, zarr_key: str, start: int, end: int | None
@@ -1741,8 +1765,31 @@ class ZarrDataset(torch.utils.data.Dataset):
             if end is not None:
                 return arr[start:end]
             return arr[start : start + 1][0]
+        if (
+            end is None
+            and self.read_block_size > 1
+            and self.read_block_cache_blocks > 0
+            and zarr_key in (self._image_keys or set())
+        ):
+            return self._read_single_from_block_cache(zarr_key, start)
         read_dict = {zarr_key: (start, end)}
         return self.episode_reader.read(read_dict)[zarr_key]
+
+    def _read_single_from_block_cache(self, zarr_key: str, start: int) -> np.ndarray:
+        block_start = (int(start) // self.read_block_size) * self.read_block_size
+        cache_key = (zarr_key, block_start)
+        cached = self._zarr_block_cache.get(cache_key)
+        if cached is not None:
+            self._zarr_block_cache.move_to_end(cache_key)
+            return cached[int(start) - block_start]
+
+        block_end = min(self.total_frames, block_start + self.read_block_size)
+        arr = self.episode_reader._store[zarr_key]
+        block = np.asarray(arr[block_start:block_end])
+        self._zarr_block_cache[cache_key] = block
+        while len(self._zarr_block_cache) > self.read_block_cache_blocks:
+            self._zarr_block_cache.popitem(last=False)
+        return block[int(start) - block_start]
 
     _CURATION_POSE_SENTINEL = 1e8
     _CURATION_MIN_QUAT_NORM = 1e-6

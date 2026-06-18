@@ -82,6 +82,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         n_copy_threads: int = 16,
         seed: int = 42,
         prepare_timeout_s: float = 3600.0,
+        index_map_order: str = "random",
+        index_map_block_size: int = 128,
     ):
         super().__init__()
         self.resolver = resolver
@@ -90,6 +92,8 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.n_copy_threads = int(n_copy_threads)
         self.seed = seed
+        self.index_map_order = str(index_map_order)
+        self.index_map_block_size = max(1, int(index_map_block_size))
         # Max time prepare_epoch blocks waiting for the window to materialize.
         # Default 1h is plenty for a normal sliding window; raise it for
         # stage-all-first configs where episodes_per_epoch == a large subset
@@ -203,12 +207,26 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         logger.info(
             "PrefetchedMapDataset [%s]: %d episodes, %d total frames, "
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
-            "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s)",
+            "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s), "
+            "index_map_order=%s, index_map_block_size=%d",
             mode, len(self._episodes), total_frames,
             self.episodes_per_epoch, lookahead_epochs,
             pool_size_gb, cache_dir, self._rank,
             "yes" if self._is_filler_rank else "no",
+            self.index_map_order, self.index_map_block_size,
         )
+
+    def _zarr_dataset_kwargs(self) -> dict:
+        return {
+            "key_map": self.resolver.key_map,
+            "transform_list": self.resolver.transform_list,
+            "norm_stats": self.resolver.norm_stats,
+            "pause_removal_epsilon": self.resolver.pause_removal_epsilon,
+            "read_block_size": getattr(self.resolver, "read_block_size", 1),
+            "read_block_cache_blocks": getattr(
+                self.resolver, "read_block_cache_blocks", 2
+            ),
+        }
 
     # ------------------------------------------------------------------
     # DataSchematic wiring (matches MultiDataset API)
@@ -253,10 +271,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if not hasattr(self, "_probe_ds"):
                 self._probe_ds = ZarrDataset(
                     self._probe_zarr_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **self._zarr_dataset_kwargs(),
                 )
             return self._probe_ds[idx % len(self._probe_ds)]
 
@@ -272,10 +287,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     try:
                         self._zarr_cache[ep_path] = ZarrDataset(
                             ep_path,
-                            key_map=self.resolver.key_map,
-                            transform_list=self.resolver.transform_list,
-                            norm_stats=self.resolver.norm_stats,
-                            pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                            **self._zarr_dataset_kwargs(),
                         )
                     except Exception as e:
                         logger.warning(
@@ -317,10 +329,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if ep_path not in self._zarr_cache:
                 self._zarr_cache[ep_path] = ZarrDataset(
                     ep_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **self._zarr_dataset_kwargs(),
                 )
             return self._zarr_cache[ep_path][frame_idx]
         except Exception as e:
@@ -430,6 +439,48 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 else:
                     n_ok += 1
         logger.info("Valid extractor: window ready (%d ok, %d failed).", n_ok, n_err)
+
+    def _build_index_map(
+        self,
+        window_eps: list[EpisodeCatalogEntry],
+        epoch: int,
+    ) -> list[tuple[str, int]]:
+        rng = random.Random(self.seed + epoch + 99999)
+
+        if self.mode != "train" or self.index_map_order == "random":
+            index_map: list[tuple[str, int]] = []
+            for ep in window_eps:
+                ep_path = str(self._pool.episode_path(ep.episode_hash))
+                for frame_idx in range(ep.n_frames):
+                    index_map.append((ep_path, frame_idx))
+            if self.mode == "train":
+                rng.shuffle(index_map)
+            return index_map
+
+        episodes = list(window_eps)
+        rng.shuffle(episodes)
+        index_map = []
+        for ep in episodes:
+            ep_path = str(self._pool.episode_path(ep.episode_hash))
+            frames = list(range(ep.n_frames))
+            if self.index_map_order == "episode_random":
+                rng.shuffle(frames)
+            elif self.index_map_order == "episode_block":
+                blocks = [
+                    frames[i : i + self.index_map_block_size]
+                    for i in range(0, len(frames), self.index_map_block_size)
+                ]
+                rng.shuffle(blocks)
+                frames = [frame_idx for block in blocks for frame_idx in block]
+            elif self.index_map_order == "episode_sequential":
+                pass
+            else:
+                raise ValueError(
+                    "index_map_order must be one of: random, episode_random, "
+                    "episode_block, episode_sequential"
+                )
+            index_map.extend((ep_path, frame_idx) for frame_idx in frames)
+        return index_map
 
     # ------------------------------------------------------------------
     # Epoch lifecycle — called from Lightning callback on main process
@@ -566,16 +617,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 gen_label, len(window_eps), wait_s,
             )
 
-        # Build frame-level index_map (deterministic per-epoch shuffle).
+        # Build frame-level index_map. The default preserves legacy global
+        # frame shuffle; storage-local modes shuffle at episode/block granularity
+        # so DataLoader reads can become larger sequential zarr ranges.
         t_build = time.perf_counter()
-        index_map: list[tuple[str, int]] = []
-        for ep in window_eps:
-            ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
-                index_map.append((ep_path, fi))
-        if self.mode == "train":
-            rng = random.Random(self.seed + epoch + 99999)
-            rng.shuffle(index_map)
+        index_map = self._build_index_map(window_eps, epoch)
         self._index_map = index_map
         logger.info(
             "[Timing] prepare_epoch %d: index_map built in %.3fs (%d frames)",
@@ -595,10 +641,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             try:
                 self._zarr_cache[ep_path] = ZarrDataset(
                     ep_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **self._zarr_dataset_kwargs(),
                 )
             except Exception as e:
                 logger.warning(
@@ -658,15 +701,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # (ep_path, frame_idx) tuples match main's index_map exactly.
         full_window_eps = self._plan.epoch_episodes(published_epoch)
         window_eps = [e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)]
-        index_map: list[tuple[str, int]] = []
-        for ep in window_eps:
-            ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
-                index_map.append((ep_path, fi))
-        if self.mode == "train":
-            rng = random.Random(self.seed + published_epoch + 99999)
-            rng.shuffle(index_map)
-        self._index_map = index_map
+        self._index_map = self._build_index_map(window_eps, published_epoch)
 
         # Evict zarr handles for episodes not in the current+lookahead
         # window so the worker's cache doesn't grow without bound.
