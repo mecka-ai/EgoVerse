@@ -24,6 +24,7 @@ class EpisodeCatalogEntry:
     episode_hash: str
     n_frames: int
     embodiment: str = "mecka_bimanual"
+    tar_size_bytes: int | None = None
 
 
 
@@ -91,6 +92,7 @@ class ZipEpisodeResolver(EpisodeResolver):
                     episode_hash=e["episode_hash"],
                     n_frames=int(e["n_frames"]),
                     embodiment=e.get("embodiment", "mecka_bimanual"),
+                    tar_size_bytes=int(tar_path.stat().st_size),
                 )
             )
 

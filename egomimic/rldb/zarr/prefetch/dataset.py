@@ -404,7 +404,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 shutil.rmtree(dest, ignore_errors=True)
             dest.mkdir(parents=True, exist_ok=True)
             try:
-                size = _extract_tar_to_dir(entry.tar_path, dest)
+                size = _extract_tar_to_dir(
+                    entry.tar_path,
+                    dest,
+                    expected_size_bytes=entry.tar_size_bytes,
+                )
             except Exception:
                 shutil.rmtree(dest, ignore_errors=True)
                 raise
@@ -758,7 +762,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             os.close(fd)
             probe_dir.mkdir(parents=True, exist_ok=True)
             logger.info("Probe: extracting %s", entry.tar_path.name)
-            _extract_tar_to_dir(entry.tar_path, probe_dir)
+            _extract_tar_to_dir(
+                entry.tar_path,
+                probe_dir,
+                expected_size_bytes=entry.tar_size_bytes,
+            )
             done_file.touch()
         except FileExistsError:
             deadline = time.monotonic() + 120

@@ -217,7 +217,11 @@ class PoolFillerThread(threading.Thread):
 
             t0 = time.perf_counter()
             try:
-                size = _extract_tar_to_dir(entry.tar_path, dest)
+                size = _extract_tar_to_dir(
+                    entry.tar_path,
+                    dest,
+                    expected_size_bytes=entry.tar_size_bytes,
+                )
             except OSError as e:
                 shutil.rmtree(dest, ignore_errors=True)
                 if e.errno == 28:  # ENOSPC — transient, no .bad
@@ -261,5 +265,4 @@ class PoolFillerThread(threading.Thread):
                 )
         finally:
             _release_extract_lock(self.pool.root, entry.episode_hash, lock_fd)
-
 
