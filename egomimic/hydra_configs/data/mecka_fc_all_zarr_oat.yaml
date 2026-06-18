@@ -14,7 +14,7 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 #     model=oat_tokenizer evaluator=eval_tokenizer_video \
 #     evaluator@train_viz_evaluator=train_viz_tokenizer \
 #     name=oat_tok_fc_all description=fold_clothes_all461 \
-#     trainer.check_val_every_n_epoch=30 trainer.limit_val_batches=100 \
+#     trainer.check_val_every_n_epoch=30 trainer.limit_train_batches=100 trainer.limit_val_batches=100 \
 #     +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
 #     +modal_volume=mecka_data_v2 \
 #     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
