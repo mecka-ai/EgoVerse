@@ -57,6 +57,7 @@ train_datasets:
     n_copy_threads: 48
     index_map_order: episode_block
     index_map_block_size: 128
+    preload_image_cache_gb: 0.0
 
 valid_datasets:
   mecka_bimanual:
