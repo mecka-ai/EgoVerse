@@ -50,6 +50,7 @@ class EmbedderSettings:
     device: str = "cuda"
     norm_min_std: float = 1e-6
     state_image: StateImageSettings = field(default_factory=StateImageSettings)
+    action_checkpoint_path: str | None = None
 
 
 def select_seed(cfg: Any) -> int:
@@ -130,6 +131,7 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
 
 def select_embedder_settings(cfg: Any) -> EmbedderSettings:
     """Read embedder settings from ``model`` config."""
+    ckpt = OmegaConf.select(cfg, "model.action_checkpoint_path", default=None)
     return EmbedderSettings(
         latent_dim=int(OmegaConf.select(cfg, "model.latent_dim", default=32)),
         device=str(OmegaConf.select(cfg, "model.device", default="cuda")),
@@ -137,6 +139,7 @@ def select_embedder_settings(cfg: Any) -> EmbedderSettings:
             OmegaConf.select(cfg, "model.norm_min_std", default=1e-6)
         ),
         state_image=select_state_image_settings(cfg),
+        action_checkpoint_path=str(ckpt) if ckpt is not None else None,
     )
 
 

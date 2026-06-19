@@ -317,6 +317,64 @@ class StateEmbedder:
         return np.concatenate(outputs, axis=0)
 
 
+class CheckpointActionEmbedder:
+    """Action embedder backed by a trained ActionVAETrainer Lightning checkpoint.
+
+    Provides the same ``fit()`` / ``embed()`` interface as ``ActionEmbedder`` so
+    it can be used as a drop-in replacement in ``build_embedders``.
+
+    ``fit()`` loads the checkpoint and extracts the inner ``ActionVAETrainer``.
+    ``embed(data)`` calls ``ActionVAETrainer.encode(data)`` which uses the
+    posterior mean (no sampling) on normalised actions.
+
+    Args:
+        checkpoint_path: Path to a Lightning ``.ckpt`` file saved from a
+                         ``ModelWrapper(ActionVAETrainer(...))`` training run.
+        device: Device to run inference on (e.g. ``"cpu"``, ``"cuda"``).
+    """
+
+    def __init__(self, checkpoint_path: str, device: str | torch.device = "cpu") -> None:
+        self.checkpoint_path = checkpoint_path
+        self.device = torch.device(device)
+        self._algo: Any | None = None
+        self._fitted = False
+
+    @property
+    def latent_dim(self) -> int:
+        if self._algo is None:
+            raise RuntimeError("Call fit() before accessing latent_dim")
+        return self._algo.latent_dim
+
+    def fit(self, episodes: list | None = None) -> None:  # noqa: ARG002
+        """Load the checkpoint and prepare the VAE encoder."""
+        from egomimic.pl_utils.pl_model import ModelWrapper
+
+        logger.info("CheckpointActionEmbedder: loading %s", self.checkpoint_path)
+        wrapper = ModelWrapper.load_from_checkpoint(
+            self.checkpoint_path, map_location=self.device
+        )
+        wrapper.eval()  # puts wrapper.nets (the nn.ModuleDict) into eval mode
+        self._algo = wrapper.model
+        self._fitted = True
+        logger.info(
+            "CheckpointActionEmbedder: loaded, latent_dim=%d", self._algo.latent_dim
+        )
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
+        """Encode flat action chunks to latent means.
+
+        Args:
+            data: (T, flat_dim) float32 numpy array where
+                  flat_dim = sample_horizon * action_dim.
+
+        Returns:
+            (T, latent_dim) float32 numpy array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        return self._algo.encode(data)
+
+
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.

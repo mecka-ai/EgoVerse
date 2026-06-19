@@ -14,7 +14,7 @@ import numpy as np
 from tqdm import tqdm
 
 from egomimic.curation.config import CurationLoaderSettings, EmbedderSettings
-from egomimic.curation.embedders import ActionEmbedder, StateEmbedder
+from egomimic.curation.embedders import ActionEmbedder, CheckpointActionEmbedder, StateEmbedder
 
 if TYPE_CHECKING:
     from egomimic.rldb.zarr.zarr_dataset_multi import ZarrDataset
@@ -34,15 +34,22 @@ def build_embedders(
     seed: int,
     *,
     global_frame_batch_size: int = 512,
-) -> tuple[ActionEmbedder, StateEmbedder]:
+) -> tuple[ActionEmbedder | CheckpointActionEmbedder, StateEmbedder]:
     """Construct fitted action and image embedders from precomputed norm stats."""
-    action_embedder = ActionEmbedder(
-        latent_dim=embed_cfg.latent_dim,
-        seed=seed,
-        norm_min_std=embed_cfg.norm_min_std,
-    )
-    action_embedder.set_precomputed_stats(action_mean, action_std)
-    action_embedder.fit([])
+    if embed_cfg.action_checkpoint_path is not None:
+        action_embedder: ActionEmbedder | CheckpointActionEmbedder = CheckpointActionEmbedder(
+            checkpoint_path=embed_cfg.action_checkpoint_path,
+            device=device,
+        )
+        action_embedder.fit([])
+    else:
+        action_embedder = ActionEmbedder(
+            latent_dim=embed_cfg.latent_dim,
+            seed=seed,
+            norm_min_std=embed_cfg.norm_min_std,
+        )
+        action_embedder.set_precomputed_stats(action_mean, action_std)
+        action_embedder.fit([])
 
     img = embed_cfg.state_image
     state_embedder = StateEmbedder(
@@ -96,7 +103,7 @@ def run_pass2_embed_episodes(
     action_key: str,
     image_key: str,
     loader: CurationLoaderSettings,
-    action_embedder: ActionEmbedder,
+    action_embedder: ActionEmbedder | CheckpointActionEmbedder,
     state_embedder: StateEmbedder,
     *,
     progress: str | None = None,
