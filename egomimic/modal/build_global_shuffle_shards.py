@@ -46,25 +46,24 @@ val_hashes inside Modal). Validation uses normal zarr access via ModalEpisodeRes
 
 USAGE
 -----
-# Dry run — list plan without building
-modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- --dry-run
+# Note: pass entrypoint flags directly to ``modal run`` (no ``--`` separator).
 
-# Build all episodes on the zarr volume (legacy; no data config)
-modal run --env robotics egomimic/modal/build_global_shuffle_shards.py
+# Dry run — list plan without building
+modal run --env robotics egomimic/modal/build_global_shuffle_shards.py --dry-run
 
 # Production build (default data config mecka_all_zarr, 1.5x coverage, 6k frames/shard)
-modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
+modal run --env robotics egomimic/modal/build_global_shuffle_shards.py \\
     --coverage-multiplier 1.5 \\
     --frames-per-shard 6000 \\
     --output-subdir global_shuffle_v2
 
 # Debug smoke build (300 episodes via mecka_all_zarr_debug300)
-modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
+modal run --env robotics egomimic/modal/build_global_shuffle_shards.py \\
     --data-config mecka_all_zarr_debug300 \\
     --output-subdir global_shuffle_debug300
 
 # With extra validation exclusion list (merged with valid_datasets from config)
-modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
+modal run --env robotics egomimic/modal/build_global_shuffle_shards.py \\
     --data-config mecka_all_zarr \\
     --val-hashes-path /path/to/val_hashes.json
 
@@ -155,7 +154,12 @@ def _batch_episodes_for_workers(
     episode_paths: list[str],
     num_workers: int,
 ) -> list[list[str]]:
-    """Split episodes into ``num_workers`` batches (one Modal container each)."""
+    """Partition episodes into at most ``num_workers`` batches (one container each).
+
+    Every episode appears in exactly one batch. When there are more episodes than
+    workers, batches are balanced (sizes differ by at most one). When there are
+    fewer episodes than workers, each episode gets its own container.
+    """
     n = len(episode_paths)
     if n == 0:
         return []
@@ -164,11 +168,46 @@ def _batch_episodes_for_workers(
             episode_paths[i : i + EPISODES_PER_WORKER]
             for i in range(0, n, EPISODES_PER_WORKER)
         ]
-    chunk_size = max(1, -(-n // num_workers))
-    return [
-        episode_paths[i : i + chunk_size]
-        for i in range(0, n, chunk_size)
-    ]
+
+    n_workers = min(num_workers, n)
+    base, extra = divmod(n, n_workers)
+    batches: list[list[str]] = []
+    start = 0
+    for i in range(n_workers):
+        size = base + (1 if i < extra else 0)
+        batches.append(episode_paths[start : start + size])
+        start += size
+    return batches
+
+
+def _summarize_batches(batches: list[list[str]]) -> tuple[int, int, int]:
+    """Return (n_workers, min_batch_size, max_batch_size)."""
+    if not batches:
+        return 0, 0, 0
+    sizes = [len(b) for b in batches]
+    return len(batches), min(sizes), max(sizes)
+
+
+def _assert_valid_batches(
+    episode_paths: list[str],
+    batches: list[list[str]],
+    num_workers: int,
+) -> None:
+    """Raise if batches do not partition episode_paths exactly once."""
+    flat = [ep for batch in batches for ep in batch]
+    if len(flat) != len(set(flat)):
+        raise RuntimeError("Worker split assigned the same episode to multiple workers")
+    if len(flat) != len(episode_paths):
+        raise RuntimeError(
+            f"Worker split size mismatch: {len(episode_paths)} in, {len(flat)} batched"
+        )
+    if episode_paths and num_workers > 0:
+        expected_workers = min(num_workers, len(episode_paths))
+        if len(batches) != expected_workers:
+            raise RuntimeError(
+                f"Expected {expected_workers} workers for {len(episode_paths)} episodes "
+                f"and num_workers={num_workers}, got {len(batches)}"
+            )
 
 
 def _write_mp4(
@@ -374,7 +413,7 @@ def list_episodes_fn() -> list[str]:
     cpu=8,
     memory=65536,
     timeout=7200,
-    max_containers=DEFAULT_NUM_WORKERS,
+    max_containers=300,
 )
 def build_shard_worker(job: dict) -> dict:
     """Process a batch of episodes, globally shuffle their frames, write shards.
@@ -667,6 +706,50 @@ def write_index_fn(
 
 
 # ---------------------------------------------------------------------------
+# Remote: coordinator — runs map() inside Modal to avoid local heartbeat timeouts
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=4096,
+    timeout=86400,  # 24 h ceiling — waits for all workers to complete
+)
+def run_coordinator(jobs: list[dict], index_args: dict) -> None:
+    """Fan out build_shard_worker.map() and write index — all inside Modal.
+
+    Running the map() from a Modal container (not the local entrypoint) avoids
+    the heartbeat timeout that causes ConflictError when pumping thousands of
+    inputs over a flaky local connection.  The local entrypoint just spawns this
+    coordinator and exits immediately.
+    """
+    results = list(
+        build_shard_worker.map(jobs, return_exceptions=True, wrap_returned_exceptions=False)
+    )
+
+    ok = [r for r in results if isinstance(r, dict)]
+    errs = [r for r in results if not isinstance(r, dict)]
+
+    total_shards = sum(r.get("n_shards", 0) for r in ok)
+    total_frames = sum(r.get("n_frames", 0) for r in ok)
+    total_episodes = sum(len(r.get("episodes", [])) for r in ok)
+
+    print(f"\nShard building complete:")
+    print(f"  Workers ok:        {len(ok)} / {len(jobs)}")
+    print(f"  Workers failed:    {len(errs)}")
+    print(f"  Episodes:          {total_episodes:,}")
+    print(f"  Shards written:    {total_shards:,}")
+    print(f"  Total frames:      {total_frames:,}")
+    if errs:
+        print(f"\nFirst error: {errs[0]}")
+
+    print("\nWriting index.json...")
+    write_index_fn.remote(**index_args, results=ok)
+    print("Done.")
+
+
+# ---------------------------------------------------------------------------
 # Local entrypoint
 # ---------------------------------------------------------------------------
 
@@ -740,8 +823,8 @@ def main(
 
     # Batch episodes across num_workers parallel containers
     batches = _batch_episodes_for_workers(all_episodes, num_workers)
-    n_workers = len(batches)
-    episodes_per_worker = len(batches[0]) if batches else 0
+    _assert_valid_batches(all_episodes, batches, num_workers)
+    n_workers, min_batch, max_batch = _summarize_batches(batches)
 
     est_source_frames = n_episodes * 150  # rough estimate ~150 frames/episode
     est_output_frames = int(est_source_frames * coverage_multiplier)
@@ -752,7 +835,10 @@ def main(
     print(f"  Data config:       {data_config or '(all volume episodes)'}")
     print(f"  Episodes:          {n_episodes:,}")
     print(f"  Workers:           {n_workers} (target {num_workers})")
-    print(f"  Episodes/worker:   ~{episodes_per_worker}")
+    if min_batch == max_batch:
+        print(f"  Episodes/worker:   {min_batch}")
+    else:
+        print(f"  Episodes/worker:   {min_batch}-{max_batch}")
     print(f"  Coverage:          {coverage_multiplier}x")
     print(f"  Frames/shard:      {frames_per_shard:,}")
     print(f"  Est. shards:       ~{est_shards:,}")
@@ -785,31 +871,19 @@ def main(
         for i, batch in enumerate(batches)
     ]
 
-    results = list(build_shard_worker.map(jobs, return_exceptions=True, wrap_returned_exceptions=False))
+    index_args = {
+        "output_subdir": output_subdir,
+        "coverage_multiplier": coverage_multiplier,
+        "frames_per_shard": frames_per_shard,
+        "gop": gop,
+        "fps": fps,
+    }
 
-    ok = [r for r in results if isinstance(r, dict)]
-    errs = [r for r in results if isinstance(r, Exception)]
-
-    total_shards = sum(r.get("n_shards", 0) for r in ok)
-    total_frames = sum(r.get("n_frames", 0) for r in ok)
-    total_episodes = sum(len(r.get("episodes", [])) for r in ok)
-
-    print(f"\nShard building complete:")
-    print(f"  Workers ok:        {len(ok)} / {n_workers}")
-    print(f"  Workers failed:    {len(errs)}")
-    print(f"  Episodes:          {total_episodes:,}")
-    print(f"  Shards written:    {total_shards:,}")
-    print(f"  Total frames:      {total_frames:,}")
-    if errs:
-        print(f"\nFirst error: {errs[0]}")
-
-    print("\nWriting index.json...")
-    write_index_fn.remote(
-        output_subdir=output_subdir,
-        results=ok,
-        coverage_multiplier=coverage_multiplier,
-        frames_per_shard=frames_per_shard,
-        gop=gop,
-        fps=fps,
-    )
-    print("Done.")
+    # Spawn the coordinator inside Modal — it runs build_shard_worker.map() and
+    # writes index.json without requiring the local process to stay alive.
+    # Pumping thousands of map inputs over a local connection causes heartbeat
+    # timeouts (ConflictError); running inside Modal avoids this entirely.
+    run_coordinator.spawn(jobs, index_args)
+    print(f"\nCoordinator spawned — {n_workers} workers queued (300 concurrent max).")
+    print("Local process exiting. Workers run independently inside Modal.")
+    print("Check progress at the URL printed above.")
