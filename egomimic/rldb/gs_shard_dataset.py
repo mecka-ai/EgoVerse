@@ -1,19 +1,21 @@
-"""GlobalShuffleShardDataset — loads pre-built globally-shuffled shards for training.
+"""GlobalShuffleShardDataset — sliding-window prefetch loader for GS shards.
 
-Each shard pair ({id}.mp4, {id}.npz) was built by build_global_shuffle_shards.py:
-  - MP4: H.264 camera frames (single front camera), +faststart, no B-frames, fixed GOP.
-    Frames are decoded lazily via torchcodec for fast local reads.
-  - NPZ: pre-transformed action arrays (T, horizon, action_dim).
+Each shard pair ({id}.mp4, {id}.npz) was built by build_global_shuffle_shards.py.
 
-At training time, shards are loaded from a locally-mounted volume or copied to
-ephemeral disk per worker. This replaces the network-volume random-seek pattern
-of the zarr dataloader with sequential local reads.
+At training time each DataLoader worker runs an independent background thread that
+downloads shards from the volume to local ephemeral disk (/cache NVMe when available,
+/tmp otherwise).  The thread maintains a bounded queue of `prefetch_shards` downloaded
+shards ahead of the consumer.  When the consumer finishes a shard it deletes the local
+files and the thread immediately starts fetching the next one — so disk usage stays at
+`prefetch_shards * num_workers` shards at any moment.
+
+Example: num_workers=6, prefetch_shards=2 → 12 shards on disk at all times.
 
 Usage in Hydra config:
   _target_: egomimic.rldb.gs_shard_dataset.GlobalShuffleShardDataset
-  shard_dir: /mnt/zarr-gs/global_shuffle_v1
+  shard_dir: /mnt/zarr-gs/global_shuffle_debug300
   image_size: [224, 224]
-  action_key: actions_cartesian
+  prefetch_shards: 2
 """
 
 from __future__ import annotations
@@ -21,32 +23,37 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
+import threading
 from pathlib import Path
+from queue import Queue
 from typing import Iterator
 
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 
+_SENTINEL = object()
+
 
 class GlobalShuffleShardDataset(IterableDataset):
-    """Iterable dataset that streams frames from pre-built globally-shuffled MP4+npz shards.
+    """Iterable dataset that streams frames from pre-built globally-shuffled shards.
 
-    Each worker loads one shard at a time and iterates over its frames in order.
-    The shard list is shuffled at the start of each epoch (based on worker seed).
-
-    The MP4 is decoded via torchcodec (fast, GPU-optional). Falls back to av
-    if torchcodec is not installed.
+    Each DataLoader worker owns a disjoint slice of shards (shuffled by worker seed).
+    A background thread prefetches up to `prefetch_shards` shards onto local ephemeral
+    disk while the worker iterates over the current shard.  When a shard is exhausted
+    its local files are deleted and the thread's next download unblocks.
 
     Args:
-        shard_dir:    Directory containing {shard_id}.mp4 and {shard_id}.npz files,
-                      plus index.json produced by build_global_shuffle_shards.py.
-        image_size:   (H, W) to resize decoded frames. None keeps native resolution.
-        action_key:   Key under which to return the action array (matches training schema).
-        image_key:    Key under which to return the image tensor.
-        seed:         Base random seed for shard shuffle order.
-        copy_to_tmp:  If True, copy each shard to /tmp before reading (avoids
-                      network-volume seek cost; requires ephemeral disk space).
+        shard_dir:       Path to directory containing {id}.mp4, {id}.npz, index.json.
+                         Typically /mnt/zarr-gs/<subdir> inside the Modal container.
+        image_size:      (H, W) to resize decoded frames. None keeps native resolution.
+        action_key:      Key for the action tensor in the returned sample dict.
+        image_key:       Key for the image tensor in the returned sample dict.
+        seed:            Base random seed for per-worker shard shuffle order.
+        prefetch_shards: How many shards to keep pre-downloaded per worker.
+                         Total disk usage = prefetch_shards * num_workers * shard_size.
+                         Default 2 — with num_workers=6 this keeps 12 shards on disk.
     """
 
     def __init__(
@@ -56,14 +63,14 @@ class GlobalShuffleShardDataset(IterableDataset):
         action_key: str = "actions_cartesian",
         image_key: str = "observations.images.front_img_1",
         seed: int = 42,
-        copy_to_tmp: bool = False,
+        prefetch_shards: int = 2,
     ):
         self.shard_dir = Path(shard_dir)
         self.image_size = tuple(image_size) if image_size else None
         self.action_key = action_key
         self.image_key = image_key
         self.seed = seed
-        self.copy_to_tmp = copy_to_tmp
+        self.prefetch_shards = prefetch_shards
 
         index_path = self.shard_dir / "index.json"
         if not index_path.exists():
@@ -80,70 +87,121 @@ class GlobalShuffleShardDataset(IterableDataset):
         index = json.loads((self.shard_dir / "index.json").read_text())
         return index.get("n_covered_frames", len(self._shard_ids) * 2000)
 
+    def __getitem__(self, index: int) -> dict:
+        # Called by trainHydra.py for shape inference (dataset[0]).
+        # Reads directly from the volume-mounted shard — no prefetch needed.
+        first_shard = self._shard_ids[0]
+        mp4_path = self.shard_dir / f"{first_shard}.mp4"
+        npz_path = self.shard_dir / f"{first_shard}.npz"
+        npz = np.load(str(npz_path))
+        action = npz["action"][index]
+        img_tensor = None
+        for i, frame in enumerate(self._decode_mp4(mp4_path)):
+            if i == index:
+                img_tensor = frame
+                break
+        if img_tensor is None:
+            raise IndexError(f"index {index} out of range for shard {first_shard}")
+        return {
+            self.image_key: img_tensor,
+            self.action_key: torch.from_numpy(action).float(),
+        }
+
     def __iter__(self) -> Iterator[dict]:
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
 
-        # Each worker handles a disjoint slice of shards
         shard_ids = list(self._shard_ids)
         rng = random.Random(self.seed + worker_id)
         rng.shuffle(shard_ids)
         my_shards = shard_ids[worker_id::num_workers]
 
-        for shard_id in my_shards:
+        yield from self._iter_with_prefetch(my_shards, worker_id)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _local_dir(self) -> Path:
+        """Return local ephemeral disk directory for shard copies."""
+        # Prefer /cache (Modal NVMe ephemeral disk).  Fall back to TMPDIR or /tmp.
+        for candidate in ["/cache", os.environ.get("TMPDIR"), "/tmp"]:
+            if candidate and Path(candidate).is_dir():
+                return Path(candidate)
+        return Path("/tmp")
+
+    def _download_shard(self, shard_id: str, worker_id: int) -> tuple[Path, Path]:
+        """Copy one shard from the volume to local ephemeral disk."""
+        dst = self._local_dir()
+        local_mp4 = dst / f"gs_w{worker_id}_{shard_id}.mp4"
+        local_npz = dst / f"gs_w{worker_id}_{shard_id}.npz"
+        shutil.copy2(self.shard_dir / f"{shard_id}.mp4", local_mp4)
+        shutil.copy2(self.shard_dir / f"{shard_id}.npz", local_npz)
+        return local_mp4, local_npz
+
+    def _iter_with_prefetch(
+        self, shard_ids: list[str], worker_id: int
+    ) -> Iterator[dict]:
+        """Background-thread sliding-window prefetch → consume → delete loop."""
+        # Bounded queue: blocks the download thread when prefetch_shards are already
+        # sitting on disk waiting to be processed.
+        q: Queue = Queue(maxsize=self.prefetch_shards)
+
+        def _prefetch() -> None:
+            for sid in shard_ids:
+                try:
+                    paths = self._download_shard(sid, worker_id)
+                except Exception as exc:
+                    print(
+                        f"[GS worker={worker_id}] prefetch failed for {sid}: {exc}"
+                    )
+                    paths = None
+                q.put(paths)  # blocks here when queue is full
+            q.put(_SENTINEL)
+
+        thread = threading.Thread(target=_prefetch, daemon=True)
+        thread.start()
+
+        while True:
+            item = q.get()
+            if item is _SENTINEL:
+                break
+            if item is None:
+                continue  # download failed — skip shard
+            local_mp4, local_npz = item
             try:
-                yield from self._iter_shard(shard_id)
-            except Exception as e:
-                print(f"[GSShardDataset worker={worker_id}] shard {shard_id} failed: {e}")
-                continue
+                yield from self._iter_local_shard(local_mp4, local_npz, worker_id)
+            finally:
+                # Delete immediately so the background thread can write the next shard.
+                local_mp4.unlink(missing_ok=True)
+                local_npz.unlink(missing_ok=True)
 
-    def _iter_shard(self, shard_id: str) -> Iterator[dict]:
-        mp4_path = self.shard_dir / f"{shard_id}.mp4"
-        npz_path = self.shard_dir / f"{shard_id}.npz"
+        thread.join()
 
-        if not mp4_path.exists() or not npz_path.exists():
-            return
-
-        local_mp4 = mp4_path
-        local_npz = npz_path
-
-        if self.copy_to_tmp:
-            import shutil
-
-            # Prefer TMPDIR (set to /cache NVMe by trainModal when ephemeral disk is
-            # provisioned) to avoid filling the in-memory /tmp tmpfs.
-            tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
-            local_mp4 = tmp_dir / f"gs_shard_{shard_id}.mp4"
-            local_npz = tmp_dir / f"gs_shard_{shard_id}.npz"
-            shutil.copy2(mp4_path, local_mp4)
-            shutil.copy2(npz_path, local_npz)
-
+    def _iter_local_shard(
+        self, mp4_path: Path, npz_path: Path, worker_id: int
+    ) -> Iterator[dict]:
+        """Yield one frame at a time from a locally cached shard."""
         try:
-            npz = np.load(str(local_npz))
+            npz = np.load(str(npz_path))
             actions = npz["action"]  # (T, H, D)
-
-            # Lazy decode — one frame at a time so no full-shard float32 array is
-            # ever allocated in the worker process.
-            for img_tensor, action in zip(self._decode_mp4(local_mp4), actions):
+            for img_tensor, action in zip(self._decode_mp4(mp4_path), actions):
                 yield {
                     self.image_key: img_tensor,
                     self.action_key: torch.from_numpy(action).float(),
                 }
-        finally:
-            if self.copy_to_tmp:
-                local_mp4.unlink(missing_ok=True)
-                local_npz.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"[GS worker={worker_id}] shard iteration failed: {exc}")
 
-    def _decode_mp4(self, path: Path):
-        """Decode frames lazily from an MP4. Tries torchvision first, falls back to av."""
+    def _decode_mp4(self, path: Path) -> Iterator[torch.Tensor]:
+        """Decode MP4 frames lazily. Tries torchvision first, falls back to av."""
         try:
             import torchvision.io as tio
 
             video, _, _ = tio.read_video(str(path), output_format="TCHW", pts_unit="pts")
-            # video: (T, C, H, W) uint8
             for t in range(video.shape[0]):
-                frame = video[t].float() / 255.0  # (C, H, W)
+                frame = video[t].float() / 255.0
                 if self.image_size:
                     import torch.nn.functional as F
                     frame = F.interpolate(
@@ -156,15 +214,14 @@ class GlobalShuffleShardDataset(IterableDataset):
         except Exception:
             yield from self._decode_mp4_av(path)
 
-    def _decode_mp4_av(self, path: Path):
-        """av fallback decoder."""
+    def _decode_mp4_av(self, path: Path) -> Iterator[torch.Tensor]:
         import av as _av
         import torch.nn.functional as F
 
         container = _av.open(str(path))
         stream = container.streams.video[0]
         for frame in container.decode(stream):
-            img = frame.to_ndarray(format="rgb24")  # (H, W, 3)
+            img = frame.to_ndarray(format="rgb24")
             tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
             if self.image_size:
                 tensor = F.interpolate(
