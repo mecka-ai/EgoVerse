@@ -1,6 +1,6 @@
 # mecka_all_zarr with debug: 300 on the ModalEpisodeResolver (first 300 SQL episodes).
 # Use for global-shuffle smoke builds:
-#   modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \
+#   modal run --env robotics egomimic/modal/build_global_shuffle_shards.py \
 #     --data-config mecka_all_zarr_debug300 \
 #     --output-subdir global_shuffle_debug300
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
