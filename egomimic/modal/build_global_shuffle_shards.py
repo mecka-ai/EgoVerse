@@ -49,17 +49,23 @@ USAGE
 # Dry run — list plan without building
 modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- --dry-run
 
-# Build with defaults (2x coverage, 2000 frames/shard, 50 episodes/worker)
+# Build all episodes on the zarr volume (legacy; no data config)
 modal run --env robotics egomimic/modal/build_global_shuffle_shards.py
 
-# Custom coverage and shard size
+# Production build (default data config mecka_all_zarr, 1.5x coverage, 6k frames/shard)
 modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
-    --coverage-multiplier 3.0 \\
-    --frames-per-shard 4000 \\
+    --coverage-multiplier 1.5 \\
+    --frames-per-shard 6000 \\
     --output-subdir global_shuffle_v2
 
-# With validation exclusion list
+# Debug smoke build (300 episodes via mecka_all_zarr_debug300)
 modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
+    --data-config mecka_all_zarr_debug300 \\
+    --output-subdir global_shuffle_debug300
+
+# With extra validation exclusion list (merged with valid_datasets from config)
+modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
+    --data-config mecka_all_zarr \\
     --val-hashes-path /path/to/val_hashes.json
 
 OUTPUT
@@ -83,8 +89,41 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+# Honor +modal_volume=mecka_data_v2 before volume mounts are resolved below.
+for _arg in sys.argv[1:]:
+    _key, _sep, _val = _arg.lstrip("+").partition("=")
+    if _sep and _key == "modal_volume":
+        os.environ["MODAL_VOLUME"] = _val
+
 import modal
-from modal_setup import app, zarr_volume, CFG, image
+from modal_setup import VOLUME_MAP, app, zarr_volume, CFG, image
+
+_SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
+
+DEFAULT_ZARR_VOLUME = "mecka_data_v2"
+
+
+def _build_zarr_volume_spec() -> tuple[modal.Volume, str, str]:
+    """Return (volume_obj, mount_path, volume_name) for the zarr episode volume."""
+    vol_name = os.environ.get("MODAL_VOLUME", DEFAULT_ZARR_VOLUME)
+    if vol_name == DEFAULT_ZARR_VOLUME:
+        return zarr_volume, CFG.volume_mount_path, vol_name
+    if vol_name in VOLUME_MAP:
+        vol_obj, mount_path = VOLUME_MAP[vol_name]
+        if mount_path != CFG.volume_mount_path:
+            raise ValueError(
+                "Global shuffle shard builder reads zarr episodes from "
+                f"{CFG.volume_mount_path!r}. Volume {vol_name!r} mounts at "
+                f"{mount_path!r}. Use +modal_volume={DEFAULT_ZARR_VOLUME}."
+            )
+        return vol_obj, mount_path, vol_name
+    raise ValueError(
+        f"Unknown Modal volume {vol_name!r}. "
+        f"Supported zarr volume: {DEFAULT_ZARR_VOLUME}."
+    )
+
+
+_zarr_input_volume, INPUT_MOUNT, ZARR_VOLUME_NAME = _build_zarr_volume_spec()
 
 # ---------------------------------------------------------------------------
 # Global-shuffle volume
@@ -92,14 +131,16 @@ from modal_setup import app, zarr_volume, CFG, image
 
 gs_volume = modal.Volume.from_name("global_shuffle", create_if_missing=True, version=2)
 GS_MOUNT = "/mnt/zarr-gs"
-INPUT_MOUNT = CFG.volume_mount_path  # /mnt/zarr-data
 
 EPISODES_PER_WORKER = 50
+DEFAULT_NUM_WORKERS = 50
 DEFAULT_FRAMES_PER_SHARD = 2000
 DEFAULT_COVERAGE_MULTIPLIER = 2.0
 DEFAULT_GOP = 30
 DEFAULT_FPS = 30
 DEFAULT_OUTPUT_SUBDIR = "global_shuffle_v1"
+DEFAULT_DATA_CONFIG = "mecka_all_zarr"
+DEBUG_DATA_CONFIG = "mecka_all_zarr_debug300"
 
 ACTION_KEY = "actions_cartesian"
 IMAGE_KEY = "observations.images.front_img_1"
@@ -108,6 +149,26 @@ IMAGE_KEY = "observations.images.front_img_1"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _batch_episodes_for_workers(
+    episode_paths: list[str],
+    num_workers: int,
+) -> list[list[str]]:
+    """Split episodes into ``num_workers`` batches (one Modal container each)."""
+    n = len(episode_paths)
+    if n == 0:
+        return []
+    if num_workers <= 0:
+        return [
+            episode_paths[i : i + EPISODES_PER_WORKER]
+            for i in range(0, n, EPISODES_PER_WORKER)
+        ]
+    chunk_size = max(1, -(-n // num_workers))
+    return [
+        episode_paths[i : i + chunk_size]
+        for i in range(0, n, chunk_size)
+    ]
 
 
 def _write_mp4(
@@ -165,19 +226,136 @@ def _write_mp4(
 
 
 # ---------------------------------------------------------------------------
-# Remote: list episode directories on volume
+# Remote: resolve episodes from a Hydra data config (or list entire volume)
 # ---------------------------------------------------------------------------
+
+
+def _resolve_dataset_episodes(ds_cfg) -> dict[str, str]:
+    """Resolve one train/valid dataset block → {episode_hash: local_path}."""
+    import random
+
+    import hydra.utils as hydra_utils
+    from omegaconf import OmegaConf
+
+    from egomimic.rldb.zarr.zarr_dataset_multi import SEED, split_dataset_names
+
+    resolver_cfg = OmegaConf.select(ds_cfg, "resolver")
+    if resolver_cfg is None:
+        raise ValueError("dataset config missing resolver (use ModalEpisodeResolver)")
+
+    resolver = hydra_utils.instantiate(resolver_cfg)
+    filters = (
+        hydra_utils.instantiate(ds_cfg.filters) if "filters" in ds_cfg else None
+    )
+    resolved = resolver.resolve(filters=filters)
+
+    mode = OmegaConf.select(ds_cfg, "mode", default="train")
+    valid_ratio = float(OmegaConf.select(ds_cfg, "valid_ratio", default=0.2))
+    train_coll, valid_coll = split_dataset_names(
+        resolved.keys(), valid_ratio=valid_ratio, seed=SEED
+    )
+
+    if mode == "train":
+        chosen = train_coll
+    elif mode == "valid":
+        chosen = valid_coll
+    elif mode == "total":
+        chosen = set(resolved.keys())
+    elif mode == "percent":
+        percent = float(OmegaConf.select(ds_cfg, "percent", default=0.1))
+        all_names = sorted(resolved.keys())
+        rng = random.Random(SEED)
+        rng.shuffle(all_names)
+        n_keep = int(len(all_names) * percent)
+        if percent > 0.0:
+            n_keep = max(1, n_keep)
+        chosen = set(all_names[:n_keep])
+    else:
+        raise ValueError(f"Unknown dataset mode: {mode}")
+
+    return {
+        ep_hash: str(resolved[ep_hash].episode_path)
+        for ep_hash in chosen
+        if ep_hash in resolved
+    }
 
 
 @app.function(
     image=image,
-    volumes={INPUT_MOUNT: zarr_volume},
+    volumes={INPUT_MOUNT: _zarr_input_volume},
+    secrets=_SHARED_SECRETS,
+    cpu=2,
+    memory=8192,
+    timeout=600,
+)
+def resolve_episodes_from_config_fn(
+    data_config: str,
+    git_remote: str,
+    git_commit: str,
+) -> dict:
+    """Resolve train episode paths and val hashes from a Hydra data config."""
+    import os
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/root")
+    from modal_setup import CFG, _prepare_repo_light
+
+    _prepare_repo_light(git_remote, git_commit, init_submodules=False)
+    remote_repo = Path(CFG.remote_repo_dir)
+    sys.path.insert(0, str(remote_repo))
+    os.chdir(remote_repo)
+    os.environ["MODAL_IS_REMOTE"] = "1"
+
+    from omegaconf import OmegaConf
+
+    from egomimic.utils.aws.aws_data_utils import load_env
+
+    load_env()
+    _zarr_input_volume.reload()
+
+    cfg_path = remote_repo / "egomimic/hydra_configs/data" / f"{data_config}.yaml"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Data config not found: {data_config}")
+
+    data_cfg = OmegaConf.load(cfg_path)
+    train_datasets = OmegaConf.select(data_cfg, "train_datasets")
+    if not train_datasets:
+        raise ValueError(f"{data_config}: no train_datasets section")
+
+    train_paths: dict[str, str] = {}
+    for ds_name, ds_cfg in train_datasets.items():
+        resolved = _resolve_dataset_episodes(ds_cfg)
+        print(f"[{data_config}/{ds_name}] {len(resolved)} train episodes resolved")
+        train_paths.update(resolved)
+
+    if not train_paths:
+        raise ValueError(f"{data_config}: resolver matched no train episodes")
+
+    val_hashes: set[str] = set()
+    valid_datasets = OmegaConf.select(data_cfg, "valid_datasets", default=None)
+    if valid_datasets:
+        for ds_name, ds_cfg in valid_datasets.items():
+            resolved = _resolve_dataset_episodes(ds_cfg)
+            print(f"[{data_config}/{ds_name}] {len(resolved)} valid episodes resolved")
+            val_hashes.update(resolved.keys())
+
+    return {
+        "episode_paths": sorted(train_paths.values()),
+        "val_hashes": sorted(val_hashes),
+    }
+
+
+@app.function(
+    image=image,
+    volumes={INPUT_MOUNT: _zarr_input_volume},
     cpu=1,
     memory=4096,
     timeout=120,
 )
 def list_episodes_fn() -> list[str]:
     """Return sorted list of all episode directory paths from the zarr volume."""
+    _zarr_input_volume.reload()
     input_root = Path(INPUT_MOUNT)
     return sorted(str(p) for p in input_root.iterdir() if p.is_dir())
 
@@ -190,13 +368,13 @@ def list_episodes_fn() -> list[str]:
 @app.function(
     image=image,
     volumes={
-        INPUT_MOUNT: zarr_volume,
+        INPUT_MOUNT: _zarr_input_volume,
         GS_MOUNT: gs_volume,
     },
     cpu=8,
     memory=65536,
     timeout=7200,
-    max_containers=300,
+    max_containers=DEFAULT_NUM_WORKERS,
 )
 def build_shard_worker(job: dict) -> dict:
     """Process a batch of episodes, globally shuffle their frames, write shards.
@@ -217,7 +395,8 @@ def build_shard_worker(job: dict) -> dict:
 
     Args:
         job: dict with keys: worker_id, episode_paths, output_subdir, git_remote,
-             git_commit, coverage_multiplier, frames_per_shard, fps, gop, seed, val_hashes.
+             git_commit, coverage_multiplier, frames_per_shard, fps, gop, seed, val_hashes,
+             data_config (optional Hydra data config for key_map/transform_list).
     """
     import sys
     import traceback
@@ -235,6 +414,7 @@ def build_shard_worker(job: dict) -> dict:
     gop: int = job["gop"]
     seed: int = job["seed"]
     val_hashes: list[str] = job["val_hashes"]
+    data_config: str = job.get("data_config", "")
 
     sys.path.insert(0, "/root")
     from modal_setup import _prepare_repo_light
@@ -244,12 +424,27 @@ def build_shard_worker(job: dict) -> dict:
     remote_repo = Path("/root/EgoVerse")
     sys.path.insert(0, str(remote_repo))
 
+    _zarr_input_volume.reload()
+
     import zarr as zarr_lib
     from egomimic.rldb.zarr.zarr_dataset_multi import ZarrDataset
     from egomimic.rldb.embodiment.human import Mecka
 
-    full_key_map = Mecka.get_keymap(mode="cartesian")
-    transform_list = Mecka.get_transform_list(mode="cartesian")
+    if data_config:
+        import hydra.utils as hydra_utils
+        from omegaconf import OmegaConf
+
+        cfg_path = remote_repo / "egomimic/hydra_configs/data" / f"{data_config}.yaml"
+        if not cfg_path.is_file():
+            raise FileNotFoundError(f"Data config not found: {data_config}")
+        data_cfg = OmegaConf.load(cfg_path)
+        first_ds = next(iter(data_cfg.train_datasets.values()))
+        resolver = hydra_utils.instantiate(first_ds.resolver)
+        full_key_map = resolver.key_map
+        transform_list = resolver.transform_list
+    else:
+        full_key_map = Mecka.get_keymap(mode="cartesian")
+        transform_list = Mecka.get_transform_list(mode="cartesian")
 
     # Camera keys are loaded directly from zarr as JPEG bytes — exclude from ZarrDataset
     # so preload_zarr_arrays() doesn't decode them into float32 arrays.
@@ -479,30 +674,33 @@ def write_index_fn(
 @app.local_entrypoint()
 def main(
     dry_run: bool = False,
+    data_config: str = DEFAULT_DATA_CONFIG,
     coverage_multiplier: float = DEFAULT_COVERAGE_MULTIPLIER,
     frames_per_shard: int = DEFAULT_FRAMES_PER_SHARD,
-    episodes_per_worker: int = EPISODES_PER_WORKER,
+    num_workers: int = DEFAULT_NUM_WORKERS,
     gop: int = DEFAULT_GOP,
     fps: int = DEFAULT_FPS,
     output_subdir: str = DEFAULT_OUTPUT_SUBDIR,
     val_hashes_path: str = "",
     seed: int = 42,
-    max_workers: int = 0,
 ) -> None:
     """Orchestrate global-shuffle shard building.
 
     Args:
         dry_run:             Print plan without launching shard workers.
+        data_config:         Hydra data config name (default mecka_all_zarr).
+                             Debug smoke: mecka_all_zarr_debug300 (300 episodes).
+                             Episodes are resolved via train_datasets.*.resolver;
+                             valid_datasets are excluded from shards.
         coverage_multiplier: Total frames = coverage_multiplier * dataset_frames.
                              Default 2.0 means 2x coverage (each frame appears ~2x).
         frames_per_shard:    Frames per shard file (default 2000).
-        episodes_per_worker: Episodes processed per Modal worker (default 50).
+        num_workers:         Number of parallel Modal containers (default 50).
         gop:                 MP4 GOP size / keyframe interval (default 30).
         fps:                 MP4 frame rate for encoding (default 30).
         output_subdir:       Sub-directory under /mnt/zarr-gs (default global_shuffle_v1).
-        val_hashes_path:     Path to JSON list of validation episode hashes to exclude.
+        val_hashes_path:     Path to JSON list of extra validation episode hashes to exclude.
         seed:                Random seed for reproducibility (default 42).
-        max_workers:         Cap worker count for testing (0 = no cap).
     """
     import subprocess
 
@@ -519,27 +717,42 @@ def main(
         val_hashes = _json.loads(Path(val_hashes_path).read_text())
         print(f"Loaded {len(val_hashes)} validation episode hashes from {val_hashes_path}")
 
-    print("Listing episodes from zarr volume...")
-    all_episodes = list_episodes_fn.remote()
-    n_episodes = len(all_episodes)
-    print(f"Found {n_episodes} episodes on volume")
+    if data_config:
+        print(f"Resolving episodes from data config {data_config!r}...")
+        resolved = resolve_episodes_from_config_fn.remote(
+            data_config, git_remote, git_commit
+        )
+        all_episodes = resolved["episode_paths"]
+        config_val_hashes = resolved.get("val_hashes", [])
+        if config_val_hashes:
+            merged = set(val_hashes) | set(config_val_hashes)
+            val_hashes = sorted(merged)
+            print(
+                f"Excluding {len(config_val_hashes)} val episodes from "
+                f"{data_config} valid_datasets"
+            )
+    else:
+        print("Listing episodes from zarr volume (no data_config)...")
+        all_episodes = list_episodes_fn.remote()
 
-    # Batch episodes into workers
-    batches: list[list[str]] = [
-        all_episodes[i : i + episodes_per_worker]
-        for i in range(0, n_episodes, episodes_per_worker)
-    ]
-    if max_workers > 0:
-        batches = batches[:max_workers]
+    n_episodes = len(all_episodes)
+    print(f"Found {n_episodes} episodes to convert")
+
+    # Batch episodes across num_workers parallel containers
+    batches = _batch_episodes_for_workers(all_episodes, num_workers)
     n_workers = len(batches)
+    episodes_per_worker = len(batches[0]) if batches else 0
 
     est_source_frames = n_episodes * 150  # rough estimate ~150 frames/episode
     est_output_frames = int(est_source_frames * coverage_multiplier)
     est_shards = int(est_output_frames / frames_per_shard)
 
     print(f"\nPlan:")
+    print(f"  Zarr volume:       {ZARR_VOLUME_NAME} @ {INPUT_MOUNT}")
+    print(f"  Data config:       {data_config or '(all volume episodes)'}")
     print(f"  Episodes:          {n_episodes:,}")
-    print(f"  Workers:           {n_workers}")
+    print(f"  Workers:           {n_workers} (target {num_workers})")
+    print(f"  Episodes/worker:   ~{episodes_per_worker}")
     print(f"  Coverage:          {coverage_multiplier}x")
     print(f"  Frames/shard:      {frames_per_shard:,}")
     print(f"  Est. shards:       ~{est_shards:,}")
@@ -567,6 +780,7 @@ def main(
             "gop": gop,
             "seed": seed,
             "val_hashes": val_hashes,
+            "data_config": data_config,
         }
         for i, batch in enumerate(batches)
     ]
