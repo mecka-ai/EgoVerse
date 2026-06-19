@@ -1911,7 +1911,18 @@ class ZarrDataset(torch.utils.data.Dataset):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return 0
             shutil.rmtree(pack_dir, ignore_errors=True)
-            os.replace(tmp_dir, pack_dir)
+            try:
+                os.replace(tmp_dir, pack_dir)
+            except OSError:
+                # Another writer finalized this pack between the rmtree and the
+                # rename (rename onto a now-populated dir -> ENOTEMPTY). If a
+                # valid pack is present, treat it as done; otherwise re-raise.
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._jpeg_pack_manifest = None  # force fresh read from disk
+                existing = self._read_jpeg_pack_manifest()
+                if existing and self._jpeg_pack_has_keys(existing, image_keys):
+                    return self._jpeg_pack_size(pack_dir)
+                raise
             self._jpeg_pack_manifest = manifest
             self._jpeg_pack_index_cache.clear()
             self._jpeg_pack_block_cache.clear()

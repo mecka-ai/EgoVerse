@@ -721,7 +721,16 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
         )
 
-        if self.mode == "train" and self.jpeg_pack_cache_bytes > 0:
+        # Only the filler rank (rank 0) builds packs. All DDP ranks on a node
+        # share /cache, so peers read rank 0's packs via the manifest check in
+        # build_jpeg_pack. Letting every rank build the same episode caused 4x
+        # redundant pack-build I/O and os.replace ENOTEMPTY collisions on the
+        # shared pool dir; gating to one writer removes both.
+        if (
+            self.mode == "train"
+            and self.jpeg_pack_cache_bytes > 0
+            and self._is_filler_rank
+        ):
             t_pack = time.perf_counter()
             packed_bytes = 0
             packed_eps = 0
