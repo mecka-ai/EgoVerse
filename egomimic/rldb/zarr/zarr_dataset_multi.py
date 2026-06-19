@@ -914,16 +914,29 @@ class LocalEpisodeResolver(EpisodeResolver):
             self.folder_path, filters, debug=self.debug
         )
 
-        valid_folder_names = {folder_name for _, folder_name in filtered_paths}
-        logger.info(f"Valid folder names: {valid_folder_names}")
-        if not valid_folder_names:
+        if not filtered_paths:
             raise ValueError(
                 "No valid collection names from local filtering: "
                 "filters matched no episodes in the local directory."
             )
-        datasets = self._load_zarr_datasets(
-            search_path=self.folder_path, valid_folder_names=valid_folder_names
-        )
+
+        # Load directly from the already-resolved paths to avoid a second full
+        # directory scan of the volume (which can be slow at 198k+ entries).
+        dataset_class = self._dataset_class or ZarrDataset
+        datasets: dict[str, "ZarrDataset"] = {}
+        for full_path_str, folder_name in filtered_paths:
+            p = Path(full_path_str)
+            try:
+                datasets[folder_name] = dataset_class(
+                    p,
+                    key_map=self.key_map,
+                    transform_list=self.transform_list,
+                    norm_stats=self.norm_stats,
+                    pause_removal_epsilon=self.pause_removal_epsilon,
+                )
+            except Exception as e:
+                logger.error("Failed to load dataset at %s: %s", p, e)
+        logger.info("Loaded %d datasets from filtered paths", len(datasets))
         self._run_pause_precompute(datasets)
         return datasets
 
