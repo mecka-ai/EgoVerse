@@ -64,7 +64,7 @@ modal run --env robotics egomimic/modal/build_global_shuffle_shards.py -- \\
 
 OUTPUT
 ------
-gs_volume (mecka_data_gs_v1) mounted at /mnt/zarr-gs:
+gs_volume (global_shuffle, version=2) mounted at /mnt/zarr-gs:
     /mnt/zarr-gs/<output_subdir>/
         000000_0000.mp4
         000000_0000.npz
@@ -90,7 +90,7 @@ from modal_setup import app, zarr_volume, CFG, image
 # Global-shuffle volume
 # ---------------------------------------------------------------------------
 
-gs_volume = modal.Volume.from_name("mecka_data_gs_v1", create_if_missing=True)
+gs_volume = modal.Volume.from_name("global_shuffle", create_if_missing=True, version=2)
 GS_MOUNT = "/mnt/zarr-gs"
 INPUT_MOUNT = CFG.volume_mount_path  # /mnt/zarr-data
 
@@ -484,7 +484,7 @@ def main(
     print(f"  Est. shards:       ~{est_shards:,}")
     print(f"  GOP:               {gop} frames")
     print(f"  FPS:               {fps}")
-    print(f"  Output:            mecka_data_gs_v1 / {output_subdir}")
+    print(f"  Output:            global_shuffle (v2) / {output_subdir}")
     print(f"  Val excluded:      {len(val_hashes)} episodes")
 
     if dry_run:
