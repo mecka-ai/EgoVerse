@@ -12,7 +12,7 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.gs_shard_dataset.GlobalShuffleShardDataset
-    shard_dir: /mnt/zarr-gs/global_shuffle_v1
+    shard_dir: /mnt/zarr-gs/global_shuffle_debug300
     image_size: [224, 224]
     action_key: actions_cartesian
     image_key: observations.images.front_img_1

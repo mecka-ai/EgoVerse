@@ -19,6 +19,7 @@ Usage in Hydra config:
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Iterator
@@ -104,40 +105,42 @@ class GlobalShuffleShardDataset(IterableDataset):
         if not mp4_path.exists() or not npz_path.exists():
             return
 
+        local_mp4 = mp4_path
+        local_npz = npz_path
+
         if self.copy_to_tmp:
             import shutil
 
-            tmp_mp4 = Path(f"/tmp/gs_shard_{shard_id}.mp4")
-            tmp_npz = Path(f"/tmp/gs_shard_{shard_id}.npz")
-            shutil.copy2(mp4_path, tmp_mp4)
-            shutil.copy2(npz_path, tmp_npz)
-            mp4_path, npz_path = tmp_mp4, tmp_npz
+            # Prefer TMPDIR (set to /cache NVMe by trainModal when ephemeral disk is
+            # provisioned) to avoid filling the in-memory /tmp tmpfs.
+            tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+            local_mp4 = tmp_dir / f"gs_shard_{shard_id}.mp4"
+            local_npz = tmp_dir / f"gs_shard_{shard_id}.npz"
+            shutil.copy2(mp4_path, local_mp4)
+            shutil.copy2(npz_path, local_npz)
 
         try:
-            npz = np.load(str(npz_path))
+            npz = np.load(str(local_npz))
             actions = npz["action"]  # (T, H, D)
 
-            frames = list(self._decode_mp4(mp4_path, len(actions)))
-
-            if len(frames) != len(actions):
-                return
-
-            for img_tensor, action in zip(frames, actions):
+            # Lazy decode — one frame at a time so no full-shard float32 array is
+            # ever allocated in the worker process.
+            for img_tensor, action in zip(self._decode_mp4(local_mp4), actions):
                 yield {
                     self.image_key: img_tensor,
                     self.action_key: torch.from_numpy(action).float(),
                 }
         finally:
             if self.copy_to_tmp:
-                mp4_path.unlink(missing_ok=True)
-                npz_path.unlink(missing_ok=True)
+                local_mp4.unlink(missing_ok=True)
+                local_npz.unlink(missing_ok=True)
 
-    def _decode_mp4(self, path: Path, n_expected: int):
-        """Decode all frames from the MP4. Tries torchcodec first, falls back to av."""
+    def _decode_mp4(self, path: Path):
+        """Decode frames lazily from an MP4. Tries torchvision first, falls back to av."""
         try:
             import torchvision.io as tio
 
-            video, _, info = tio.read_video(str(path), output_format="TCHW", pts_unit="pts")
+            video, _, _ = tio.read_video(str(path), output_format="TCHW", pts_unit="pts")
             # video: (T, C, H, W) uint8
             for t in range(video.shape[0]):
                 frame = video[t].float() / 255.0  # (C, H, W)

@@ -33,6 +33,7 @@ if _HERE not in sys.path:
 
 from modal_setup import (  # noqa: E402
     CFG,
+    GS_MOUNT_PATH,
     REPO_ROOT,
     VOLUME_MAP,
     _local_wandb_key,
@@ -41,6 +42,7 @@ from modal_setup import (  # noqa: E402
     _uses_pi_model,
     app,
     app_name_from_hydra_args,
+    gs_volume,
     launch_detached,
     pop_init_submodules,
     training_outputs_volume,
@@ -125,6 +127,7 @@ def _build_volumes() -> dict:
     return {
         mount_path: vol_obj,
         CFG.output_mount_path: training_outputs_volume,
+        GS_MOUNT_PATH: gs_volume,
     }
 
 

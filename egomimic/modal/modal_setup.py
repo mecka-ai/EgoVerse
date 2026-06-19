@@ -297,7 +297,9 @@ zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True, ve
 zip_fold_clothes_volume = modal.Volume.from_name(
     "mecka_data_zip_fold_clothes", create_if_missing=True, version=2
 )
+gs_volume = modal.Volume.from_name("global_shuffle", create_if_missing=True, version=2)
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
+GS_MOUNT_PATH = "/mnt/zarr-gs"
 
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
@@ -305,6 +307,7 @@ VOLUME_MAP: dict[str, tuple] = {
     "mecka_data_zip": (zip_volume, "/mnt/zarr-zip"),
     # Standalone single-task zip volume (folding_clothes); same /mnt/zarr-zip mount.
     "mecka_data_zip_fold_clothes": (zip_fold_clothes_volume, "/mnt/zarr-zip"),
+    "global_shuffle": (gs_volume, GS_MOUNT_PATH),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
