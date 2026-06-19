@@ -510,7 +510,7 @@ def main(
         for i, batch in enumerate(batches)
     ]
 
-    results = list(build_shard_worker.map(jobs, return_exceptions=True))
+    results = list(build_shard_worker.map(jobs, return_exceptions=True, wrap_returned_exceptions=False))
 
     ok = [r for r in results if isinstance(r, dict)]
     errs = [r for r in results if isinstance(r, Exception)]
