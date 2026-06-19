@@ -1857,7 +1857,16 @@ class ZarrDataset(torch.utils.data.Dataset):
         if existing and self._jpeg_pack_has_keys(existing, image_keys):
             return self._jpeg_pack_size(pack_dir)
 
-        tmp_dir = pack_dir.with_name(f"{pack_dir.name}.tmp.{os.getpid()}")
+        # Build into a scratch dir OUTSIDE the pool-managed episode directory.
+        # Writing the tmp pack inside pool/<hash>/ races the background filler,
+        # which rmtree's pool/<hash>/ under disk pressure while the slow
+        # store[key][:] read runs — deleting the tmp dir mid-build (FileNotFound
+        # on every write). The scratch root is a sibling of the pool (same
+        # filesystem as cache_dir) so the final os.replace stays atomic.
+        ep_path = Path(self.episode_path)
+        pack_tmp_root = ep_path.parent.parent / ".egomimic_pack_tmp"
+        pack_tmp_root.mkdir(parents=True, exist_ok=True)
+        tmp_dir = pack_tmp_root / f"{ep_path.name}.{os.getpid()}"
         shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1895,6 +1904,12 @@ class ZarrDataset(torch.utils.data.Dataset):
             with (tmp_dir / self.JPEG_PACK_MANIFEST).open("w") as f:
                 json.dump(manifest, f, sort_keys=True)
 
+            # The episode dir may have been evicted by the filler while we built
+            # the pack in scratch. If so, skip cleanly — there is nothing to read
+            # packs for anymore — rather than crashing the epoch.
+            if not pack_dir.parent.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return 0
             shutil.rmtree(pack_dir, ignore_errors=True)
             os.replace(tmp_dir, pack_dir)
             self._jpeg_pack_manifest = manifest

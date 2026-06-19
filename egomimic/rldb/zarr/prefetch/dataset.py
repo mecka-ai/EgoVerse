@@ -619,10 +619,27 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 break
             now = time.monotonic()
             if now > deadline:
-                raise RuntimeError(
-                    f"prepare_epoch: timeout ({self.prepare_timeout_s / 3600:.1f}h) waiting "
-                    f"for {len(pending)} episodes for epoch {gen_label}"
+                # Some episodes can sit "pending" forever — neither .done nor
+                # .bad — when the filler can't make progress on a stuck tar.
+                # Don't let a small unmaterialized remainder kill a multi-hour
+                # run: if the overwhelming majority of the window is ready, drop
+                # the stragglers (treated like .bad below) and proceed. Only
+                # hard-fail when staging is catastrophically behind.
+                ready_frac = ready_count / max(1, len(window_eps))
+                if ready_frac < 0.95:
+                    raise RuntimeError(
+                        f"prepare_epoch: timeout ({self.prepare_timeout_s / 3600:.1f}h) "
+                        f"with only {ready_count}/{len(window_eps)} episodes ready "
+                        f"({len(pending)} still pending) for epoch {gen_label}"
+                    )
+                logger.warning(
+                    "prepare_epoch %d: timeout after %.0fs with %d/%d ready; dropping "
+                    "%d unmaterialized episodes from this epoch's window and proceeding",
+                    gen_label, now - t0, ready_count, len(window_eps), len(pending),
                 )
+                bad_during_wait.update(e.episode_hash for e in pending)
+                pending = []
+                break
             if now - last_log > 30.0:
                 stats = self._filler.stats() if self._filler is not None else {}
                 logger.info(
