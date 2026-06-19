@@ -1,0 +1,11 @@
+# Training entrypoint for StateVAE (DemInf state embedder).
+#
+# Example:
+#   python egomimic/trainHydra.py --config-name train_state_vae \
+#     name=state_vae_run description=mecka_front data=mecka_all_zarr
+defaults:
+  - train_zarr_cartesian
+  - override evaluator@train_viz_evaluator: null
+  - override /model: state_vae
+  - override /evaluator: eval_state_vae
+  - _self_

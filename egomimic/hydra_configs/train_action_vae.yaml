@@ -1,0 +1,11 @@
+# Training entrypoint for ActionVAE (DemInf action embedder).
+#
+# Example:
+#   python egomimic/trainHydra.py --config-name train_action_vae \
+#     name=action_vae_run description=mecka_cartesian data=mecka_all_zarr
+defaults:
+  - train_zarr_cartesian
+  - override evaluator@train_viz_evaluator: null
+  - override /model: action_vae
+  - override /evaluator: eval_action_vae
+  - _self_
