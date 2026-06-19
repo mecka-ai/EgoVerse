@@ -196,7 +196,7 @@ def list_episodes_fn() -> list[str]:
     cpu=8,
     memory=65536,
     timeout=7200,
-    max_containers=200,
+    max_containers=300,
 )
 def build_shard_worker(job: dict) -> dict:
     """Process a batch of episodes, globally shuffle their frames, write shards.
