@@ -111,55 +111,56 @@ IMAGE_KEY = "observations.images.front_img_1"
 
 
 def _write_mp4(
-    images_chw: "np.ndarray",
+    frames_iter,
     path: Path,
     fps: int,
     gop: int,
+    n_frames: int | None = None,
 ) -> None:
-    """Write (T, C, H, W) float32 [0,1] frames to H.264 MP4.
+    """Write frames from an iterable of (C, H, W) float32 [0,1] arrays to H.264 MP4.
+
+    Accepts an iterable (not a pre-stacked array) so callers can decode frames
+    on-the-fly without holding all decoded data in RAM simultaneously.
 
     Options applied:
       +faststart  — moov atom at file front for streaming-friendly decoding.
-                    PyAV/libavformat handles the two-pass rewrite internally
-                    when writing to a file path (not a buffer).
-      bf=0        — no B-frames; each frame depends only on its nearest keyframe
-      g=<gop>     — fixed GOP size; keyframe positions are deterministic
+      bf=0        — no B-frames; each frame depends only on its nearest keyframe.
+      g=<gop>     — fixed GOP size; keyframe positions are deterministic.
     """
     import av
     import numpy as np
 
-    T, C, H, W = images_chw.shape
-
-    # movflags=+faststart is a container-level option. libavformat rewrites the
-    # moov atom to the front of the file after container.close() — this only
-    # works for file-path output (not BytesIO), which is our case.
     container = av.open(
         str(path),
         mode="w",
         format="mp4",
         options={"movflags": "+faststart"},
     )
-    stream = container.add_stream("libx264", rate=fps)
-    stream.width = W
-    stream.height = H
-    stream.pix_fmt = "yuv420p"
-    stream.options = {
-        "bf": "0",
-        "g": str(gop),
-        "keyint_min": str(gop),
-        "preset": "fast",
-        "crf": "23",
-    }
+    stream = None
 
-    for t in range(T):
-        frame_rgb = (images_chw[t].transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+    for t, frame_chw in enumerate(frames_iter):
+        if stream is None:
+            _, H, W = frame_chw.shape
+            stream = container.add_stream("libx264", rate=fps)
+            stream.width = W
+            stream.height = H
+            stream.pix_fmt = "yuv420p"
+            stream.options = {
+                "bf": "0",
+                "g": str(gop),
+                "keyint_min": str(gop),
+                "preset": "fast",
+                "crf": "23",
+            }
+        frame_rgb = (frame_chw.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
         av_frame = av.VideoFrame.from_ndarray(frame_rgb, format="rgb24")
         av_frame.pts = t
         for packet in stream.encode(av_frame):
             container.mux(packet)
 
-    for packet in stream.encode():
-        container.mux(packet)
+    if stream is not None:
+        for packet in stream.encode():
+            container.mux(packet)
     container.close()
 
 
@@ -200,20 +201,26 @@ def list_episodes_fn() -> list[str]:
 def build_shard_worker(job: dict) -> dict:
     """Process a batch of episodes, globally shuffle their frames, write shards.
 
-    Steps:
-      1. Clone the repo and import egomimic (for key_map, transforms).
-      2. For each episode: open ZarrDataset, call collect_curation_episode.
-         This filters zero/invalid frames and applies transforms in one shot.
-      3. Concatenate all valid frames across episodes.
-      4. Build a shuffled index of coverage_multiplier * N frames.
-      5. Split into ceil(n_target / frames_per_shard) shards.
-      6. For each shard: write MP4 (H.264) + npz (action, meta).
+    Memory-efficient two-phase approach to avoid OOM:
+
+    Phase 1 (per episode, no image decoding):
+      - Load only pose/action zarr arrays via ZarrDataset with non-image key_map.
+      - Apply _curation_valid_logical_indices + batched transforms → actions_cartesian.
+      - Load JPEG bytes (compressed) for valid frames from zarr — ~30 KB/frame vs
+        ~1 MB decoded. 50 eps × 2000 frames × 30 KB ≈ 3 GB total (vs 100 GB+).
+
+    Phase 2: build global shuffle plan (index arithmetic only, no data).
+
+    Phase 3 (per shard):
+      - Decode JPEG bytes one frame at a time into the MP4 encoder.
+      - Never hold more than one decoded (C, H, W) float32 frame in RAM.
 
     Args:
         job: dict with keys: worker_id, episode_paths, output_subdir, git_remote,
              git_commit, coverage_multiplier, frames_per_shard, fps, gop, seed, val_hashes.
     """
     import sys
+    import traceback
     import numpy as np
     from pathlib import Path
 
@@ -229,7 +236,6 @@ def build_shard_worker(job: dict) -> dict:
     seed: int = job["seed"]
     val_hashes: list[str] = job["val_hashes"]
 
-    # Clone repo so egomimic is importable
     sys.path.insert(0, "/root")
     from modal_setup import _prepare_repo_light
 
@@ -238,18 +244,28 @@ def build_shard_worker(job: dict) -> dict:
     remote_repo = Path("/root/EgoVerse")
     sys.path.insert(0, str(remote_repo))
 
+    import zarr as zarr_lib
     from egomimic.rldb.zarr.zarr_dataset_multi import ZarrDataset
     from egomimic.rldb.embodiment.human import Mecka
 
-    key_map = Mecka.get_keymap(mode="cartesian")
+    full_key_map = Mecka.get_keymap(mode="cartesian")
     transform_list = Mecka.get_transform_list(mode="cartesian")
+
+    # Camera keys are loaded directly from zarr as JPEG bytes — exclude from ZarrDataset
+    # so preload_zarr_arrays() doesn't decode them into float32 arrays.
+    non_img_key_map = {
+        k: v
+        for k, v in full_key_map.items()
+        if v.get("key_type") not in ("camera_keys", "annotation_keys")
+    }
 
     val_set = set(val_hashes)
     rng = np.random.default_rng(seed + worker_id)
 
-    all_actions: list[np.ndarray] = []
-    all_images: list[np.ndarray] = []
-    ep_stats: list[dict] = []
+    # =========================================================================
+    # Phase 1: per-episode — compute valid actions + cache compressed JPEG bytes
+    # =========================================================================
+    episode_data: list[dict] = []
 
     for ep_path in episode_paths:
         ep_hash = Path(ep_path).name
@@ -262,49 +278,88 @@ def build_shard_worker(job: dict) -> dict:
         try:
             ds = ZarrDataset(
                 Path(ep_path),
-                key_map=key_map,
+                key_map=non_img_key_map,
                 transform_list=transform_list,
             )
-            actions, images, _ = ds.collect_curation_episode(
-                action_key=ACTION_KEY,
-                image_key=IMAGE_KEY,
-                image_decode_workers=4,
+            # Loads pose + action arrays only — no images, no float32 CHW blowup
+            ds.preload_zarr_arrays()
+
+            valid_logical = ds._curation_valid_logical_indices()
+            if len(valid_logical) == 0:
+                print(f"[worker {worker_id}] skipped {ep_hash}: no valid frames")
+                continue
+
+            batch_in = ds._build_batched_transform_batch(valid_logical)
+            batch_out, ok_pos = ds._apply_transform_list_batched(batch_in)
+            if batch_out is None or ACTION_KEY not in batch_out:
+                print(f"[worker {worker_id}] skipped {ep_hash}: transform failed")
+                continue
+
+            actions = batch_out[ACTION_KEY].astype(np.float32)  # (T, H, D)
+            valid_logical = valid_logical[ok_pos]
+
+            real_indices = np.array(
+                [ds._logical_to_real_index(int(li)) for li in valid_logical],
+                dtype=np.int64,
             )
+
+            # Read all JPEG bytes sequentially, keep only valid frames, free the rest.
+            # Compressed JPEG: ~30 KB/frame × 2000 frames = 60 MB per episode.
+            z = zarr_lib.open_group(str(ep_path), mode="r")
+            jpeg_all = np.asarray(z["images.front_1"][:])
+            valid_jpegs = jpeg_all[real_indices].copy()
+            del jpeg_all
+
+            episode_data.append({
+                "episode_hash": ep_hash,
+                "actions": actions,
+                "jpegs": valid_jpegs,
+            })
+            print(f"[worker {worker_id}] {ep_hash}: {len(actions)} valid frames")
+
         except Exception as e:
             print(f"[worker {worker_id}] ERROR {ep_hash}: {e}")
+            traceback.print_exc()
             continue
 
-        if actions is None or images is None or len(actions) == 0:
-            print(f"[worker {worker_id}] skipped {ep_hash}: no valid frames")
-            continue
-
-        all_actions.append(actions.astype(np.float32))
-        all_images.append(images.astype(np.float32))
-        ep_stats.append({"episode_hash": ep_hash, "n_valid_frames": len(actions)})
-        print(
-            f"[worker {worker_id}] {ep_hash}: {len(actions)} valid frames"
-        )
-
-    if not all_actions:
+    if not episode_data:
         print(f"[worker {worker_id}] no valid episodes — skipping")
-        return {"worker_id": worker_id, "n_shards": 0, "n_frames": 0, "episodes": []}
+        return {
+            "worker_id": worker_id,
+            "n_shards": 0,
+            "n_frames": 0,
+            "n_source_frames": 0,
+            "shard_ids": [],
+            "episodes": [],
+        }
 
-    # Concatenate all frames from this worker's episodes
-    actions_all = np.concatenate(all_actions, axis=0)  # (N, H, D)
-    images_all = np.concatenate(all_images, axis=0)    # (N, C, H, W)
-    N = len(actions_all)
+    ep_stats = [
+        {"episode_hash": ep["episode_hash"], "n_valid_frames": len(ep["actions"])}
+        for ep in episode_data
+    ]
 
-    # Build shuffled index with coverage multiplier (repeat full permutations as needed)
+    # =========================================================================
+    # Phase 2: build global shuffle plan (index arithmetic only)
+    # =========================================================================
+    all_frames: list[tuple[int, int]] = []
+    for ep_idx, ep in enumerate(episode_data):
+        T = len(ep["actions"])
+        all_frames.extend((ep_idx, t) for t in range(T))
+
+    N = len(all_frames)
     n_target = int(np.ceil(coverage_multiplier * N))
+
     index_parts: list[np.ndarray] = []
     remaining = n_target
     while remaining > 0:
         perm = rng.permutation(N)
         index_parts.append(perm[: min(remaining, N)])
         remaining -= N
-    global_indices = np.concatenate(index_parts)[:n_target]
+    global_order = np.concatenate(index_parts)[:n_target]
 
-    # Write shards
+    # =========================================================================
+    # Phase 3: write shards — decode JPEG bytes one frame at a time
+    # =========================================================================
     output_root = Path(GS_MOUNT) / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -314,7 +369,7 @@ def build_shard_worker(job: dict) -> dict:
     for shard_local in range(n_shards):
         start = shard_local * frames_per_shard
         end = min(start + frames_per_shard, n_target)
-        sel = global_indices[start:end]
+        sel = global_order[start:end]
 
         shard_id = f"{worker_id:05d}_{shard_local:04d}"
         mp4_path = output_root / f"{shard_id}.mp4"
@@ -325,21 +380,27 @@ def build_shard_worker(job: dict) -> dict:
             shard_ids.append(shard_id)
             continue
 
-        shard_images = images_all[sel]    # (T, C, H, W)
-        shard_actions = actions_all[sel]  # (T, H, D)
+        shard_actions = np.stack([
+            episode_data[all_frames[fi][0]]["actions"][all_frames[fi][1]]
+            for fi in sel
+        ])  # (T, H, D)
+
+        def _frame_iter(sel_indices):
+            for fi in sel_indices:
+                ep_idx, frame_pos = all_frames[fi]
+                jpeg_bytes = episode_data[ep_idx]["jpegs"][frame_pos]
+                yield ZarrDataset._decode_jpeg_to_chw(jpeg_bytes)
 
         try:
-            _write_mp4(shard_images, mp4_path, fps=fps, gop=gop)
+            _write_mp4(_frame_iter(sel), mp4_path, fps=fps, gop=gop)
         except Exception as e:
             print(f"[worker {worker_id}] MP4 write failed for shard {shard_id}: {e}")
+            mp4_path.unlink(missing_ok=True)
             continue
 
         np.savez_compressed(npz_path, action=shard_actions)
         shard_ids.append(shard_id)
-        print(
-            f"[worker {worker_id}] shard {shard_id}: {len(sel)} frames "
-            f"→ {mp4_path.name} + {npz_path.name}"
-        )
+        print(f"[worker {worker_id}] shard {shard_id}: {len(sel)} frames → {mp4_path.name} + {npz_path.name}")
 
     gs_volume.commit()
 
