@@ -172,6 +172,10 @@ class ActionVAETrainer(Algo):
     def device(self) -> torch.device:
         return next(iter(self.nets.parameters())).device
 
+    @device.setter
+    def device(self, value) -> None:
+        pass  # Lightning sets this; actual device tracked from parameters via .to(device)
+
     # ------------------------------------------------------------------
     # Algo interface
     # ------------------------------------------------------------------
