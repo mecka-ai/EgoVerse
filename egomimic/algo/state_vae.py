@@ -187,7 +187,9 @@ class StateVAETrainer(Algo):
             img_key_short = img_key_full.split(".")[-1]           # front_img_1
 
             # The batch uses short keynames; try full path then short form then any 4D tensor.
-            raw = _batch.get(img_key_full) or _batch.get(img_key_short)
+            raw = _batch.get(img_key_full)
+            if raw is None:
+                raw = _batch.get(img_key_short)
             if raw is None:
                 for k, v in _batch.items():
                     if isinstance(v, torch.Tensor) and v.ndim >= 3:
