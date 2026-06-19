@@ -826,6 +826,8 @@ class LocalEpisodeResolver(EpisodeResolver):
             logger.warning("Local path does not exist: %s", search_path)
             return []
 
+        debug_limit = (10 if debug is True else int(debug)) if debug else None
+
         if filters.is_empty():
             filtered = []
             for p in search_path.iterdir():
@@ -833,6 +835,8 @@ class LocalEpisodeResolver(EpisodeResolver):
                     continue
                 episode_hash = p.name[:-5] if p.name.endswith(".zarr") else p.name
                 filtered.append((str(p), episode_hash))
+                if debug_limit and len(filtered) >= debug_limit:
+                    break
             logger.info("Local paths (no filter): %d episodes", len(filtered))
         else:
             filtered = []
@@ -851,12 +855,12 @@ class LocalEpisodeResolver(EpisodeResolver):
 
                 if cls._local_filters_match(metadata, episode_hash, filters):
                     filtered.append((str(p), episode_hash))
+                    if debug_limit and len(filtered) >= debug_limit:
+                        break
 
             logger.info("Local filtered paths: %d episodes", len(filtered))
 
-        if debug:
-            k = 10 if debug is True else int(debug)
-            filtered = filtered[:k]
+        if debug_limit:
             logger.info("Debug mode: using first %d episodes", len(filtered))
 
         return filtered

@@ -7,9 +7,6 @@
 # Then train:
 #   python egomimic/modal/trainModal.py name=<run> description=<desc> data=mecka_all_gs model=deminf_default trainer=ddp_modal init_submodules=false +modal_gpu=H200
 
-norm_stats:
-  precomputed_norm_path: precomputed_norm_stats/mecka_all_zarr
-
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
