@@ -183,24 +183,21 @@ class StateVAETrainer(Algo):
         processed: dict = {}
         for embodiment_name, _batch in batch.items():
             embodiment_id = get_embodiment_id(embodiment_name)
-            # Remap zarr keys → DataSchematic keynames.
-            remapped: dict = {}
-            for key, value in _batch.items():
-                key_name = self.data_schematic.zarr_key_to_keyname(key, embodiment_id)
-                if key_name is not None:
-                    remapped[key_name] = value
-                else:
-                    remapped[key] = value  # keep unknown keys as-is
+            img_key_full = self.img_keys[embodiment_id]           # observations.images.front_img_1
+            img_key_short = img_key_full.split(".")[-1]           # front_img_1
 
-            img_key = self.img_keys[embodiment_id]
-            raw = remapped.get(img_key)
+            # The batch uses short keynames; try full path then short form then any 4D tensor.
+            raw = _batch.get(img_key_full) or _batch.get(img_key_short)
             if raw is None:
-                # Try the fallback keyname.
-                raw = remapped.get(_FRONT_IMG_KEYNAME)
+                for k, v in _batch.items():
+                    if isinstance(v, torch.Tensor) and v.ndim >= 3:
+                        raw = v
+                        break
             if raw is None:
                 raise KeyError(
-                    f"StateVAETrainer: image key {img_key!r} not found in batch. "
-                    f"Available: {list(remapped.keys())}"
+                    f"StateVAETrainer: no image tensor found in batch. "
+                    f"Tried {img_key_full!r}, {img_key_short!r}. "
+                    f"Available: {list(_batch.keys())}"
                 )
 
             img = _prep_images(raw.to(self.device), self.image_size)
