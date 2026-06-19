@@ -139,6 +139,7 @@ class ActionVAETrainer(Algo):
 
         self.data_schematic = data_schematic
         self.domains = domains
+        self.viz_func = viz_func
         self.latent_dim = latent_dim
         self.sample_horizon = sample_horizon
         self.sample_dim = sample_dim

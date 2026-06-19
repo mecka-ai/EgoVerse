@@ -148,6 +148,7 @@ class StateVAETrainer(Algo):
         super().__init__()
         self.data_schematic = data_schematic
         self.domains = domains
+        self.viz_func = viz_func
         self.latent_dim = latent_dim
         self.image_size = image_size
         self.beta = beta
@@ -220,6 +221,7 @@ class StateVAETrainer(Algo):
             predictions[f"{emb_name}_recon_loss"] = recon_loss
             predictions[f"{emb_name}_kl_loss"] = kl_loss
             predictions[f"{emb_name}_mu"] = mu
+            predictions[f"{emb_name}_recon"] = recon
         return predictions
 
     def forward_eval(self, batch: dict) -> dict:
