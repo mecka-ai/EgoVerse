@@ -247,11 +247,12 @@ class StateVAETrainer(Algo):
     def log_info(self, info: dict) -> dict:
         losses = info.get("losses", {})
         label_map = {"action_loss": "Loss", "recon_loss": "ReconLoss", "kl_loss": "KLLoss"}
-        return {
-            label_map[k]: (v.item() if isinstance(v, torch.Tensor) else float(v))
-            for k in label_map
-            if k in losses
-        }
+        out: dict = {}
+        for k, label in label_map.items():
+            if k in losses:
+                val = losses[k]
+                out[label] = val.item() if isinstance(val, torch.Tensor) else float(val)
+        return out
 
     # ------------------------------------------------------------------
     # DemInf embedding hook
