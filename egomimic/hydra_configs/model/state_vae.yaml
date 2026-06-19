@@ -1,0 +1,16 @@
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+robomimic_model:
+  _target_: egomimic.algo.state_vae.StateVAETrainer
+  data_schematic: null  # injected at runtime by ModelWrapper from data_schematic_state
+  domains: ["mecka_bimanual"]
+  image_keys:
+    mecka_bimanual: "images.front_1"
+  latent_dim: 32
+  image_size: 64
+  beta: 1.0
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  weight_decay: 0.0001
+scheduler: null

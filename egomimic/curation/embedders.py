@@ -825,6 +825,135 @@ class OATActionEmbedder:
         return result
 
 
+class CheckpointStateEmbedder:
+    """State embedder backed by a trained StateVAETrainer checkpoint.
+
+    Loads a Lightning ``.ckpt`` written by ``model=state_vae`` and uses the
+    StateVAETrainer.encode() method to embed front-camera images.
+
+    Args:
+        checkpoint_path: Path to the StateVAETrainer Lightning ``.ckpt``.
+        device: Torch device for inference.
+        batch_size: Max images per forward call.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str | torch.device = "cpu",
+        batch_size: int = 256,
+    ) -> None:
+        self.checkpoint_path = checkpoint_path
+        self.device = torch.device(device)
+        self.batch_size = batch_size
+        self._model = None
+        self._fitted = False
+
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        logger.debug("CheckpointStateEmbedder: ignoring external norm stats (VAE handles normalisation internally)")
+
+    def fit(self, episodes: list | None = None) -> None:
+        from egomimic.pl_utils.pl_model import ModelWrapper
+        logger.info("CheckpointStateEmbedder: loading StateVAE from %s", self.checkpoint_path)
+        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        self._model = wrapper.model.to(self.device).eval()
+        for p in self._model.parameters():
+            p.requires_grad_(False)
+        self._fitted = True
+        logger.info("CheckpointStateEmbedder: ready, latent_dim=%d", self._model.latent_dim)
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
+        """Embed front-camera images.
+
+        Args:
+            data: (N, C, H, W) uint8 numpy array.
+
+        Returns:
+            (N, latent_dim) float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        if len(data) == 0:
+            return np.empty((0, self._model.latent_dim), dtype=np.float32)
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, len(data), self.batch_size):
+            chunk = data[start : start + self.batch_size]
+            outputs.append(self._model.encode(chunk))
+        elapsed = time.perf_counter() - t0
+        result = np.concatenate(outputs, axis=0)
+        logger.info(
+            "[images] CheckpointStateEmbedder: %d images in %.2fs (%.0f imgs/s)",
+            len(data), elapsed, len(data) / elapsed if elapsed > 0 else 0,
+        )
+        return result
+
+
+class CheckpointActionEmbedder:
+    """Action embedder backed by a trained ActionVAETrainer checkpoint.
+
+    Loads a Lightning ``.ckpt`` written by ``model=action_vae`` and uses the
+    ActionVAETrainer.encode() method to embed action chunks.
+
+    Args:
+        checkpoint_path: Path to the ActionVAETrainer Lightning ``.ckpt``.
+        device: Torch device for inference.
+        batch_size: Max chunks per forward call.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str | torch.device = "cpu",
+        batch_size: int = 512,
+    ) -> None:
+        self.checkpoint_path = checkpoint_path
+        self.device = torch.device(device)
+        self.batch_size = batch_size
+        self._model = None
+        self._fitted = False
+
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        logger.debug("CheckpointActionEmbedder: ignoring external norm stats (VAE normalises from data_schematic)")
+
+    def fit(self, episodes: list | None = None) -> None:
+        from egomimic.pl_utils.pl_model import ModelWrapper
+        logger.info("CheckpointActionEmbedder: loading ActionVAE from %s", self.checkpoint_path)
+        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        self._model = wrapper.model.to(self.device).eval()
+        for p in self._model.parameters():
+            p.requires_grad_(False)
+        self._fitted = True
+        logger.info("CheckpointActionEmbedder: ready, latent_dim=%d", self._model.latent_dim)
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
+        """Embed action chunks.
+
+        Args:
+            data: (N, flat_dim) or (N, horizon, action_dim) float32 array.
+
+        Returns:
+            (N, latent_dim) float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        if len(data) == 0:
+            return np.empty((0, self._model.latent_dim), dtype=np.float32)
+        flat = data.reshape(len(data), -1).astype(np.float32)
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, len(flat), self.batch_size):
+            chunk = flat[start : start + self.batch_size]
+            outputs.append(self._model.encode(chunk))
+        elapsed = time.perf_counter() - t0
+        result = np.concatenate(outputs, axis=0)
+        logger.debug(
+            "[actions] CheckpointActionEmbedder: %d chunks in %.3fs → latent_dim=%d",
+            len(data), elapsed, result.shape[1],
+        )
+        return result
+
+
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.
