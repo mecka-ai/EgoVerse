@@ -1,0 +1,43 @@
+# Training: globally-shuffled shards (MP4+npz, pre-transformed).
+# Validation: normal zarr volume access via ModalEpisodeResolver.
+#
+# Build shards first:
+#   modal run --env robotics egomimic/modal/build_global_shuffle_shards.py
+#
+# Then train:
+#   python egomimic/trainHydra.py data=mecka_all_gs ...
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.gs_shard_dataset.GlobalShuffleShardDataset
+    shard_dir: /mnt/zarr-gs/global_shuffle_v1
+    image_size: [224, 224]
+    action_key: actions_cartesian
+    image_key: observations.images.front_img_1
+    copy_to_tmp: true
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 8
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 8
