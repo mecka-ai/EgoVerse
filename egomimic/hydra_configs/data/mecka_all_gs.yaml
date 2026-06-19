@@ -7,6 +7,9 @@
 # Then train:
 #   python egomimic/trainHydra.py data=mecka_all_gs ...
 
+norm_stats:
+  precomputed_norm_path: precomputed_norm_stats/mecka_all_zarr
+
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
