@@ -132,6 +132,28 @@ class PI(Algo):
             pi05=getattr(config.model, "pi05", False),
         )
 
+        # TEMP DIAGNOSTIC (mse scorer base-load): why is the action expert built
+        # without adaRMS despite cfg pi05=true? Log the resolved flag + the node
+        # PI actually reads it from. Remove once root-caused.
+        try:
+            from omegaconf import OmegaConf as _OC
+
+            logger.warning(
+                "[PI05-DIAG] resolved pi05=%r | config.model keys=%r | "
+                "config.model.pi05=%r | model_cfg.pi05=%r | type(config)=%s",
+                getattr(config.model, "pi05", "MISSING"),
+                list(config.model.keys())
+                if hasattr(config.model, "keys")
+                else "n/a",
+                _OC.select(config, "model.pi05", default="SELECT_MISSING")
+                if _OC.is_config(config)
+                else "not-omegaconf",
+                getattr(model_cfg, "pi05", "NO_ATTR"),
+                type(config).__name__,
+            )
+        except Exception as _diag_exc:  # never let diagnostics break the run
+            logger.warning("[PI05-DIAG] logging failed: %r", _diag_exc)
+
         self.model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
 
         if self.config.pytorch_weight_path is not None:
