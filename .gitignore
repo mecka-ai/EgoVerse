@@ -53,3 +53,6 @@ hydra_configs/data/extra/**
 settings.json
 failures.jsonl
 scratch/
+# Local large checkpoints — never commit (would balloon repo / break push)
+last.ckpt
+*.ckpt

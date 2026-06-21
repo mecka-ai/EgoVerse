@@ -112,8 +112,13 @@ def _boot_container(git_remote: str, git_commit: str, hf_token: str) -> None:
     """Clone the repo (with openpi + the pi transformers overlay) and set env.
 
     Uses the FULL _prepare_repo (init_submodules=True) — PI imports openpi, whose
-    pi0.5 pytorch model requires the transformers==4.53.2 overlay. openpi becomes
-    importable in-process via the .pth _prepare_repo writes.
+    pi0.5 pytorch model requires the transformers==4.53.2 overlay.
+
+    Unlike training (which re-execs a fresh interpreter per DDP rank, picking up
+    the openpi .pth _prepare_repo writes), _score_shard imports egomimic.algo.pi
+    in THIS already-running process — the .pth is only read at interpreter
+    startup, so it never takes effect here. Insert openpi src onto the live
+    sys.path explicitly, mirroring the egomimic repo-root insert below.
     """
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
@@ -127,6 +132,8 @@ def _boot_container(git_remote: str, git_commit: str, hf_token: str) -> None:
     os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     _openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
+    if Path(_openpi_src).is_dir() and _openpi_src not in sys.path:
+        sys.path.insert(0, _openpi_src)
     existing = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{_openpi_src}:{existing}" if existing else _openpi_src
 
