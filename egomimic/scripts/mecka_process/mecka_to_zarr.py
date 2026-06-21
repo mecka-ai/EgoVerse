@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 
+from egomimic.rldb.zarr.zarr_writer import ZarrWriter
+
 # Lightweight string mapping instead of importing EMBODIMENT, which transitively
 # pulls in torch via action_chunk_transforms. Only the `.name` strings are used.
 _ARM_TO_EMBODIMENT_NAME = {
@@ -29,7 +31,6 @@ _ARM_TO_EMBODIMENT_NAME = {
     "left": "MECKA_LEFT_ARM",
     "right": "MECKA_RIGHT_ARM",
 }
-from egomimic.rldb.zarr.zarr_writer import ZarrWriter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,14 +72,18 @@ def download_with_retry(
             result = subprocess.run(
                 [
                     "curl",
-                    "-fL",                # -f: fail on HTTP >=400, -L: follow redirects
-                    "-C", "-",            # resume support
-                    "--retry", "3",
-                    "--retry-delay", "2",
-                    "-o", str(dest_path),
+                    "-fL",  # -f: fail on HTTP >=400, -L: follow redirects
+                    "-C",
+                    "-",  # resume support
+                    "--retry",
+                    "3",
+                    "--retry-delay",
+                    "2",
+                    "-o",
+                    str(dest_path),
                     url,
                 ],
-                check=False,              # we inspect stderr ourselves so we can log it
+                check=False,  # we inspect stderr ourselves so we can log it
                 capture_output=True,
                 timeout=600,
                 text=True,
@@ -421,7 +426,13 @@ class MeckaExtractor:
             hand_poses_world = hand_poses_world[:num_frames]
             wrist_poses_world = wrist_poses_world[:num_frames]
             hand_keypoints_world = hand_keypoints_world[:num_frames]
-            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(egomotion)
+            # Trailing-truncate to the synced length like every other per-frame
+            # stream above (egomotion can have a few extra trailing samples vs
+            # video/frames; without this the head-pose array is longer than the
+            # rest and ZarrWriter rejects the episode for inconsistent lengths).
+            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(
+                egomotion
+            )[:num_frames]
             # Flatten 21×3 keypoints to 63 per hand for Zarr schema
             # hand_index 0=left, 1=right
             right_keypoints = hand_keypoints_world[:, 1, :, :].reshape(num_frames, 63)
