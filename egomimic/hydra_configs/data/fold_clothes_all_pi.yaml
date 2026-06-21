@@ -1,0 +1,87 @@
+# FOLD_CLOTHES_ALL — pi0.5 variant.
+#
+# Mirrors fold_clothes_pi.yaml (same optimal dataloader params and pi0.5
+# tokenizer/prompt wiring) but points at the FULL fold-clothes JSON allowlist
+# (extra/fold_clothes_all.json — 461 accepted episode hashes; the complete set
+# rather than the curated 178 subset used by fold_clothes_pi.yaml).
+#
+# Download the episodes first (parallel):
+#   set -a; . /root/.egoverse_env; set +a
+#   python download_episodes_local.py \
+#     --ids-file egomimic/hydra_configs/data/extra/fold_clothes_all.json \
+#     --output-dir /workspace/fold_clothes_zarr \
+#     --workers 32
+#
+# Launch (4xH200, pi0.5) via run_pi05.sh:
+#   ./run_pi05.sh launch_params.gpus_per_node=4
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/fold_clothes_zarr
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/fold_clothes_all.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/fold_clothes_zarr
+      allowed_episode_ids:
+        _target_: json.load
+        fp:
+          _target_: builtins.open
+          file: ${hydra:runtime.cwd}/egomimic/hydra_configs/data/extra/fold_clothes_all.json
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+# --- pi0.5 tokenizer / prompt wiring (from cotrain_pi_base) ---
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: "random"
+annotation_key: "annotations"
+default_prompt: ""
+proprio: false
+embodiment_label: true
+state_num_bins: 256
+control_mode: null
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 32
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 8
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false

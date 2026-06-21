@@ -150,6 +150,18 @@ class ModelWrapper(LightningModule):
         for k, v in self.model.log_info(info).items():
             self.log("Train/" + k, v, sync_dist=True, on_step=True, on_epoch=False)
 
+        # Log LR every step (the cosine scheduler updates it per step) so the
+        # Optimizer/param_group_*_lr chart is a smooth curve rather than a single
+        # point per epoch. lr is identical across ranks -> sync_dist=False.
+        for i, param_group in enumerate(self.optimizers().param_groups):
+            self.log(
+                f"Optimizer/param_group_{i}_lr",
+                param_group["lr"],
+                on_step=True,
+                on_epoch=False,
+                sync_dist=False,
+            )
+
         return losses["action_loss"]
 
     def on_after_backward(self):
@@ -332,13 +344,6 @@ class ModelWrapper(LightningModule):
         )
 
     def on_train_epoch_start(self):
-        for i, param_group in enumerate(self.optimizers().param_groups):
-            self.log(
-                f"Optimizer/param_group_{i}_lr",
-                param_group["lr"],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-            )
-
+        # LR is now logged per-step in training_step (smooth Optimizer/param_group_*_lr
+        # curve); per-epoch logging removed to avoid duplicate-key logging.
         return super().on_train_epoch_start()

@@ -37,6 +37,7 @@ import zarr
 
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.filters import DatasetFilter
+from egomimic.rldb.zarr import store_handle_cache as hc
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.aws.aws_sql import (
     create_default_engine,
@@ -732,9 +733,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         filters: DatasetFilter | None = None,
         debug: int | bool | None = None,
     ):
-        import time
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
             logger.warning("Local path does not exist: %s", search_path)
@@ -879,20 +877,30 @@ class ModalEpisodeResolver(EpisodeResolver):
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
                 self.exclude_hashes.update(json.load(f))
-            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
+            logger.info(
+                "eps_to_ignore: %d hashes from %s",
+                len(self.exclude_hashes),
+                eps_to_ignore,
+            )
         self.include_hashes: set[str] | None = None
         if eps_to_use:
             with open(eps_to_use) as f:
                 self.include_hashes = set(json.load(f))
-            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
+            logger.info(
+                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
+            )
         # allowed_episode_ids: restrict to exactly these hashes (used by curation per-task scoping)
         if allowed_episode_ids is not None:
             allowed_set = set(allowed_episode_ids)
             self.include_hashes = (
-                allowed_set if self.include_hashes is None
+                allowed_set
+                if self.include_hashes is None
                 else self.include_hashes & allowed_set
             )
-            logger.info("allowed_episode_ids: restricted to %d episodes", len(self.include_hashes))
+            logger.info(
+                "allowed_episode_ids: restricted to %d episodes",
+                len(self.include_hashes),
+            )
 
     def resolve(
         self,
@@ -1209,9 +1217,8 @@ class ModalEpisodeResolver(EpisodeResolver):
 
     @staticmethod
     def _should_use_modal_pause_precompute(datasets: dict) -> bool:
-        inside_modal = (
-            os.environ.get("MODAL_IS_REMOTE") == "1"
-            or bool(os.environ.get("MODAL_TASK_ID"))
+        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
+            os.environ.get("MODAL_TASK_ID")
         )
         if not inside_modal:
             return False
@@ -1231,7 +1238,9 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
         n = len(work)
-        n_shards = min(int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
         shards = [work[i::n_shards] for i in range(n_shards)]
         shards = [s for s in shards if s]
         total_shards = len(shards)
@@ -1757,9 +1766,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             cache[zarr_key] = np.asarray(store[zarr_key][:])
         self._zarr_bulk_cache = cache
 
-    def _read_key_slice(
-        self, zarr_key: str, start: int, end: int | None
-    ) -> np.ndarray:
+    def _read_key_slice(self, zarr_key: str, start: int, end: int | None) -> np.ndarray:
         if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
             arr = self._zarr_bulk_cache[zarr_key]
             if end is not None:
@@ -1822,13 +1829,19 @@ class ZarrDataset(torch.utils.data.Dataset):
         left = np.asarray(cache["left.obs_ee_pose"])
         right = np.asarray(cache["right.obs_ee_pose"])
         head_ok = self._pose_rows_valid(
-            head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            head,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         left_ok = self._pose_rows_valid(
-            left, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            left,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         right_ok = self._pose_rows_valid(
-            right, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            right,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
 
         valid: list[int] = []
@@ -1839,7 +1852,10 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
             if not head_ok[real_idx]:
                 continue
-            if not left_ok[real_idx:end_idx].all() or not right_ok[real_idx:end_idx].all():
+            if (
+                not left_ok[real_idx:end_idx].all()
+                or not right_ok[real_idx:end_idx].all()
+            ):
                 continue
             if not left_ok[real_idx] or not right_ok[real_idx]:
                 continue
@@ -1910,7 +1926,9 @@ class ZarrDataset(torch.utils.data.Dataset):
                 if horizon is not None:
                     end_idx = self._chunk_end_idx(real_idx, int(horizon), key_type)
                     window = self._read_key_slice(zarr_key, real_idx, end_idx)
-                    window = self._pad_sequences({zarr_key: window}, int(horizon))[zarr_key]
+                    window = self._pad_sequences({zarr_key: window}, int(horizon))[
+                        zarr_key
+                    ]
                     rows.append(np.asarray(window))
                 else:
                     rows.append(
@@ -1941,7 +1959,11 @@ class ZarrDataset(torch.utils.data.Dataset):
                 data = batch
                 for transform in self.transform:
                     data = transform.transform_batch(data)
-                out = {k: np.asarray(v) for k, v in data.items() if isinstance(v, np.ndarray)}
+                out = {
+                    k: np.asarray(v)
+                    for k, v in data.items()
+                    if isinstance(v, np.ndarray)
+                }
                 return out, np.arange(batch_size, dtype=np.int64)
             except Exception as exc:
                 logger.debug(
@@ -2286,7 +2308,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             for transform in self.transform:
                 try:
                     data = transform.transform(data)
-                except Exception as e:
+                except Exception:
                     origin = _fallback_origin if _fallback_origin is not None else idx
                     next_idx, attempts = get_fallback_idx(
                         idx=idx,
@@ -2391,6 +2413,10 @@ class ZarrEpisode:
             path: Path to the .zarr episode directory
         """
         self._path = Path(path)
+        # Reuse fds + cache shard indices on the per-frame NFS read path. Idempotent,
+        # env-gated, and runs in every fork/spawn worker since each opens its own
+        # episodes. See egomimic.rldb.zarr.store_handle_cache.
+        hc.ensure_enabled()
         self._store = zarr.open_group(str(self._path), mode="r")
         self.metadata = dict(self._store.attrs)
         self.keys = self.metadata["features"]
@@ -2399,6 +2425,12 @@ class ZarrEpisode:
         """Close the underlying zarr store to drop mmap mappings."""
         store = getattr(self, "_store", None)
         if store is not None:
+            # Close cached fds + drop the shard-index cache so they don't
+            # accumulate as the working set slides over a large dataset.
+            try:
+                hc.close_store(store)
+            except Exception:
+                pass
             try:
                 store.close()
             except Exception:

@@ -44,6 +44,10 @@ class DataLoaderStallLogger(Callback):
         # Windowed (intra-epoch) throughput accumulators, reset each window.
         self._window_start: float | None = None
         self._window_frames: int = 0
+        # Sum of GPU-idle waits (gap between batch_end and next batch_start)
+        # observed within the current window — i.e. time the train loop blocked
+        # on next(dataloader). Lets us report the idle fraction of wall time.
+        self._window_wait_s: float = 0.0
 
     @classmethod
     def _collated_batch_size(cls, batch) -> int | None:
@@ -83,6 +87,7 @@ class DataLoaderStallLogger(Callback):
         self._epoch_frames = 0
         self._window_start = self._epoch_start
         self._window_frames = 0
+        self._window_wait_s = 0.0
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx) -> None:
         if not trainer.is_global_zero:
@@ -95,6 +100,11 @@ class DataLoaderStallLogger(Callback):
             wait_s = now - self._epoch_start
         else:
             return
+
+        # Accumulate the GPU-idle wait into the current throughput window so the
+        # periodic log can report what fraction of wall time was spent blocked on
+        # the dataloader (the headline "where the stall is" number).
+        self._window_wait_s += wait_s
 
         bs = self._collated_batch_size(batch)
         bs_note = f" batch_size={bs}" if bs is not None else ""
@@ -129,22 +139,36 @@ class DataLoaderStallLogger(Callback):
             and trainer.is_global_zero
             and (batch_idx + 1) % n == 0
             and self._window_start is not None
-            and trainer.logger
         ):
             now = self._last_batch_end
             window_s = now - self._window_start
             fps = self._window_frames / max(window_s, 1e-6)
+            idle_s = self._window_wait_s
+            idle_pct = 100.0 * idle_s / max(window_s, 1e-6)
             wall_time_s = now - self._train_start if self._train_start else 0.0
-            trainer.logger.log_metrics(
-                {
-                    "wall_time_s": wall_time_s,
-                    "throughput/frames_per_sec": fps,
-                    "throughput/total_frames": self._total_frames + self._epoch_frames,
-                },
-                step=trainer.global_step,
+            # Console first so fps/idle are visible even without a W&B logger.
+            log.info(
+                f"[fps] step {trainer.global_step}: {fps:.1f} frames/s "
+                f"over {window_s:.1f}s ({n} batches) | GPU idle on dataloader "
+                f"{idle_s:.1f}s ({idle_pct:.0f}% of window)"
             )
+            if trainer.logger:
+                trainer.logger.log_metrics(
+                    {
+                        "wall_time_s": wall_time_s,
+                        "throughput/frames_per_sec": fps,
+                        "throughput/total_frames": self._total_frames
+                        + self._epoch_frames,
+                        # Fraction of this window the train loop spent blocked on
+                        # the dataloader. High => dataloader-bound; ~0 => GPU-bound.
+                        "throughput/gpu_idle_sec": idle_s,
+                        "throughput/gpu_idle_pct": idle_pct,
+                    },
+                    step=trainer.global_step,
+                )
             self._window_start = now
             self._window_frames = 0
+            self._window_wait_s = 0.0
 
     def on_train_epoch_end(self, trainer, pl_module) -> None:
         if (
