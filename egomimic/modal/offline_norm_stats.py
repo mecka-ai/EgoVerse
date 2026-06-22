@@ -11,21 +11,31 @@ Architecture
   accumulates Welford online mean/std (Chan's parallel formula), running
   min/max, and per-dimension t-digest sketches for quantiles on the
   post-transform keys.
-* Stats are produced for the DataSchematic key names used by training:
-    - "ee_pose"           → shape (12,)      (obs: left+right in head frame, XYZYPR)
-    - "actions_cartesian" → mean/std/min/max shape (100, 12);
-                            quantiles shape (12,) pooled over 100 steps
-  under embodiment ID "9" (mecka_bimanual).
+* Stats are produced for the DataSchematic key names used by training, with the
+  per-vector width set by --mode:
+    - --mode cartesian     (default): 12-dim Euler ypr  (xyz3+ypr3 per arm)
+    - --mode cartesian_6d           : 18-dim continuous 6D (xyz3+col1_3+col2_3 per arm)
+  Keys:
+    - "ee_pose"           → shape (D,)        (obs: left+right in head frame)
+    - "actions_cartesian" → mean/std/min/max shape (100, D);
+                            quantiles shape (D,) pooled over 100 steps
+  under embodiment ID for mecka_bimanual.
 * The coordinator merges all shard results and writes norm_stats.json in the
   format expected by DataSchematic.infer_norm_from_dataset() and _check_bounds().
 
 Output path on egoverse-training-outputs volume:
     precomputed_norm_stats/<data_config>/norm_stats.json
 
-Usage:
+Usage (CPU only — no GPU is requested by any container):
+    # 12-dim ypr (legacy default), sampled:
     modal run --detach --env robotics egomimic/modal/offline_norm_stats.py \\
         -- mecka_all_zarr [--n_shards 300] [--samples_per_shard 700]
-                          [--exclude_hashes_file /path/to/failures.jsonl]
+
+    # 18-dim 6D over the ENTIRE zarr v2 volume (every frame of every episode),
+    # for model=pi0.5_bc_mecka + data=mecka_all_zarr_6d:
+    modal run --detach --env robotics egomimic/modal/offline_norm_stats.py \\
+        -- mecka_all_zarr_6d --mode cartesian_6d --all-frames --n_shards 600
+        [--exclude_hashes_file /path/to/failures.jsonl]
 
 In training, point at the result with:
     norm_stats.precomputed_norm_path=precomputed_norm_stats/<data_config>
@@ -84,8 +94,13 @@ _ZK_HEAD = "obs_head_pose"
 # Transform params (must match training config)
 _ACTION_HORIZON = 30  # raw frames read per action chunk
 _CHUNK_LEN = 100  # interpolated action steps after InterpolatePose
-_OBS_DIM = 12  # left(6) + right(6) after XYZWXYZ→XYZYPR
-_ACT_DIM = 12  # same
+# Post-transform per-vector width by rotation mode. "cartesian" = Euler ypr
+# (xyz3+ypr3 per arm → 12); "cartesian_6d" = continuous 6D columns
+# (xyz3+col1_3+col2_3 per arm → 18). The 6D stats are what model=pi0.5_bc_mecka
+# (HumanBimanualCartesian6D) + data=mecka_all_zarr_6d expect.
+_MODE_DIMS = {"cartesian": 12, "cartesian_6d": 18}
+_OBS_DIM = 12  # ypr default; overridden per-run from the transform mode
+_ACT_DIM = 12  # ypr default; overridden per-run from the transform mode
 
 # ---------------------------------------------------------------------------
 # Image — add tdigest for mergeable quantile sketches
@@ -237,17 +252,25 @@ def _prepare_repo(
 def compute_shard_stats(
     shard_id: int,
     episodes: list[dict],
-    samples_per_shard: int,
+    samples_per_shard: int | None,
+    mode: str = "cartesian",
+    obs_dim: int = _OBS_DIM,
+    act_dim: int = _ACT_DIM,
     git_remote: str = "",
     git_commit: str = "",
 ) -> dict:
     """Per-shard stats on post-transform data.
 
-    Applies the mecka_bimanual cartesian transform pipeline to each sampled
-    frame and accumulates Welford + t-digest stats for:
-      - "ee_pose"           (12,)       obs in head frame, XYZYPR
-      - "actions_cartesian" (100, 12)   action chunk in head frame, XYZYPR
-                            (quantiles: (12,) pooled over 100 steps)
+    Applies the mecka_bimanual cartesian transform pipeline (``mode``) to each
+    sampled frame and accumulates Welford + t-digest stats for:
+      - "ee_pose"           (obs_dim,)         obs in head frame
+      - "actions_cartesian" (100, act_dim)     action chunk in head frame
+                            (quantiles: (act_dim,) pooled over 100 steps)
+    ``mode="cartesian"`` → 12-dim ypr; ``mode="cartesian_6d"`` → 18-dim 6D.
+
+    ``samples_per_shard=None`` processes EVERY valid frame of every episode in
+    the shard (entire-volume mode); otherwise it caps the shard at that many
+    randomly-sampled frames.
 
     episodes: [{"episode_hash", "local_path", "num_frames"}, ...]
     Returns serialized per-key stats dict.
@@ -264,34 +287,36 @@ def compute_shard_stats(
             git_remote=git_remote, git_commit=git_commit, recurse_submodules=False
         )
 
-    # Build transform pipeline matching training (mecka_bimanual, cartesian mode)
+    # Build transform pipeline matching training (mecka_bimanual, given mode)
     import sys as _sys
 
     _sys.path.insert(0, CFG.remote_repo_dir)
     from egomimic.rldb.embodiment.human import Mecka
 
     transform_list = Mecka.get_transform_list(
-        mode="cartesian",
+        mode=mode,
     )
+
+    all_frames = samples_per_shard is None
 
     # Per-key accumulators
     accum = {
         "ee_pose": {
             "n": 0,
-            "mean": np.zeros(_OBS_DIM),
-            "M2": np.zeros(_OBS_DIM),
-            "min": np.full(_OBS_DIM, np.inf),
-            "max": np.full(_OBS_DIM, -np.inf),
-            "digests": [TDigest() for _ in range(_OBS_DIM)],
+            "mean": np.zeros(obs_dim),
+            "M2": np.zeros(obs_dim),
+            "min": np.full(obs_dim, np.inf),
+            "max": np.full(obs_dim, -np.inf),
+            "digests": [TDigest() for _ in range(obs_dim)],
         },
         "actions_cartesian": {
             "n": 0,
-            "mean": np.zeros((_CHUNK_LEN, _ACT_DIM)),
-            "M2": np.zeros((_CHUNK_LEN, _ACT_DIM)),
-            "min": np.full((_CHUNK_LEN, _ACT_DIM), np.inf),
-            "max": np.full((_CHUNK_LEN, _ACT_DIM), -np.inf),
-            # Quantile digests: 12 per-dim, pooled over all 100 steps
-            "digests": [TDigest() for _ in range(_ACT_DIM)],
+            "mean": np.zeros((_CHUNK_LEN, act_dim)),
+            "M2": np.zeros((_CHUNK_LEN, act_dim)),
+            "min": np.full((_CHUNK_LEN, act_dim), np.inf),
+            "max": np.full((_CHUNK_LEN, act_dim), -np.inf),
+            # Quantile digests: act_dim per-dim, pooled over all 100 steps
+            "digests": [TDigest() for _ in range(act_dim)],
         },
     }
     n_collected = 0
@@ -300,7 +325,7 @@ def compute_shard_stats(
     random.shuffle(episodes)
 
     for ep in episodes:
-        if n_collected >= samples_per_shard:
+        if not all_frames and n_collected >= samples_per_shard:
             break
 
         try:
@@ -322,8 +347,12 @@ def compute_shard_stats(
             continue
 
         valid_frames = list(range(T - _ACTION_HORIZON))
-        need = samples_per_shard - n_collected
-        sample_frames = random.sample(valid_frames, min(need, len(valid_frames)))
+        if all_frames:
+            # Entire-volume mode: use every valid chunk-start frame.
+            sample_frames = valid_frames
+        else:
+            need = samples_per_shard - n_collected
+            sample_frames = random.sample(valid_frames, min(need, len(valid_frames)))
 
         for t in sample_frames:
             data = {
@@ -361,7 +390,7 @@ def compute_shard_stats(
                 np.minimum(a["min"], ee, out=a["min"])
                 np.maximum(a["max"], ee, out=a["max"])
             a["n"] += 1
-            for d in range(_OBS_DIM):
+            for d in range(obs_dim):
                 a["digests"][d].update(ee[d])
 
             # --- Welford update: actions_cartesian (1 obs = (100,12) chunk) ---
@@ -379,10 +408,11 @@ def compute_shard_stats(
                 np.minimum(a["min"], ac, out=a["min"])
                 np.maximum(a["max"], ac, out=a["max"])
             a["n"] += 1
-            # Pooled quantile digests: sample 10 of 100 steps to avoid 1200 tdigest
-            # insertions per sample (the full 100*12=1200 makes ~285ms/sample).
+            # Pooled quantile digests: sample 10 of 100 steps to avoid a full
+            # 100*act_dim tdigest insertions per sample (the full set makes
+            # ~285ms/sample). Step-subsampling keeps quantiles ~unbiased.
             step_sample = random.sample(range(_CHUNK_LEN), min(10, _CHUNK_LEN))
-            for d in range(_ACT_DIM):
+            for d in range(act_dim):
                 for s in step_sample:
                     a["digests"][d].update(ac[s, d])
 
@@ -481,17 +511,28 @@ def run_norm_stats(
     n_shards: int = 300,
     samples_per_shard: int = 700,
     exclude_hashes: list[str] | None = None,
+    mode: str = "cartesian",
+    all_frames: bool = False,
 ) -> str:
     """Fan out to shard workers, merge results, write norm_stats.json.
 
     Stats are keyed by DataSchematic key names ("ee_pose", "actions_cartesian")
     under the embodiment ID for mecka_bimanual.
+
+    ``mode`` selects the rotation representation: "cartesian" (12-dim ypr) or
+    "cartesian_6d" (18-dim continuous 6D). ``all_frames=True`` processes EVERY
+    valid frame of EVERY episode on the volume (entire-volume mode) instead of
+    sampling ``samples_per_shard`` frames per shard.
     """
     import json
     import math
     import time
 
     import numpy as np
+
+    act_dim = _MODE_DIMS[mode]
+    obs_dim = _MODE_DIMS[mode]
+    per_shard = None if all_frames else samples_per_shard
 
     _prepare_repo(git_remote=git_remote, git_commit=git_commit)
     zarr_volume.reload()
@@ -558,21 +599,27 @@ def run_norm_stats(
     actual_shards = min(n_shards, len(episodes))
     shard_size = math.ceil(len(episodes) / actual_shards)
     shards = [episodes[i : i + shard_size] for i in range(0, len(episodes), shard_size)]
+    if all_frames:
+        print(
+            f"[NormStats] {len(shards)} shards × ~{shard_size} episodes each, "
+            f"ALL valid frames/episode (entire-volume mode), mode={mode!r}"
+        )
+    else:
+        print(
+            f"[NormStats] {len(shards)} shards × ~{shard_size} episodes each, "
+            f"{samples_per_shard} samples/shard → "
+            f"~{len(shards) * samples_per_shard} total frames sampled, mode={mode!r}"
+        )
     print(
-        f"[NormStats] {len(shards)} shards × ~{shard_size} episodes each, "
-        f"{samples_per_shard} samples/shard → "
-        f"~{len(shards) * samples_per_shard} total frames sampled"
-    )
-    print(
-        f"[NormStats] Stats produced for: ee_pose ({_OBS_DIM},), "
-        f"actions_cartesian ({_CHUNK_LEN}, {_ACT_DIM}) "
-        f"[quantiles: ({_ACT_DIM},) pooled over {_CHUNK_LEN} steps]"
+        f"[NormStats] Stats produced for: ee_pose ({obs_dim},), "
+        f"actions_cartesian ({_CHUNK_LEN}, {act_dim}) "
+        f"[quantiles: ({act_dim},) pooled over {_CHUNK_LEN} steps]"
     )
 
     # ---- Fan out ----
     t_start = time.time()
     shard_inputs = [
-        (i, shard, samples_per_shard, git_remote, git_commit)
+        (i, shard, per_shard, mode, obs_dim, act_dim, git_remote, git_commit)
         for i, shard in enumerate(shards)
     ]
     shard_results = list(
@@ -628,8 +675,10 @@ def run_norm_stats(
         min_ = np.asarray(m["min"], dtype=np.float32)
         max_ = np.asarray(m["max"], dtype=np.float32)
 
-        # Quantiles: always shape (_ACT_DIM,) = (12,), computed from pooled t-digests
-        n_dims = _ACT_DIM  # 12 for both keys
+        # Quantiles: shape (D,) where D is the per-vector width (12 ypr / 18 6D),
+        # computed from pooled t-digests. Derived from the merged mean's last
+        # axis so it tracks obs_dim/act_dim for whichever mode was used.
+        n_dims = int(mean.shape[-1])
         quantile_stats = {
             "median": np.zeros(n_dims, dtype=np.float32),
             "quantile_1": np.zeros(n_dims, dtype=np.float32),
@@ -735,6 +784,23 @@ def main(*args: str) -> None:
         default=None,
         help="JSONL file with episode_hash fields to exclude",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="cartesian",
+        choices=sorted(_MODE_DIMS.keys()),
+        help="Rotation representation: cartesian (12-dim ypr) or "
+        "cartesian_6d (18-dim continuous 6D). Use cartesian_6d for "
+        "data=mecka_all_zarr_6d + model=pi0.5_bc_mecka.",
+    )
+    parser.add_argument(
+        "--all-frames",
+        dest="all_frames",
+        action="store_true",
+        help="Process EVERY valid frame of EVERY episode on the volume "
+        "(entire-volume mode) instead of sampling samples_per_shard per shard. "
+        "mean/std/min/max become exact over the whole dataset.",
+    )
     parsed = parser.parse_args(list(args))
 
     exclude_hashes: list[str] = []
@@ -752,17 +818,27 @@ def main(*args: str) -> None:
             "Warning: local repo has uncommitted changes. Modal runs the last committed state."
         )
 
-    total_frames = parsed.n_shards * parsed.samples_per_shard
+    dim = _MODE_DIMS[parsed.mode]
+    if parsed.all_frames:
+        print(
+            f"Submitting norm-stats job: data={parsed.data_config!r} "
+            f"mode={parsed.mode!r} n_shards={parsed.n_shards} "
+            f"ALL frames (entire-volume)"
+            + (f"  exclude_hashes={len(exclude_hashes)}" if exclude_hashes else "")
+        )
+    else:
+        total_frames = parsed.n_shards * parsed.samples_per_shard
+        print(
+            f"Submitting norm-stats job: data={parsed.data_config!r} "
+            f"mode={parsed.mode!r} n_shards={parsed.n_shards} "
+            f"samples_per_shard={parsed.samples_per_shard} "
+            f"→ ~{total_frames:,} total frames sampled"
+            + (f"  exclude_hashes={len(exclude_hashes)}" if exclude_hashes else "")
+        )
     print(
-        f"Submitting norm-stats job: data={parsed.data_config!r} "
-        f"n_shards={parsed.n_shards} samples_per_shard={parsed.samples_per_shard} "
-        f"→ ~{total_frames:,} total frames sampled"
-        + (f"  exclude_hashes={len(exclude_hashes)}" if exclude_hashes else "")
-    )
-    print(
-        f"Stats will be keyed as: ee_pose ({_OBS_DIM},), "
-        f"actions_cartesian ({_CHUNK_LEN},{_ACT_DIM}) "
-        f"[quantiles: ({_ACT_DIM},)]"
+        f"Stats will be keyed as: ee_pose ({dim},), "
+        f"actions_cartesian ({_CHUNK_LEN},{dim}) "
+        f"[quantiles: ({dim},)]"
     )
 
     out_path = run_norm_stats.remote(
@@ -772,6 +848,8 @@ def main(*args: str) -> None:
         n_shards=parsed.n_shards,
         samples_per_shard=parsed.samples_per_shard,
         exclude_hashes=exclude_hashes or None,
+        mode=parsed.mode,
+        all_frames=parsed.all_frames,
     )
 
     print(f"\nDone. Volume path: {out_path}")

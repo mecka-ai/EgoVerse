@@ -42,6 +42,7 @@ from egomimic.utils.aws.aws_sql import (
     create_default_engine,
     episode_table_to_df,
 )
+from egomimic.utils.pose_utils import bimanual_cartesian_layout
 
 if TYPE_CHECKING:
     # Annotation-only import — avoids a runtime circular import with
@@ -1437,7 +1438,30 @@ class MultiDataset(torch.utils.data.Dataset):
                 )
                 break
 
-            if torch.any(arr < q_low) or torch.any(arr > q_high):
+            # The bimanual cartesian action chunk and the ee_pose proprio share a
+            # [L | R] layout whose rotation channels are either Euler ypr (wraps
+            # at ±π) or continuous 6D columns. In both cases quantile bounds on
+            # the rotation channels are meaningless and reject otherwise-valid
+            # frames, so we only bounds-check the translation (and gripper)
+            # channels. ``bimanual_cartesian_layout`` recognizes widths 12/14
+            # (ypr) and 18/20 (6D); any other width falls through to a
+            # full-vector check. NaN/Inf above still covers the full vector.
+            cartesian_layout = None
+            if zarr_key in ("actions_cartesian", "observations.state.ee_pose"):
+                cartesian_layout = bimanual_cartesian_layout(arr.shape[-1])
+            if cartesian_layout is not None:
+                check_idx = list(cartesian_layout["xyz"]) + list(
+                    cartesian_layout["grip"]
+                )
+                arr_q = arr[..., check_idx]
+                q_low_c = q_low[..., check_idx]
+                q_high_c = q_high[..., check_idx]
+            else:
+                arr_q = arr
+                q_low_c = q_low
+                q_high_c = q_high
+
+            if torch.any(arr_q < q_low_c) or torch.any(arr_q > q_high_c):
                 episode_name = self._episode_name_for_dataset(dataset, dataset_name)
                 prefix = (
                     f"Bounds violation ep={episode_name} frame={idx} key={zarr_key}"

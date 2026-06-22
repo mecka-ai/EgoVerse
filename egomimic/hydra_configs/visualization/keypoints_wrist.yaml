@@ -14,7 +14,7 @@ aria_bimanual:
   action_key: actions_keypoints
   mode: keypoints
   transform_list:
-    _target_: egomimic.rldb.embodiment.human._build_aria_keypoints_revert_eef_frame_transform_list
+    _target_: egomimic.rldb.embodiment.human._build_human_keypoints_revert_eef_frame_transform_list
     is_quat: false
     obs_key: state_keypoints
 mecka_bimanual:
@@ -24,7 +24,7 @@ mecka_bimanual:
   action_key: actions_keypoints
   mode: keypoints
   transform_list:
-    _target_: egomimic.rldb.embodiment.human._build_aria_keypoints_revert_eef_frame_transform_list
+    _target_: egomimic.rldb.embodiment.human._build_human_keypoints_revert_eef_frame_transform_list
     is_quat: false
     obs_key: state_keypoints
 scale_bimanual:
@@ -34,6 +34,6 @@ scale_bimanual:
   action_key: actions_keypoints
   mode: keypoints
   transform_list:
-    _target_: egomimic.rldb.embodiment.human._build_aria_keypoints_revert_eef_frame_transform_list
+    _target_: egomimic.rldb.embodiment.human._build_human_keypoints_revert_eef_frame_transform_list
     is_quat: false
     obs_key: state_keypoints

@@ -14,5 +14,5 @@ aria_bimanual:
   action_key: actions_cartesian
   mode: traj
   transform_list:
-    _target_: egomimic.rldb.embodiment.human._build_aria_cartesian_revert_eef_frame_transform_list
+    _target_: egomimic.rldb.embodiment.human._build_human_cartesian_revert_eef_frame_transform_list
     is_quat: false
