@@ -10,4 +10,4 @@ model_checkpoint:
   save_top_k: -1
   # Step-based so checkpoint cadence is independent of epoch size
   # (a full epoch is thousands of batches when limit_train_batches=null).
-  every_n_train_steps: 2000
+  every_n_train_steps: 5000
