@@ -83,6 +83,10 @@ class GlobalShuffleShardDataset(IterableDataset):
         if not self._shard_ids:
             raise ValueError(f"No shards listed in {index_path}")
 
+    def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
+        self.data_schematic = data_schematic
+        self.bounds_slack = bounds_slack
+
     def __len__(self) -> int:
         index = json.loads((self.shard_dir / "index.json").read_text())
         return index.get("n_covered_frames", len(self._shard_ids) * 2000)
