@@ -267,36 +267,23 @@ class GlobalShuffleShardDataset(IterableDataset):
             rank_shards = self._shard_ids[rank::world_size]
             local_dir = self._local_dir()
 
-            # Signal previous downloader to stop (stored as instance attr on this worker process)
+            # Signal previous downloader to stop.
             prev_stop: "threading.Event | None" = getattr(self, "_dl_stop_event", None)
             if prev_stop is not None:
                 prev_stop.set()
 
-            # Drain stale shard paths from the previous epoch and delete their files.
-            # This unblocks the old thread (it was blocked on a full queue) so it
-            # can observe stop_event and exit, releasing its ThreadPoolExecutor.
+            # Drain stale paths from previous epoch non-blocking — collect them
+            # but don't delete yet so we don't delay starting the new downloader.
+            stale_paths: list[tuple[Path, Path]] = []
             while True:
                 try:
                     item = self._path_q.get_nowait()
                     if item is not None:
-                        try:
-                            Path(item[0]).unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        try:
-                            Path(item[1]).unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                        stale_paths.append((Path(item[0]), Path(item[1])))
                 except Exception:
                     break
 
-            # Glob-delete any residual shard files for this rank (paranoia catch-all)
-            for p in local_dir.glob(f"gsdl_r{rank}_*"):
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
+            # Start the new downloader immediately — no disk I/O blocking it.
             stop_event = threading.Event()
             self._dl_stop_event = stop_event  # stored per-process, persists across epochs
 
@@ -317,6 +304,21 @@ class GlobalShuffleShardDataset(IterableDataset):
             )
             t.start()
 
+            # Delete stale files in a background thread so cleanup never delays
+            # the downloader or the workers consuming the new epoch's shards.
+            if stale_paths:
+                def _delete_stale(paths: list[tuple[Path, Path]]) -> None:
+                    for p1, p2 in paths:
+                        try:
+                            p1.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        try:
+                            p2.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                threading.Thread(target=_delete_stale, args=(stale_paths,), daemon=True).start()
+
         # All workers consume from the shared pool
         while True:
             item = self._path_q.get()
@@ -326,8 +328,15 @@ class GlobalShuffleShardDataset(IterableDataset):
             try:
                 yield from self._iter_local_shard(local_mp4, local_npz, worker_id)
             finally:
-                local_mp4.unlink(missing_ok=True)
-                local_npz.unlink(missing_ok=True)
+                # Delete in a background thread — worker immediately proceeds to
+                # path_q.get() for the next shard without waiting for disk I/O.
+                _p1, _p2 = local_mp4, local_npz
+                threading.Thread(
+                    target=lambda a=_p1, b=_p2: (
+                        a.unlink(missing_ok=True), b.unlink(missing_ok=True)
+                    ),
+                    daemon=True,
+                ).start()
 
     # ------------------------------------------------------------------
     # Internals
