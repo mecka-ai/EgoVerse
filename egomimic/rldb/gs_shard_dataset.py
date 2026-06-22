@@ -163,6 +163,8 @@ class GlobalShuffleShardDataset(IterableDataset):
                 f"({len(self._shard_ids)}/{len(all_ids)} available)"
             )
 
+        self._frames_per_shard: int = index.get("frames_per_shard", 2000)
+
         # Shared multiprocessing Queue — survives fork into DataLoader workers.
         # Created here (main process) so it's inherited by all worker forks.
         ctx = mp.get_context("fork")
@@ -177,8 +179,13 @@ class GlobalShuffleShardDataset(IterableDataset):
         self.bounds_slack = bounds_slack
 
     def __len__(self) -> int:
-        index = json.loads((self.shard_dir / "index.json").read_text())
-        return index.get("n_covered_frames", len(self._shard_ids) * 2000)
+        # Return the frames this rank will actually yield in one epoch.
+        # Shards are split across ranks (shard_ids[rank::world_size]), so each
+        # rank owns 1/world_size of the shards. If DDP isn't initialised yet
+        # (e.g. trainHydra frame-count display), fall back to total frames.
+        world_size = self._get_world_size()
+        rank_shard_count = len(self._shard_ids) // world_size
+        return rank_shard_count * self._frames_per_shard
 
     def __getitem__(self, index: int) -> dict:
         # Called by trainHydra.py for shape inference (dataset[0]).
