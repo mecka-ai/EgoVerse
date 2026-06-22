@@ -14,7 +14,7 @@ class PIEvalVideo(EvalVideo):
     delegates per-embodiment image visualization to the algo's viz_func.
     """
 
-    def compute_metrics_and_viz(self, batch):
+    def compute_metrics_and_viz(self, batch, do_viz=True):
         algo = self.model
         preds = algo.forward_eval(batch)
 
@@ -38,17 +38,18 @@ class PIEvalVideo(EvalVideo):
             # the training signal. A viz error (missing per-embodiment viz_func,
             # unexpected image key, etc.) must never abort a (multi-hour) run, so
             # log and skip images for this embodiment instead of raising.
-            try:
-                ims = self._visualize_preds(preds, _batch)
-            except Exception as exc:
-                logger.warning(
-                    "PIEvalVideo: visualization failed for %s (%r); skipping images",
-                    embodiment_name,
-                    exc,
-                )
-                ims = None
-            if ims is not None:
-                images_dict[embodiment_id] = ims
+            if do_viz:
+                try:
+                    ims = self._visualize_preds(preds, _batch)
+                except Exception as exc:
+                    logger.warning(
+                        "PIEvalVideo: visualization failed for %s (%r); skipping images",
+                        embodiment_name,
+                        exc,
+                    )
+                    ims = None
+                if ims is not None:
+                    images_dict[embodiment_id] = ims
         return metrics, images_dict
 
     def _visualize_preds(self, predictions, batch):
