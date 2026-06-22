@@ -57,6 +57,7 @@ def _run_downloader(
     local_dir_str: str,
     rank: int,
     metrics_q: "mp.Queue | None" = None,
+    stop_event: "threading.Event | None" = None,
 ) -> None:
     """Runs in a dedicated thread inside worker 0. Copies shards volume → local disk."""
     import concurrent.futures
@@ -79,8 +80,17 @@ def _run_downloader(
         total_bytes = src_mp4.stat().st_size + src_npz.stat().st_size
         return dst_mp4, dst_npz, elapsed, total_bytes
 
+    def _put(item):
+        """Put into path_q with timeout so stop_event can interrupt a full queue."""
+        while True:
+            try:
+                path_q.put(item, timeout=0.5)
+                return True
+            except Exception:
+                if stop_event is not None and stop_event.is_set():
+                    return False  # signal to abort
+
     # Sliding window of n_threads concurrent downloads.
-    # path_q.put() blocks when the queue is full → natural backpressure.
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as pool:
         pending = list(shard_ids)
         window: list[tuple[str, "concurrent.futures.Future"]] = []
@@ -98,23 +108,27 @@ def _run_downloader(
             _submit_next()
 
         while window:
+            if stop_event is not None and stop_event.is_set():
+                break
             sid, fut = window.pop(0)
             try:
                 dst_mp4, dst_npz, elapsed, total_bytes = fut.result()
-                _submit_next()       # overlap: start next download while we put
+                _submit_next()
                 if metrics_q is not None:
                     try:
                         metrics_q.put_nowait((total_bytes, elapsed))
                     except Exception:
                         pass  # queue full — drop metric, never block
-                path_q.put((dst_mp4, dst_npz))    # blocks when queue full
+                if not _put((dst_mp4, dst_npz)):
+                    break  # stop_event set while blocked on full queue
             except Exception as exc:
                 print(f"[GS downloader rank={rank}] {sid}: {exc}", flush=True)
                 _submit_next()
 
-    # One sentinel per DataLoader worker so each breaks cleanly
-    for _ in range(num_workers):
-        path_q.put(None)
+    if stop_event is None or not stop_event.is_set():
+        # One sentinel per DataLoader worker so each breaks cleanly
+        for _ in range(num_workers):
+            path_q.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -243,13 +257,49 @@ class GlobalShuffleShardDataset(IterableDataset):
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
 
-        # Worker 0 spawns the rank-level downloader process for this epoch.
-        # Other workers simply block on path_q.get() until data arrives.
+        # Worker 0 spawns the rank-level downloader thread for this epoch.
+        # Before spawning, stop any previous epoch's downloader and drain stale
+        # queue items — this prevents thread accumulation and disk leaks when
+        # limit_train_batches cuts an epoch short before all shards are consumed.
         if worker_id == 0:
             rank = self._get_rank()
             world_size = self._get_world_size()
             rank_shards = self._shard_ids[rank::world_size]
             local_dir = self._local_dir()
+
+            # Signal previous downloader to stop (stored as instance attr on this worker process)
+            prev_stop: "threading.Event | None" = getattr(self, "_dl_stop_event", None)
+            if prev_stop is not None:
+                prev_stop.set()
+
+            # Drain stale shard paths from the previous epoch and delete their files.
+            # This unblocks the old thread (it was blocked on a full queue) so it
+            # can observe stop_event and exit, releasing its ThreadPoolExecutor.
+            while True:
+                try:
+                    item = self._path_q.get_nowait()
+                    if item is not None:
+                        try:
+                            Path(item[0]).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        try:
+                            Path(item[1]).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    break
+
+            # Glob-delete any residual shard files for this rank (paranoia catch-all)
+            for p in local_dir.glob(f"gsdl_r{rank}_*"):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            stop_event = threading.Event()
+            self._dl_stop_event = stop_event  # stored per-process, persists across epochs
+
             t = threading.Thread(
                 target=_run_downloader,
                 args=(
@@ -261,6 +311,7 @@ class GlobalShuffleShardDataset(IterableDataset):
                     str(local_dir),
                     rank,
                     self._dl_metrics_q,
+                    stop_event,
                 ),
                 daemon=True,
             )
