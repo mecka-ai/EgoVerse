@@ -79,9 +79,21 @@ class GlobalShuffleShardDataset(IterableDataset):
                 "Run build_global_shuffle_shards.py first."
             )
         index = json.loads(index_path.read_text())
-        self._shard_ids: list[str] = index.get("shard_ids", [])
+        all_ids: list[str] = index.get("shard_ids", [])
+        self._shard_ids = [
+            sid for sid in all_ids
+            if (self.shard_dir / f"{sid}.mp4").exists()
+            and (self.shard_dir / f"{sid}.npz").exists()
+        ]
         if not self._shard_ids:
-            raise ValueError(f"No shards listed in {index_path}")
+            raise ValueError(f"No valid shard files found in {shard_dir}")
+        if len(self._shard_ids) < len(all_ids):
+            import warnings
+            warnings.warn(
+                f"[GlobalShuffleShardDataset] {len(all_ids) - len(self._shard_ids)} shards "
+                f"listed in index.json are missing on disk and will be skipped. "
+                f"({len(self._shard_ids)}/{len(all_ids)} shards available)"
+            )
 
     def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
         self.data_schematic = data_schematic
