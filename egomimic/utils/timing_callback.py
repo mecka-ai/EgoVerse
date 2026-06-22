@@ -34,6 +34,7 @@ class DataLoaderStallLogger(Callback):
         self._train_start: float | None = None
         self._epoch_frames: int = 0
         self._total_frames: int = 0
+        self._gs_datasets: list = []  # GlobalShuffleShardDataset instances on this rank
 
     @classmethod
     def _collated_batch_size(cls, batch) -> int | None:
@@ -54,6 +55,14 @@ class DataLoaderStallLogger(Callback):
     def on_train_start(self, trainer, pl_module) -> None:
         self._train_start = time.perf_counter()
         self._total_frames = 0
+        # Discover any GlobalShuffleShardDataset instances so we can drain their
+        # download metrics at epoch end. Only runs once; zero cost during training.
+        self._gs_datasets = []
+        dm = getattr(trainer, "datamodule", None)
+        if dm is not None:
+            for ds in getattr(dm, "train_datasets", {}).values():
+                if hasattr(ds, "drain_download_metrics"):
+                    self._gs_datasets.append(ds)
         if trainer.is_global_zero and trainer.logger and hasattr(trainer.logger, "experiment"):
             try:
                 trainer.logger.experiment.define_metric("throughput/*", step_metric="wall_time_s")
@@ -98,19 +107,37 @@ class DataLoaderStallLogger(Callback):
     def on_train_epoch_end(self, trainer, pl_module) -> None:
         if not trainer.is_global_zero or self._train_start is None or self._epoch_start is None:
             return
-        wall_time_s = time.perf_counter() - self._train_start
-        epoch_s = time.perf_counter() - self._epoch_start
+        now = time.perf_counter()
+        wall_time_s = now - self._train_start
+        epoch_s = now - self._epoch_start
         self._total_frames += self._epoch_frames
         fps = self._epoch_frames / max(epoch_s, 1e-6)
+
+        metrics: dict = {
+            "wall_time_s": wall_time_s,
+            "throughput/frames_per_sec": fps,
+            "throughput/total_frames": self._total_frames,
+        }
+
+        # Drain download stats from GlobalShuffleShardDataset (rank 0 only).
+        # put_nowait in the downloader ensures this never blocked training.
+        if self._gs_datasets:
+            total_shards, total_bytes = 0, 0.0
+            for ds in self._gs_datasets:
+                n, b, _ = ds.drain_download_metrics()
+                total_shards += n
+                total_bytes += b
+            if epoch_s > 0:
+                world_size = getattr(trainer, "world_size", 1) or 1
+                # per-rank stats (rank 0)
+                metrics["throughput/dl_shards_per_sec"] = total_shards / epoch_s
+                metrics["throughput/dl_mb_per_sec"] = total_bytes / epoch_s / 1e6
+                # total across all ranks (estimated — each rank downloads its own slice)
+                metrics["throughput/dl_total_shards_per_sec"] = total_shards / epoch_s * world_size
+                metrics["throughput/dl_total_mb_per_sec"] = total_bytes / epoch_s / 1e6 * world_size
+
         if trainer.logger:
-            trainer.logger.log_metrics(
-                {
-                    "wall_time_s": wall_time_s,
-                    "throughput/frames_per_sec": fps,
-                    "throughput/total_frames": self._total_frames,
-                },
-                step=trainer.global_step,
-            )
+            trainer.logger.log_metrics(metrics, step=trainer.global_step)
 
 
 class WandbProfilerLogger(Callback):

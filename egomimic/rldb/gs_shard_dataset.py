@@ -56,21 +56,28 @@ def _run_downloader(
     n_threads: int,
     local_dir_str: str,
     rank: int,
+    metrics_q: "mp.Queue | None" = None,
 ) -> None:
-    """Runs in a dedicated process. Copies shards volume → local disk."""
+    """Runs in a dedicated thread inside worker 0. Copies shards volume → local disk."""
     import concurrent.futures
     import shutil
+    import time
     from pathlib import Path
 
     shard_dir = Path(shard_dir_str)
     local_dir = Path(local_dir_str)
 
     def copy_one(sid: str):
+        t0 = time.perf_counter()
+        src_mp4 = shard_dir / f"{sid}.mp4"
+        src_npz = shard_dir / f"{sid}.npz"
         dst_mp4 = local_dir / f"gsdl_r{rank}_{sid}.mp4"
         dst_npz = local_dir / f"gsdl_r{rank}_{sid}.npz"
-        shutil.copy2(shard_dir / f"{sid}.mp4", dst_mp4)
-        shutil.copy2(shard_dir / f"{sid}.npz", dst_npz)
-        return dst_mp4, dst_npz
+        shutil.copy2(src_mp4, dst_mp4)
+        shutil.copy2(src_npz, dst_npz)
+        elapsed = time.perf_counter() - t0
+        total_bytes = src_mp4.stat().st_size + src_npz.stat().st_size
+        return dst_mp4, dst_npz, elapsed, total_bytes
 
     # Sliding window of n_threads concurrent downloads.
     # path_q.put() blocks when the queue is full → natural backpressure.
@@ -93,9 +100,14 @@ def _run_downloader(
         while window:
             sid, fut = window.pop(0)
             try:
-                paths = fut.result()
+                dst_mp4, dst_npz, elapsed, total_bytes = fut.result()
                 _submit_next()       # overlap: start next download while we put
-                path_q.put(paths)    # blocks when queue full
+                if metrics_q is not None:
+                    try:
+                        metrics_q.put_nowait((total_bytes, elapsed))
+                    except Exception:
+                        pass  # queue full — drop metric, never block
+                path_q.put((dst_mp4, dst_npz))    # blocks when queue full
             except Exception as exc:
                 print(f"[GS downloader rank={rank}] {sid}: {exc}", flush=True)
                 _submit_next()
@@ -165,10 +177,12 @@ class GlobalShuffleShardDataset(IterableDataset):
 
         self._frames_per_shard: int = index.get("frames_per_shard", 2000)
 
-        # Shared multiprocessing Queue — survives fork into DataLoader workers.
-        # Created here (main process) so it's inherited by all worker forks.
+        # Shared multiprocessing Queues — created in main process, inherited by all worker forks.
         ctx = mp.get_context("fork")
         self._path_q: "mp.Queue" = ctx.Queue(maxsize=pool_size)
+        # metrics_q: downloader puts (bytes: int, elapsed_s: float) per shard via put_nowait.
+        # Drained at epoch end by the timing callback — zero cost on the hot path.
+        self._dl_metrics_q: "mp.Queue" = ctx.Queue(maxsize=2000)
 
     # ------------------------------------------------------------------
     # PyTorch / trainHydra interface
@@ -177,6 +191,23 @@ class GlobalShuffleShardDataset(IterableDataset):
     def set_data_schematic(self, data_schematic, bounds_slack: float = 0.0) -> None:
         self.data_schematic = data_schematic
         self.bounds_slack = bounds_slack
+
+    def drain_download_metrics(self) -> tuple[int, float, float]:
+        """Non-blocking drain of downloader stats for this rank.
+
+        Returns (n_shards, total_bytes, total_elapsed_s).
+        Called at epoch end by the timing callback — never on the training hot path.
+        """
+        n, total_bytes, total_elapsed = 0, 0.0, 0.0
+        while True:
+            try:
+                b, e = self._dl_metrics_q.get_nowait()
+                n += 1
+                total_bytes += b
+                total_elapsed += e
+            except Exception:
+                break
+        return n, total_bytes, total_elapsed
 
     def __len__(self) -> int:
         # Return the frames this rank will actually yield in one epoch.
@@ -229,6 +260,7 @@ class GlobalShuffleShardDataset(IterableDataset):
                     self.n_download_threads,
                     str(local_dir),
                     rank,
+                    self._dl_metrics_q,
                 ),
                 daemon=True,
             )
