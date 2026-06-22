@@ -91,7 +91,8 @@ def _run_downloader(
                     return False  # signal to abort
 
     # Sliding window of n_threads concurrent downloads.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_threads)
+    try:
         pending = list(shard_ids)
         window: list[tuple[str, "concurrent.futures.Future"]] = []
         idx = 0
@@ -124,6 +125,9 @@ def _run_downloader(
             except Exception as exc:
                 print(f"[GS downloader rank={rank}] {sid}: {exc}", flush=True)
                 _submit_next()
+    finally:
+        # Don't wait for in-flight shutil.copy2 calls when stopping early.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     if stop_event is None or not stop_event.is_set():
         # One sentinel per DataLoader worker so each breaks cleanly
@@ -372,8 +376,9 @@ class GlobalShuffleShardDataset(IterableDataset):
         self, mp4_path: Path, npz_path: Path, worker_id: int
     ) -> Iterator[dict]:
         try:
-            npz = np.load(str(npz_path))
-            actions = npz["action"]
+            npz_file = np.load(str(npz_path))
+            actions = npz_file["action"]
+            npz_file.close()  # release file handle immediately — actions array is already in RAM
             for img_tensor, action in zip(self._decode_mp4(mp4_path), actions):
                 yield {
                     self.image_key: img_tensor,
@@ -383,38 +388,28 @@ class GlobalShuffleShardDataset(IterableDataset):
             print(f"[GS worker={worker_id}] shard iteration failed: {exc}", flush=True)
 
     def _decode_mp4(self, path: Path) -> Iterator[torch.Tensor]:
-        try:
-            import torchvision.io as tio
-            video, _, _ = tio.read_video(str(path), output_format="TCHW", pts_unit="sec")
-            for t in range(video.shape[0]):
-                frame = video[t].float() / 255.0
-                if self.image_size:
-                    import torch.nn.functional as F
-                    frame = F.interpolate(
-                        frame.unsqueeze(0),
-                        size=self.image_size,
-                        mode="bilinear",
-                        align_corners=False,
-                    ).squeeze(0)
-                yield frame
-        except Exception:
-            yield from self._decode_mp4_av(path)
+        """Decode MP4 frame-by-frame via PyAV — keeps only ONE frame in RAM at a time.
 
-    def _decode_mp4_av(self, path: Path) -> Iterator[torch.Tensor]:
+        Never use tio.read_video here: it loads the entire video as a (T,C,H,W) float32
+        tensor (~1 GB per 2000-frame shard) and holds it for the full iteration lifetime.
+        With N workers each loading a shard simultaneously that causes RAM to explode.
+        """
         import av as _av
         import torch.nn.functional as F
 
         container = _av.open(str(path))
-        stream = container.streams.video[0]
-        for frame in container.decode(stream):
-            img = frame.to_ndarray(format="rgb24")
-            tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            if self.image_size:
-                tensor = F.interpolate(
-                    tensor.unsqueeze(0),
-                    size=self.image_size,
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-            yield tensor
-        container.close()
+        try:
+            stream = container.streams.video[0]
+            for frame in container.decode(stream):
+                img = frame.to_ndarray(format="rgb24")
+                tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+                if self.image_size:
+                    tensor = F.interpolate(
+                        tensor.unsqueeze(0),
+                        size=self.image_size,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                yield tensor
+        finally:
+            container.close()
