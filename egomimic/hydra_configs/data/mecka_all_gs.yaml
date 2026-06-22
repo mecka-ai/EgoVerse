@@ -31,7 +31,6 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-    mode: valid
 
 train_dataloader_params:
   mecka_bimanual:
