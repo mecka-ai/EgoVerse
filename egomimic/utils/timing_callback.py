@@ -122,6 +122,14 @@ class DataLoaderStallLogger(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         self._last_batch_end = time.perf_counter()
+        # Resume-safety: on a mid-epoch resume (trainer.fit ckpt_path=...),
+        # on_train_epoch_start may not fire, leaving _window_start=None so the
+        # periodic fps block below never runs and fps is silently absent. Lazily
+        # start the throughput window here so fps logs after a resume too.
+        if self._window_start is None:
+            self._window_start = self._last_batch_end
+            self._window_frames = 0
+            self._window_wait_s = 0.0
         bs = self._collated_batch_size(batch)
         if bs is None:
             return

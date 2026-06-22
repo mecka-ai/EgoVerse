@@ -1,0 +1,97 @@
+# MECKA_RANDOM_400H — random 400h-train sample of mecka_data_v2 (pi0.5 variant).
+#
+# A random ~500h pool of mecka_bimanual episodes (all tasks), built by REUSING the
+# 250h already on disk and adding a random 250h delta (allowlist
+# extra/mecka_random_500h.json, 20134 eps), fed to the DEFAULT MultiDataset split
+# (valid_ratio 0.2, seed 42, by episode):
+#   TRAIN 16108 eps ≈ 400.0h   |   VALID 4026 eps ≈ 100.0h
+# LocalEpisodeResolver scans folder_path and reads per-episode metadata from the
+# zarr attrs — NO database. The folder must contain exactly the 20134 allowlist
+# episodes, so scanning it == the allowlist (hence no eps_to_use here).
+#
+# folder_path /workspace/mecka_random_500h_zarr is populated by symlinking the
+# existing /workspace/mecka_random_250h_zarr into it (instant reuse — the resolver
+# follows symlinks) then downloading the delta:
+#   download_episodes_local.py --ids-file extra/mecka_random_500h_delta.json \
+#       --output-dir /workspace/mecka_random_500h_zarr --workers 10
+#
+# Allowlist built by extra/gen_random_500h.py (local fs ∩ Postgres app.episodes,
+# converted mecka_bimanual, seed-7 random fill to a 500h budget at 30 fps). NOTE:
+# keymap requests annotations (pi0.5 language conditioning) — episodes without
+# annotations fall back to default_prompt; set annotations: false for a non-language run.
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/mecka_random_500h_zarr
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/mecka_random_500h_zarr
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+
+# Small viz set (8 episodes from the pool) for evaluator@train_viz_evaluator=train_viz_pi
+# (dataloader_idx=1). Omit the train_viz evaluator at launch if you don't want it.
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/mecka_random_500h_zarr
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+        annotations: true
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      debug: 8
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64        # per-device; 8×H200 → global batch 512
+    num_workers: 32
+    persistent_workers: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 8
+    persistent_workers: true
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 4
+    persistent_workers: true
+    shuffle: false
