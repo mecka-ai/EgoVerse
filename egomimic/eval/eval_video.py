@@ -43,10 +43,18 @@ class EvalVideo(Eval):
         Metrics are computed/logged on every validation pass; only the
         expensive viz/video rendering is gated to every `viz_every_n_epochs`
         epochs. A non-positive value disables viz entirely.
+
+        The gate uses ``current_epoch + 1`` to match Lightning's own
+        validation trigger ``(current_epoch + 1) % check_val_every_n_epoch``
+        (during the end-of-epoch val loop ``current_epoch`` is still the
+        just-finished epoch ``e``, not ``e + 1``). For viz to ever fire,
+        ``viz_every_n_epochs`` must be an integer multiple of
+        ``check_val_every_n_epoch``; otherwise the validation-trigger epochs
+        never land on a viz multiple and no video is ever written.
         """
         if not self.viz_every_n_epochs or self.viz_every_n_epochs <= 0:
             return False
-        return (self.trainer.current_epoch % self.viz_every_n_epochs) == 0
+        return ((self.trainer.current_epoch + 1) % self.viz_every_n_epochs) == 0
 
     @abstractmethod
     def compute_metrics_and_viz(self, batch, do_viz=True):
@@ -72,7 +80,9 @@ class EvalVideo(Eval):
             )
 
     def on_validation_end(self):
-        if not self._should_viz():
+        # Only rank 0 buffers/writes videos (see on_validation_step), so the
+        # flush of remaining frames is rank-0 only too.
+        if not (self.trainer.is_global_zero and self._should_viz()):
             return
         for key, buffer in self.val_image_buffer.items():
             os.makedirs(
@@ -97,7 +107,10 @@ class EvalVideo(Eval):
             self.val_image_buffer[key] = []
 
     def on_validation_step(self, batch, batch_idx, dataloader_idx=0):
-        do_viz = self._should_viz()
+        # Metrics are computed and log_dict'd (sync_dist) on every rank so the
+        # reduction does not deadlock; only rank 0 renders/writes video frames,
+        # otherwise every DDP rank writes to the same path and clobbers it.
+        do_viz = self._should_viz() and self.trainer.is_global_zero
         metrics, images_dict = self.compute_metrics_and_viz(batch, do_viz=do_viz)
 
         device = self.trainer.lightning_module.device
