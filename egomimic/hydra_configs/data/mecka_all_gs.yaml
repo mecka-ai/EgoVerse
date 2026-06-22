@@ -16,7 +16,8 @@ train_datasets:
     image_size: [224, 224]
     action_key: actions_cartesian
     image_key: observations.images.front_img_1
-    prefetch_shards: 2
+    pool_size: 12          # shards buffered on disk per rank
+    n_download_threads: 2  # concurrent volume→disk copies in downloader per rank (try 1 or 2)
 
 valid_datasets:
   mecka_bimanual:
