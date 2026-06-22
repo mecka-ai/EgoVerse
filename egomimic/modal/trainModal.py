@@ -416,6 +416,12 @@ if __name__ == "__main__":
         "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",
     }
 
+    # Data configs that stream shards to local disk — require large ephemeral disk
+    # so shards land on /cache (NVMe) instead of /tmp (tmpfs/SHM).
+    # Without this, pool_size shards × 34 MB compete with PyTorch SHM and cause SIGBUS.
+    _GS_DATA_CONFIGS = {"mecka_all_gs"}
+    _GS_DEFAULT_EPHEMERAL_GB = 3000
+
     modal_env = os.environ.copy()
     container_overrides = []
     gpu_count = 1
@@ -428,6 +434,17 @@ if __name__ == "__main__":
                 gpu_count = int(val.split(":")[1]) if ":" in val else 1
         else:
             container_overrides.append(arg)
+
+    # Auto-inject ephemeral disk for GS data configs when not explicitly set.
+    if "MODAL_EPHEMERAL_DISK_GB" not in modal_env:
+        data_val = next(
+            (a.partition("=")[2] for a in container_overrides
+             if a.lstrip("+").startswith("data=")),
+            "",
+        )
+        if data_val in _GS_DATA_CONFIGS:
+            modal_env["MODAL_EPHEMERAL_DISK_GB"] = str(_GS_DEFAULT_EPHEMERAL_GB)
+            print(f"Auto-setting ephemeral disk to {_GS_DEFAULT_EPHEMERAL_GB} GB for {data_val}")
 
     container_overrides = [
         a
@@ -443,7 +460,8 @@ if __name__ == "__main__":
     mem = modal_env.get("MODAL_MEMORY_GB") or str(
         int(modal_env.get("MODAL_MEMORY_MB", "65536")) // 1024
     )
+    disk_gb = modal_env.get("MODAL_EPHEMERAL_DISK_GB", "none")
     print(f"Modal app:       {modal_env['MODAL_APP_NAME']}")
-    print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB")
+    print(f"Modal resources: gpu={gpu}  cpu={cpu}  memory={mem}GB  ephemeral_disk={disk_gb}GB")
 
     launch_detached(Path(__file__).resolve(), "submit", container_overrides, modal_env)
