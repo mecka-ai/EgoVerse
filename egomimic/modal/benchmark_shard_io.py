@@ -93,23 +93,39 @@ def run_benchmark(shard_subdir: str = "global_shuffle_debug300", n_shards: int =
         dst_npz.unlink(missing_ok=True)
         return elapsed
 
+    # Assign non-overlapping shard slices to each parallelism level so every
+    # download is cold (no FUSE/OS page-cache hits from a previous trial).
+    total_needed = sum(p for p in PARALLELISM_SWEEP if p <= n_shards)
+    if total_needed > len(all_ids):
+        print(f"Warning: only {len(all_ids)} shards but need {total_needed} for cold runs — some reuse unavoidable")
+
+    cursor = 0
     rows = []
     for n_parallel in PARALLELISM_SWEEP:
         if n_parallel > n_shards:
             break
 
-        # Pick the first n_parallel shards for a fair comparison
-        batch = shard_ids[:n_parallel]
-        batch_mb = sum(sizes_mb[:n_parallel])
+        # Fresh non-overlapping slice of shards for this trial
+        batch_ids = all_ids[cursor % len(all_ids) : cursor % len(all_ids) + n_parallel]
+        if len(batch_ids) < n_parallel:  # wrap-around
+            batch_ids += all_ids[: n_parallel - len(batch_ids)]
+        cursor += n_parallel
 
-        # Warm up the volume mount (avoid cold-start noise on first sweep)
+        batch_mb = sum(
+            (shard_dir / f"{sid}.mp4").stat().st_size / 1_048_576 +
+            (shard_dir / f"{sid}.npz").stat().st_size / 1_048_576
+            for sid in batch_ids
+        )
+
+        # Warm up volume mount with a shard we won't reuse
         if n_parallel == PARALLELISM_SWEEP[0]:
-            print("Warming up volume mount...")
-            copy_shard(batch[0], 99)
+            print("Warming up volume mount (1 shard, discarded)...")
+            warmup_id = all_ids[-1]
+            copy_shard(warmup_id, 99)
 
         t_wall_start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_parallel) as pool:
-            futs = [pool.submit(copy_shard, sid, i) for i, sid in enumerate(batch)]
+            futs = [pool.submit(copy_shard, sid, i) for i, sid in enumerate(batch_ids)]
             per_shard_times = [f.result() for f in futs]
         wall = time.perf_counter() - t_wall_start
 
