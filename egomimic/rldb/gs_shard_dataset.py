@@ -210,7 +210,7 @@ class GlobalShuffleShardDataset(IterableDataset):
         try:
             import torchvision.io as tio
 
-            video, _, _ = tio.read_video(str(path), output_format="TCHW", pts_unit="pts")
+            video, _, _ = tio.read_video(str(path), output_format="TCHW", pts_unit="sec")
             for t in range(video.shape[0]):
                 frame = video[t].float() / 255.0
                 if self.image_size:
