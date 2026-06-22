@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import shutil
 import threading
 from pathlib import Path
@@ -62,14 +61,12 @@ class GlobalShuffleShardDataset(IterableDataset):
         image_size: list[int] | None = None,
         action_key: str = "actions_cartesian",
         image_key: str = "observations.images.front_img_1",
-        seed: int = 42,
         prefetch_shards: int = 2,
     ):
         self.shard_dir = Path(shard_dir)
         self.image_size = tuple(image_size) if image_size else None
         self.action_key = action_key
         self.image_key = image_key
-        self.seed = seed
         self.prefetch_shards = prefetch_shards
 
         index_path = self.shard_dir / "index.json"
@@ -128,10 +125,8 @@ class GlobalShuffleShardDataset(IterableDataset):
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
 
-        shard_ids = list(self._shard_ids)
-        rng = random.Random(self.seed + worker_id)
-        rng.shuffle(shard_ids)
-        my_shards = shard_ids[worker_id::num_workers]
+        # No shuffle — shards are already globally pre-shuffled at build time.
+        my_shards = self._shard_ids[worker_id::num_workers]
 
         yield from self._iter_with_prefetch(my_shards, worker_id)
 
