@@ -5,13 +5,18 @@ Architecture
 Old: each of N DataLoader workers has its own background thread downloading shards.
      num_workers × world_size = 6 × 4 = 24 concurrent volume readers.
 
-New: one downloader PROCESS per rank maintains a shared pool of ready shards.
-     Workers never touch the volume — they only read from local disk (/cache or /tmp).
+New: one downloader THREAD (inside worker 0's process) per rank maintains a shared
+     pool of ready shards on local disk. Workers never touch the volume directly.
      Total concurrent volume readers = world_size (one per rank).
 
+     Note: we use a thread rather than a process because PyTorch DataLoader workers
+     are daemon processes, and Python forbids daemon processes from spawning children.
+     A thread inside worker 0 produces into a multiprocessing.Queue; all worker
+     processes (0-N) consume from it — this works fine across process boundaries.
+
 Flow per rank per epoch:
-  1. First DataLoader worker to call __iter__ spawns the downloader process and
-     passes it the rank's shard slice: shard_ids[rank::world_size].
+  1. DataLoader worker 0 spawns a background thread that downloads the rank's shard
+     slice: shard_ids[rank::world_size].
   2. Downloader uses n_download_threads concurrent copies to pipeline volume → disk.
      A multiprocessing.Queue(maxsize=pool_size) provides backpressure: downloader
      blocks when pool_size shards are already downloaded and waiting.
@@ -30,6 +35,7 @@ import json
 import multiprocessing as mp
 import os
 import shutil
+import threading
 import warnings
 from pathlib import Path
 from typing import Iterator
@@ -206,7 +212,7 @@ class GlobalShuffleShardDataset(IterableDataset):
             world_size = self._get_world_size()
             rank_shards = self._shard_ids[rank::world_size]
             local_dir = self._local_dir()
-            p = mp.Process(
+            t = threading.Thread(
                 target=_run_downloader,
                 args=(
                     str(self.shard_dir),
@@ -219,7 +225,7 @@ class GlobalShuffleShardDataset(IterableDataset):
                 ),
                 daemon=True,
             )
-            p.start()
+            t.start()
 
         # All workers consume from the shared pool
         while True:
