@@ -205,14 +205,19 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info(f"[Timing] Shape inference for {dataset_name}: {time.perf_counter() - t_shape:.2f}s")
 
         instantiate_copy = copy.deepcopy(cfg.data.train_datasets[dataset_name])
-        keymap_cfg = instantiate_copy.resolver.key_map
-        km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
+        if OmegaConf.select(instantiate_copy, "resolver", default=None) is not None:
+            keymap_cfg = instantiate_copy.resolver.key_map
+            km = OmegaConf.to_container(keymap_cfg, resolve=False)  # plain dict
 
-        # this remove annotation and image keys from the keymap
-        km["norm_mode"] = True
+            # this remove annotation and image keys from the keymap
+            km["norm_mode"] = True
 
-        instantiate_copy.resolver.key_map = km
-        norm_dataset = hydra.utils.instantiate(instantiate_copy)
+            instantiate_copy.resolver.key_map = km
+            norm_dataset = hydra.utils.instantiate(instantiate_copy)
+        else:
+            # Dataset has no resolver (e.g. GlobalShuffleShardDataset); use the
+            # already-instantiated train dataset. Only valid when precomputed_norm_path is set.
+            norm_dataset = dataset
         # infer_norm_from_dataset: load from precomputed JSON/dir if set, else compute (no disk write).
         t_norm = time.perf_counter()
         data_schematic.infer_norm_from_dataset(
