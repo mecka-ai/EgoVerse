@@ -191,38 +191,7 @@ image = (
         add_python="3.10",
     )
     .apt_install("git", "libgl1", "libglib2.0-0")
-    # Bake modal_setup.py into the image so curateModal.py / trainModal.py can
-    # import it at module-load time (before the repo is cloned via _prepare_repo).
-    # Path(__file__).parent resolves to /root/ in the container, so:
-    #   from modal_setup import (...)  works in both local and remote contexts.
-    .add_local_file(
-        Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
-    )
-    .add_local_file(
-        Path(__file__).resolve().parent / "shard_zarr_to_tar.py",
-        remote_path="/root/shard_zarr_to_tar.py",
-        copy=True,
-    )
-    .add_local_file(
-        Path(__file__).resolve().parent / "curateModal.py",
-        remote_path="/root/curateModal.py",
-        copy=True,
-    )
-    .add_local_file(
-        Path(__file__).resolve().parent / "build_deminf_shards.py",
-        remote_path="/root/build_deminf_shards.py",
-        copy=True,
-    )
-    .add_local_file(
-        Path(__file__).resolve().parent / "embed_deminf_shards.py",
-        remote_path="/root/embed_deminf_shards.py",
-        copy=True,
-    )
-    .add_local_file(
-        Path(__file__).resolve().parent / "curate_v2.py",
-        remote_path="/root/curate_v2.py",
-        copy=True,
-    )
+    # Heavy pip installs first so they stay cached across code changes.
     .pip_install(
         "lightning",
         "hydra-core",
@@ -280,11 +249,6 @@ image = (
     # ultralytics pulls in full opencv-python which requires system GL/gthread libs.
     # Force-reinstall headless (bundled libs, no system deps) so cv2 works headless.
     .run_commands("pip install --force-reinstall --no-deps opencv-python-headless")
-    .add_local_file(
-        "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt",
-        remote_path="/root/wes_h_v3.0.pt",
-        copy=True,
-    )
     # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
     # JAX-first: even its pytorch model path imports jax/flax at module load
     # (openpi.models.pi0_config, openpi.shared.image_tools). We add the jax/flax
@@ -303,6 +267,47 @@ image = (
         "equinox>=0.11.8",
         "augmax>=0.3.4",
         "pytest",  # openpi.models_pytorch.gemma_pytorch imports pytest at module load
+    )
+    # Large model weights (rarely change — keep above code files for better caching).
+    .add_local_file(
+        "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt",
+        remote_path="/root/wes_h_v3.0.pt",
+        copy=True,
+    )
+    # Bake modal scripts into the image so they can be imported at module-load time
+    # (before the repo is cloned via _prepare_repo). Ordered least→most frequently
+    # changed so that a single-file edit only invalidates the tail layers.
+    # Path(__file__).parent resolves to /root/ in the container, so:
+    #   from modal_setup import (...)  works in both local and remote contexts.
+    .add_local_file(
+        Path(__file__).resolve().parent / "shard_zarr_to_tar.py",
+        remote_path="/root/shard_zarr_to_tar.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "curateModal.py",
+        remote_path="/root/curateModal.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "embed_deminf_shards.py",
+        remote_path="/root/embed_deminf_shards.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "build_deminf_shards.py",
+        remote_path="/root/build_deminf_shards.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "curate_v2.py",
+        remote_path="/root/curate_v2.py",
+        copy=True,
+    )
+    # modal_setup.py last: changes here invalidate all code-file layers above,
+    # but NOT the heavy pip/model layers.
+    .add_local_file(
+        Path(__file__).resolve(), remote_path="/root/modal_setup.py", copy=True
     )
 )
 
