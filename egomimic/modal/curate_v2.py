@@ -250,7 +250,7 @@ def run_curate_v2(
 
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-    _prepare_repo(git_remote=git_remote, git_commit=git_commit, init_submodules=False)
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
     _sys.path.insert(0, CFG.remote_repo_dir)
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
@@ -460,6 +460,38 @@ def run_curate_v2(
             "mi_median": float(_np.median(all_vals))  if len(all_vals) else float("nan"),
             "per_task":  per_task_stats,
         }, f, indent=2)
+
+    # ── 7. t-SNE export for latent viewer ────────────────────────────────────
+    print("\nPhase 4: exporting t-SNE for latent viewer …")
+    from egomimic.curation.tsne_viz import export_task_tsne3d
+
+    tsne_dir = output_dir / "tsne3d"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+
+    for t_name in sorted(scores_by_task.keys()):
+        lat_dir = output_dir / "latents_v2" / t_name
+        s_path = lat_dir / "state.npz"
+        a_path = lat_dir / "action.npz"
+        if not s_path.exists() or not a_path.exists():
+            print(f"[{t_name}] latents missing — skipping t-SNE")
+            continue
+        try:
+            s_npz = _np.load(str(s_path), allow_pickle=True)
+            a_npz = _np.load(str(a_path), allow_pickle=True)
+            common = sorted(set(s_npz.files) & set(a_npz.files))
+            if not common:
+                print(f"[{t_name}] no common episodes in state/action — skipping t-SNE")
+                continue
+            json_path = export_task_tsne3d(
+                t_name,
+                [s_npz[h] for h in common],
+                [a_npz[h] for h in common],
+                common,
+                tsne_dir,
+            )
+            print(f"[{t_name}] tsne3d → {json_path} ({len(common)} episodes)")
+        except Exception as exc:
+            print(f"[{t_name}] t-SNE FAILED: {exc}")
 
     zarr_volume.commit()
     training_outputs_volume.commit()
