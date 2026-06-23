@@ -163,9 +163,7 @@ def _embed_state_shards(
         t_ep = _time.perf_counter()
         for start in range(0, T, _STATE_EMBED_BATCH):
             batch = _np.ascontiguousarray(frames_chw[start : start + _STATE_EMBED_BATCH])
-            batch_t = torch.from_numpy(batch).to(device)
-            with torch.no_grad():
-                lats = state_embedder.embed_batch(batch_t)
+            lats = state_embedder.embed(batch)
             ep_latents.append(_np.asarray(lats))
 
         ep_arr = _np.concatenate(ep_latents, axis=0)  # (T, D)
@@ -272,7 +270,7 @@ def _embed_action_shards(
         ep_latents = []
         for start in range(0, T, batch_size):
             batch = actions[start : start + batch_size]
-            lats = action_embedder.embed_batch(batch)
+            lats = action_embedder.embed(batch)
             ep_latents.append(_np.asarray(lats))
 
         ep_arr = _np.concatenate(ep_latents, axis=0)  # (T, D)
