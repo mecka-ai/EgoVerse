@@ -84,7 +84,7 @@ def _decode_mp4_frames(mp4_path: str) -> "np.ndarray":
 
 @app.function(
     image=image,
-    gpu="L40S",
+    gpu="H200",
     cpu=4,
     memory=32768,
     timeout=14400,
@@ -105,7 +105,7 @@ def _embed_state_shards(
     git_commit: str,
     output_dir: str,
     hf_token: str = "",
-    batch_size: int = 64,
+    batch_size: int = 512,
     prefetch: int = 4,
 ) -> str:
     """Embed state (image) latents from MP4 shards. Returns path to state.npz.
