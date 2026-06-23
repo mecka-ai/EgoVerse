@@ -86,7 +86,7 @@ def _decode_mp4_frames(mp4_path: str) -> "np.ndarray":
     image=image,
     gpu="H200",
     cpu=4,
-    memory=32768,
+    memory=65536,
     timeout=14400,
     secrets=_SHARED_SECRETS,
     volumes={
