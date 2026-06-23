@@ -709,7 +709,7 @@ def _boot_container(
     """Shared container boot: clone repo, register on sys.path, set env vars."""
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit, init_submodules=init_submodules)
+    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit)
     sys.path.insert(0, CFG.remote_repo_dir)
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
