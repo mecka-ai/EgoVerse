@@ -24,7 +24,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_STANDARD_MODALITIES = ("state", "action")
+_STANDARD_MODALITIES = ("state", "action", "joint")
 _LANGUAGE_MODALITIES = ("state_lang", "language", "state_by_lang")
 
 
@@ -362,6 +362,16 @@ def make_task_tsne_plots(
     paths["action"] = _make_one(
         task_name, action_latents, "action", out, every_n, seed, color_by="episode"
     )
+    paths["joint"] = _make_one(
+        task_name,
+        _hstack_episode_latents(state_latents, action_latents),
+        "joint",
+        out,
+        every_n,
+        seed,
+        color_by="episode",
+        subtitle="latent = [state ∥ action] — KSG input space",
+    )
 
     if not has_lang:
         return paths
@@ -446,6 +456,7 @@ def export_task_tsne3d(
     modalities: list[tuple[str, list, list[list[str]] | None]] = [
         ("state", state_latents, language_texts_by_episode if has_texts else None),
         ("action", action_latents, None),
+        ("joint", _hstack_episode_latents(state_latents, action_latents), None),
     ]
     if has_lang:
         if cfg.include_state_lang:

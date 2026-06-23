@@ -208,6 +208,21 @@ image = (
         remote_path="/root/curateModal.py",
         copy=True,
     )
+    .add_local_file(
+        Path(__file__).resolve().parent / "build_deminf_shards.py",
+        remote_path="/root/build_deminf_shards.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "embed_deminf_shards.py",
+        remote_path="/root/embed_deminf_shards.py",
+        copy=True,
+    )
+    .add_local_file(
+        Path(__file__).resolve().parent / "curate_v2.py",
+        remote_path="/root/curate_v2.py",
+        copy=True,
+    )
     .pip_install(
         "lightning",
         "hydra-core",
@@ -309,6 +324,8 @@ VOLUME_MAP: dict[str, tuple] = {
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
 )
+deminf_v2_volume = modal.Volume.from_name("egoverse-deminf-v2", create_if_missing=True)
+DEMINF_V2_MOUNT = "/mnt/deminf-v2"
 _modal_app_name = (
     os.environ.get("MODAL_APP_NAME", _MODAL_APP_DEFAULT).strip() or _MODAL_APP_DEFAULT
 )
@@ -675,6 +692,23 @@ def _install_pi_transformers() -> None:
     # (the trailing "/." copies directory *contents*, overwriting in place).
     subprocess.run(["cp", "-r", f"{replace_dir}/.", tdir], check=True)
     print(f"pi: transformers==4.53.2 + transformers_replace overlaid into {tdir}")
+
+
+def _boot_container(
+    git_remote: str,
+    git_commit: str,
+    hf_token: str = "",
+    *,
+    init_submodules: bool = False,
+) -> None:
+    """Shared container boot: clone repo, register on sys.path, set env vars."""
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit, init_submodules=init_submodules)
+    sys.path.insert(0, CFG.remote_repo_dir)
+    os.chdir(CFG.remote_repo_dir)
+    os.environ["MODAL_IS_REMOTE"] = "1"
+    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
 
 def _prepare_repo_light(
