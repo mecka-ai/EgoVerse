@@ -103,70 +103,50 @@ _OBS_DIM = 12  # ypr default; overridden per-run from the transform mode
 _ACT_DIM = 12  # ypr default; overridden per-run from the transform mode
 
 # ---------------------------------------------------------------------------
-# Image — add tdigest for mergeable quantile sketches
+# Image — minimal worker (à la modal_mecka_to_zarr): the code is baked in with
+# add_local_dir, so workers do NOT clone the repo / openpi submodules / uv-build
+# at startup (that per-container clone was dominating startup and timing workers
+# out). Only the deps the transform import-chain actually needs:
+#   egomimic.rldb.embodiment.human / action_chunk_transforms / pose_utils / viz_utils
+#   → numpy, scipy, torch (import-only, CPU), projectaria-tools (SE3),
+#     opencv (viz_utils imports cv2), matplotlib (viz_utils), zarr/numcodecs, tdigest.
 # ---------------------------------------------------------------------------
 
 image = (
-    modal.Image.from_registry(
-        "pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime",
-        add_python="3.10",
-    )
-    .apt_install("git", "curl", "build-essential")
-    .run_commands("curl -LsSf https://astral.sh/uv/install.sh | sh")
-    .env({"PATH": "/root/.local/bin:$PATH"})
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1-mesa-glx", "libglib2.0-0")  # runtime libs for opencv/mujoco
+    # The transform import-chain is human -> embodiment -> viz_utils ->
+    # egomimicUtils, and egomimicUtils imports pytorch_kinematics (pulls mujoco),
+    # einops, huggingface_hub, pandas, pyarrow, av, torchvision. This is the full
+    # transitive set traced from the worker imports — still far lighter than the
+    # training image (no transformers/lightning/hydra/openpi/datasets/timm/...).
+    # CPU-only torch/torchvision FIRST, from the CPU wheel index — so the
+    # torch-dependent packages below (pytorch-kinematics) resolve against this
+    # CPU build instead of pulling the multi-GB CUDA wheel.
     .pip_install(
-        "lightning",
-        "hydra-core",
-        "omegaconf",
-        "wandb",
-        "boto3",
-        "cloudpathlib",
-        "zarr==3.1.5",
-        "pyarrow",
-        "simplejpeg",
-        "h5py",
-        "av==12.0.0",
-        "mediapy",
-        "datasets==4.0.0",
-        "transformers==4.57.3",
-        "timm",
-        "einops",
-        "positional-encodings[pytorch]",
-        "pytorch-kinematics",
-        "arm-pytorch-utilities",
-        "geomloss",
-        "tslearn",
-        "scipy",
-        "hydra-submitit-launcher==1.2.0",
-        "submitit",
-        "opencv-python-headless",
-        "projectaria-tools",
-        "pyquaternion",
-        "sqlalchemy",
-        "psycopg[binary]",
-        "pandas",
-        "rich",
-        "tabulate",
-        "prettytable",
-        "packaging",
-        "overrides",
-        "typing_extensions",
-        "pyyaml",
-        "matplotlib",
-        "termcolor",
-        "tqdm",
-        "filelock",
-        "imageio",
-        "imageio-ffmpeg",
-        "safetensors",
-        "huggingface-hub",
-        "scaleapi",
-        "openai",
-        "pyzmq",
-        "torchvision==0.21.0",
-        "s5cmd",
-        "tdigest==0.5.2.1",
+        "torch",
+        "torchvision",
+        index_url="https://download.pytorch.org/whl/cpu",
     )
+    .pip_install(
+        "numpy",
+        "scipy",
+        "zarr==3.1.5",
+        "numcodecs",
+        "tdigest==0.5.2.1",
+        "projectaria-tools",
+        "opencv-python-headless",
+        "matplotlib",
+        "einops",
+        "huggingface_hub",
+        "pandas",
+        "pyarrow",
+        "pytorch-kinematics",
+        "av",
+    )
+    # Bake the egomimic package into the image at build time. No git clone,
+    # no submodules, no uv build per worker. Ships the local working tree.
+    .add_local_dir("egomimic", remote_path="/root/EgoVerse/egomimic")
 )
 
 zarr_volume = modal.Volume.from_name(CFG.zarr_volume_name)
@@ -256,6 +236,7 @@ def compute_shard_stats(
     mode: str = "cartesian",
     obs_dim: int = _OBS_DIM,
     act_dim: int = _ACT_DIM,
+    frames_per_episode: int | None = None,
     git_remote: str = "",
     git_commit: str = "",
 ) -> dict:
@@ -268,27 +249,26 @@ def compute_shard_stats(
                             (quantiles: (act_dim,) pooled over 100 steps)
     ``mode="cartesian"`` → 12-dim ypr; ``mode="cartesian_6d"`` → 18-dim 6D.
 
-    ``samples_per_shard=None`` processes EVERY valid frame of every episode in
-    the shard (entire-volume mode); otherwise it caps the shard at that many
-    randomly-sampled frames.
+    Sampling mode (first match wins):
+      * ``frames_per_episode=N``  → visit EVERY episode in the shard and sample
+        N random frames from each (full episode coverage; total ≈ n_eps * N).
+      * ``samples_per_shard=None`` → EVERY valid frame of every episode
+        (entire-volume / exact).
+      * ``samples_per_shard=M``   → fill M random frames, taken from the first
+        episodes until the quota is met (cheap, low episode coverage).
 
-    episodes: [{"episode_hash", "local_path", "num_frames"}, ...]
+    episodes: [{"episode_hash", "local_path"}, ...]
     Returns serialized per-key stats dict.
     """
     import random
 
+    # egomimic is baked into the image (add_local_dir) — no clone needed, just
+    # make it importable.
+    import sys as _sys
+
     import numpy as np
     import zarr
     from tdigest import TDigest
-
-    # Install repo so egomimic is importable; skip submodules (openpi etc.) — not needed here
-    if git_remote and git_commit:
-        _prepare_repo(
-            git_remote=git_remote, git_commit=git_commit, recurse_submodules=False
-        )
-
-    # Build transform pipeline matching training (mecka_bimanual, given mode)
-    import sys as _sys
 
     _sys.path.insert(0, CFG.remote_repo_dir)
     from egomimic.rldb.embodiment.human import Mecka
@@ -298,6 +278,7 @@ def compute_shard_stats(
     )
 
     all_frames = samples_per_shard is None
+    per_episode = frames_per_episode is not None
 
     # Per-key accumulators
     accum = {
@@ -320,18 +301,43 @@ def compute_shard_stats(
         },
     }
     n_collected = 0
+    # Diagnostic counters — the previous code silently swallowed every skip
+    # (open / read / transform / non-finite), which made an all-shards
+    # collected=0 impossible to diagnose. Count and report each reason.
+    diag = {
+        "eps_open_fail": 0,
+        "eps_read_fail": 0,
+        "eps_short": 0,
+        "eps_ok": 0,
+        "frames_seen": 0,
+        "nonfinite": 0,
+        "tf_errors": {},
+    }
+    _logged_tf_tb = False
+    if not transform_list:
+        print(
+            f"[Shard {shard_id}] WARNING: transform_list empty/None for "
+            f"mode={mode!r} — every frame will be skipped."
+        )
 
     episodes = list(episodes)
     random.shuffle(episodes)
+    print(
+        f"[Shard {shard_id}] received {len(episodes)} episodes, mode={mode!r}, "
+        f"first_path={episodes[0]['local_path'] if episodes else 'NONE'}"
+    )
 
     for ep in episodes:
-        if not all_frames and n_collected >= samples_per_shard:
+        # per_episode mode visits ALL episodes; only the quota mode early-exits.
+        if not per_episode and not all_frames and n_collected >= samples_per_shard:
             break
 
         try:
             store = zarr.open_group(ep["local_path"], mode="r")
         except Exception as e:
-            print(f"[Shard {shard_id}] Failed to open {ep['local_path']}: {e}")
+            diag["eps_open_fail"] += 1
+            if diag["eps_open_fail"] <= 3:
+                print(f"[Shard {shard_id}] Failed to open {ep['local_path']}: {e}")
             continue
 
         try:
@@ -339,15 +345,24 @@ def compute_shard_stats(
             left_ee = np.asarray(store[_ZK_LEFT_EE][:], dtype=np.float64)
             head = np.asarray(store[_ZK_HEAD][:], dtype=np.float64)
         except Exception as e:
-            print(f"[Shard {shard_id}] Failed to read from {ep['local_path']}: {e}")
+            diag["eps_read_fail"] += 1
+            if diag["eps_read_fail"] <= 3:
+                print(f"[Shard {shard_id}] Failed to read from {ep['local_path']}: {e}")
             continue
 
+        diag["eps_ok"] += 1
         T = right_ee.shape[0]
         if T <= _ACTION_HORIZON:
+            diag["eps_short"] += 1
             continue
 
         valid_frames = list(range(T - _ACTION_HORIZON))
-        if all_frames:
+        if per_episode:
+            # Full episode coverage: a fixed number of random frames per episode.
+            sample_frames = random.sample(
+                valid_frames, min(frames_per_episode, len(valid_frames))
+            )
+        elif all_frames:
             # Entire-volume mode: use every valid chunk-start frame.
             sample_frames = valid_frames
         else:
@@ -363,16 +378,28 @@ def compute_shard_stats(
                 "obs_head_pose": head[t],  # (7,)
             }
 
+            diag["frames_seen"] += 1
             try:
                 for tf in transform_list:
                     data = tf.transform(data)
-            except Exception:
+            except Exception as e:
+                k = type(e).__name__
+                diag["tf_errors"][k] = diag["tf_errors"].get(k, 0) + 1
+                if not _logged_tf_tb:
+                    _logged_tf_tb = True
+                    import traceback as _tb
+
+                    print(
+                        f"[Shard {shard_id}] FIRST transform error "
+                        f"({k}: {str(e)[:100]}):\n{_tb.format_exc()}"
+                    )
                 continue
 
-            ee = np.asarray(data[_OBS_KEY], dtype=np.float64)  # (12,)
-            ac = np.asarray(data[_ACT_KEY], dtype=np.float64)  # (100, 12)
+            ee = np.asarray(data[_OBS_KEY], dtype=np.float64)  # (obs_dim,)
+            ac = np.asarray(data[_ACT_KEY], dtype=np.float64)  # (100, act_dim)
 
             if np.any(~np.isfinite(ee)) or np.any(~np.isfinite(ac)):
+                diag["nonfinite"] += 1
                 continue
 
             # --- Welford update: ee_pose (1 observation = 12-dim vector) ---
@@ -418,7 +445,12 @@ def compute_shard_stats(
 
             n_collected += 1
 
-    print(f"[Shard {shard_id}] collected={n_collected}")
+    print(
+        f"[Shard {shard_id}] collected={n_collected} eps_ok={diag['eps_ok']} "
+        f"open_fail={diag['eps_open_fail']} read_fail={diag['eps_read_fail']} "
+        f"short={diag['eps_short']} frames_seen={diag['frames_seen']} "
+        f"nonfinite={diag['nonfinite']} tf_errors={diag['tf_errors']}"
+    )
 
     # Serialize
     out: dict = {}
@@ -513,11 +545,18 @@ def run_norm_stats(
     exclude_hashes: list[str] | None = None,
     mode: str = "cartesian",
     all_frames: bool = False,
+    max_episodes: int | None = None,
+    frames_per_episode: int | None = None,
 ) -> str:
     """Fan out to shard workers, merge results, write norm_stats.json.
 
     Stats are keyed by DataSchematic key names ("ee_pose", "actions_cartesian")
     under the embodiment ID for mecka_bimanual.
+
+    Episodes are sourced directly from the ``.zarr`` directories present on the
+    zarr v2 volume (no SQL dependency) — so norm stats only ever cover episodes
+    actually present in the volume. ``max_episodes`` caps the episode count for
+    fast debug runs.
 
     ``mode`` selects the rotation representation: "cartesian" (12-dim ypr) or
     "cartesian_6d" (18-dim continuous 6D). ``all_frames=True`` processes EVERY
@@ -534,15 +573,11 @@ def run_norm_stats(
     obs_dim = _MODE_DIMS[mode]
     per_shard = None if all_frames else samples_per_shard
 
-    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
+    # egomimic is baked into the image (add_local_dir) — no clone needed.
     zarr_volume.reload()
     sys.path.insert(0, CFG.remote_repo_dir)
 
     from egomimic.rldb.embodiment.embodiment import get_embodiment_id
-    from egomimic.utils.aws.aws_data_utils import load_env
-    from egomimic.utils.aws.aws_sql import create_default_engine, episode_table_to_df
-
-    load_env()
 
     out_path = (
         Path(CFG.output_mount_path) / _NORM_SUBDIR / data_config / "norm_stats.json"
@@ -551,55 +586,49 @@ def run_norm_stats(
 
     all_stats_out: dict = {}
 
-    # ---- Query SQL for episode list ----
-    engine = create_default_engine()
-    df = episode_table_to_df(engine)
-    if df.empty:
-        raise ValueError("SQL episode table is empty")
-    df = df[df["is_deleted"] != True]  # noqa: E712
-    if exclude_hashes:
-        df = df[~df["episode_hash"].isin(set(exclude_hashes))]
-        print(
-            f"[NormStats] After excluding {len(exclude_hashes)} hashes: {len(df)} rows"
-        )
-
-    # ---- Find episodes present on local volume ----
-    volume_path = Path(CFG.volume_mount_path)
-    print(f"[NormStats] Listing volume directory {volume_path} ...")
+    # ---- Source episodes directly from the zarr v2 volume (present-only) ----
+    # No SQL: we only ever compute norm stats over episodes actually present on
+    # the volume. Each entry is a ``<hash>.zarr`` (or bare ``<hash>``) directory.
     import os as _os
 
-    local_names = set(_os.listdir(str(volume_path)))
-    print(f"[NormStats] Volume has {len(local_names)} entries")
+    volume_path = Path(CFG.volume_mount_path)
+    print(f"[NormStats] Listing volume directory {volume_path} ...")
+    entries = sorted(_os.listdir(str(volume_path)))
+    excl = set(exclude_hashes or [])
 
     episodes: list[dict] = []
-    n_missing = 0
-    for _, row in df.iterrows():
-        h = row["episode_hash"]
-        if h in local_names:
-            local_path = str(volume_path / h)
-        elif f"{h}.zarr" in local_names:
-            local_path = str(volume_path / f"{h}.zarr")
-        else:
-            n_missing += 1
+    for name in entries:
+        h = name[:-5] if name.endswith(".zarr") else name
+        if h in excl:
             continue
-        episodes.append(
-            {
-                "episode_hash": h,
-                "local_path": local_path,
-                "num_frames": int(row["num_frames"]),
-            }
-        )
+        local_path = str(volume_path / name)
+        if not _os.path.isdir(local_path):
+            continue
+        episodes.append({"episode_hash": h, "local_path": local_path})
 
-    print(f"[NormStats] {len(episodes)} episodes found locally, {n_missing} missing")
+    print(
+        f"[NormStats] {len(episodes)} episodes present on volume"
+        + (f" (excluded {len(excl)})" if excl else "")
+    )
+
+    if max_episodes is not None and len(episodes) > max_episodes:
+        episodes = episodes[:max_episodes]
+        print(f"[NormStats] DEBUG cap: using first {len(episodes)} episodes")
 
     if not episodes:
-        raise ValueError("No episodes found on local volume.")
+        raise ValueError("No .zarr episodes found on the volume.")
 
     # ---- Split into shards ----
     actual_shards = min(n_shards, len(episodes))
     shard_size = math.ceil(len(episodes) / actual_shards)
     shards = [episodes[i : i + shard_size] for i in range(0, len(episodes), shard_size)]
-    if all_frames:
+    if frames_per_episode is not None:
+        print(
+            f"[NormStats] {len(shards)} shards × ~{shard_size} episodes each, "
+            f"{frames_per_episode} frames/episode (FULL episode coverage) → "
+            f"~{len(episodes) * frames_per_episode} total frames, mode={mode!r}"
+        )
+    elif all_frames:
         print(
             f"[NormStats] {len(shards)} shards × ~{shard_size} episodes each, "
             f"ALL valid frames/episode (entire-volume mode), mode={mode!r}"
@@ -619,7 +648,17 @@ def run_norm_stats(
     # ---- Fan out ----
     t_start = time.time()
     shard_inputs = [
-        (i, shard, per_shard, mode, obs_dim, act_dim, git_remote, git_commit)
+        (
+            i,
+            shard,
+            per_shard,
+            mode,
+            obs_dim,
+            act_dim,
+            frames_per_episode,
+            git_remote,
+            git_commit,
+        )
         for i, shard in enumerate(shards)
     ]
     shard_results = list(
@@ -801,6 +840,25 @@ def main(*args: str) -> None:
         "(entire-volume mode) instead of sampling samples_per_shard per shard. "
         "mean/std/min/max become exact over the whole dataset.",
     )
+    parser.add_argument(
+        "--max-episodes",
+        dest="max_episodes",
+        type=int,
+        default=None,
+        help="Debug cap: use only the first N episodes present on the volume "
+        "instead of all of them. Great for a fast end-to-end smoke of the "
+        "norm pipeline before running the full job.",
+    )
+    parser.add_argument(
+        "--frames-per-episode",
+        dest="frames_per_episode",
+        type=int,
+        default=None,
+        help="Full episode coverage: visit EVERY episode and sample this many "
+        "random frames from each (total ≈ n_episodes * N). Use this for "
+        "representative stats spanning the whole pool, instead of "
+        "samples_per_shard (which fills the quota from the first few episodes).",
+    )
     parsed = parser.parse_args(list(args))
 
     exclude_hashes: list[str] = []
@@ -850,6 +908,8 @@ def main(*args: str) -> None:
         exclude_hashes=exclude_hashes or None,
         mode=parsed.mode,
         all_frames=parsed.all_frames,
+        max_episodes=parsed.max_episodes,
+        frames_per_episode=parsed.frames_per_episode,
     )
 
     print(f"\nDone. Volume path: {out_path}")
