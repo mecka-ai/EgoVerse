@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ego-rating</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">ego<span>·</span>rating</div>
+      <nav id="nav">
+        <a href="#rate" data-route="rate">Rate</a>
+        <a href="#leaderboard" data-route="leaderboard">Leaderboard</a>
+        <a href="#admin" data-route="admin">Admin</a>
+      </nav>
+      <div class="spacer"></div>
+      <div class="ctrl">
+        <label for="rater">Rater</label>
+        <input type="number" id="rater" min="1" step="1" />
+      </div>
+      <div class="ctrl">
+        <label for="scene">Scene</label>
+        <select id="scene"></select>
+      </div>
+      <div class="ctrl">
+        <label for="operator">Operator</label>
+        <select id="operator"></select>
+      </div>
+    </header>
+
+    <main id="app"></main>
+
+    <!-- Bulk-score modal -->
+    <div class="modal-backdrop" id="modal-backdrop">
+      <div class="modal">
+        <h3 id="modal-title">Bulk score</h3>
+        <p id="modal-sub"></p>
+        <div class="scores" id="modal-scores"></div>
+        <button class="modal-close" id="modal-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <script>
+      // ----------------------------------------------------------------
+      // State
+      // ----------------------------------------------------------------
+      const state = {
+        config: { annotation: "", scenes: [], operators: [] },
+        raterId: parseInt(sessionStorage.getItem("raterId") || "1", 10) || 1,
+        scene: sessionStorage.getItem("scene") || "",
+        operator: sessionStorage.getItem("operator") || "",
+        currentSpan: null,
+      };
+
+      const app = document.getElementById("app");
+
+      // ----------------------------------------------------------------
+      // Helpers
+      // ----------------------------------------------------------------
+      function qs(extra = {}) {
+        const p = new URLSearchParams();
+        if (state.scene) p.set("scene", state.scene);
+        if (state.operator) p.set("operator", state.operator);
+        for (const [k, v] of Object.entries(extra)) {
+          if (v !== undefined && v !== null && v !== "") p.set(k, v);
+        }
+        const s = p.toString();
+        return s ? "?" + s : "";
+      }
+
+      async function api(path, opts) {
+        const res = await fetch(path, opts);
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error(`${res.status} ${path}: ${body}`);
+        }
+        return res.json();
+      }
+
+      function fmt(x, digits = 2) {
+        return x === null || x === undefined ? "—" : Number(x).toFixed(digits);
+      }
+
+      // Escape config/data strings before interpolating into innerHTML.
+      // scene/operator/span_id/video are free-form per the spec, so a value
+      // with & < > " ' would otherwise corrupt the rendered markup.
+      function esc(s) {
+        return String(s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+        );
+      }
+
+      function currentRoute() {
+        const r = (location.hash || "#rate").slice(1);
+        return ["rate", "leaderboard", "admin"].includes(r) ? r : "rate";
+      }
+
+      // ----------------------------------------------------------------
+      // Header controls
+      // ----------------------------------------------------------------
+      function populateFilters() {
+        const sceneSel = document.getElementById("scene");
+        const opSel = document.getElementById("operator");
+        const opts = (arr) =>
+          ['<option value="">All</option>']
+            .concat(arr.map((v) => `<option value="${esc(v)}">${esc(v)}</option>`))
+            .join("");
+        sceneSel.innerHTML = opts(state.config.scenes);
+        opSel.innerHTML = opts(state.config.operators);
+        sceneSel.value = state.scene;
+        opSel.value = state.operator;
+        document.getElementById("rater").value = state.raterId;
+      }
+
+      function wireHeader() {
+        document.getElementById("rater").addEventListener("change", (e) => {
+          state.raterId = parseInt(e.target.value, 10) || 1;
+          e.target.value = state.raterId;
+          sessionStorage.setItem("raterId", state.raterId);
+          render();
+        });
+        document.getElementById("scene").addEventListener("change", (e) => {
+          state.scene = e.target.value;
+          sessionStorage.setItem("scene", state.scene);
+          render();
+        });
+        document.getElementById("operator").addEventListener("change", (e) => {
+          state.operator = e.target.value;
+          sessionStorage.setItem("operator", state.operator);
+          render();
+        });
+      }
+
+      function highlightNav() {
+        const route = currentRoute();
+        document.querySelectorAll("#nav a").forEach((a) => {
+          a.classList.toggle("active", a.dataset.route === route);
+        });
+      }
+
+      // ----------------------------------------------------------------
+      // Rate screen
+      // ----------------------------------------------------------------
+      async function renderRate() {
+        app.innerHTML = `
+          <div class="annotation">
+            <div class="label">Annotation</div>
+            <div class="text" id="annotation-text"></div>
+          </div>
+          <div class="progress">
+            <span id="progress-text">…</span>
+            <div class="bar"><div id="progress-fill"></div></div>
+          </div>
+          <div id="rate-body"></div>
+        `;
+        document.getElementById("annotation-text").textContent =
+          state.config.annotation;
+        await loadProgress();
+        await loadNext();
+      }
+
+      async function loadProgress() {
+        const data = await api("/spans" + qs({ rater_id: state.raterId }));
+        const total = data.rows.length;
+        const rated = data.rows.filter((r) => r.rated).length;
+        const txt = document.getElementById("progress-text");
+        const fill = document.getElementById("progress-fill");
+        if (txt) txt.textContent = `${rated} of ${total} spans rated`;
+        if (fill) fill.style.width = total ? (rated / total) * 100 + "%" : "0%";
+      }
+
+      async function loadNext() {
+        const span = await api("/next" + qs({ rater_id: state.raterId }));
+        state.currentSpan = span;
+        const body = document.getElementById("rate-body");
+        if (!body) return;
+
+        if (!span) {
+          body.innerHTML = `
+            <div class="end-state">
+              <h2>All spans rated for this filter 🎉</h2>
+              <p>Nothing left in the current queue.</p>
+              <p><a href="#leaderboard">View the leaderboard →</a></p>
+            </div>`;
+          return;
+        }
+
+        const frag = `${esc(span.video_uri)}#t=${span.start},${span.end}`;
+        body.innerHTML = `
+          <div class="video-wrap">
+            <video id="clip" src="${frag}" autoplay muted loop playsinline></video>
+          </div>
+          <div class="span-meta">
+            <code>${esc(span.span_id)}</code> · scene <code>${esc(span.scene)}</code> ·
+            operator <code>${esc(span.operator)}</code> ·
+            ${span.start.toFixed(1)}s–${span.end.toFixed(1)}s
+          </div>
+          <div class="scores" id="score-buttons">
+            ${[1, 2, 3, 4, 5]
+              .map((n) => `<button data-score="${n}">${n}</button>`)
+              .join("")}
+          </div>
+          <div class="bulk-links">
+            <a href="#" id="bulk-scene">Bulk score this scene (${esc(span.scene)})</a>
+            <a href="#" id="bulk-operator">Bulk score this operator (${esc(span.operator)})</a>
+          </div>
+          <div class="status-msg" id="rate-status"></div>
+        `;
+
+        setupVideoLoop(span);
+
+        document.querySelectorAll("#score-buttons button").forEach((btn) => {
+          btn.addEventListener("click", () => submitScore(parseInt(btn.dataset.score, 10)));
+        });
+        document.getElementById("bulk-scene").addEventListener("click", (e) => {
+          e.preventDefault();
+          openBulkModal("scene", span.scene);
+        });
+        document.getElementById("bulk-operator").addEventListener("click", (e) => {
+          e.preventDefault();
+          openBulkModal("operator", span.operator);
+        });
+      }
+
+      function setupVideoLoop(span) {
+        const v = document.getElementById("clip");
+        if (!v) return;
+        const seekStart = () => {
+          if (v.currentTime < span.start || v.currentTime > span.end) {
+            v.currentTime = span.start;
+          }
+        };
+        v.addEventListener("loadedmetadata", () => {
+          v.currentTime = span.start;
+        });
+        // Enforce looping within [start, end] (media-fragment looping is
+        // inconsistent across browsers).
+        v.addEventListener("timeupdate", () => {
+          if (v.currentTime >= span.end - 0.05) v.currentTime = span.start;
+        });
+        seekStart();
+      }
+
+      async function submitScore(score) {
+        if (!state.currentSpan) return;
+        await api("/rate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            span_id: state.currentSpan.span_id,
+            rater_id: state.raterId,
+            score,
+          }),
+        });
+        await loadProgress();
+        await loadNext();
+      }
+
+      // ----------------------------------------------------------------
+      // Bulk modal
+      // ----------------------------------------------------------------
+      const backdrop = document.getElementById("modal-backdrop");
+      let bulkTarget = null;
+
+      function openBulkModal(groupBy, groupValue) {
+        bulkTarget = { groupBy, groupValue };
+        document.getElementById("modal-title").textContent = `Bulk score ${groupBy}`;
+        document.getElementById(
+          "modal-sub"
+        ).textContent = `Score all unrated spans in ${groupBy} "${groupValue}"? Existing individual ratings are kept.`;
+        document.getElementById("modal-scores").innerHTML = [1, 2, 3, 4, 5]
+          .map((n) => `<button data-score="${n}">${n}</button>`)
+          .join("");
+        document
+          .querySelectorAll("#modal-scores button")
+          .forEach((btn) =>
+            btn.addEventListener("click", () =>
+              submitBulk(parseInt(btn.dataset.score, 10))
+            )
+          );
+        backdrop.classList.add("open");
+      }
+
+      function closeBulkModal() {
+        backdrop.classList.remove("open");
+        bulkTarget = null;
+      }
+
+      document.getElementById("modal-cancel").addEventListener("click", closeBulkModal);
+      backdrop.addEventListener("click", (e) => {
+        if (e.target === backdrop) closeBulkModal();
+      });
+
+      async function submitBulk(score) {
+        if (!bulkTarget) return;
+        const res = await api("/bulk-rate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            group_by: bulkTarget.groupBy,
+            group_value: bulkTarget.groupValue,
+            rater_id: state.raterId,
+            score,
+          }),
+        });
+        closeBulkModal();
+        await loadProgress();
+        await loadNext();
+        const status = document.getElementById("rate-status");
+        if (status) {
+          status.textContent = `Scored ${res.rated_count}, skipped ${res.skipped_count} already-rated.`;
+          setTimeout(() => {
+            if (status) status.textContent = "";
+          }, 5000);
+        }
+      }
+
+      // ----------------------------------------------------------------
+      // Leaderboard screen
+      // ----------------------------------------------------------------
+      async function renderLeaderboard() {
+        app.innerHTML = `
+          <h2 class="section-title">Quality leaderboard</h2>
+          <div class="toolbar">
+            <button class="btn secondary" id="refresh">Refresh</button>
+            <span class="muted" id="lb-count"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Scene</th><th>Operator</th><th>Span ID</th>
+                  <th>Mean</th><th>95% CI</th><th>N</th><th>Bulk%</th>
+                </tr>
+              </thead>
+              <tbody id="lb-body"></tbody>
+            </table>
+          </div>
+          <div class="alpha" id="lb-alpha"></div>
+        `;
+        document.getElementById("refresh").addEventListener("click", loadLeaderboard);
+        await loadLeaderboard();
+      }
+
+      async function loadLeaderboard() {
+        const [data, iota] = await Promise.all([
+          api("/ratings" + qs()),
+          api("/iota" + qs()),
+        ]);
+        const body = document.getElementById("lb-body");
+        body.innerHTML = data.rows
+          .map((r) => {
+            const ci =
+              r.ci_low === null || r.ci_low === undefined
+                ? "—"
+                : `${fmt(r.ci_low)} – ${fmt(r.ci_high)}`;
+            const bf = r.bulk_fraction;
+            const bulkPct = bf === null || bf === undefined ? "—" : `${(bf * 100).toFixed(0)}%`;
+            const badge = bf > 0 ? '<span class="badge">bulk</span>' : "";
+            const rowClass = bf === 1 ? "all-bulk" : "";
+            return `
+              <tr class="${rowClass}">
+                <td>${esc(r.scene)}</td>
+                <td>${esc(r.operator)}</td>
+                <td><code>${esc(r.span_id)}</code></td>
+                <td>${fmt(r.mean)}</td>
+                <td>${ci}</td>
+                <td>${r.n}</td>
+                <td>${bulkPct}${badge}</td>
+              </tr>`;
+          })
+          .join("");
+        document.getElementById("lb-count").textContent = `${data.rows.length} spans`;
+        const a = iota.alpha;
+        document.getElementById("lb-alpha").innerHTML =
+          a === null || a === undefined
+            ? `Krippendorff's α (ordinal): <strong>—</strong> <span class="muted">(needs ≥2 raters sharing a span)</span>`
+            : `Krippendorff's α (ordinal): <strong>${fmt(a, 3)}</strong>`;
+      }
+
+      // ----------------------------------------------------------------
+      // Admin screen
+      // ----------------------------------------------------------------
+      async function renderAdmin() {
+        app.innerHTML = `
+          <h2 class="section-title">Admin</h2>
+          <div class="toolbar">
+            <button class="btn" id="reload">Reload config</button>
+            <button class="btn secondary" id="refresh-admin">Refresh ratings</button>
+            <span class="muted" id="admin-status"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Rating ID</th><th>Span ID</th><th>Scene</th><th>Operator</th>
+                  <th>Rater</th><th>Score</th><th>Type</th><th>Timestamp</th>
+                </tr>
+              </thead>
+              <tbody id="admin-body"></tbody>
+            </table>
+          </div>
+        `;
+        document.getElementById("reload").addEventListener("click", async () => {
+          const res = await api("/reload-config", { method: "POST" });
+          document.getElementById("admin-status").textContent =
+            `Reloaded config — ${res.span_count} spans upserted.`;
+          // Refresh filter dropdowns in case scenes/operators changed.
+          await loadConfig();
+          populateFilters();
+        });
+        document.getElementById("refresh-admin").addEventListener("click", loadAdmin);
+        await loadAdmin();
+      }
+
+      async function loadAdmin() {
+        const data = await api("/raw-ratings");
+        const body = document.getElementById("admin-body");
+        if (!data.rows.length) {
+          body.innerHTML = `<tr><td colspan="8" class="muted">No ratings yet.</td></tr>`;
+          return;
+        }
+        body.innerHTML = data.rows
+          .map(
+            (r) => `
+            <tr>
+              <td>${r.rating_id}</td>
+              <td><code>${esc(r.span_id)}</code></td>
+              <td>${esc(r.scene ?? "—")}</td>
+              <td>${esc(r.operator ?? "—")}</td>
+              <td>${r.rater_id}</td>
+              <td>${r.score}</td>
+              <td>${
+                r.is_bulk
+                  ? '<span class="pill bulk">bulk</span>'
+                  : '<span class="pill indiv">individual</span>'
+              }</td>
+              <td class="muted">${esc(r.ts)}</td>
+            </tr>`
+          )
+          .join("");
+      }
+
+      // ----------------------------------------------------------------
+      // Router
+      // ----------------------------------------------------------------
+      async function render() {
+        highlightNav();
+        try {
+          const route = currentRoute();
+          if (route === "rate") await renderRate();
+          else if (route === "leaderboard") await renderLeaderboard();
+          else if (route === "admin") await renderAdmin();
+        } catch (err) {
+          app.innerHTML = `<div class="end-state"><h2>Error</h2><p class="muted">${err.message}</p></div>`;
+          console.error(err);
+        }
+      }
+
+      async function loadConfig() {
+        state.config = await api("/config");
+      }
+
+      window.addEventListener("hashchange", render);
+
+      (async function init() {
+        wireHeader();
+        await loadConfig();
+        populateFilters();
+        if (!location.hash) location.hash = "#rate";
+        await render();
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,55 @@
+# ego-rating config — single source of truth for the rating session.
+#
+# `annotation` is one shared instruction string for the WHOLE session (not per-span).
+# Every span must have a unique `id`. `scene` and `operator` are the two grouping
+# axes used for filtering and bulk-scoring. Spans are upserted into the DB on
+# startup (and on POST /reload-config); they are never created/edited through the UI.
+#
+# `video` paths are served from the `videos/` directory at the repo root
+# (mounted at /videos by the backend). Drop your clips there, or point the path
+# at any URL the browser can reach.
+
+annotation: "Pick up the wrench from the table and place it in the tray."
+
+spans:
+  - id: "span_001"
+    video: "videos/alice_bench1_take1.mp4"
+    start: 4.2
+    end: 11.0
+    scene: "lab_bench_1"
+    operator: "alice"
+
+  - id: "span_002"
+    video: "videos/alice_bench1_take2.mp4"
+    start: 2.0
+    end: 8.5
+    scene: "lab_bench_1"
+    operator: "alice"
+
+  - id: "span_003"
+    video: "videos/bob_bench2_take1.mp4"
+    start: 7.0
+    end: 14.3
+    scene: "lab_bench_2"
+    operator: "bob"
+
+  - id: "span_004"
+    video: "videos/bob_bench2_take2.mp4"
+    start: 1.5
+    end: 9.0
+    scene: "lab_bench_2"
+    operator: "bob"
+
+  - id: "span_005"
+    video: "videos/carol_bench1_take1.mp4"
+    start: 0.0
+    end: 6.2
+    scene: "lab_bench_1"
+    operator: "carol"
+
+  - id: "span_006"
+    video: "videos/carol_bench2_take1.mp4"
+    start: 3.3
+    end: 12.1
+    scene: "lab_bench_2"
+    operator: "carol"
