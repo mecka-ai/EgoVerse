@@ -219,8 +219,8 @@ def _cache_collect(cache_dir: Path, out_path: str, _np) -> int:
 @app.function(
     image=image,
     gpu="H200",
-    cpu=8,
-    memory=65536,
+    cpu=16,
+    memory=131072,
     ephemeral_disk=2 * 1024 * 1024,
     timeout=14400,
     secrets=_SHARED_SECRETS,
