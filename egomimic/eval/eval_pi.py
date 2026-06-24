@@ -14,6 +14,20 @@ class PIEvalVideo(EvalVideo):
     delegates per-embodiment image visualization to the algo's viz_func.
     """
 
+    @staticmethod
+    def _xyzypr_split_idx(action_dim):
+        """Index lists for the translation (xyz) and rotation (ypr) channels of
+        a cartesian action laid out as a sequence of 6D [x,y,z,yaw,pitch,roll]
+        poses (e.g. mecka bimanual = left[0:6] + right[6:12]). Returns
+        (xyz_idx, ypr_idx) or None if the action isn't a clean stack of 6D poses.
+        """
+        if action_dim <= 0 or action_dim % 6 != 0:
+            return None
+        n_pose = action_dim // 6
+        xyz_idx = [6 * p + i for p in range(n_pose) for i in range(3)]
+        ypr_idx = [6 * p + 3 + i for p in range(n_pose) for i in range(3)]
+        return xyz_idx, ypr_idx
+
     def compute_metrics_and_viz(self, batch, do_viz=True):
         algo = self.model
         preds = algo.forward_eval(batch)
@@ -27,12 +41,38 @@ class PIEvalVideo(EvalVideo):
             ac_key = algo.ac_keys[embodiment_id]
             pred_key = f"{embodiment_name}_{ac_key}"
             if pred_key in preds:
+                # torchmetrics MeanSquaredError.update calls preds.view(-1),
+                # which requires contiguous inputs; slices like [:, -1] and
+                # advanced-index gathers are not guaranteed contiguous, so
+                # .contiguous() every tensor handed to mse().
+                pred = preds[pred_key].cpu()
+                gt = _batch[ac_key].cpu()
                 metrics[f"Valid/{pred_key}_paired_mse_avg"] = mse(
-                    preds[pred_key].cpu(), _batch[ac_key].cpu()
+                    pred.contiguous(), gt.contiguous()
                 )
                 metrics[f"Valid/{pred_key}_final_mse_avg"] = mse(
-                    preds[pred_key][:, -1].cpu(), _batch[ac_key][:, -1].cpu()
+                    pred[:, -1].contiguous(), gt[:, -1].contiguous()
                 )
+                # Break the combined MSE into translation (xyz, meters) vs
+                # rotation (ypr, radians) so we can see which channel dominates
+                # the error. Only valid when the action is a stack of 6D poses.
+                split = self._xyzypr_split_idx(pred.shape[-1])
+                if split is not None:
+                    xyz_idx, ypr_idx = split
+                    metrics[f"Valid/{pred_key}_paired_xyz_mse_avg"] = mse(
+                        pred[..., xyz_idx].contiguous(), gt[..., xyz_idx].contiguous()
+                    )
+                    metrics[f"Valid/{pred_key}_paired_ypr_mse_avg"] = mse(
+                        pred[..., ypr_idx].contiguous(), gt[..., ypr_idx].contiguous()
+                    )
+                    metrics[f"Valid/{pred_key}_final_xyz_mse_avg"] = mse(
+                        pred[:, -1][..., xyz_idx].contiguous(),
+                        gt[:, -1][..., xyz_idx].contiguous(),
+                    )
+                    metrics[f"Valid/{pred_key}_final_ypr_mse_avg"] = mse(
+                        pred[:, -1][..., ypr_idx].contiguous(),
+                        gt[:, -1][..., ypr_idx].contiguous(),
+                    )
 
             # Visualization is non-essential: the Valid/*_mse metrics above are
             # the training signal. A viz error (missing per-embodiment viz_func,

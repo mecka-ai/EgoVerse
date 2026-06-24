@@ -1,3 +1,6 @@
 _target_: egomimic.eval.eval_pi.PIEvalVideo
-# Render viz videos every N epochs; MSE metrics still log every validation pass.
-viz_every_n_epochs: 100
+# Step-based viz gating to match the step-based training regime: render/write
+# eval videos every 10000 steps while cheap MSE metrics still log every
+# validation pass (val_check_interval=2000). Must be a multiple of
+# val_check_interval so the modulo lines up with validation passes.
+viz_every_n_steps: 10000

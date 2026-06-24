@@ -1,3 +1,4 @@
 _target_: egomimic.eval.eval_hpt.HPTEvalVideo
-# Render viz videos every N epochs; MSE metrics still log every validation pass.
-viz_every_n_epochs: 100
+# Step-based viz gating (see eval_pi.yaml). Must be a multiple of the run's
+# val_check_interval for the modulo to line up with validation passes.
+viz_every_n_steps: 10000

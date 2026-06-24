@@ -13,17 +13,24 @@ class EvalVideo(Eval):
     Base evaluator that buffers per-embodiment frames and writes them out as
     validation videos. Subclasses implement `compute_metrics_and_viz` to compute
     model-specific metrics and produce the frames to buffer.
+
+    Eval is split into a cheap part (metrics, computed every validation pass) and
+    an expensive part (per-embodiment visualization + mp4 writes to the shared
+    volume). The expensive viz is gated by `viz_every_n_steps` so it runs far less
+    often than the metrics. Gating is **step based** (trainer.global_step) to match
+    a step-based training regime (val_check_interval in steps). `viz_every_n_steps`
+    should be an integer multiple of trainer.val_check_interval so the modulo lines
+    up with validation passes (e.g. val_check_interval=2000, viz_every_n_steps=10000
+    -> metrics every 2000 steps, viz every 5th validation = every 10000 steps).
     """
 
-    def __init__(self, limit_val_batches: int = 400, viz_every_n_epochs: int = 1):
+    def __init__(self, limit_val_batches: int = 400, viz_every_n_steps: int = 1):
         super().__init__()
         self.trainer = None
         self.model = None
-        # Metrics are logged every validation pass; the (expensive) viz/video
-        # rendering is gated to every `viz_every_n_epochs` epochs via _should_viz.
-        self.viz_every_n_epochs = viz_every_n_epochs
         self.val_image_buffer = {}
         self.val_counter = {}
+        self.viz_every_n_steps = viz_every_n_steps
         self.override_dict = {
             "strategy": "ddp_find_unused_parameters_true",
             "limit_train_batches": 0,
@@ -37,24 +44,21 @@ class EvalVideo(Eval):
     def video_dir(self):
         return os.path.join(self.root_dir(), "videos")
 
+    def _viz_subdir(self) -> str:
+        """Per-eval output subdir, keyed by global step (step-based regime)."""
+        return f"step_{self.trainer.global_step}"
+
     def _should_viz(self) -> bool:
-        """Whether to render visualization videos this validation pass.
+        """Whether to render/write visualization videos this validation pass.
 
-        Metrics are computed/logged on every validation pass; only the
-        expensive viz/video rendering is gated to every `viz_every_n_epochs`
-        epochs. A non-positive value disables viz entirely.
-
-        The gate uses ``current_epoch + 1`` to match Lightning's own
-        validation trigger ``(current_epoch + 1) % check_val_every_n_epoch``
-        (during the end-of-epoch val loop ``current_epoch`` is still the
-        just-finished epoch ``e``, not ``e + 1``). For viz to ever fire,
-        ``viz_every_n_epochs`` must be an integer multiple of
-        ``check_val_every_n_epoch``; otherwise the validation-trigger epochs
-        never land on a viz multiple and no video is ever written.
+        Cheap metrics (MSE) are logged every validation pass regardless; only the
+        expensive viz is gated. Fires when trainer.global_step is a multiple of
+        viz_every_n_steps. viz_every_n_steps <= 0 disables viz entirely. In
+        standalone eval mode global_step == 0, so viz always fires there.
         """
-        if not self.viz_every_n_epochs or self.viz_every_n_epochs <= 0:
+        if not self.viz_every_n_steps or self.viz_every_n_steps <= 0:
             return False
-        return ((self.trainer.current_epoch + 1) % self.viz_every_n_epochs) == 0
+        return (int(self.trainer.global_step) % int(self.viz_every_n_steps)) == 0
 
     @abstractmethod
     def compute_metrics_and_viz(self, batch, do_viz=True):
@@ -64,8 +68,9 @@ class EvalVideo(Eval):
         Args:
             batch (dict): processed batch produced by the algo's
                 `process_batch_for_training`.
-            do_viz (bool): when False, skip the visualization rendering and
-                return an empty images_dict (metrics are still computed).
+            do_viz (bool): when False, skip the expensive per-embodiment
+                visualization and return an empty images dict (metrics still
+                computed). The caller passes the result of `_should_viz()`.
         Returns:
             metrics (dict[str, torch.Tensor | float])
             images_dict (dict[embodiment_id, np.ndarray (B, H, W, 3)])
@@ -75,20 +80,21 @@ class EvalVideo(Eval):
     def on_validation_start(self):
         if self.trainer.is_global_zero and self._should_viz():
             os.makedirs(
-                os.path.join(self.video_dir(), f"epoch_{self.trainer.current_epoch}"),
+                os.path.join(self.video_dir(), self._viz_subdir()),
                 exist_ok=True,
             )
 
     def on_validation_end(self):
-        # Only rank 0 buffers/writes videos (see on_validation_step), so the
-        # flush of remaining frames is rank-0 only too.
-        if not (self.trainer.is_global_zero and self._should_viz()):
+        # Rank-0 only, matching on_validation_step / on_validation_start: non-zero
+        # ranks never buffered frames, but guard explicitly so the residual mp4
+        # flush below stays single-writer and never collides across DDP ranks.
+        if not (self._should_viz() and self.trainer.is_global_zero):
             return
         for key, buffer in self.val_image_buffer.items():
             os.makedirs(
                 os.path.join(
                     self.video_dir(),
-                    f"epoch_{self.trainer.current_epoch}",
+                    self._viz_subdir(),
                     str(get_embodiment(key)),
                 ),
                 exist_ok=True,
@@ -97,7 +103,7 @@ class EvalVideo(Eval):
                 frames = torch.stack(buffer)
                 path = os.path.join(
                     self.video_dir(),
-                    f"epoch_{self.trainer.current_epoch}",
+                    self._viz_subdir(),
                     str(get_embodiment(key)),
                     f"validation_video_{self.val_counter[key]}.mp4",
                 )
@@ -107,9 +113,15 @@ class EvalVideo(Eval):
             self.val_image_buffer[key] = []
 
     def on_validation_step(self, batch, batch_idx, dataloader_idx=0):
-        # Metrics are computed and log_dict'd (sync_dist) on every rank so the
-        # reduction does not deadlock; only rank 0 renders/writes video frames,
-        # otherwise every DDP rank writes to the same path and clobbers it.
+        # Viz (frame buffering + mp4 writes) is rank-0 only. Under DDP this hook
+        # runs on every rank, each holding a different val shard, but the output
+        # path is identical across ranks
+        # (step_{global_step}/<embodiment>/validation_video_{counter}.mp4) because
+        # global_step and val_counter are DDP-synchronized. Writing from all ranks
+        # streams to the same file concurrently -> corrupt mp4 / silently dropped
+        # frames. Gating do_viz on is_global_zero also skips wasted frame rendering
+        # on non-zero ranks. Metrics are unaffected: they are computed regardless
+        # of do_viz and logged on every rank for the sync_dist all-reduce below.
         do_viz = self._should_viz() and self.trainer.is_global_zero
         metrics, images_dict = self.compute_metrics_and_viz(batch, do_viz=do_viz)
 
@@ -125,7 +137,7 @@ class EvalVideo(Eval):
                 os.makedirs(
                     os.path.join(
                         self.video_dir(),
-                        f"epoch_{self.trainer.current_epoch}",
+                        self._viz_subdir(),
                         str(get_embodiment(key)),
                     ),
                     exist_ok=True,
@@ -141,7 +153,7 @@ class EvalVideo(Eval):
                     frames = torch.stack(self.val_image_buffer[key])
                     path = os.path.join(
                         self.video_dir(),
-                        f"epoch_{self.trainer.current_epoch}",
+                        self._viz_subdir(),
                         str(get_embodiment(key)),
                         f"validation_video_{self.val_counter[key]}.mp4",
                     )
@@ -149,4 +161,13 @@ class EvalVideo(Eval):
                     self.val_image_buffer[key].clear()
                     self.val_counter[key] += 1
 
-        self.trainer.lightning_module.log_dict(metrics, sync_dist=True)
+        # add_dataloader_idx=False keeps metric key names stable. When train_viz
+        # is enabled, val_dataloader returns [eval, train_viz] and Lightning would
+        # otherwise append "/dataloader_idx_0" / "/dataloader_idx_1" to every key,
+        # diverging from the single-loader (train_viz-disabled) names and from the
+        # held-out loss keys (pl_model already logs those with add_dataloader_idx=
+        # False). The eval ("Valid/...") and train_viz ("train_viz/Valid/...") keys
+        # are already disambiguated by the train_viz/ prefix, so no collision.
+        self.trainer.lightning_module.log_dict(
+            metrics, sync_dist=True, add_dataloader_idx=False
+        )
