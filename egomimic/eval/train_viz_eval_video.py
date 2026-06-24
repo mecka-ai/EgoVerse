@@ -18,9 +18,17 @@ from egomimic.eval.eval_video import EvalVideo
 
 
 class TrainVizEvalVideo(EvalVideo):
-    def __init__(self, base: EvalVideo, limit_val_batches: int = 400):
+    def __init__(
+        self,
+        base: EvalVideo,
+        limit_val_batches: int = 400,
+        viz_every_n_steps: int = 1,
+    ):
         self.base = base
-        super().__init__(limit_val_batches=limit_val_batches)
+        super().__init__(
+            limit_val_batches=limit_val_batches,
+            viz_every_n_steps=viz_every_n_steps,
+        )
 
     @property
     def trainer(self):
@@ -43,7 +51,7 @@ class TrainVizEvalVideo(EvalVideo):
     def video_dir(self):
         return os.path.join(self.root_dir(), "videos_train_viz")
 
-    def compute_metrics_and_viz(self, batch):
-        metrics, images_dict = self.base.compute_metrics_and_viz(batch)
+    def compute_metrics_and_viz(self, batch, do_viz=True):
+        metrics, images_dict = self.base.compute_metrics_and_viz(batch, do_viz=do_viz)
         metrics = {f"train_viz/{k}": v for k, v in metrics.items()}
         return metrics, images_dict

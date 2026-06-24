@@ -15,7 +15,7 @@ class HPTEvalVideo(EvalVideo):
     optional reverse KL from samples for the main / shared / auxiliary action heads.
     """
 
-    def compute_metrics_and_viz(self, batch):
+    def compute_metrics_and_viz(self, batch, do_viz=True):
         algo = self.model
         preds = algo.forward_eval(batch)
 
@@ -143,8 +143,9 @@ class HPTEvalVideo(EvalVideo):
                     rkl = reverse_kl_from_samples(samples, gt_tensor)
                     metrics[f"Valid/{pred_key_name}_reverse_kl_M{M}"] = rkl.item()
 
-            ims = self._visualize_preds(preds, _batch)
-            images_dict[embodiment_id] = ims
+            if do_viz:
+                ims = self._visualize_preds(preds, _batch)
+                images_dict[embodiment_id] = ims
         return metrics, images_dict
 
     def _visualize_preds(self, predictions, batch):
