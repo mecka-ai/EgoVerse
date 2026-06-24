@@ -221,6 +221,7 @@ def _cache_collect(cache_dir: Path, out_path: str, _np) -> int:
     gpu="H200",
     cpu=8,
     memory=65536,
+    ephemeral_disk=2 * 1024 * 1024,
     timeout=14400,
     secrets=_SHARED_SECRETS,
     volumes={
@@ -239,7 +240,7 @@ def _embed_state_shards(
     git_commit: str,
     output_dir: str,
     hf_token: str = "",
-    batch_size: int = 512,
+    batch_size: int = 2048,
     pool_size: int = 4,
     n_dl_threads: int = 4,
 ) -> str:
@@ -366,6 +367,7 @@ def _embed_state_shards(
     gpu=None,
     cpu=4,
     memory=16384,
+    ephemeral_disk=2 * 1024 * 1024,
     timeout=7200,
     secrets=_SHARED_SECRETS,
     volumes={
@@ -455,6 +457,7 @@ def _embed_action_shards(
     gpu="L40S",
     cpu=4,
     memory=32768,
+    ephemeral_disk=2 * 1024 * 1024,
     timeout=7200,
     secrets=_SHARED_SECRETS,
     volumes={
