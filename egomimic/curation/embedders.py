@@ -443,6 +443,7 @@ class StateEmbedder:
                 pooled = patches.float().mean(dim=1)
                 proj_in = self._proj_layer.weight.dtype
                 outputs.append(self._proj_layer(pooled.to(proj_in)).cpu().numpy())
+            del tensor, hidden, patches, pooled
             t_fwd = time.perf_counter()
             logger.debug(
                 "DINOv3 batch [%d:%d] preproc=%.3fs forward=%.3fs total=%.3fs (%.0f imgs/s)",
