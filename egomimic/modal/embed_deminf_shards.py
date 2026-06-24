@@ -259,7 +259,6 @@ def _embed_state_shards(
     Peak RAM = pool_size × compressed_shard_size (~30 MB) + batch_size × frame (~600 KB).
     Constant regardless of dataset size.
     """
-    import gc as _gc
     import queue as _queue
     import tempfile as _tempfile
     import threading as _threading
@@ -267,6 +266,11 @@ def _embed_state_shards(
 
     import numpy as _np
     import torch
+
+    # Disable CUDA caching allocator — pure inference, no allocation reuse needed.
+    # Without this, PyTorch holds freed VRAM in an internal free-list that grows
+    # across hundreds of episodes and eventually causes OOM via unified memory spill.
+    os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
 
     _boot_container(git_remote, git_commit, hf_token)
 
@@ -339,11 +343,6 @@ def _embed_state_shards(
             f"{tag} {ep_hash[:8]}: {T} frames → {batch_size}-frame batches "
             f"in {_time.perf_counter() - t_ep:.1f}s ({n_done}/{len(shard_pairs)})"
         )
-        # Release CUDA allocator cache between episodes — without this, PyTorch holds
-        # freed VRAM in an internal free-list that grows across hundreds of episodes and
-        # eventually spills to CPU unified memory, triggering SIGKILL.
-        torch.cuda.empty_cache()
-        _gc.collect()
         if n_done <= 5 or n_done % 25 == 0:
             rss_gb = 0.0
             try:
@@ -354,11 +353,9 @@ def _embed_state_shards(
                             break
             except Exception:
                 rss_gb = -1.0
-            vram_res_gb = torch.cuda.memory_reserved() / 1024 ** 3
             vram_alloc_gb = torch.cuda.memory_allocated() / 1024 ** 3
             print(
-                f"{tag} [mem/{n_done}] RSS={rss_gb:.1f}GB "
-                f"VRAM_res={vram_res_gb:.1f}GB VRAM_alloc={vram_alloc_gb:.1f}GB",
+                f"{tag} [mem/{n_done}] RSS={rss_gb:.1f}GB VRAM_alloc={vram_alloc_gb:.1f}GB",
                 flush=True,
             )
 
