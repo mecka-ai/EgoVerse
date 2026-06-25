@@ -1,0 +1,69 @@
+# DemInf curation data config — first 40 fold_clothes episodes for EgoVideo embedder test.
+
+defaults:
+  - _self_
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      pause_removal_epsilon: 0.005
+      allowed_episode_ids:
+        - "696a1b1176b41c2326097747"
+        - "696ba3b9a491d5abbd79528b"
+        - "696ba3f375020a567fd375b4"
+        - "696bc11770d628f8b0742337"
+        - "696bc17eed8ed158122ec6a3"
+        - "696bc7e021d8e8ab8ddc8380"
+        - "696bcbe0e13d37dd4293f58b"
+        - "696bcbe86377d0871b6a9253"
+        - "696bcc71ed8ed158122ec794"
+        - "696bcd7c1376c8db5e3154a4"
+        - "696bce8dcd29fb97fb107f44"
+        - "696bcebfd3cc9dc76c561899"
+        - "696bd14770d628f8b074249e"
+        - "696bd1efd99e01dc631f3f13"
+        - "696bd310a907c8962e22a9fa"
+        - "696bd324d1a6773989721fd3"
+        - "696bd3fac426c607c88b2fa0"
+        - "696bd77693818b7b258ec43b"
+        - "696bd78eb0b2b22cc0d1f867"
+        - "696bd7fc8688d0ceb96d3e76"
+        - "696bdafd476e9a6e777fffde"
+        - "692de240996d7b24ba715c0f"
+        - "696bdc47cfb39c7ef2d48e64"
+        - "696bdde3246cb36ca375820a"
+        - "696d0d524b2b73eea2f1cc51"
+        - "696d0f02c7470f85da9346db"
+        - "696d0f031244464a4aac1b8f"
+        - "696d0fdafad368fca385f5a5"
+        - "696d0fe4a199224e8d66242c"
+        - "696d119e1fe17643f95f9fb9"
+        - "696d119fc0c2d9149de65a2f"
+        - "696d2fb388af7cc080636a98"
+        - "696d30391b5841990138a18b"
+        - "696d3055d878202cf6c99df7"
+        - "696d327667df29fbace8f267"
+        - "696d8e837d42972c2ce7decf"
+        - "696d8eb6bcbf0c32b4b22a20"
+        - "696d92ebdd1a587f40c9b67f"
+        - "696da1be2ddbc19f3c9b0899"
+        - "696da40edc787523fe33b60b"
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+      eps_to_ignore: null
+    filters: null
+    mode: total
+
+curation_loader:
+  mecka_bimanual:
+    episode_workers: 6
+    pass2_image_decode_workers: 12
+    frame_queue_maxsize: 12
+    global_frame_batch_size: 64

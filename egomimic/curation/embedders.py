@@ -12,7 +12,7 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3", "wes"})
+_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3", "wes", "egovideo"})
 _DINOV3_DEFAULT_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
 
 
@@ -100,6 +100,8 @@ class StateEmbedder:
         seed: int = 42,
         norm_min_std: float = 1e-6,
         wes_checkpoint_path: str | None = None,
+        egovideo_checkpoint_path: str | None = None,
+        egovideo_num_frames: int = 4,
     ) -> None:
         self.mode = mode
         self.latent_dim = latent_dim
@@ -113,6 +115,8 @@ class StateEmbedder:
         self._seed = seed
         self.norm_min_std = norm_min_std
         self.wes_checkpoint_path = wes_checkpoint_path
+        self.egovideo_checkpoint_path = egovideo_checkpoint_path
+        self.egovideo_num_frames = egovideo_num_frames
         self._fitted = False
 
         self._mean: np.ndarray | None = None
@@ -122,6 +126,10 @@ class StateEmbedder:
         self._proj_layer: nn.Linear | None = None
         self._processor: Any | None = None
         self._num_patches: int = 0
+        self._egovideo_model: nn.Module | None = None
+        self._egovideo_proj: nn.Parameter | None = None
+        self._ev_mean: "torch.Tensor | None" = None
+        self._ev_std: "torch.Tensor | None" = None
 
     def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
         """
@@ -158,6 +166,8 @@ class StateEmbedder:
                 self._fit_resnet()
             elif self.image_backbone == "wes":
                 self._fit_wes()
+            elif self.image_backbone == "egovideo":
+                self._fit_egovideo()
             else:
                 self._fit_dinov3()
         self._fitted = True
@@ -349,6 +359,8 @@ class StateEmbedder:
             return self._embed_image_resnet(data)
         if self.image_backbone == "wes":
             return self._embed_image_wes(data)
+        if self.image_backbone == "egovideo":
+            return self._embed_image_egovideo(data)
         return self._embed_image_dinov3(data)
 
     def _embed_image_resnet(self, data: np.ndarray) -> np.ndarray:
@@ -458,6 +470,84 @@ class StateEmbedder:
             n_total, elapsed, n_total / elapsed if elapsed > 0 else 0, self.image_batch_size,
         )
         return np.concatenate(outputs, axis=0)
+
+    def _fit_egovideo(self) -> None:
+        """Load frozen EgoVideo ViT-H/14 + image_projection + fixed random proj (512 → latent_dim)."""
+        if not self.egovideo_checkpoint_path:
+            raise ValueError("egovideo_checkpoint_path must be set when using backbone=egovideo")
+        from egomimic.algo.egovideo.build import build_visual_model
+
+        visual, image_proj = build_visual_model(
+            ckpt_path=self.egovideo_checkpoint_path,
+            num_frames=self.egovideo_num_frames,
+        )
+        visual.eval()
+        for p in visual.parameters():
+            p.requires_grad_(False)
+        self._egovideo_model = visual.to(self.device)
+        self._egovideo_proj = image_proj.to(self.device)
+
+        dtype = torch.float32
+        self._ev_mean = torch.tensor([0.485, 0.456, 0.406], dtype=dtype, device=self.device).view(1, 3, 1, 1)
+        self._ev_std  = torch.tensor([0.229, 0.224, 0.225], dtype=dtype, device=self.device).view(1, 3, 1, 1)
+
+        self._proj_layer = nn.Linear(512, self.latent_dim, bias=True).to(self.device)
+        nn.init.xavier_uniform_(self._proj_layer.weight)
+        nn.init.zeros_(self._proj_layer.bias)
+        for p in self._proj_layer.parameters():
+            p.requires_grad_(False)
+
+        logger.info("StateEmbedder (image/egovideo): 512 → %d (fixed random proj)", self.latent_dim)
+
+    def _embed_image_egovideo(self, data: np.ndarray) -> np.ndarray:
+        """Batched EgoVideo ViT-H/14 inference (repeat-4 frames → 512-dim → latent_dim).
+
+        Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1].
+        Each frame is tiled 4× along the temporal axis to satisfy the model's
+        (B, 3, num_frames, 224, 224) input shape.
+        """
+        import torch.nn.functional as F
+
+        n_total = data.shape[0]
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+
+        for start in range(0, n_total, self.image_batch_size):
+            chunk = data[start : start + self.image_batch_size]
+            if chunk.dtype == np.uint8:
+                t = torch.from_numpy(chunk).to(self.device, dtype=torch.float32).div_(255.0)
+            else:
+                t = torch.from_numpy(chunk.astype(np.float32)).to(self.device).clamp_(0.0, 1.0)
+
+            if t.shape[-2] != 224 or t.shape[-1] != 224:
+                t = F.interpolate(t, size=(224, 224), mode="bilinear", align_corners=False)
+
+            t = (t - self._ev_mean) / self._ev_std
+            # (B, 3, H, W) → (B, 3, num_frames, H, W)
+            t = t.unsqueeze(2).expand(-1, -1, self.egovideo_num_frames, -1, -1).contiguous()
+
+            with torch.no_grad():
+                vis_out = self._egovideo_model(t)        # (x_vis, x_pool_vis, ...)
+                pooled = vis_out[1]                      # (B, 768) — AttentionPool output
+                feats = pooled @ self._egovideo_proj     # (B, 512)
+                feats = F.normalize(feats, dim=-1)
+                projected = self._proj_layer(feats)      # (B, latent_dim)
+            outputs.append(projected.cpu().numpy())
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "[images] EgoVideo embed: %d images in %.2fs (%.0f imgs/s)",
+            n_total, elapsed, n_total / elapsed if elapsed > 0 else 0,
+        )
+        return np.concatenate(outputs, axis=0)
+
+    def embed_batch(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Tensor fast-path for the shard pipeline (embed_deminf_shards.py).
+
+        Takes a (N, C, H, W) tensor already on device, returns (N, latent_dim) tensor.
+        """
+        result = self.embed(tensor.cpu().numpy())
+        return torch.from_numpy(result).to(tensor.device)
 
 
 def _last_token_pool(
@@ -1041,3 +1131,8 @@ class ActionEmbedder:
             len(data), data.shape[1], result.shape[1], elapsed,
         )
         return result
+
+    def embed_batch(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Tensor fast-path for the shard pipeline (embed_deminf_shards.py)."""
+        result = self.embed(tensor.cpu().numpy())
+        return torch.from_numpy(result).to(tensor.device)

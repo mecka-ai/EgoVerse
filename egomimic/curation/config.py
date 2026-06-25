@@ -41,6 +41,8 @@ class StateImageSettings:
     dinov3_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     dinov3_dtype: str = "float16"
     wes_checkpoint_path: str | None = None
+    egovideo_checkpoint_path: str | None = None
+    egovideo_num_frames: int = 4
 
 
 @dataclass(frozen=True)
@@ -201,11 +203,21 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
         if wes_checkpoint_path is not None:
             wes_checkpoint_path = str(wes_checkpoint_path)
 
+    egovideo_checkpoint_path: str | None = None
+    egovideo_num_frames: int = StateImageSettings().egovideo_num_frames
+    if backbone == "egovideo":
+        ev = OmegaConf.select(cfg, "model.state_image.egovideo", default={}) or {}
+        ckpt = ev.get("checkpoint_path", None)
+        egovideo_checkpoint_path = str(ckpt) if ckpt is not None else None
+        egovideo_num_frames = int(ev.get("num_frames", egovideo_num_frames))
+
     return StateImageSettings(
         backbone=backbone,
         dinov3_model_name=dinov3_model_name,
         dinov3_dtype=dinov3_dtype,
         wes_checkpoint_path=wes_checkpoint_path,
+        egovideo_checkpoint_path=egovideo_checkpoint_path,
+        egovideo_num_frames=egovideo_num_frames,
     )
 
 

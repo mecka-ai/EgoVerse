@@ -1,0 +1,32 @@
+# DemInf curation with EgoVideo ViT-H/14 state embedder.
+# Inherits all defaults from deminf_default.yaml; only state_image is overridden.
+#
+# Before running: upload the checkpoint to the egoverse-deminf-v2 Modal Volume:
+#   modal volume put egoverse-deminf-v2 \
+#     /path/to/ckpt_4frames.pth checkpoints/ckpt_4frames.pth --env robotics
+
+latent_dim: 32
+device: cuda
+
+keys:
+  action: actions_cartesian
+  image: observations.images.front_img_1
+
+norm_min_std: 1.0e-6
+
+state_image:
+  backbone: egovideo
+  egovideo:
+    checkpoint_path: /mnt/deminf-v2/checkpoints/ckpt_4frames.pth
+    num_frames: 4
+
+precomputed_norm_stats:
+  path: precomputed_norm_stats/mecka_all_zarr
+  embodiment_id: "9"
+
+ksg:
+  n_threads: 12
+  k_range: [3, 7]
+  chunked_threshold: null
+  chunked_max_points: null
+  batch_size: 10000
