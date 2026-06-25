@@ -63,6 +63,9 @@ def trajectory_scorer_from_cfg(cfg: Any) -> "TrajectoryScorer":
         language_enabled=lang.enabled,
         language_mode=lang.mode,
         stratified_min_cluster_size=lang.stratified_min_cluster_size,
+        n_clusters=lang.n_clusters,
+        n_clusters_max=lang.n_clusters_max,
+        clustered_min_spans=lang.clustered_min_spans,
     )
 
 
@@ -110,6 +113,9 @@ class TrajectoryScorer:
         language_enabled: bool = False,
         language_mode: str = "concat",
         stratified_min_cluster_size: int = 10,
+        n_clusters: int | str = "auto",
+        n_clusters_max: int = 20,
+        clustered_min_spans: int = 8,
     ) -> None:
         self.k_range = k_range
         self.n_threads = n_threads
@@ -121,6 +127,9 @@ class TrajectoryScorer:
         self.language_enabled = language_enabled
         self.language_mode = language_mode
         self.stratified_min_cluster_size = stratified_min_cluster_size
+        self.n_clusters = n_clusters
+        self.n_clusters_max = n_clusters_max
+        self.clustered_min_spans = clustered_min_spans
 
     def score_latents(
         self,
@@ -266,6 +275,165 @@ class TrajectoryScorer:
             sum(1 for idx in clusters.values() if len(idx) >= min_size),
         )
         return mi
+
+    def _cluster_spans(self, emb: np.ndarray) -> np.ndarray:
+        """K-means cluster span embeddings; ``n_clusters="auto"`` picks via silhouette."""
+        from sklearn.cluster import KMeans
+
+        n = emb.shape[0]
+        if n <= 1:
+            return np.zeros(n, dtype=np.int64)
+
+        if self.n_clusters == "auto":
+            from sklearn.metrics import silhouette_score
+
+            k_min = 2
+            k_max_c = min(int(self.n_clusters_max), n - 1)
+            if k_max_c < k_min:
+                return np.zeros(n, dtype=np.int64)
+
+            # Silhouette is O(n^2); subsample for the score to keep auto-k fast.
+            sample_size = min(2000, n)
+            best_k, best_score, best_labels = k_min, -1.0, None
+            for k in range(k_min, k_max_c + 1):
+                km = KMeans(n_clusters=k, random_state=self.seed, n_init=10)
+                lab = km.fit_predict(emb)
+                try:
+                    sc = silhouette_score(
+                        emb, lab, sample_size=sample_size, random_state=self.seed
+                    )
+                except Exception:
+                    continue
+                logger.info("Clustered KSG: k=%d silhouette=%.4f", k, sc)
+                if sc > best_score:
+                    best_k, best_score, best_labels = k, sc, lab
+            logger.info(
+                "Clustered KSG: auto-selected k=%d (silhouette=%.4f)", best_k, best_score
+            )
+            return (
+                best_labels if best_labels is not None else np.zeros(n, dtype=np.int64)
+            )
+
+        k = min(int(self.n_clusters), n)
+        km = KMeans(n_clusters=k, random_state=self.seed, n_init=10)
+        return km.fit_predict(emb)
+
+    def score_clusters(
+        self,
+        span_state: list[np.ndarray],
+        span_action: list[np.ndarray],
+        span_ids: list[str],
+        span_texts: list[str],
+        span_meta: list[dict],
+        text_embeddings: np.ndarray,
+    ) -> dict[str, dict]:
+        """
+        Cluster annotation spans by language, then KSG-score each cluster.
+
+        The atomic unit is the annotation span (a contiguous ``[start, end)`` frame
+        range with one instruction). Spans are clustered by their Qwen3 language
+        embedding; for each cluster, KSG MI is estimated over all frames belonging
+        to its spans, and each span is scored by the mean per-frame MI over its own
+        frames. Clusters with fewer than ``max(clustered_min_spans, k_max+1)`` spans
+        are still formed but skipped for scoring (logged, spans recorded with
+        ``score=None``).
+
+        Returns:
+            ``{cluster_id: {label, n_spans, scored, reason?, spans: {span_id: {...}}}}``,
+            spans within each scored cluster sorted by score descending.
+        """
+        from collections import Counter
+
+        n_spans = len(span_ids)
+        emb = np.asarray(text_embeddings, dtype=np.float64)
+        if emb.shape[0] != n_spans:
+            raise ValueError(
+                f"text_embeddings rows {emb.shape[0]} != n_spans {n_spans}"
+            )
+
+        labels = self._cluster_spans(emb)
+        n_clusters = (int(labels.max()) + 1) if len(labels) else 0
+        logger.info("Clustered KSG: %d spans → %d clusters", n_spans, n_clusters)
+
+        k_max = self.k_range[1]
+        min_spans = max(self.clustered_min_spans, k_max + 1)
+
+        by_cluster: dict[int, list[int]] = {}
+        for i, c in enumerate(labels):
+            by_cluster.setdefault(int(c), []).append(i)
+
+        def _dropped(idxs: list[int], label: str, reason: str) -> dict:
+            return {
+                "label": label,
+                "n_spans": len(idxs),
+                "scored": False,
+                "reason": reason,
+                "spans": {span_ids[i]: {**span_meta[i], "score": None} for i in idxs},
+            }
+
+        result: dict[str, dict] = {}
+        for c in sorted(by_cluster):
+            idxs = by_cluster[c]
+            texts = [span_texts[i] for i in idxs]
+            label = Counter(texts).most_common(1)[0][0] if texts else ""
+            cluster_key = f"cluster_{c}"
+
+            if len(idxs) < min_spans:
+                logger.info(
+                    "Clustered KSG: %s dropped (%d spans < %d)",
+                    cluster_key, len(idxs), min_spans,
+                )
+                result[cluster_key] = _dropped(
+                    idxs, label, f"only {len(idxs)} spans (< {min_spans})"
+                )
+                continue
+
+            s_cat = np.concatenate([span_state[i] for i in idxs], axis=0).astype(np.float64)
+            a_cat = np.concatenate([span_action[i] for i in idxs], axis=0).astype(np.float64)
+            lengths = [len(span_state[i]) for i in idxs]
+
+            if s_cat.shape[0] <= k_max:
+                result[cluster_key] = _dropped(
+                    idxs, label, f"only {s_cat.shape[0]} frames (<= k_max={k_max})"
+                )
+                continue
+
+            mi = self._ksg_exact(s_cat, a_cat)
+
+            spans_out: dict[str, dict] = {}
+            start = 0
+            for i, length in zip(idxs, lengths):
+                span_mi = mi[start : start + length]
+                score = float(np.nanmean(span_mi)) if length > 0 else float("nan")
+                if not np.isfinite(score):
+                    score = None
+                spans_out[span_ids[i]] = {**span_meta[i], "score": score}
+                start += length
+
+            spans_out = dict(
+                sorted(
+                    spans_out.items(),
+                    key=lambda kv: kv[1]["score"] if kv[1]["score"] is not None else float("-inf"),
+                    reverse=True,
+                )
+            )
+            result[cluster_key] = {
+                "label": label,
+                "n_spans": len(idxs),
+                "scored": True,
+                "spans": spans_out,
+            }
+            logger.info(
+                "Clustered KSG: %s scored %d spans (label=%r)",
+                cluster_key, len(idxs), label[:60],
+            )
+
+        n_scored = sum(1 for v in result.values() if v["scored"])
+        logger.info(
+            "Clustered KSG: scored %d / %d clusters (%d spans total)",
+            n_scored, len(result), n_spans,
+        )
+        return result
 
     def _mi_chunked(self, s_all: np.ndarray, a_all: np.ndarray) -> np.ndarray:
         """Approximate KSG via a subsampled reference set (large N)."""

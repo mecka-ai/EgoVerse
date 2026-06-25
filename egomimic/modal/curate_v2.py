@@ -62,6 +62,140 @@ def _load_cfg(hydra_args: tuple[str, ...]):
         return _hydra.compose("curate", overrides=list(hydra_args))
 
 
+def _read_episode_spans(zarr_root: Path, ep_hash: str) -> list[dict]:
+    """Read decoded ``{text, start_idx, end_idx}`` annotation spans from an episode's zarr."""
+    import json as _json
+
+    import zarr
+
+    def _decode(value):
+        import numpy as _np
+        if isinstance(value, _np.void):
+            value = value.item()
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytearray):
+            value = bytes(value)
+        if isinstance(value, bytes):
+            return _json.loads(value.decode("utf-8"))
+        if isinstance(value, str):
+            return _json.loads(value)
+        return value
+
+    for cand in (zarr_root / ep_hash, zarr_root / f"{ep_hash}.zarr"):
+        if not cand.exists():
+            continue
+        store = zarr.open(str(cand), mode="r", zarr_format=3)
+        if "annotations" not in store:
+            return []
+        raw = store["annotations"][:]
+        return [d for d in (_decode(x) for x in raw) if isinstance(d, dict)]
+    return []
+
+
+def _score_task_clustered(
+    task_name: str,
+    cfg,
+    output_dir: str,
+    tag: str,
+    t_start: float,
+    episode_hashes: list,
+    state_latents_list: list,
+    action_latents_list: list,
+) -> tuple[str, dict]:
+    """Span-granularity clustered KSG scoring (model.language_conditioning.mode=clustered).
+
+    Reads annotation spans from zarr, slices per-frame latents per span, Qwen3-embeds
+    span text, K-means clusters spans, then KSG-scores each cluster independently.
+    Writes ``scores_v2/<task>_clustered_scores.json`` and returns a flat
+    ``{span_id: score}`` map for scored spans.
+    """
+    import time as _time
+
+    import numpy as _np
+    import torch as _torch
+
+    from egomimic.curation.config import select_language_conditioning_settings, select_seed
+    from egomimic.curation.embedders import LanguageEmbedder
+    from egomimic.curation.scoring import trajectory_scorer_from_cfg
+
+    lang = select_language_conditioning_settings(cfg)
+    zarr_root = Path(CFG.volume_mount_path)
+
+    span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
+    for ep_hash, s, a in zip(episode_hashes, state_latents_list, action_latents_list):
+        spans = _read_episode_spans(zarr_root, ep_hash)
+        T = len(s)
+        for ann in spans:
+            text = str(ann.get("text", "")).strip()
+            start = int(ann.get("start_idx", -1))
+            end = int(ann.get("end_idx", -1))
+            if not text or start < 0 or end <= start:
+                continue
+            start = max(0, min(start, T))
+            end = max(0, min(end, T))
+            if end - start < 1:
+                continue
+            span_state.append(s[start:end])
+            span_action.append(a[start:end])
+            span_ids.append(f"{ep_hash}::{start}-{end}")
+            span_texts.append(text)
+            span_meta.append(
+                {"episode": ep_hash, "start": start, "end": end, "text": text}
+            )
+
+    print(
+        f"{tag} clustered: {len(span_ids)} annotation spans "
+        f"from {len(episode_hashes)} episodes"
+    )
+    if not span_ids:
+        print(f"{tag} no annotation spans found — skipping clustered scoring")
+        return task_name, {}
+
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    lemb = LanguageEmbedder(
+        source="qwen3",
+        latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
+        device=device,
+        model_name=lang.model_name,
+        max_length=lang.max_length,
+        batch_size=lang.batch_size,
+        dtype=lang.dtype,
+        seed=select_seed(cfg),
+    )
+    lemb.fit()
+    text_embeddings = lemb.embed(span_texts)
+
+    t_ksg = _time.perf_counter()
+    scorer = trajectory_scorer_from_cfg(cfg)
+    clustered = scorer.score_clusters(
+        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings
+    )
+    print(
+        f"{tag} clustered KSG done in {_time.perf_counter() - t_ksg:.1f}s — "
+        f"{len(clustered)} clusters"
+    )
+
+    scores_dir = Path(output_dir) / "scores_v2"
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    out_path = scores_dir / f"{task_name}_clustered_scores.json"
+    with open(out_path, "w") as f:
+        json.dump(clustered, f, indent=2)
+    training_outputs_volume.commit()
+
+    flat = {
+        sid: rec["score"]
+        for cl in clustered.values()
+        for sid, rec in cl["spans"].items()
+        if rec.get("score") is not None
+    }
+    print(
+        f"{tag} clustered total: {_time.perf_counter() - t_start:.1f}s → {out_path} "
+        f"({len(flat)} spans scored)"
+    )
+    return task_name, flat
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: KSG scoring from pre-computed latents
 # ---------------------------------------------------------------------------
@@ -76,6 +210,7 @@ def _load_cfg(hydra_args: tuple[str, ...]):
     secrets=_SHARED_SECRETS,
     volumes={
         CFG.output_mount_path: training_outputs_volume,
+        CFG.volume_mount_path: zarr_volume,
     },
 )
 def _score_task_v2(
@@ -152,6 +287,16 @@ def _score_task_v2(
     if not episode_hashes:
         print(f"{tag} no valid episodes after length checks — returning empty")
         return task_name, {}
+
+    # Clustered mode: atomic unit is the annotation span, not the episode.
+    from egomimic.curation.config import select_language_conditioning_settings
+
+    lang = select_language_conditioning_settings(cfg)
+    if lang.enabled and lang.mode == "clustered":
+        return _score_task_clustered(
+            task_name, cfg, output_dir, tag, t_start,
+            episode_hashes, state_latents_list, action_latents_list,
+        )
 
     s_all = _np.concatenate(state_latents_list, axis=0)
     a_all = _np.concatenate(action_latents_list, axis=0)

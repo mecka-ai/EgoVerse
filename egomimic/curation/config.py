@@ -96,6 +96,10 @@ class LanguageConditioningSettings:
       ``concat``     — I(S, L; A): concatenate state + language latents, one KSG pass.
       ``stratified`` — I(S; A | L): partition timesteps by instruction text, KSG
                        within each language cluster, then assign per-sample MI.
+      ``clustered``  — Atomic unit is the annotation span. K-means clusters spans by
+                       their Qwen3 language embedding, then KSG-scores each cluster
+                       independently and ranks spans within it. ``n_clusters`` may be
+                       an int or ``"auto"`` (silhouette over 2..``n_clusters_max``).
     """
 
     enabled: bool = False
@@ -107,6 +111,10 @@ class LanguageConditioningSettings:
     batch_size: int = 64
     dtype: str = "float16"
     stratified_min_cluster_size: int = 10
+    # clustered mode (annotation-span granularity)
+    n_clusters: int | str = "auto"
+    n_clusters_max: int = 20
+    clustered_min_spans: int = 8
 
 
 @dataclass(frozen=True)
@@ -271,9 +279,10 @@ def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSetti
         return LanguageConditioningSettings()
     enabled = bool(block.get("enabled", False))
     mode = str(block.get("mode", "concat")).lower().strip()
-    if mode not in ("concat", "stratified"):
+    if mode not in ("concat", "stratified", "clustered"):
         raise ValueError(
-            f"model.language_conditioning.mode must be 'concat' or 'stratified', got {mode!r}"
+            "model.language_conditioning.mode must be 'concat', 'stratified', or "
+            f"'clustered', got {mode!r}"
         )
     source = str(block.get("source", "qwen3")).lower().strip()
     if source not in ("qwen3", "precomputed"):
@@ -283,6 +292,13 @@ def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSetti
         )
     qwen3 = block.get("qwen3", {}) or {}
     defaults = LanguageConditioningSettings()
+
+    raw_nc = block.get("n_clusters", defaults.n_clusters)
+    if isinstance(raw_nc, str) and raw_nc.strip().lower() == "auto":
+        n_clusters: int | str = "auto"
+    else:
+        n_clusters = int(raw_nc)
+
     return LanguageConditioningSettings(
         enabled=enabled,
         mode=mode,
@@ -294,6 +310,11 @@ def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSetti
         dtype=str(qwen3.get("dtype", block.get("dtype", defaults.dtype))),
         stratified_min_cluster_size=int(
             block.get("stratified_min_cluster_size", defaults.stratified_min_cluster_size)
+        ),
+        n_clusters=n_clusters,
+        n_clusters_max=int(block.get("n_clusters_max", defaults.n_clusters_max)),
+        clustered_min_spans=int(
+            block.get("clustered_min_spans", defaults.clustered_min_spans)
         ),
     )
 
