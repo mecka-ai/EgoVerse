@@ -45,9 +45,9 @@ class QuestTokenizerTrainer(Algo):
             self.device = torch.device(device_arg)
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
         else:
+            # MPS is skipped: SkillVAE.quantize uses numpy on device tensors which
+            # fails on MPS (no float64). CPU works for local debug runs.
             self.device = torch.device("cpu")
 
         self.ac_keys_by_id: Dict[int, str] = {}
