@@ -293,9 +293,19 @@ def _embed_state_shards(
     dl_thread.start()
 
     # ── GPU consumer: decode frame-by-frame → batch → embed → cache ──────────
+    # Timing decomposition (cumulative, to expose GPU starvation):
+    #   cum_wait   — blocked on path_q.get() (downloader/network can't keep up)
+    #   cum_decode — CPU PyAV decode + batch stacking (GPU idle between embeds)
+    #   cum_embed  — state_embedder.embed() (GPU busy)
+    # "GPU waiting for frames" = cum_wait + cum_decode.
     n_done = 0
+    cum_wait = 0.0
+    cum_decode = 0.0
+    cum_embed = 0.0
     while True:
+        t_get = _time.perf_counter()
         item = path_q.get()
+        cum_wait += _time.perf_counter() - t_get
         if item is _DONE:
             break
 
@@ -306,21 +316,31 @@ def _embed_state_shards(
         frame_buf: list = []
         ep_latents: list = []
         T = 0
+        ep_embed = 0.0
 
         for frame_chw in _iter_mp4_frames(str(local_mp4)):
             frame_buf.append(frame_chw)
             T += 1
             if len(frame_buf) == batch_size:
                 batch = _np.ascontiguousarray(_np.stack(frame_buf))
+                t_e = _time.perf_counter()
                 ep_latents.append(_np.asarray(state_embedder.embed(batch)))
+                ep_embed += _time.perf_counter() - t_e
                 del batch, frame_buf
                 frame_buf = []
 
         # Flush remaining frames
         if frame_buf:
             batch = _np.ascontiguousarray(_np.stack(frame_buf))
+            t_e = _time.perf_counter()
             ep_latents.append(_np.asarray(state_embedder.embed(batch)))
+            ep_embed += _time.perf_counter() - t_e
             del batch, frame_buf
+
+        ep_total = _time.perf_counter() - t_ep
+        ep_decode = max(ep_total - ep_embed, 0.0)
+        cum_decode += ep_decode
+        cum_embed += ep_embed
 
         # Delete local shard files in background — GPU moves to next immediately
         _p1, _p2 = local_mp4, local_npz
@@ -341,7 +361,8 @@ def _embed_state_shards(
         n_done += 1
         print(
             f"{tag} {ep_hash[:8]}: {T} frames → {batch_size}-frame batches "
-            f"in {_time.perf_counter() - t_ep:.1f}s ({n_done}/{len(shard_pairs)})"
+            f"in {ep_total:.1f}s (embed={ep_embed:.1f}s decode={ep_decode:.1f}s) "
+            f"({n_done}/{len(shard_pairs)})"
         )
         if n_done <= 5 or n_done % 25 == 0:
             rss_gb = 0.0
@@ -354,8 +375,13 @@ def _embed_state_shards(
             except Exception:
                 rss_gb = -1.0
             vram_alloc_gb = torch.cuda.memory_allocated() / 1024 ** 3
+            cum_busy = cum_wait + cum_decode + cum_embed
+            gpu_pct = 100.0 * cum_embed / cum_busy if cum_busy > 0 else 0.0
+            idle_pct = 100.0 - gpu_pct
             print(
-                f"{tag} [mem/{n_done}] RSS={rss_gb:.1f}GB VRAM_alloc={vram_alloc_gb:.1f}GB",
+                f"{tag} [mem/{n_done}] RSS={rss_gb:.1f}GB VRAM_alloc={vram_alloc_gb:.1f}GB "
+                f"| GPU busy={gpu_pct:.0f}% idle={idle_pct:.0f}% "
+                f"(embed={cum_embed:.0f}s decode={cum_decode:.0f}s shard_wait={cum_wait:.0f}s)",
                 flush=True,
             )
 
@@ -370,9 +396,13 @@ def _embed_state_shards(
     n_saved = _cache_collect(cache_dir, out_path, _np)
     training_outputs_volume.commit()
 
+    _cum_busy = cum_wait + cum_decode + cum_embed
+    _gpu_pct = 100.0 * cum_embed / _cum_busy if _cum_busy > 0 else 0.0
     print(
         f"{tag} done — {n_saved} episodes, {out_path}, "
-        f"total {_time.perf_counter() - t_total:.1f}s"
+        f"total {_time.perf_counter() - t_total:.1f}s "
+        f"| GPU busy={_gpu_pct:.0f}% "
+        f"(embed={cum_embed:.0f}s decode={cum_decode:.0f}s shard_wait={cum_wait:.0f}s)"
     )
     return out_path
 
