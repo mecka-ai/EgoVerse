@@ -1,0 +1,5 @@
+# Train-viz evaluator for the QueST tokenizer: runs the same encode→decode→overlay
+# logic on the dataloader_idx=1 (train_viz) leg. Reuses the OAT evaluator since
+# QuestTokenizerTrainer exposes the same interface (forward_eval, ac_keys_by_id,
+# viz_func, data_schematic).
+_target_: egomimic.eval.eval_tokenizer_video.TrainVizTokenizerEvalVideo

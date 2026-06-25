@@ -4,3 +4,6 @@
 [submodule "external/oat"]
 	path = external/oat
 	url = https://github.com/Chaoqi-LIU/oat.git
+[submodule "external/quest"]
+	path = external/quest
+	url = https://github.com/pairlab/QueST.git

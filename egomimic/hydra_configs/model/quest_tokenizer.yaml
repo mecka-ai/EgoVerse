@@ -1,0 +1,58 @@
+# Train the QueST SkillVAE action tokenizer on action chunks from the egomimic
+# data pipeline. Pair with mecka_fc_all_zarr_oat data config and the tokenizer
+# evaluator.
+#
+#   python egomimic/trainHydra.py \
+#       model=quest_tokenizer \
+#       data=mecka_fc_all_zarr_oat \
+#       evaluator=eval_quest_tokenizer_video \
+#       evaluator@train_viz_evaluator=train_viz_quest_tokenizer \
+#       name=quest_tok_fc_all description=fold_clothes_all461 \
+#       trainer=ddp_modal \
+#       trainer.check_val_every_n_epoch=30 trainer.limit_train_batches=100 \
+#       +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 \
+#       +modal_volume=mecka_data_v2 \
+#       norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#       init_submodules=quest reject_outliers=false \
+#       launch_params.gpus_per_node=1
+#
+# Keep skill_block_size in sync with the action chunk length from your dataset.
+# downsample_factor must be a power of 2; skill_block_size/downsample_factor gives
+# the number of latent tokens (100/4 = 25 here).
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+
+robomimic_model:
+  _target_: egomimic.algo.quest_tokenizer.QuestTokenizerTrainer
+  data_schematic: _${data.dataset.data_schematic}
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  skill_vae:
+    _target_: quest.algos.quest_modules.skill_vae.SkillVAE
+    action_dim: 12          # bimanual cartesian action dim
+    encoder_dim: 256
+    decoder_dim: 256
+    skill_block_size: 100   # action chunk length (must match dataset seq_len)
+    downsample_factor: 4    # power-of-2 temporal compression; 100/4 = 25 latent tokens
+    attn_pdrop: 0.1
+    use_causal_encoder: true
+    use_causal_decoder: true
+    encoder_heads: 4
+    encoder_layers: 2
+    decoder_heads: 4
+    decoder_layers: 4
+    vq_type: "fsq"
+    fsq_level: [8, 5, 5, 5]  # codebook size = 8×5×5×5 = 1000
+    codebook_dim: 512         # unused for FSQ; required by constructor
+    codebook_size: 1024       # unused when fsq_level is explicit
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+
+scheduler: null

@@ -210,6 +210,7 @@ image = (
         "timm",
         "einops",
         "positional-encodings[pytorch]",
+        "vector-quantize-pytorch",
         "pytorch-kinematics",
         "arm-pytorch-utilities",
         "geomloss",
@@ -245,6 +246,7 @@ image = (
         "torchvision==0.21.0",
         "s5cmd",
         "ultralytics",
+        "vector-quantize-pytorch",  # required by QueST SkillVAE
     )
     # ultralytics pulls in full opencv-python which requires system GL/gthread libs.
     # Force-reinstall headless (bundled libs, no system deps) so cv2 works headless.
@@ -439,7 +441,7 @@ def _git_output(args: list[str]) -> str:
     return subprocess.check_output(args, cwd=REPO_ROOT, text=True).strip()
 
 
-_KNOWN_SUBMODULES = {"oat", "openpi"}
+_KNOWN_SUBMODULES = {"oat", "openpi", "quest"}
 
 
 def pop_init_submodules(
@@ -544,6 +546,9 @@ def _prepare_repo(
       frozenset({"oat"})    → external/oat only (OAT tokenizer runs)
       frozenset({"openpi"}) → external/openpi only (Pi0.5 runs)
       frozenset({"oat","openpi"}) → both
+      quest                → frozenset({"quest"})
+      oat,quest            → frozenset({"oat", "quest"})
+      true / all           → frozenset({"oat", "openpi", "quest"})
     """
     clone_url = _ssh_to_https(git_remote)
     repo_dir = Path(CFG.remote_repo_dir)
@@ -601,6 +606,26 @@ def _prepare_repo(
              "external/openpi"],
             check=True,
         )
+
+    if "quest" in submodules:
+        # external/quest: QueST SkillVAE tokenizer. Uses vector_quantize_pytorch
+        # (pre-installed in the image), einops, and positional-encodings.
+        subprocess.run(
+            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
+             "external/quest"],
+            check=True,
+        )
+        quest_dir = f"{CFG.remote_repo_dir}/external/quest"
+        if Path(quest_dir).is_dir():
+            subprocess.run(
+                [CFG.python_bin, "-c",
+                 "import sysconfig, os, sys; "
+                 "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_quest.pth'); "
+                 "open(p, 'w').write(sys.argv[1]); "
+                 "print('registered quest path ->', sys.argv[1])",
+                 quest_dir],
+                check=True,
+            )
 
     # Make egomimic importable WITHOUT `pip install -e .`. The editable install
     # runs setuptools' egg-info file walk over the repo root, which on Modal

@@ -18,3 +18,8 @@ try:
     from egomimic.algo.autoregressive import oattok_from_egomimic_lightning_ckpt as oattok_from_egomimic_lightning_ckpt
 except ImportError:
     pass  # oat submodule not initialized (init_submodules=false) — non-oat run
+
+try:
+    from egomimic.algo.quest_tokenizer import QuestTokenizerTrainer as QuestTokenizerTrainer
+except ImportError:
+    pass  # quest submodule not initialized (init_submodules=quest) — non-quest run
