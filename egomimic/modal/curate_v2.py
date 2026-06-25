@@ -62,6 +62,18 @@ def _load_cfg(hydra_args: tuple[str, ...]):
         return _hydra.compose("curate", overrides=list(hydra_args))
 
 
+def _clean_latent_key(key: str) -> str:
+    """Recover the bare episode hash from a latent key.
+
+    Older shards keyed latents by the mangled ``np.bytes_(b'<hash>')`` repr of the
+    episode_hash. Episode hashes are 24-char Mongo ObjectIds, so extract that; for
+    already-clean keys this returns the key unchanged.
+    """
+    import re as _re
+    m = _re.search(r"[0-9a-fA-F]{24}", key)
+    return m.group(0) if m else key
+
+
 def _read_episode_spans(zarr_root: Path, ep_hash: str) -> list[dict]:
     """Read decoded ``{text, start_idx, end_idx}`` annotation spans from an episode's zarr."""
     import json as _json
@@ -124,7 +136,10 @@ def _score_task_clustered(
 
     span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
     for ep_hash, s, a in zip(episode_hashes, state_latents_list, action_latents_list):
-        spans = _read_episode_spans(zarr_root, ep_hash)
+        # Latents may be keyed by the legacy mangled np.bytes_ repr — recover the
+        # bare hash so we can locate the episode's zarr dir for annotations.
+        clean = _clean_latent_key(ep_hash)
+        spans = _read_episode_spans(zarr_root, clean)
         T = len(s)
         for ann in spans:
             text = str(ann.get("text", "")).strip()
@@ -138,10 +153,10 @@ def _score_task_clustered(
                 continue
             span_state.append(s[start:end])
             span_action.append(a[start:end])
-            span_ids.append(f"{ep_hash}::{start}-{end}")
+            span_ids.append(f"{clean}::{start}-{end}")
             span_texts.append(text)
             span_meta.append(
-                {"episode": ep_hash, "start": start, "end": end, "text": text}
+                {"episode": clean, "start": start, "end": end, "text": text}
             )
 
     print(
@@ -682,6 +697,114 @@ def submit_curate_v2(*hydra_args: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resume: score-only (Phase 3) against pre-computed latents
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=CFG.timeout_seconds,
+    secrets=_SHARED_SECRETS,
+    volumes={CFG.output_mount_path: training_outputs_volume},
+)
+def run_score_v2(
+    output_dir: str,
+    hydra_args: tuple[str, ...],
+    git_remote: str,
+    git_commit: str,
+    run_name: str,
+    score_task: str = "",
+    hf_token: str = "",
+) -> str:
+    """Resume: run ONLY Phase 3 (KSG scoring) against latents already in output_dir.
+
+    Discovers tasks under ``output_dir/latents_v2/`` (or just ``score_task``) and
+    invokes ``_score_task_v2`` per task — no shard build, no embedding.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
+    _sys.path.insert(0, CFG.remote_repo_dir)
+    os.chdir(CFG.remote_repo_dir)
+    os.environ["MODAL_IS_REMOTE"] = "1"
+
+    lat_root = _Path(output_dir) / "latents_v2"
+    if not lat_root.is_dir():
+        print(f"No latents_v2 dir under {output_dir} — nothing to score")
+        return ""
+
+    if score_task:
+        tasks = [score_task]
+    else:
+        tasks = sorted(p.name for p in lat_root.iterdir() if p.is_dir())
+    print(f"Resume scoring {len(tasks)} task(s) from {output_dir}: {tasks}")
+
+    for task_name in tasks:
+        print(f"\n── [{task_name}] scoring …")
+        try:
+            _score_task_v2.remote(
+                task_name, run_name, hydra_args,
+                [], [], output_dir, git_remote, git_commit, hf_token,
+            )
+        except Exception as exc:
+            print(f"[{task_name}] scoring FAILED: {exc}")
+
+    training_outputs_volume.commit()
+    print(f"\nResume scoring done — {output_dir}")
+    return output_dir
+
+
+@app.local_entrypoint()
+def submit_score_v2(*args: str) -> None:
+    """Fire-and-forget: resume KSG scoring on an existing run's latents.
+
+    Required: ``score_output_dir=<output dir under /root/EgoVerse/logs>``
+    Optional: ``score_task=<task>`` (default: all tasks under latents_v2/)
+    Remaining args are normal hydra overrides (model=…, data=…, language_conditioning…).
+    """
+    args, _ = pop_init_submodules(args)
+    output_dir = ""
+    score_task = ""
+    hydra_args: list[str] = []
+    for a in args:
+        key, sep, val = a.lstrip("+").partition("=")
+        if sep and key == "score_output_dir":
+            output_dir = val.strip()
+        elif sep and key == "score_task":
+            score_task = val.strip()
+        else:
+            hydra_args.append(a)
+    if not output_dir:
+        raise SystemExit("score_output_dir=<path> is required for score-only resume")
+
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo has uncommitted changes.")
+
+    run_name = "deminf_v2"
+    for a in hydra_args:
+        key, sep, val = a.lstrip("+").partition("=")
+        if sep and key == "name":
+            run_name = val.strip()
+            break
+
+    print(f"Resume scoring: output_dir={output_dir} at commit {git_commit[:12]}")
+    handle = run_score_v2.spawn(
+        output_dir, tuple(hydra_args), git_remote, git_commit, run_name, score_task,
+        hf_token=_local_hf_token(),
+    )
+    _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
+    _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
+    print(f"Submitted: {handle.object_id}")
+    print(f"Monitor: https://modal.com/apps/mecka/{_env}/apps/{_app}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -698,6 +821,13 @@ if __name__ == "__main__":
         else:
             hydra_args.append(arg)
 
+    # Route to score-only resume when score_output_dir= is supplied.
+    entrypoint = (
+        "submit_score_v2"
+        if any(a.startswith("score_output_dir=") for a in hydra_args)
+        else "submit_curate_v2"
+    )
+
     modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(hydra_args)
-    print(f"DemInf v2 — app: {modal_env['MODAL_APP_NAME']}")
-    launch_detached(Path(__file__).resolve(), "submit_curate_v2", hydra_args, modal_env)
+    print(f"DemInf v2 — app: {modal_env['MODAL_APP_NAME']} (entrypoint: {entrypoint})")
+    launch_detached(Path(__file__).resolve(), entrypoint, hydra_args, modal_env)
