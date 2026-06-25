@@ -203,7 +203,7 @@ def _build_shards_worker(
         _np.savez_compressed(
             npz_path,
             action=flat_actions,
-            episode_hash=_np.bytes_(_np.str_(ep_hash)),
+            episode_hash=_np.str_(ep_hash),
         )
         done_flag.touch()
 

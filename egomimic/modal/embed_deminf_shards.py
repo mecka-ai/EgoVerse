@@ -56,6 +56,18 @@ _DONE = object()  # end-sentinel for producer-consumer queues
 # ---------------------------------------------------------------------------
 
 
+def _ep_hash_str(npz) -> str:
+    """Decode the episode_hash scalar from a shard npz to a clean str.
+
+    Shards store it as a numpy bytes scalar; ``str()`` on that yields the mangled
+    ``np.bytes_(b'...')`` repr. Unwrap the 0-d array and decode bytes → str so the
+    latent key is the bare episode hash (needed to map back to the zarr dir).
+    """
+    v = npz["episode_hash"]
+    v = v.item() if hasattr(v, "item") else v
+    return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+
+
 def _boot_container(git_remote: str, git_commit: str, hf_token: str) -> None:
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
@@ -135,7 +147,7 @@ def _run_shard_downloader(
         shutil.copy2(mp4_src, local_mp4)
         shutil.copy2(npz_src, local_npz)
         npz = _np.load(str(local_npz), allow_pickle=True)
-        ep_hash = str(npz["episode_hash"])
+        ep_hash = _ep_hash_str(npz)
         return ep_hash, local_mp4, local_npz
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=n_dl_threads)
@@ -462,7 +474,7 @@ def _embed_action_shards(
     for _, npz_path in shard_pairs:
         try:
             npz = _np.load(npz_path, allow_pickle=True)
-            ep_hash = str(npz["episode_hash"])
+            ep_hash = _ep_hash_str(npz)
             actions = npz["action"].astype(_np.float32)  # shard NPZ always uses "action"
         except Exception as exc:
             print(f"{tag} failed to read NPZ {npz_path}: {exc}")
