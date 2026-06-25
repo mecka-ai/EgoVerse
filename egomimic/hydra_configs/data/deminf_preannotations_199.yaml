@@ -1,5 +1,8 @@
 # DemInf curation data config for the 199 trusted-labeler pre-annotated episodes.
 # Source: egomimic/hydra_configs/data/extra/preannotations_trusted_labelers_199.json
+# These episodes were ingested from the new Mecka MongoDB (ObjectId hashes) into the
+# zarr volume; they are NOT in the legacy AWS SQL table, so we use LocalEpisodeResolver
+# (volume-direct, no SQL) rather than ModalEpisodeResolver.
 # Usage: python egomimic/modal/curate_v2.py data=deminf_preannotations_199 ...
 
 defaults:
@@ -9,7 +12,7 @@ train_datasets:
   mecka_bimanual:
     _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
     resolver:
-      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
       folder_path: /mnt/zarr-data
       pause_removal_epsilon: 0.005
       allowed_episode_ids:
@@ -218,7 +221,6 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
-      eps_to_ignore: null
     filters: null
     mode: total
 
