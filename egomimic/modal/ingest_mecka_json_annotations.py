@@ -180,7 +180,9 @@ def _convert_one(
         "objects": doc.get("objects", []),
     }
     episode_json_path = work / "episode.json"
-    episode_json_path.write_text(json.dumps(episode_meta))
+    # Mongo fields (userId, scene_id, environment_id, objects, …) may be ObjectIds;
+    # str-coerce them — these values only become zarr metadata attributes.
+    episode_json_path.write_text(json.dumps(episode_meta, default=str))
 
     # --- 5. Convert (writes <id>.zarr + <id>.mp4 preview into out_dir) ------
     out_dir = Path(tempfile.mkdtemp(prefix=f"out_{episode_id}_"))
