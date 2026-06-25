@@ -40,19 +40,15 @@ class QuestTokenizerTrainer(Algo):
         self.ac_keys = dict(ac_keys)
         self.skill_vae = skill_vae
 
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "QuestTokenizerTrainer requires CUDA; no CUDA device is available."
-            )
         device_arg = kwargs.get("device")
         if device_arg is not None:
             self.device = torch.device(device_arg)
-            if self.device.type != "cuda":
-                raise ValueError(
-                    f"device must be CUDA (e.g. cuda or cuda:0), got {self.device!r}"
-                )
-        else:
+        elif torch.cuda.is_available():
             self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         self.ac_keys_by_id: Dict[int, str] = {}
         for embodiment in self.domains:
