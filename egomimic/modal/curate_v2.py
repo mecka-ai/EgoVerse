@@ -49,8 +49,8 @@ from embed_deminf_shards import _embed_state_shards, _embed_action_shards  # noq
 
 _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 
-# Per-task KSG scoring: 32 CPUs so n_threads can be set high.
-_SCORE_COMPUTE = ModalCompute(gpu=None, cpu=32.0, memory_mb=49152)
+# Per-task KSG scoring: L40S GPU for GPU-accelerated marginal counting; 8 CPUs for tree build.
+_SCORE_COMPUTE = ModalCompute(gpu="L40S", cpu=8, memory_mb=32768)
 
 
 def _load_cfg(hydra_args: tuple[str, ...]):

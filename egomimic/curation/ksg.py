@@ -128,6 +128,30 @@ def _count_neighbours_batched(
     return counts
 
 
+def _count_neighbours_gpu(
+    points: np.ndarray,
+    radii: np.ndarray,
+    query_batch_size: int = 4096,
+) -> np.ndarray:
+    """GPU Chebyshev (L∞) radius count via batched torch.cdist. Excludes self.
+
+    points serves as both query and reference set (self-ball query).
+    Uses float32 on GPU; output is cast back to float64.
+    """
+    import torch
+    device = torch.device("cuda")
+    N = len(points)
+    all_t = torch.from_numpy(points).to(device=device, dtype=torch.float32)
+    rad_t = torch.from_numpy(radii).to(device=device, dtype=torch.float32)
+    counts = torch.empty(N, dtype=torch.float32, device=device)
+    for start in range(0, N, query_batch_size):
+        end = min(start + query_batch_size, N)
+        dists = torch.cdist(all_t[start:end], all_t, p=float("inf"))  # (B, N)
+        within = (dists < rad_t[start:end, None]).sum(dim=1).float() - 1.0
+        counts[start:end] = within.clamp(min=0.0)
+    return counts.cpu().numpy().astype(np.float64)
+
+
 def ksg_mi_averaged(
     x: np.ndarray,
     y: np.ndarray,
@@ -195,34 +219,58 @@ def ksg_mi_averaged(
     dists, _ = tree_z.query(z, k=k_max + 1, p=np.inf, workers=n_workers)
     logger.info("KSG joint NN query (k_max=%d): %.2fs", k_max, time.perf_counter() - t_nn)
 
-    def _marginals(eps_strict: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Compute n_x and n_y in parallel, each using half the workers."""
-        half = max(1, n_workers // 2)
-        if N <= batch_threshold:
-            def _cx():
-                return _count_neighbours(tree_x, x, eps_strict, n_workers=half)
-            def _cy():
-                return _count_neighbours(tree_y, y, eps_strict, n_workers=half)
-        else:
-            def _cx():
-                return _count_neighbours_batched(tree_x, x, eps_strict, batch_size=batch_size, n_workers=half)
-            def _cy():
-                return _count_neighbours_batched(tree_y, y, eps_strict, batch_size=batch_size, n_workers=half)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fx = pool.submit(_cx)
-            fy = pool.submit(_cy)
-            return fx.result(), fy.result()
+    try:
+        import torch as _torch
+        _use_gpu = _torch.cuda.is_available() and N > batch_threshold
+    except ImportError:
+        _use_gpu = False
 
-    estimates = []
-    for k in tqdm(k_values, desc="KSG k-values", unit="k", dynamic_ncols=True):
-        eps = dists[:, k]
-        eps_strict = eps * (1.0 - 1e-10)
-        t_m = time.perf_counter()
-        n_x, n_y = _marginals(eps_strict)
-        logger.info("KSG k=%d marginals: %.2fs", k, time.perf_counter() - t_m)
-        mi = digamma(k) - digamma(n_x + 1) - digamma(n_y + 1) + digamma(N)
-        logger.info("KSG k=%d: mi_mean=%.4f mi_std=%.4f", k, float(mi.mean()), float(mi.std()))
-        estimates.append(mi.astype(np.float64))
+    if _use_gpu:
+        # GPU path: sequential k-values, GPU does inner parallelism.
+        logger.info("KSG using GPU (CUDA) for marginal counting")
+        estimates = []
+        for k in tqdm(k_values, desc="KSG k-values", unit="k", dynamic_ncols=True):
+            eps_strict = dists[:, k] * (1.0 - 1e-10)
+            t_m = time.perf_counter()
+            n_x = _count_neighbours_gpu(x, eps_strict)
+            n_y = _count_neighbours_gpu(y, eps_strict)
+            logger.info("KSG k=%d marginals (GPU): %.2fs", k, time.perf_counter() - t_m)
+            mi = digamma(k) - digamma(n_x + 1) - digamma(n_y + 1) + digamma(N)
+            logger.info("KSG k=%d: mi_mean=%.4f mi_std=%.4f", k, float(mi.mean()), float(mi.std()))
+            estimates.append(mi.astype(np.float64))
+    else:
+        # CPU path: all k-values run concurrently, each gets leaf_workers threads.
+        # cKDTree.query_ball_point releases the GIL so threading is effective.
+        leaf_w = max(1, n_workers // (len(k_values) * 2))
+
+        def _marginals(eps_strict: np.ndarray, leaf_workers: int) -> tuple[np.ndarray, np.ndarray]:
+            """n_x and n_y run in parallel, each using leaf_workers threads."""
+            if N <= batch_threshold:
+                def _cx():
+                    return _count_neighbours(tree_x, x, eps_strict, n_workers=leaf_workers)
+                def _cy():
+                    return _count_neighbours(tree_y, y, eps_strict, n_workers=leaf_workers)
+            else:
+                def _cx():
+                    return _count_neighbours_batched(tree_x, x, eps_strict, batch_size=batch_size, n_workers=leaf_workers)
+                def _cy():
+                    return _count_neighbours_batched(tree_y, y, eps_strict, batch_size=batch_size, n_workers=leaf_workers)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fx = pool.submit(_cx)
+                fy = pool.submit(_cy)
+                return fx.result(), fy.result()
+
+        def _run_k(k: int) -> np.ndarray:
+            eps_strict = dists[:, k] * (1.0 - 1e-10)
+            t_m = time.perf_counter()
+            n_x, n_y = _marginals(eps_strict, leaf_workers=leaf_w)
+            logger.info("KSG k=%d marginals: %.2fs", k, time.perf_counter() - t_m)
+            mi = digamma(k) - digamma(n_x + 1) - digamma(n_y + 1) + digamma(N)
+            logger.info("KSG k=%d: mi_mean=%.4f mi_std=%.4f", k, float(mi.mean()), float(mi.std()))
+            return mi.astype(np.float64)
+
+        with ThreadPoolExecutor(max_workers=len(k_values)) as pool:
+            estimates = list(pool.map(_run_k, k_values))
 
     result = np.stack(estimates, axis=0).mean(axis=0)
     logger.info(

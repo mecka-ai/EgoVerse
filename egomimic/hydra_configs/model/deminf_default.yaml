@@ -63,7 +63,7 @@ tsne:
 
 # Pass 3: KSG on concatenated episode latents (CPU).
 ksg:
-  n_threads: 12
+  n_threads: 28
   k_range: [3, 7]
   # Approximate subsampled KSG (disabled when null). Enable both, e.g. 100000.
   chunked_threshold: null
