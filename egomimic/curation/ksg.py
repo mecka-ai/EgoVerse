@@ -221,7 +221,7 @@ def ksg_mi_averaged(
 
     try:
         import torch as _torch
-        _use_gpu = _torch.cuda.is_available() and N > batch_threshold
+        _use_gpu = _torch.cuda.is_available()
     except ImportError:
         _use_gpu = False
 
