@@ -52,6 +52,9 @@ language_conditioning:
   n_clusters: auto        # "auto" (silhouette over 2..n_clusters_max) or an int
   n_clusters_max: 20      # upper bound for auto silhouette search
   clustered_min_spans: 8  # clusters with fewer spans are formed but not scored (logged)
+  # Qwen3 instruction that steers clustering toward verbs + handedness over objects.
+  # Set to "" to cluster on the raw annotation text (objects included).
+  cluster_instruction: "Represent this manipulation instruction by the actions the hands perform — the verbs and whether the left hand, right hand, or both hands are used — and ignore the specific objects involved."
   qwen3:
     model_name: Qwen/Qwen3-Embedding-0.6B
     max_length: 512

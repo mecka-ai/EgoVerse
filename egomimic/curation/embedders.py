@@ -503,6 +503,7 @@ class LanguageEmbedder:
         batch_size: int = 64,
         dtype: str = "float16",
         seed: int = 42,
+        instruction: str = "",
     ) -> None:
         self.source = source.lower().strip()
         if self.source not in ("qwen3", "precomputed"):
@@ -516,6 +517,10 @@ class LanguageEmbedder:
         self.batch_size = batch_size
         self.dtype_name = dtype
         self._seed = seed
+        # Qwen3-Embedding is instruction-tuned: a task instruction prepended as
+        # "Instruct: {instruction}\nQuery: {text}" steers the representation toward
+        # the requested aspect (e.g. verbs + handedness rather than objects).
+        self.instruction = instruction.strip()
         self._fitted = False
         self._proj: np.ndarray | None = None
         self._raw_dim: int | None = None
@@ -592,6 +597,8 @@ class LanguageEmbedder:
         assert self._model is not None and self._tokenizer is not None
         outputs: list[np.ndarray] = []
         t0 = time.perf_counter()
+        if self.instruction:
+            texts = [f"Instruct: {self.instruction}\nQuery: {t}" for t in texts]
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
             tokens = self._tokenizer(

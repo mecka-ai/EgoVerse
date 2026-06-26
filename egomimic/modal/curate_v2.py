@@ -177,7 +177,10 @@ def _score_task_clustered(
         batch_size=lang.batch_size,
         dtype=lang.dtype,
         seed=select_seed(cfg),
+        instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
     )
+    if lang.cluster_instruction:
+        print(f"{tag} clustering instruction: {lang.cluster_instruction}")
     lemb.fit()
     text_embeddings = lemb.embed(span_texts)
 

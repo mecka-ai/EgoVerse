@@ -115,6 +115,12 @@ class LanguageConditioningSettings:
     n_clusters: int | str = "auto"
     n_clusters_max: int = 20
     clustered_min_spans: int = 8
+    # Qwen3 instruction steering clustering toward verbs + handedness over objects.
+    cluster_instruction: str = (
+        "Represent this manipulation instruction by the actions the hands perform — "
+        "the verbs and whether the left hand, right hand, or both hands are used — "
+        "and ignore the specific objects involved."
+    )
 
 
 @dataclass(frozen=True)
@@ -315,6 +321,9 @@ def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSetti
         n_clusters_max=int(block.get("n_clusters_max", defaults.n_clusters_max)),
         clustered_min_spans=int(
             block.get("clustered_min_spans", defaults.clustered_min_spans)
+        ),
+        cluster_instruction=str(
+            block.get("cluster_instruction", defaults.cluster_instruction)
         ),
     )
 
