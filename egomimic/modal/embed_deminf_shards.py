@@ -402,7 +402,7 @@ def _embed_state_shards(
     if n_done == 0:
         print(f"{tag} WARNING: no episodes embedded")
 
-    lat_dir = Path(output_dir) / "latents_v2" / task_name
+    lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(lat_dir / "state.npz")
     n_saved = _cache_collect(cache_dir, out_path, _np)
@@ -496,7 +496,7 @@ def _embed_action_shards(
     if not ep_to_action:
         print(f"{tag} WARNING: no episodes embedded")
 
-    lat_dir = Path(output_dir) / "latents_v2" / task_name
+    lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(lat_dir / "action.npz")
     _np.savez_compressed(out_path, **ep_to_action)
@@ -627,7 +627,7 @@ def _embed_action_shards_gpu(
     if n_done == 0:
         print(f"{tag} WARNING: no episodes embedded")
 
-    lat_dir = Path(output_dir) / "latents_v2" / task_name
+    lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
     out_path = str(lat_dir / "action.npz")
     n_saved = _cache_collect(cache_dir, out_path, _np)

@@ -119,7 +119,7 @@ def _score_task_clustered(
 
     Reads annotation spans from zarr, slices per-frame latents per span, Qwen3-embeds
     span text, K-means clusters spans, then KSG-scores each cluster independently.
-    Writes ``scores_v2/<task>_clustered_scores.json`` and returns a flat
+    Writes ``scores/<task>_clustered_scores.json`` and returns a flat
     ``{span_id: score}`` map for scored spans.
     """
     import time as _time
@@ -194,7 +194,7 @@ def _score_task_clustered(
         f"{len(clustered)} clusters"
     )
 
-    scores_dir = Path(output_dir) / "scores_v2"
+    scores_dir = Path(output_dir) / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
     out_path = scores_dir / f"{task_name}_clustered_scores.json"
     with open(out_path, "w") as f:
@@ -359,7 +359,7 @@ def _score_task_v2(
     tag = f"[{task_name}][score]"
     t_start = _time.perf_counter()
 
-    lat_dir = Path(output_dir) / "latents_v2" / task_name
+    lat_dir = Path(output_dir) / "latents" / task_name
     state_path = lat_dir / "state.npz"
     action_path = lat_dir / "action.npz"
 
@@ -448,8 +448,8 @@ def _score_task_v2(
             include_state_by_lang=tsne_cfg.include_state_by_lang,
             state_color_by=tsne_cfg.state_color_by,
         )
-        tsne_dir = Path(output_dir) / "tsne_v2"
-        tsne3d_dir = Path(output_dir) / "tsne3d_v2"
+        tsne_dir = Path(output_dir) / "tsne"
+        tsne3d_dir = Path(output_dir) / "tsne3d"
         make_task_tsne_plots(
             task_name,
             state_latents_list,
@@ -471,7 +471,7 @@ def _score_task_v2(
         traceback.print_exc()
 
     # Write per-task scores
-    scores_dir = Path(output_dir) / "scores_v2"
+    scores_dir = Path(output_dir) / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)
     with open(scores_dir / f"{task_name}_scores.json", "w") as f:
         json.dump(dict(sorted(scores.items(), key=lambda kv: kv[1], reverse=True)), f, indent=2)
@@ -711,7 +711,7 @@ def run_curate_v2(
         json.dump(sorted_by_task, f, indent=2)
     with open(output_dir / "kept_hashes.json", "w") as f:
         json.dump(list(sorted_flat.keys()), f, indent=2)
-    with open(output_dir / "curation_stats_v2.json", "w") as f:
+    with open(output_dir / "curation_stats.json", "w") as f:
         json.dump({
             "total_input":     total_episodes,
             "n_tasks":         len(scores_by_task),
@@ -732,7 +732,7 @@ def run_curate_v2(
     tsne_dir.mkdir(parents=True, exist_ok=True)
 
     for t_name in sorted(scores_by_task.keys()):
-        lat_dir = output_dir / "latents_v2" / t_name
+        lat_dir = output_dir / "latents" / t_name
         s_path = lat_dir / "state.npz"
         a_path = lat_dir / "action.npz"
         if not s_path.exists() or not a_path.exists():
@@ -823,7 +823,7 @@ def run_score_v2(
 ) -> str:
     """Resume: run ONLY Phase 3 (KSG scoring) against latents already in output_dir.
 
-    Discovers tasks under ``output_dir/latents_v2/`` (or just ``score_task``) and
+    Discovers tasks under ``output_dir/latents/`` (or just ``score_task``) and
     invokes ``_score_task_v2`` per task — no shard build, no embedding.
     """
     import sys as _sys
@@ -836,9 +836,9 @@ def run_score_v2(
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
 
-    lat_root = _Path(output_dir) / "latents_v2"
+    lat_root = _Path(output_dir) / "latents"
     if not lat_root.is_dir():
-        print(f"No latents_v2 dir under {output_dir} — nothing to score")
+        print(f"No latents dir under {output_dir} — nothing to score")
         return ""
 
     if score_task:
@@ -867,7 +867,7 @@ def submit_score_v2(*args: str) -> None:
     """Fire-and-forget: resume KSG scoring on an existing run's latents.
 
     Required: ``score_output_dir=<output dir under /root/EgoVerse/logs>``
-    Optional: ``score_task=<task>`` (default: all tasks under latents_v2/)
+    Optional: ``score_task=<task>`` (default: all tasks under latents/)
     Remaining args are normal hydra overrides (model=…, data=…, language_conditioning…).
     """
     args, _ = pop_init_submodules(args)
