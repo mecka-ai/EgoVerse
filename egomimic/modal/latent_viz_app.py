@@ -91,6 +91,27 @@ def _list_cluster_runs(outputs_root: Path) -> list[str]:
     return sorted(set(runs), reverse=True)
 
 
+def _run_mtime(run_dir: Path) -> float:
+    """Latest mtime of a run's output artifacts — a cache version stamp so re-scored
+    runs auto-refresh (the HTML is rebuilt when scores/tsne3d change)."""
+    latest = 0.0
+    for sub in ("tsne3d", "scores", "scores_v2"):
+        d = run_dir / sub
+        if d.is_dir():
+            for f in d.glob("*"):
+                try:
+                    latest = max(latest, f.stat().st_mtime)
+                except OSError:
+                    pass
+    p = run_dir / "scores_by_task.json"
+    if p.is_file():
+        try:
+            latest = max(latest, p.stat().st_mtime)
+        except OSError:
+            pass
+    return latest
+
+
 def _landing_html(runs: list[str], default_run: str, error: str = "",
                   span_runs: list[str] | None = None,
                   cluster_runs: list[str] | None = None) -> str:
@@ -300,9 +321,10 @@ def viewer():
     from build_cluster_viz import build_cluster_html
 
     web = FastAPI(title="Meckaverse")
-    html_cache:         dict[str, str]   = {}
-    span_html_cache:    dict[str, str]   = {}
-    cluster_html_cache: dict[str, str]   = {}
+    # run path → (mtime stamp, HTML); rebuilt when the run's outputs change.
+    html_cache:         dict[str, tuple[float, str]] = {}
+    span_html_cache:    dict[str, tuple[float, str]] = {}
+    cluster_html_cache: dict[str, tuple[float, str]] = {}
     frame_cache:        dict[str, bytes] = {}
     val_list = json.load(open("/root/mecka_d64_val.json"))
 
@@ -320,10 +342,12 @@ def viewer():
         run = run.strip().strip("/")
         if not run:
             raise HTTPException(400, "run path is required")
-        if run in html_cache:
-            return html_cache[run]
-
         run_dir = Path(OUTPUTS_MOUNT) / run
+        stamp = _run_mtime(run_dir)
+        cached = html_cache.get(run)
+        if cached and cached[0] == stamp:
+            return cached[1]
+
         tsne_dir = run_dir / "tsne3d"
         scores_path = run_dir / "scores_by_task.json"
         if not tsne_dir.is_dir():
@@ -342,7 +366,7 @@ def viewer():
         metadata = _fetch_episode_metadata(list(all_hashes))
 
         body = build_html(tsne_dir, scores, val_list, video_base="/video/", frame_base="/frame/", run_label=run, metadata=metadata)
-        html_cache[run] = body
+        html_cache[run] = (stamp, body)
         print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run} ({len(metadata)} metadata entries)")
         return body
 
@@ -385,15 +409,17 @@ def viewer():
         run = run.strip().strip("/")
         if not run:
             raise HTTPException(400, "run path is required")
-        if run in span_html_cache:
-            return span_html_cache[run]
         _reload_volumes()
+        stamp = _run_mtime(Path(OUTPUTS_MOUNT) / run)
+        cached = span_html_cache.get(run)
+        if cached and cached[0] == stamp:
+            return cached[1]
         json_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
         if not json_path.is_file():
             raise HTTPException(404, f"tsne3d/spans_tsne3d.json not found under {run!r}")
         data = json.load(open(json_path))
         body = build_span_html(data, video_base="/video/", frame_base="/frame/", run_label=run)
-        span_html_cache[run] = body
+        span_html_cache[run] = (stamp, body)
         print(f"viewer: built span HTML {len(body)/1e6:.1f} MB for run={run} ({len(data.get('spans',[]))} spans)")
         return body
 
@@ -439,10 +465,12 @@ def viewer():
         run = run.strip().strip("/")
         if not run:
             raise HTTPException(400, "run path is required")
-        if run in cluster_html_cache:
-            return cluster_html_cache[run]
         _reload_volumes()
         run_dir = Path(OUTPUTS_MOUNT) / run
+        stamp = _run_mtime(run_dir)
+        cached = cluster_html_cache.get(run)
+        if cached and cached[0] == stamp:
+            return cached[1]
         scores_dir = _cluster_scores_dir(run_dir)
         if scores_dir is None:
             raise HTTPException(404, f"No *_clustered_scores.json found under {run!r} (checked scores/ and scores_v2/)")
@@ -451,7 +479,7 @@ def viewer():
             clusters.update(json.load(open(sf)))
         tsne = _load_cluster_tsne(run)
         body = build_cluster_html(clusters, tsne, video_base="/video/", frame_base="/frame/", run_label=run)
-        cluster_html_cache[run] = body
+        cluster_html_cache[run] = (stamp, body)
         n_spans = sum(len(c.get("spans", {})) for c in clusters.values())
         print(f"[viewer] cluster HTML {len(body)/1e6:.1f} MB run={run} ({len(clusters)} clusters, {n_spans} spans, scores_dir={scores_dir.name}, tsne={'yes' if tsne else 'no'})")
         return body
