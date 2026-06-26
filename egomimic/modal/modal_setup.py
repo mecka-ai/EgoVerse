@@ -301,11 +301,6 @@ image = (
         remote_path="/root/build_deminf_shards.py",
         copy=True,
     )
-    .add_local_file(
-        Path(__file__).resolve().parent / "curate_v2.py",
-        remote_path="/root/curate_v2.py",
-        copy=True,
-    )
     # modal_setup.py last: changes here invalidate all code-file layers above,
     # but NOT the heavy pip/model layers.
     .add_local_file(

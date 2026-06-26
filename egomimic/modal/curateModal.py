@@ -1,45 +1,17 @@
-"""Modal curation entrypoints for DemInf scoring at scale.
+"""DemInf curation pipeline — three-phase orchestrator.
 
-Architecture
-------------
-run_curate (orchestrator, CPU)
-  • SQL task lookup partitions episode hashes by task.
-  • Ensures per-task tar shards exist on WDS volume (auto-provisions missing ones).
-  • Fans out one _score_task_split container per task.
+Phase 1: build MP4+NPZ shards from zarr episodes (50 parallel workers)
+Phase 2: embed state (L40S GPU) + action (CPU) in parallel per task
+Phase 3: KSG mutual-information scoring from pre-computed latents
 
-Shard provisioning (inside run_curate, only for tasks missing shards)
-  • convert_shard (from shard_zarr_to_tar): bundles zarr dirs → tar on WDS volume.
-  • _write_task_indexes_remote: writes shard_index.json + metadata.json per task.
-  • Idempotent: existing per-task shard dirs are skipped.
+Usage:
+  python egomimic/modal/curateModal.py \\
+    name=<run_name> description=<desc> \\
+    data=mecka_all_zarr model=deminf_default trainer=ddp_modal
 
-_score_task_split (CPU worker, one per task)
-  • Reads precomputed action norm stats (required — raises if missing).
-  • Shards episode hashes into chunks of ≤ max_episodes_per_shard (default 100).
-  • Spawns one _embed_task_shard GPU container per shard (all in parallel).
-  • Collects shard latents, concatenates in shard-index order.
-  • Pass 2 (KSG): mutual-information scoring on combined latents.
-
-_embed_task_shard (GPU worker, one per shard of ≤ max_episodes_per_shard episodes)
-  • Reads from per-task tar shards on WDS volume (fast sequential NVMe I/O).
-  • Falls back to global shard_index if no per-task dir exists.
-  • Pass 1 (embed): extract tar → GPU embed → returns (state, action) latents.
-
-Norm stats are always precomputed offline (model.precomputed_norm_stats in
-deminf_default.yaml). Sharding is controlled by max_episodes_per_shard in
-curate.yaml. Per-shard GPU compute is overridden at launch via
-+modal_gpu / +modal_cpu / +modal_memory_gb.
-
-Usage
------
-    python egomimic/modal/curateModal.py \\
-        name=my_run description=test
-
-    python egomimic/modal/curateModal.py \\
-        name=my_run description=test init_submodules=false \\
-        +modal_gpu=L40S:1 +modal_cpu=32 +modal_memory_gb=128
-
-    modal run --env robotics egomimic/modal/curateModal.py::submit_curate -- \\
-        name=my_run description=test
+Replaces the legacy WDS tar-sharding curation pipeline with a decoupled format that
+separates state/action embedding onto different hardware and stores latents in a
+provenance-first store (flat arrays + manifest + annotation spans).
 """
 
 from __future__ import annotations
@@ -49,75 +21,41 @@ import os
 import sys
 from pathlib import Path
 
-import modal
-
 _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from modal_setup import (  # noqa: E402
+import modal
+from modal_setup import (
     CFG,
     CURATE_ORCHESTRATOR,
     MODAL_COMPUTE_ARG_MAP,
     ModalCompute,
-    WDS_MOUNT_PATH,
+    _boot_container,
     _local_hf_token,
     _prepare_repo,
-    _prepare_repo_light,
     _resolve_git_state,
+    app,
     app_name_from_hydra_args,
-    decode_submodules,
-    encode_submodules,
+    deminf_v2_volume,
+    DEMINF_V2_MOUNT,
+    image,
     launch_detached,
     pop_init_submodules,
-    app,
     training_outputs_volume,
-    wds_volume,
     zarr_volume,
 )
-from shard_zarr_to_tar import (  # noqa: E402
-    EPISODES_PER_SHARD,
-    _task_shard_dir,
-    _write_task_indexes_remote,
-    convert_shard,
-)
-
-# GPU embed-shard workers — override at launch via +modal_gpu / +modal_cpu / +modal_memory_gb.
-TASK_COMPUTE = ModalCompute.from_environ(
-    default_gpu="L40S",
-    default_cpu=16.0,
-    default_memory_mb=131072,
-)
-
-# Per-task CPU orchestrator (shard fan-out + KSG) — fixed, no GPU. 32 CPUs so the
-# KSG k-NN queries / parallel marginals can use a high model.ksg.n_threads.
-TASK_SCORE_COMPUTE = ModalCompute(gpu=None, cpu=32.0, memory_mb=49152)
+from build_deminf_shards import build_shards_for_task, _build_shards_worker  # noqa: F401
+from embed_deminf_shards import _embed_state_shards, _embed_action_shards  # noqa: F401
 
 _SHARED_SECRETS = [modal.Secret.from_name(name) for name in CFG.secret_names]
 
-
-# ---------------------------------------------------------------------------
-# Shared container boot helpers
-# ---------------------------------------------------------------------------
-
-
-def _boot_container(git_remote: str, git_commit: str, hf_token: str) -> None:
-    """Set up the remote container: env vars, repo clone, sys.path."""
-    import sys as _sys
-
-    if hf_token:
-        os.environ["HF_TOKEN"] = hf_token
-    _prepare_repo_light(git_remote=git_remote, git_commit=git_commit)
-    _sys.path.insert(0, CFG.remote_repo_dir)
-    os.chdir(CFG.remote_repo_dir)
-    os.environ["MODAL_IS_REMOTE"] = "1"
-    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
+# Per-task KSG scoring: L40S GPU for GPU-accelerated marginal counting; 8 CPUs for tree build.
+_SCORE_COMPUTE = ModalCompute(gpu="L40S", cpu=8, memory_mb=32768)
 
 
 def _load_cfg(hydra_args: tuple[str, ...]):
-    """Compose the curate Hydra config inside an already-booted container."""
     import hydra as _hydra
-
     with _hydra.initialize_config_dir(
         config_dir=f"{CFG.remote_repo_dir}/egomimic/hydra_configs",
         version_base="1.3",
@@ -125,462 +63,526 @@ def _load_cfg(hydra_args: tuple[str, ...]):
         return _hydra.compose("curate", overrides=list(hydra_args))
 
 
+def _clean_latent_key(key: str) -> str:
+    """Recover the bare episode hash from a latent key.
+
+    Older shards keyed latents by the mangled ``np.bytes_(b'<hash>')`` repr of the
+    episode_hash. Episode hashes are 24-char Mongo ObjectIds, so extract that; for
+    already-clean keys this returns the key unchanged.
+    """
+    import re as _re
+    m = _re.search(r"[0-9a-fA-F]{24}", key)
+    return m.group(0) if m else key
+
+
+def _read_episode_spans(zarr_root: Path, ep_hash: str) -> list[dict]:
+    """Read decoded ``{text, start_idx, end_idx}`` annotation spans from an episode's zarr."""
+    import json as _json
+
+    import zarr
+
+    def _decode(value):
+        import numpy as _np
+        if isinstance(value, _np.void):
+            value = value.item()
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytearray):
+            value = bytes(value)
+        if isinstance(value, bytes):
+            return _json.loads(value.decode("utf-8"))
+        if isinstance(value, str):
+            return _json.loads(value)
+        return value
+
+    for cand in (zarr_root / ep_hash, zarr_root / f"{ep_hash}.zarr"):
+        if not cand.exists():
+            continue
+        store = zarr.open(str(cand), mode="r", zarr_format=3)
+        if "annotations" not in store:
+            return []
+        raw = store["annotations"][:]
+        return [d for d in (_decode(x) for x in raw) if isinstance(d, dict)]
+    return []
+
+
 # ---------------------------------------------------------------------------
-# Pass-1 GPU embed shard (one per shard of ≤ max_episodes_per_shard episodes)
+# Latent store: flat memmap arrays + provenance manifest + annotation spans
+# ---------------------------------------------------------------------------
+
+
+def load_latent_store(lat_dir: Path):
+    """Load an assembled latent store.
+
+    Returns ``(state_mmap, action_mmap, manifest, spans)`` where the arrays are
+    memmapped (N, D) float32, ``manifest`` maps each episode to its row range, and
+    ``spans`` carries annotation spans with precomputed ``row_start``/``row_count``.
+    """
+    import json as _json
+
+    import numpy as _np
+
+    manifest = _json.loads((lat_dir / "manifest.json").read_text())
+    spans_path = lat_dir / "spans.json"
+    spans = _json.loads(spans_path.read_text()) if spans_path.exists() else []
+    state = _np.load(str(lat_dir / "state.npy"), mmap_mode="r")
+    action = _np.load(str(lat_dir / "action.npy"), mmap_mode="r")
+    return state, action, manifest, spans
+
+
+def assemble_latent_store(output_dir: str, task_name: str, shard_dir: str) -> bool:
+    """Merge the embedder flats into the canonical provenance-first latent store.
+
+    Inputs (written by the embedders): ``latents/<task>/_state.npy`` +
+    ``_state_manifest.json`` and ``_action.npy`` + ``_action_manifest.json``.
+    Build sidecars on the shard volume (``<hash>.meta.json`` spans, ``<hash>.npz``
+    ``orig_frames``) supply annotation spans and original-frame provenance.
+
+    Writes ``state.npy``, ``action.npy``, ``orig_frame.npy``, ``manifest.json``,
+    ``spans.json`` under ``latents/<task>/`` in sorted-hash canonical row order, then
+    removes the embedder temporaries. Returns True on success.
+    """
+    import json as _json
+
+    import numpy as _np
+
+    lat_dir = Path(output_dir) / "latents" / task_name
+    sm_path = lat_dir / "_state_manifest.json"
+    am_path = lat_dir / "_action_manifest.json"
+    if not sm_path.exists() or not am_path.exists():
+        print(f"[{task_name}][assemble] missing embedder flats — skipping")
+        return False
+
+    sm = _json.loads(sm_path.read_text())
+    am = _json.loads(am_path.read_text())
+    state_flat = _np.load(str(lat_dir / "_state.npy"), mmap_mode="r")
+    action_flat = _np.load(str(lat_dir / "_action.npy"), mmap_mode="r")
+
+    s_idx = {e["hash"]: e for e in sm["episodes"]}
+    a_idx = {e["hash"]: e for e in am["episodes"]}
+    common = sorted(set(s_idx) & set(a_idx))
+    if not common:
+        print(f"[{task_name}][assemble] no episodes present in both modalities")
+        return False
+
+    episodes: list[dict] = []
+    n_rows = 0
+    for h in common:
+        T = int(min(s_idx[h]["n_frames"], a_idx[h]["n_frames"]))
+        episodes.append({"hash": h, "row_start": n_rows, "n_frames": T})
+        n_rows += T
+
+    Ds, Da = int(sm["dim"]), int(am["dim"])
+    state = _np.lib.format.open_memmap(
+        str(lat_dir / "state.npy"), mode="w+", dtype=_np.float32, shape=(n_rows, Ds)
+    )
+    action = _np.lib.format.open_memmap(
+        str(lat_dir / "action.npy"), mode="w+", dtype=_np.float32, shape=(n_rows, Da)
+    )
+    orig_frame = _np.empty(n_rows, dtype=_np.int32)
+    shard = Path(shard_dir)
+    spans_out: list[dict] = []
+
+    for ep in episodes:
+        h, rs, T = ep["hash"], ep["row_start"], ep["n_frames"]
+        state[rs : rs + T] = state_flat[s_idx[h]["row_start"] : s_idx[h]["row_start"] + T]
+        action[rs : rs + T] = action_flat[a_idx[h]["row_start"] : a_idx[h]["row_start"] + T]
+
+        of = None
+        npz_p = shard / f"{h}.npz"
+        if npz_p.exists():
+            try:
+                of = _np.asarray(_np.load(str(npz_p), allow_pickle=True)["orig_frames"], dtype=_np.int64)
+            except Exception:
+                of = None
+        if of is None or len(of) < T:
+            of = _np.arange(T, dtype=_np.int64)
+        of = of[:T]
+        orig_frame[rs : rs + T] = of.astype(_np.int32)
+
+        meta_p = shard / f"{h}.meta.json"
+        if not meta_p.exists():
+            continue
+        try:
+            spans = _json.loads(meta_p.read_text()).get("spans", [])
+        except Exception:
+            continue
+        for sp in spans:
+            s0, e0 = int(sp.get("start_idx", -1)), int(sp.get("end_idx", -1))
+            txt = str(sp.get("text", "")).strip()
+            if not txt or s0 < 0 or e0 <= s0:
+                continue
+            lo = int(_np.searchsorted(of, s0, side="left"))
+            hi = int(_np.searchsorted(of, e0, side="left"))
+            if hi <= lo:
+                continue
+            spans_out.append(
+                {"episode": h, "start": s0, "end": e0, "text": txt,
+                 "row_start": rs + lo, "row_count": hi - lo}
+            )
+
+    state.flush()
+    action.flush()
+    del state, action
+    _np.save(str(lat_dir / "orig_frame.npy"), orig_frame)
+
+    manifest = {"task": task_name, "fps": 30, "n_rows": n_rows,
+                "state_dim": Ds, "action_dim": Da, "episodes": episodes}
+    (lat_dir / "manifest.json").write_text(_json.dumps(manifest))
+    (lat_dir / "spans.json").write_text(_json.dumps(spans_out))
+
+    for tmp in ("_state.npy", "_action.npy", "_state_manifest.json", "_action_manifest.json"):
+        try:
+            (lat_dir / tmp).unlink()
+        except Exception:
+            pass
+
+    print(
+        f"[{task_name}][assemble] store: {n_rows} rows, {len(episodes)} episodes, "
+        f"{len(spans_out)} spans"
+    )
+    return True
+
+
+def _score_task_clustered(
+    task_name: str,
+    cfg,
+    output_dir: str,
+    tag: str,
+    t_start: float,
+) -> tuple[str, dict]:
+    """Span-granularity clustered KSG scoring (model.language_conditioning.mode=clustered).
+
+    Reads the latent store (flat arrays + spans.json with row ranges), Qwen3-embeds
+    span text, K-means clusters spans, then KSG-scores each cluster independently.
+    Writes ``scores/<task>_clustered_scores.json`` and returns a flat
+    ``{span_id: score}`` map for scored spans.
+    """
+    import time as _time
+
+    import numpy as _np
+    import torch as _torch
+
+    from egomimic.curation.config import select_language_conditioning_settings, select_seed
+    from egomimic.curation.embedders import LanguageEmbedder
+    from egomimic.curation.scoring import trajectory_scorer_from_cfg
+
+    lang = select_language_conditioning_settings(cfg)
+    lat_dir = Path(output_dir) / "latents" / task_name
+    state, action, manifest, spans = load_latent_store(lat_dir)
+
+    span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
+    for sp in spans:
+        rs, rc = int(sp["row_start"]), int(sp["row_count"])
+        if rc < 1:
+            continue
+        span_state.append(_np.asarray(state[rs : rs + rc]))
+        span_action.append(_np.asarray(action[rs : rs + rc]))
+        span_ids.append(f"{sp['episode']}::{sp['start']}-{sp['end']}")
+        span_texts.append(sp["text"])
+        span_meta.append(
+            {"episode": sp["episode"], "start": int(sp["start"]),
+             "end": int(sp["end"]), "text": sp["text"]}
+        )
+
+    print(
+        f"{tag} clustered: {len(span_ids)} annotation spans "
+        f"from {len(manifest['episodes'])} episodes"
+    )
+    if not span_ids:
+        print(f"{tag} no annotation spans found — skipping clustered scoring")
+        return task_name, {}
+
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    lemb = LanguageEmbedder(
+        source="qwen3",
+        latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
+        device=device,
+        model_name=lang.model_name,
+        max_length=lang.max_length,
+        batch_size=lang.batch_size,
+        dtype=lang.dtype,
+        seed=select_seed(cfg),
+        instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
+    )
+    if lang.cluster_instruction:
+        print(f"{tag} clustering instruction: {lang.cluster_instruction}")
+    lemb.fit()
+    text_embeddings = lemb.embed(span_texts)
+
+    t_ksg = _time.perf_counter()
+    scorer = trajectory_scorer_from_cfg(cfg)
+    clustered = scorer.score_clusters(
+        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings
+    )
+    print(
+        f"{tag} clustered KSG done in {_time.perf_counter() - t_ksg:.1f}s — "
+        f"{len(clustered)} clusters"
+    )
+
+    scores_dir = Path(output_dir) / "scores"
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    out_path = scores_dir / f"{task_name}_clustered_scores.json"
+    with open(out_path, "w") as f:
+        json.dump(clustered, f, indent=2)
+
+    # Per-span artifact for the latent viewer: pooled state/action latents, the
+    # Qwen3 language embedding, cluster id, score, and the (episode, start, end)
+    # needed to play each span's video clip. One row per span, aligned arrays.
+    span_cluster: dict[str, int] = {}
+    span_score: dict[str, float] = {}
+    cluster_labels: dict[str, str] = {}
+    for ck, cv in clustered.items():
+        cid = int(ck.split("_")[1])
+        cluster_labels[str(cid)] = cv["label"]
+        for sid, rec in cv["spans"].items():
+            span_cluster[sid] = cid
+            span_score[sid] = rec.get("score")
+
+    state_pool = _np.stack([s.mean(axis=0) for s in span_state]).astype(_np.float32)
+    action_pool = _np.stack([a.mean(axis=0) for a in span_action]).astype(_np.float32)
+    lang_emb = _np.asarray(text_embeddings, dtype=_np.float32)
+    cluster_ids = _np.asarray([span_cluster[s] for s in span_ids], dtype=_np.int32)
+    scores_arr = _np.asarray(
+        [(_np.nan if span_score[s] is None else span_score[s]) for s in span_ids],
+        dtype=_np.float32,
+    )
+    spans_npz = scores_dir / f"{task_name}_clustered_spans.npz"
+    _np.savez_compressed(
+        spans_npz,
+        span_ids=_np.asarray(span_ids, dtype=object),
+        episodes=_np.asarray([m["episode"] for m in span_meta], dtype=object),
+        starts=_np.asarray([m["start"] for m in span_meta], dtype=_np.int32),
+        ends=_np.asarray([m["end"] for m in span_meta], dtype=_np.int32),
+        texts=_np.asarray(span_texts, dtype=object),
+        cluster_ids=cluster_ids,
+        scores=scores_arr,
+        state_emb=state_pool,
+        action_emb=action_pool,
+        lang_emb=lang_emb,
+    )
+    with open(scores_dir / f"{task_name}_cluster_labels.json", "w") as f:
+        json.dump(cluster_labels, f, indent=2)
+    print(
+        f"{tag} wrote span viewer artifact → {spans_npz} "
+        f"(state{state_pool.shape} action{action_pool.shape} lang{lang_emb.shape})"
+    )
+
+    # 3D t-SNE per modality → tsne3d/spans_tsne3d.json (consumed by the span viewer:
+    # egomimic/modal/latent_viz_app.py::view_spans and scripts/build_span_viz.py).
+    seed = select_seed(cfg)
+
+    def _tsne3d(X) -> "_np.ndarray":
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+        Xf = _np.asarray(X, dtype=_np.float32)
+        if Xf.shape[1] > 50:
+            Xf = PCA(n_components=50, random_state=seed).fit_transform(Xf)
+        return TSNE(
+            n_components=3, init="pca", perplexity=30, random_state=seed
+        ).fit_transform(Xf)
+
+    coords = {}
+    for name, X in (("state", state_pool), ("action", action_pool), ("language", lang_emb)):
+        t_t = _time.perf_counter()
+        e = _tsne3d(X)
+        coords[name] = {
+            "x": e[:, 0].astype(float).tolist(),
+            "y": e[:, 1].astype(float).tolist(),
+            "z": e[:, 2].astype(float).tolist(),
+            "span_idx": list(range(len(e))),
+        }
+        print(f"{tag} t-SNE {name}: {len(e)} pts in {_time.perf_counter() - t_t:.1f}s")
+
+    spans_list = [
+        {
+            "id": span_ids[i],
+            "ep": span_meta[i]["episode"],
+            "start": int(span_meta[i]["start"]),
+            "end": int(span_meta[i]["end"]),
+            "text": span_texts[i],
+            "score": (None if not _np.isfinite(scores_arr[i]) else float(scores_arr[i])),
+            "cluster": int(cluster_ids[i]),
+        }
+        for i in range(len(span_ids))
+    ]
+    clusters_meta = {
+        str(cid): {
+            "label": cluster_labels[str(cid)],
+            "n_spans": int((cluster_ids == cid).sum()),
+        }
+        for cid in sorted(set(cluster_ids.tolist()))
+    }
+    spans_tsne = {
+        "n_clusters": len(clusters_meta),
+        "clusters": clusters_meta,
+        "spans": spans_list,
+        **coords,
+    }
+    tsne_dir = Path(output_dir) / "tsne3d"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+    with open(tsne_dir / "spans_tsne3d.json", "w") as f:
+        json.dump(spans_tsne, f)
+    print(f"{tag} wrote {tsne_dir / 'spans_tsne3d.json'} ({len(spans_list)} spans)")
+
+    training_outputs_volume.commit()
+
+    flat = {
+        sid: rec["score"]
+        for cl in clustered.values()
+        for sid, rec in cl["spans"].items()
+        if rec.get("score") is not None
+    }
+    print(
+        f"{tag} clustered total: {_time.perf_counter() - t_start:.1f}s → {out_path} "
+        f"({len(flat)} spans scored)"
+    )
+    return task_name, flat
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: KSG scoring from pre-computed latents
 # ---------------------------------------------------------------------------
 
 
 @app.function(
-    gpu=TASK_COMPUTE.gpu,
-    cpu=TASK_COMPUTE.cpu,
-    memory=TASK_COMPUTE.memory_mb,
+    image=image,
+    gpu=_SCORE_COMPUTE.gpu,
+    cpu=_SCORE_COMPUTE.cpu,
+    memory=_SCORE_COMPUTE.memory_mb,
     timeout=86400,
     secrets=_SHARED_SECRETS,
     volumes={
-        WDS_MOUNT_PATH: wds_volume,
         CFG.output_mount_path: training_outputs_volume,
+        CFG.volume_mount_path: zarr_volume,
     },
 )
-def _embed_task_shard(
+def _score_task(
     task_name: str,
-    shard_idx: int,
-    shard_hashes: list[str],
-    action_mean: "np.ndarray",
-    action_std: "np.ndarray",
+    run_name: str,
+    hydra_args: tuple[str, ...],
+    action_mean: list,
+    action_std: list,
+    output_dir: str,
     git_remote: str,
     git_commit: str,
-    hydra_args: tuple[str, ...],
     hf_token: str = "",
-) -> tuple[int, list, list, list, list[str], list[int], list[list[str]]]:
-    """
-    GPU embed worker for one shard of ≤ max_episodes_per_shard episodes.
-
-    Reads episodes from tar shards on the WDS volume (fast sequential NVMe I/O),
-    builds embedders from the provided precomputed norm stats, and returns latents.
-
-    Returns
-    -------
-    (shard_idx, state_latents, action_latents, language_latents, hashes, ep_lengths, language_texts)
-    where state_latents / action_latents are lists of per-episode (T, D) arrays.
-    """
-    import shutil
-    import numpy as _np
-    import torch
-    from omegaconf import OmegaConf
-    import time as _time
-
-    t_shard_start = _time.perf_counter()
-
-    _boot_container(git_remote, git_commit, hf_token)
-    import hydra as _hydra
-    from egomimic.utils.aws.aws_data_utils import load_env
-    load_env()
-
-    cfg = _load_cfg(hydra_args)
-    tag = f"[{task_name}][shard {shard_idx}]"
-    print(f"{tag} {len(shard_hashes)} episodes — embedding")
-
-    # Instantiate key_map and transform_list from the data config
-    ds_name = next(iter(cfg.data.train_datasets))
-    resolver_cfg = cfg.data.train_datasets[ds_name].resolver
-    key_map = _hydra.utils.instantiate(resolver_cfg.key_map)
-    transform_list = _hydra.utils.instantiate(resolver_cfg.transform_list)
-    pause_eps = OmegaConf.select(resolver_cfg, "pause_removal_epsilon")
-
-    # Auto-discover per-task shard dir; fall back to global mixed shards.
-    # Per-task shards are created by shard_zarr_to_tar.py::shard_by_task and live at:
-    #   {WDS_MOUNT_PATH}/tasks/{task_name}_{sha6}/
-    import hashlib as _hl
-    task_hash = _hl.sha256(task_name.encode()).hexdigest()[:6]
-    task_shard_root = Path(WDS_MOUNT_PATH) / "tasks" / f"{task_name}_{task_hash}"
-    if (task_shard_root / "shard_index.json").exists():
-        shard_root = task_shard_root
-        print(f"{tag} Using per-task shards at tasks/{task_name}_{task_hash}/")
-    else:
-        shard_root = Path(WDS_MOUNT_PATH)
-        print(f"{tag} No per-task shards found — using global shard_index")
-
-    shard_index = json.loads((shard_root / "shard_index.json").read_text())
-
-    tmp_dir = "/tmp/curation_tar_cache"
-    from egomimic.curation.tar_loader import load_episodes_from_tars
-
-    t_map = _time.perf_counter()
-    all_episodes = load_episodes_from_tars(
-        shard_hashes,
-        shard_index,
-        str(shard_root),
-        tmp_dir,
-        key_map,
-        transform_list,
-        pause_removal_epsilon=pause_eps,
-    )
-    print(f"{tag} Episode map built: {len(all_episodes)} episodes in {_time.perf_counter() - t_map:.2f}s")
-
-    if not all_episodes:
-        print(f"{tag} No episodes loaded — returning empty shard")
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return shard_idx, [], [], [], [], [], []
-
-    from egomimic.curation.config import (
-        apply_curation_seed,
-        select_curation_loader,
-        select_embedder_settings,
-        select_seed,
-        select_tensor_keys,
-    )
-    from egomimic.curation.episode_pipeline import (
-        build_embedders,
-        build_language_embedder,
-        run_pass2_embed_episodes,
-    )
-
-    apply_curation_seed(select_seed(cfg))
-    embed_cfg = select_embedder_settings(cfg)
-    device = torch.device(embed_cfg.device if torch.cuda.is_available() else "cpu")
-    action_key, image_key = select_tensor_keys(cfg)
-    loader_cfg = select_curation_loader(cfg, ds_name)
-
-    t_embed_build = _time.perf_counter()
-    action_embedder, state_embedder = build_embedders(
-        embed_cfg,
-        _np.asarray(action_mean, dtype=_np.float32),
-        _np.asarray(action_std, dtype=_np.float32),
-        device,
-        select_seed(cfg),
-        global_frame_batch_size=loader_cfg.global_frame_batch_size,
-    )
-    language_embedder = build_language_embedder(
-        embed_cfg, device, select_seed(cfg)
-    )
-    lang_cfg = embed_cfg.language_conditioning
-    print(
-        f"{tag} Embedders ready in {_time.perf_counter() - t_embed_build:.2f}s — "
-        f"backbone={embed_cfg.state_image.backbone}, device={device}, "
-        f"global_frame_batch={loader_cfg.global_frame_batch_size}, "
-        f"language={lang_cfg.mode if lang_cfg.enabled else 'off'}"
-    )
-
-    t_pass2 = _time.perf_counter()
-    try:
-        (
-            state_latents,
-            action_latents,
-            hashes,
-            ep_lengths,
-            language_latents,
-            language_texts,
-        ) = run_pass2_embed_episodes(
-            all_episodes,
-            set(all_episodes.keys()),
-            action_key,
-            image_key,
-            loader_cfg,
-            action_embedder,
-            state_embedder,
-            language_embedder=language_embedder,
-            language_cfg=lang_cfg if lang_cfg.enabled else None,
-            progress=f"{tag} embed",
-        )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    n_frames = sum(ep_lengths)
-    print(
-        f"{tag} Pass2 done in {_time.perf_counter() - t_pass2:.2f}s — "
-        f"{len(hashes)} episodes, {n_frames} frames"
-    )
-    print(f"{tag} Shard total: {_time.perf_counter() - t_shard_start:.2f}s")
-    return (
-        shard_idx,
-        state_latents,
-        action_latents,
-        language_latents,
-        hashes,
-        ep_lengths,
-        language_texts,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Per-task CPU orchestrator: load norm stats → shard → fan-out → KSG
-# ---------------------------------------------------------------------------
-
-
-@app.function(
-    gpu=TASK_SCORE_COMPUTE.gpu,
-    cpu=TASK_SCORE_COMPUTE.cpu,
-    memory=TASK_SCORE_COMPUTE.memory_mb,
-    timeout=86400,
-    secrets=_SHARED_SECRETS,
-    volumes={CFG.output_mount_path: training_outputs_volume},
-)
-def _score_task_split(
-    task_name: str,
-    task_episode_hashes: list[str],
-    git_remote: str,
-    git_commit: str,
-    hydra_args: tuple[str, ...],
-    hf_token: str = "",
-    run_output_dir: str = "",
-) -> tuple[str, dict]:
-    """
-    CPU orchestrator for one task: norm stats → shard GPU embed → KSG.
-
-    Steps
-    -----
-    1. Read precomputed action norm stats (raises if not configured).
-    2. Shard task_episode_hashes into chunks of ≤ max_episodes_per_shard.
-    3. Spawn one _embed_task_shard GPU container per shard (all in parallel).
-    4. Collect and concatenate latents from all shards (in shard-index order).
-    5. KSG mutual-information scoring on combined latents (CPU).
-    """
+) -> tuple[str, dict[str, float]]:
+    """Load pre-computed latents and run KSG scoring. Returns (task_name, scores)."""
     import time as _time
     import numpy as _np
-    from omegaconf import OmegaConf
 
-    t_task_start = _time.perf_counter()
     _boot_container(git_remote, git_commit, hf_token)
-    import hydra as _hydra
-    from egomimic.utils.aws.aws_data_utils import load_env
-    load_env()
 
-    cfg = _load_cfg(hydra_args)
-    tag = f"[{task_name}]"
-
-    if not task_episode_hashes:
-        print(f"{tag} No episodes — skipping")
-        return task_name, {}
-
-    max_per_shard = int(OmegaConf.select(cfg, "max_episodes_per_shard", default=100))
-    print(f"{tag} {len(task_episode_hashes)} episodes, max_per_shard={max_per_shard}")
-
-    from egomimic.curation.config import (
-        apply_curation_seed,
-        load_action_norm_stats,
-        select_embedder_settings,
-        select_seed,
-        select_tensor_keys,
-        select_tsne_viz_config,
-    )
-
-    apply_curation_seed(select_seed(cfg))
-    embed_cfg = select_embedder_settings(cfg)
-    action_key, _ = select_tensor_keys(cfg)
-
-    # ── Precomputed norm stats (required) ─────────────────────────────────────
-    t_norm = _time.perf_counter()
-    action_mean, action_std = load_action_norm_stats(
-        cfg,
-        action_key=action_key,
-        norm_min_std=embed_cfg.norm_min_std,
-        search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
-    )
-    print(
-        f"{tag} Norm stats loaded in {_time.perf_counter() - t_norm:.2f}s — "
-        f"action_key={action_key}, dim={action_mean.shape}"
-    )
-
-    # ── Shard episodes ────────────────────────────────────────────────────────
-    episode_list = sorted(task_episode_hashes)
-    shards = [
-        episode_list[i : i + max_per_shard]
-        for i in range(0, len(episode_list), max_per_shard)
-    ]
-    print(f"{tag} {len(episode_list)} episodes → {len(shards)} shard(s)")
-
-    # ── Spawn GPU embed shards in parallel ────────────────────────────────────
-    t_spawn = _time.perf_counter()
-    handles = [
-        (
-            shard_idx,
-            _embed_task_shard.spawn(
-                task_name,
-                shard_idx,
-                shard_hashes,
-                action_mean,
-                action_std,
-                git_remote,
-                git_commit,
-                hydra_args,
-                hf_token,
-            ),
-        )
-        for shard_idx, shard_hashes in enumerate(shards)
-    ]
-    print(f"{tag} {len(handles)} embed shard(s) spawned in {_time.perf_counter() - t_spawn:.2f}s — collecting …")
-
-    # ── Collect shard results ordered by shard_idx ────────────────────────────
-    t_collect = _time.perf_counter()
-    results_by_idx: dict[int, tuple] = {}
-    n_shard_failures = 0
-    for shard_idx, handle in handles:
-        t_shard = _time.perf_counter()
-        try:
-            idx, s_lats, a_lats, l_lats, hashes, lengths, lang_texts = handle.get(
-                timeout=CFG.timeout_seconds
-            )
-            results_by_idx[idx] = (s_lats, a_lats, l_lats, hashes, lengths, lang_texts)
-            print(
-                f"{tag}[shard {shard_idx}] collected: {len(hashes)} episodes, "
-                f"{sum(lengths)} frames in {_time.perf_counter() - t_shard:.2f}s"
-            )
-        except Exception as exc:
-            n_shard_failures += 1
-            print(f"{tag}[shard {shard_idx}] FAILED after {_time.perf_counter() - t_shard:.2f}s: {exc}")
-
-    print(f"{tag} All shards collected in {_time.perf_counter() - t_collect:.2f}s ({n_shard_failures} failure(s))")
-
-    state_latents: list = []
-    action_latents: list = []
-    language_latents: list = []
-    language_texts: list[list[str]] = []
-    scored_hashes: list[str] = []
-    ep_lengths: list[int] = []
-    for idx in sorted(results_by_idx):
-        s_lats, a_lats, l_lats, hashes, lengths, lang_texts = results_by_idx[idx]
-        state_latents.extend(s_lats)
-        action_latents.extend(a_lats)
-        language_latents.extend(l_lats)
-        language_texts.extend(lang_texts)
-        scored_hashes.extend(hashes)
-        ep_lengths.extend(lengths)
-
-    if not state_latents:
-        print(
-            f"{tag} No latents collected ({n_shard_failures} shard failure(s)) "
-            "— returning empty"
-        )
-        return task_name, {}
-
-    n_total = sum(ep_lengths)
-    print(
-        f"{tag} KSG input: {len(scored_hashes)} episodes, {n_total} timesteps "
-        f"({n_shard_failures} shard failure(s))"
-    )
-
-    # ── Per-task t-SNE viz of state/action latents (before KSG frees them) ─────
-    # state_latents/action_latents are per-episode (T, D) arrays in the same
-    # order, so each episode gets a consistent hue across both plots. Auxiliary
-    # to scoring: a viz failure is logged loudly but never aborts the run.
-    if run_output_dir:
-        t_viz = _time.perf_counter()
-        try:
-            from egomimic.curation.tsne_viz import (
-                TsneVizSettings,
-                export_task_tsne3d,
-                make_task_tsne_plots,
-            )
-
-            lang_cfg = embed_cfg.language_conditioning
-            tsne_cfg = select_tsne_viz_config(cfg)
-            viz_settings = TsneVizSettings(
-                every_n=tsne_cfg.every_n,
-                seed=select_seed(cfg),
-                include_state_lang=tsne_cfg.include_state_lang,
-                include_language=tsne_cfg.include_language,
-                include_state_by_lang=tsne_cfg.include_state_by_lang,
-                state_color_by=tsne_cfg.state_color_by,
-            )
-            lang_lats = language_latents if language_latents else None
-            lang_texts = language_texts if language_texts else None
-            lang_mode = lang_cfg.mode if lang_cfg.enabled else None
-
-            tsne3d_json = export_task_tsne3d(
-                task_name,
-                state_latents,
-                action_latents,
-                scored_hashes,
-                Path(run_output_dir) / "tsne3d",
-                language_latents=lang_lats,
-                language_texts_by_episode=lang_texts,
-                language_mode=lang_mode,
-                settings=viz_settings,
-            )
-            training_outputs_volume.commit()
-            tsne_dir = Path(run_output_dir) / "tsne"
-            try:
-                png_paths = make_task_tsne_plots(
-                    task_name,
-                    state_latents,
-                    action_latents,
-                    tsne_dir,
-                    language_latents=lang_lats,
-                    language_texts_by_episode=lang_texts,
-                    language_mode=lang_mode,
-                    settings=viz_settings,
-                )
-            except Exception as _png_exc:
-                import traceback as _tb
-                print(f"{tag} 2D PNG generation failed (non-fatal): {_png_exc}")
-                _tb.print_exc()
-                png_paths = {}
-            lat_dir = Path(run_output_dir) / "latents"
-            lat_dir.mkdir(parents=True, exist_ok=True)
-            npz_kwargs: dict = dict(
-                state=_np.concatenate(state_latents, axis=0),
-                action=_np.concatenate(action_latents, axis=0),
-                lengths=_np.asarray(ep_lengths, dtype=_np.int64),
-                hashes=_np.asarray(scored_hashes),
-            )
-            if lang_lats:
-                npz_kwargs["language"] = _np.concatenate(lang_lats, axis=0)
-            if lang_texts:
-                flat_texts = [t for ep in lang_texts for t in ep]
-                npz_kwargs["language_texts"] = _np.asarray(flat_texts, dtype=object)
-            _np.savez_compressed(lat_dir / f"latents_{task_name}.npz", **npz_kwargs)
-            training_outputs_volume.commit()
-            print(
-                f"{tag} t-SNE viz written in {_time.perf_counter() - t_viz:.1f}s "
-                f"— pngs={list(png_paths.keys())}, tsne3d={tsne3d_json}"
-            )
-        except Exception as exc:
-            import traceback
-
-            print(f"{tag} t-SNE viz FAILED (continuing to KSG): {exc}")
-            traceback.print_exc()
-
-    # ── KSG scoring on combined latents ───────────────────────────────────────
+    from egomimic.curation.config import apply_curation_seed, select_seed
     from egomimic.curation.scoring import trajectory_scorer_from_cfg
+    from egomimic.utils.aws.aws_data_utils import load_env
 
-    t_concat = _time.perf_counter()
-    s_all = _np.concatenate(state_latents, axis=0)
-    a_all = _np.concatenate(action_latents, axis=0)
-    language_latents_by_ep = list(language_latents) if language_latents else None
-    l_all = _np.concatenate(language_latents, axis=0) if language_latents else None
-    del state_latents, action_latents, language_latents
+    load_env()
+    cfg = _load_cfg(hydra_args)
+    apply_curation_seed(select_seed(cfg))
+
+    tag = f"[{task_name}][score]"
+    t_start = _time.perf_counter()
+
+    lat_dir = Path(output_dir) / "latents" / task_name
+    if not (lat_dir / "state.npy").exists() or not (lat_dir / "manifest.json").exists():
+        print(f"{tag} latent store not found — skipping KSG")
+        return task_name, {}
+
+    # Clustered mode: atomic unit is the annotation span, not the episode.
+    from egomimic.curation.config import select_language_conditioning_settings
+
+    lang = select_language_conditioning_settings(cfg)
+    if lang.enabled and lang.mode == "clustered":
+        return _score_task_clustered(task_name, cfg, output_dir, tag, t_start)
+
+    state, action, manifest, _spans = load_latent_store(lat_dir)
+    episodes = manifest["episodes"]
+    if not episodes:
+        print(f"{tag} empty latent store — returning empty")
+        return task_name, {}
+
+    episode_hashes = [e["hash"] for e in episodes]
+    ep_lengths = [int(e["n_frames"]) for e in episodes]
+    state_latents_list = [
+        _np.asarray(state[e["row_start"] : e["row_start"] + e["n_frames"]]) for e in episodes
+    ]
+    action_latents_list = [
+        _np.asarray(action[e["row_start"] : e["row_start"] + e["n_frames"]]) for e in episodes
+    ]
+    s_all = _np.asarray(state)
+    a_all = _np.asarray(action)
+    n_total = s_all.shape[0]
+
     print(
-        f"{tag} Latent concat: state={s_all.shape}, action={a_all.shape}, "
-        f"language={None if l_all is None else l_all.shape}, "
-        f"{_time.perf_counter() - t_concat:.2f}s"
+        f"{tag} KSG: {len(episode_hashes)} episodes, {n_total} timesteps, "
+        f"state_dim={s_all.shape[1]}, action_dim={a_all.shape[1]}"
     )
 
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
-    scores = scorer.score_latents(
-        s_all,
-        a_all,
-        scored_hashes,
-        ep_lengths,
-        language_latents=l_all,
-        language_texts_by_episode=language_texts or None,
-        language_latents_by_episode=language_latents_by_ep,
-    )
-    del s_all, a_all, l_all
-    print(
-        f"{tag} KSG done in {_time.perf_counter() - t_ksg:.2f}s — "
-        f"scored {len(scores)} episodes ({n_total} timesteps)"
-    )
-    print(f"{tag} Task total: {_time.perf_counter() - t_task_start:.2f}s")
+    scores = scorer.score_latents(s_all, a_all, episode_hashes, ep_lengths)
+    print(f"{tag} KSG done in {_time.perf_counter() - t_ksg:.1f}s — {len(scores)} episodes scored")
+
+    # t-SNE visualization (non-fatal)
+    try:
+        from egomimic.curation.tsne_viz import (
+            TsneVizSettings,
+            export_task_tsne3d,
+            make_task_tsne_plots,
+        )
+        from egomimic.curation.config import select_tsne_viz_config
+
+        tsne_cfg = select_tsne_viz_config(cfg)
+        viz_settings = TsneVizSettings(
+            every_n=tsne_cfg.every_n,
+            seed=select_seed(cfg),
+            include_state_lang=tsne_cfg.include_state_lang,
+            include_language=tsne_cfg.include_language,
+            include_state_by_lang=tsne_cfg.include_state_by_lang,
+            state_color_by=tsne_cfg.state_color_by,
+        )
+        tsne_dir = Path(output_dir) / "tsne"
+        tsne3d_dir = Path(output_dir) / "tsne3d"
+        make_task_tsne_plots(
+            task_name,
+            state_latents_list,
+            action_latents_list,
+            tsne_dir,
+            settings=viz_settings,
+        )
+        export_task_tsne3d(
+            task_name,
+            state_latents_list,
+            action_latents_list,
+            episode_hashes,
+            tsne3d_dir,
+            settings=viz_settings,
+        )
+    except Exception as exc:
+        import traceback
+        print(f"{tag} t-SNE viz FAILED (non-fatal): {exc}")
+        traceback.print_exc()
+
+    # Write per-task scores
+    scores_dir = Path(output_dir) / "scores"
+    scores_dir.mkdir(parents=True, exist_ok=True)
+    with open(scores_dir / f"{task_name}_scores.json", "w") as f:
+        json.dump(dict(sorted(scores.items(), key=lambda kv: kv[1], reverse=True)), f, indent=2)
+    training_outputs_volume.commit()
+
+    print(f"{tag} total: {_time.perf_counter() - t_start:.1f}s")
     return task_name, scores
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator: SQL task grouping + per-task fan-out
+# Orchestrator
 # ---------------------------------------------------------------------------
 
 
 @app.function(
+    image=image,
     gpu=CURATE_ORCHESTRATOR.gpu,
     cpu=CURATE_ORCHESTRATOR.cpu,
     memory=CURATE_ORCHESTRATOR.memory_mb,
@@ -588,7 +590,7 @@ def _score_task_split(
     secrets=_SHARED_SECRETS,
     volumes={
         CFG.volume_mount_path: zarr_volume,
-        WDS_MOUNT_PATH: wds_volume,
+        DEMINF_V2_MOUNT: deminf_v2_volume,
         CFG.output_mount_path: training_outputs_volume,
     },
 )
@@ -596,21 +598,17 @@ def run_curate(
     hydra_args: tuple[str, ...],
     git_remote: str,
     git_commit: str,
-    submodules: frozenset = frozenset(),
+    run_name: str,
     hf_token: str = "",
 ) -> str:
-    """Orchestrator: SQL task grouping + per-task container fan-out."""
+    """Three-phase DemInf orchestrator: build shards → embed → KSG."""
     import sys as _sys
     import time as _time
     import numpy as _np
 
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-    _prepare_repo(
-        git_remote=git_remote,
-        git_commit=git_commit,
-        submodules=submodules,
-    )
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
     _sys.path.insert(0, CFG.remote_repo_dir)
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
@@ -618,7 +616,12 @@ def run_curate(
 
     import hydra as _hydra
     from omegaconf import OmegaConf
-    from egomimic.curation.config import apply_curation_seed, select_seed
+    from egomimic.curation.config import (
+        apply_curation_seed,
+        load_action_norm_stats,
+        select_seed,
+        select_tensor_keys,
+    )
     from egomimic.utils.aws.aws_data_utils import load_env
 
     load_env()
@@ -631,7 +634,7 @@ def run_curate(
 
     apply_curation_seed(select_seed(cfg))
 
-    # ── 1. SQL task lookup: episode_hash → task_name ──────────────────────────
+    # ── 1. SQL task lookup ────────────────────────────────────────────────────
     print("Running SQL task lookup …")
     from egomimic.utils.aws.aws_sql import episode_table_to_df, create_default_engine
 
@@ -646,9 +649,10 @@ def run_curate(
             zip(full_df["episode_hash"], full_df["task"].fillna("unknown"))
         )
 
-    # ── 2. Resolve episodes via data-config resolvers ─────────────────────────
-    by_task: dict[str, list[str]] = {}
+    # ── 2. Resolve episodes via data-config resolver ──────────────────────────
+    by_task: dict[str, list[str]] = {}  # task → list of zarr episode dirs
 
+    zarr_root = Path(CFG.volume_mount_path)
     for ds_name, ds_cfg in cfg.data.train_datasets.items():
         resolver = _hydra.utils.instantiate(ds_cfg.resolver)
         dataset_filter = (
@@ -661,144 +665,132 @@ def run_curate(
             task = hash_to_task.get(episode_hash) or "unknown"
             if str(task) in ("nan", "None", ""):
                 task = "unknown"
-            by_task.setdefault(task, []).append(episode_hash)
+            # Resolve zarr dir path on volume
+            ep_dir: str | None = None
+            for cand in (zarr_root / episode_hash, zarr_root / f"{episode_hash}.zarr"):
+                if cand.is_dir():
+                    ep_dir = str(cand)
+                    break
+            if ep_dir is None:
+                continue
+            by_task.setdefault(task, []).append(ep_dir)
 
     total_episodes = sum(len(v) for v in by_task.values())
-    max_per_shard = int(OmegaConf.select(cfg, "max_episodes_per_shard", default=100))
-    total_shards = sum(-(-len(v) // max_per_shard) for v in by_task.values())
     print(
-        f"Episode partition: {total_episodes} episodes across {len(by_task)} tasks "
-        f"({total_shards} total embed shards at max_per_shard={max_per_shard}) — "
+        f"Episode partition: {total_episodes} episodes across {len(by_task)} tasks — "
         + ", ".join(f"{t}:{len(h)}" for t, h in sorted(by_task.items())[:5])
         + ("…" if len(by_task) > 5 else "")
     )
-
     if total_episodes == 0:
-        print("No episodes found — check data config resolver settings")
+        print("No episodes found — check data config resolver")
         return ""
 
-    # ── 3. Ensure per-task tar shards exist on WDS volume ────────────────────
-    def _shard_index_valid(task_name: str) -> bool:
-        import json as _json
-        p = Path(WDS_MOUNT_PATH) / _task_shard_dir(task_name) / "shard_index.json"
-        if not p.exists():
-            return False
-        try:
-            return bool(_json.loads(p.read_text()))
-        except Exception:
-            return False
-
-    tasks_needing_shards = [
-        task_name for task_name in by_task
-        if not _shard_index_valid(task_name)
-    ]
-
-    if tasks_needing_shards:
-        print(
-            f"Provisioning tar shards for {len(tasks_needing_shards)}/{len(by_task)} "
-            f"task(s): {', '.join(sorted(tasks_needing_shards))}"
+    # ── 3. Load norm stats ────────────────────────────────────────────────────
+    action_key, _ = select_tensor_keys(cfg)
+    try:
+        action_mean_arr, action_std_arr = load_action_norm_stats(
+            cfg,
+            action_key,
+            search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
         )
-        zarr_root = Path(CFG.volume_mount_path)
-        episode_batches: list[list[str]] = []
-        output_subdirs: list[str] = []
-        batch_task_labels: list[str] = []
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load norm stats: {exc}") from exc
 
-        for task_name in sorted(tasks_needing_shards):
-            subdir = _task_shard_dir(task_name)
-            ep_dirs: list[str] = []
-            for ep_hash in by_task[task_name]:
-                for cand in (zarr_root / ep_hash, zarr_root / f"{ep_hash}.zarr"):
-                    if cand.is_dir():
-                        ep_dirs.append(str(cand))
-                        break
-            if not ep_dirs:
-                print(f"  [{task_name}] no zarr dirs found on volume — skipping shard provisioning")
-                continue
-            n_batches = -(-len(ep_dirs) // EPISODES_PER_SHARD)
-            print(f"  [{task_name}] {len(ep_dirs)} episodes → {n_batches} shard(s) → {subdir}/")
-            for i in range(0, len(ep_dirs), EPISODES_PER_SHARD):
-                episode_batches.append(ep_dirs[i : i + EPISODES_PER_SHARD])
-                output_subdirs.append(subdir)
-                batch_task_labels.append(task_name)
+    action_mean = action_mean_arr.tolist()
+    action_std = action_std_arr.tolist()
 
-        if episode_batches:
-            print(f"Launching {len(episode_batches)} parallel shard conversion(s) ...")
-            shard_results = list(
-                convert_shard.map(
-                    episode_batches,
-                    output_subdirs,
-                    return_exceptions=True,
-                    wrap_returned_exceptions=False,
-                )
-            )
-
-            task_shard_results: dict[str, list[dict]] = {t: [] for t in tasks_needing_shards}
-            n_shard_errors = 0
-            for i, r in enumerate(shard_results):
-                if isinstance(r, dict):
-                    task_shard_results[batch_task_labels[i]].append(r)
-                else:
-                    n_shard_errors += 1
-                    print(f"  Shard error ({batch_task_labels[i]}): {r}")
-
-            print(f"Shard conversion done ({n_shard_errors} error(s)) — writing per-task indexes ...")
-            _write_task_indexes_remote.remote(task_shard_results)
-            print("Shard provisioning complete.")
-    else:
-        print(f"All {len(by_task)} task(s) already have tar shards — skipping provisioning.")
-
-    # ── 4. Output dir ─────────────────────────────────────────────────────────
+    # ── 4. Output directory ───────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
-    output_dir = (
-        Path(CFG.output_mount_path) / cfg.name / f"{cfg.description}_{timestamp}"
-    )
+    output_dir = Path(CFG.output_mount_path) / cfg.name / f"{cfg.description}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir_str = str(output_dir)
 
-    # ── 5. Fan-out per-task scoring containers ────────────────────────────────
-    print(f"Spawning {len(by_task)} per-task CPU orchestrators …")
+    print(f"Output dir: {output_dir_str}")
+
+    # ── 5. Per-task fan-out ───────────────────────────────────────────────────
+    print(f"Processing {len(by_task)} task(s) …")
     t0 = _time.time()
-
-    handles = [
-        (
-            task_name,
-            _score_task_split.spawn(
-                task_name,
-                episode_hashes,
-                git_remote,
-                git_commit,
-                hydra_args,
-                hf_token,
-                str(output_dir),
-            ),
-        )
-        for task_name, episode_hashes in sorted(by_task.items())
-    ]
-    print(f"All {len(handles)} task container(s) spawned — collecting results …")
 
     scores_by_task: dict[str, dict[str, float]] = {}
     n_failures = 0
 
-    for task_name, handle in handles:
+    for task_name, ep_dirs in sorted(by_task.items()):
+        print(f"\n── [{task_name}] {len(ep_dirs)} episodes ──")
+        t_task = _time.perf_counter()
+
+        # Phase 1: build MP4+NPZ shards
+        print(f"[{task_name}] Phase 1: building shards …")
+        shard_pairs = build_shards_for_task(
+            ep_dirs,
+            task_name,
+            run_name,
+            hydra_args,
+            git_remote,
+            git_commit,
+            hf_token,
+        )
+        if not shard_pairs:
+            print(f"[{task_name}] No shards built — skipping")
+            n_failures += 1
+            continue
+        print(f"[{task_name}] Phase 1 done: {len(shard_pairs)} shards")
+
+        # Phase 2: parallel state + action embedding
+        print(f"[{task_name}] Phase 2: spawning state + action embedders …")
+        state_handle = _embed_state_shards.spawn(
+            shard_pairs, task_name, run_name, hydra_args,
+            action_mean, action_std, git_remote, git_commit, output_dir_str, hf_token,
+        )
+        action_handle = _embed_action_shards.spawn(
+            shard_pairs, task_name, run_name, hydra_args,
+            action_mean, action_std, git_remote, git_commit, output_dir_str, hf_token,
+        )
         try:
-            _label, task_scores = handle.get(timeout=CFG.timeout_seconds)
+            state_path = state_handle.get(timeout=14400)
+            action_path = action_handle.get(timeout=14400)
+        except Exception as exc:
+            print(f"[{task_name}] embedding FAILED: {exc}")
+            n_failures += 1
+            continue
+        print(f"[{task_name}] Phase 2 done: state={state_path}, action={action_path}")
+
+        # Phase 2.5: assemble the provenance-first latent store (flat arrays + manifest + spans).
+        training_outputs_volume.reload()
+        deminf_v2_volume.reload()
+        shard_dir = str(Path(DEMINF_V2_MOUNT) / run_name / "shards" / task_name)
+        if not assemble_latent_store(output_dir_str, task_name, shard_dir):
+            print(f"[{task_name}] latent-store assembly FAILED — skipping")
+            n_failures += 1
+            continue
+        training_outputs_volume.commit()
+
+        # Phase 3: KSG scoring
+        print(f"[{task_name}] Phase 3: KSG scoring …")
+        try:
+            _, task_scores = _score_task.remote(
+                task_name, run_name, hydra_args,
+                action_mean, action_std, output_dir_str,
+                git_remote, git_commit, hf_token,
+            )
             scores_by_task[task_name] = task_scores
         except Exception as exc:
+            print(f"[{task_name}] KSG FAILED: {exc}")
             n_failures += 1
-            print(f"[task] FAILED ({task_name}): {exc}")
+            continue
+
+        print(
+            f"[{task_name}] complete — {len(task_scores)} scores "
+            f"in {_time.perf_counter() - t_task:.1f}s"
+        )
 
     elapsed = _time.time() - t0
-    print(
-        f"Scoring done in {elapsed:.1f}s — "
-        f"{len(scores_by_task)}/{len(by_task)} tasks succeeded "
-        f"({n_failures} failed)"
-    )
 
-    # ── 6. Aggregate + save outputs ───────────────────────────────────────────
+    # ── 6. Aggregate + save ───────────────────────────────────────────────────
     flat_scores: dict[str, float] = {}
     for t_scores in scores_by_task.values():
         flat_scores.update(t_scores)
 
-    all_score_vals = _np.array([s for s in flat_scores.values() if _np.isfinite(s)])
+    all_vals = _np.array([s for s in flat_scores.values() if _np.isfinite(s)])
 
     per_task_stats: dict[str, dict] = {}
     for t_name, t_scores in scores_by_task.items():
@@ -812,29 +804,8 @@ def run_curate(
             "mi_max":    float(_np.nanmax(vals))    if len(vals) else float("nan"),
         }
 
-    stats = {
-        "total_input":           total_episodes,
-        "n_tasks":               len(scores_by_task),
-        "n_task_failures":       n_failures,
-        "scored":                len(flat_scores),
-        "elapsed_seconds":       round(elapsed, 1),
-        "max_episodes_per_shard": max_per_shard,
-        "mi_mean":   float(all_score_vals.mean())       if len(all_score_vals) else float("nan"),
-        "mi_std":    float(all_score_vals.std())        if len(all_score_vals) else float("nan"),
-        "mi_median": float(_np.median(all_score_vals))  if len(all_score_vals) else float("nan"),
-        "mi_min":    float(all_score_vals.min())        if len(all_score_vals) else float("nan"),
-        "mi_max":    float(all_score_vals.max())        if len(all_score_vals) else float("nan"),
-        "per_task":  per_task_stats,
-    }
-
     def _sort_scores(d: dict) -> dict:
-        return dict(
-            sorted(
-                d.items(),
-                key=lambda kv: kv[1] if _np.isfinite(kv[1]) else float("-inf"),
-                reverse=True,
-            )
-        )
+        return dict(sorted(d.items(), key=lambda kv: kv[1] if _np.isfinite(kv[1]) else float("-inf"), reverse=True))
 
     sorted_flat = _sort_scores(flat_scores)
     sorted_by_task = {t: _sort_scores(s) for t, s in scores_by_task.items()}
@@ -846,49 +817,212 @@ def run_curate(
     with open(output_dir / "kept_hashes.json", "w") as f:
         json.dump(list(sorted_flat.keys()), f, indent=2)
     with open(output_dir / "curation_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump({
+            "total_input":     total_episodes,
+            "n_tasks":         len(scores_by_task),
+            "n_task_failures": n_failures,
+            "scored":          len(flat_scores),
+            "elapsed_seconds": round(elapsed, 1),
+            "mi_mean":   float(all_vals.mean())       if len(all_vals) else float("nan"),
+            "mi_std":    float(all_vals.std())        if len(all_vals) else float("nan"),
+            "mi_median": float(_np.median(all_vals))  if len(all_vals) else float("nan"),
+            "per_task":  per_task_stats,
+        }, f, indent=2)
 
-    print(
-        f"Curation done — scored={len(flat_scores)}  "
-        f"n_tasks={len(scores_by_task)}  output={output_dir}"
-    )
+    # ── 7. t-SNE export for latent viewer (from the latent store) ────────────
+    print("\nPhase 4: exporting t-SNE for latent viewer …")
+    from egomimic.curation.tsne_viz import export_task_tsne3d
+
+    tsne_dir = output_dir / "tsne3d"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+
+    all_hashes: list[str] = []
+    for t_name in sorted(scores_by_task.keys()):
+        lat_dir = output_dir / "latents" / t_name
+        if not (lat_dir / "state.npy").exists() or not (lat_dir / "manifest.json").exists():
+            print(f"[{t_name}] latent store missing — skipping t-SNE")
+            continue
+        try:
+            state, action, manifest, _spans = load_latent_store(lat_dir)
+            eps = manifest["episodes"]
+            common = [e["hash"] for e in eps]
+            all_hashes.extend(common)
+            json_path = export_task_tsne3d(
+                t_name,
+                [_np.asarray(state[e["row_start"] : e["row_start"] + e["n_frames"]]) for e in eps],
+                [_np.asarray(action[e["row_start"] : e["row_start"] + e["n_frames"]]) for e in eps],
+                common,
+                tsne_dir,
+            )
+            print(f"[{t_name}] tsne3d → {json_path} ({len(common)} episodes)")
+        except Exception as exc:
+            print(f"[{t_name}] t-SNE FAILED: {exc}")
+
+    # ── 8. Episode-preview MP4s so the viewer's /video + /frame resolve ───────
+    if all_hashes:
+        print(f"\nPhase 5: rendering {len(all_hashes)} episode previews …")
+        try:
+            render_episode = modal.Function.from_name(
+                "egoverse-episode-preview-render", "render_episode"
+            )
+            n_prev = sum(1 for _ in render_episode.map(sorted(set(all_hashes))))
+            print(f"Episode previews done — {n_prev} episodes")
+        except Exception as exc:
+            print(f"Episode preview render FAILED (non-fatal): {exc}")
 
     zarr_volume.commit()
     training_outputs_volume.commit()
 
-    return str(output_dir)
+    print(
+        f"\nDemInf curation done — scored={len(flat_scores)} episodes "
+        f"across {len(scores_by_task)}/{len(by_task)} tasks "
+        f"in {elapsed:.1f}s\nOutput: {output_dir_str}"
+    )
+    return output_dir_str
 
 
 # ---------------------------------------------------------------------------
-# Local entrypoints
+# Local entrypoint
 # ---------------------------------------------------------------------------
 
 
 @app.local_entrypoint()
 def submit_curate(*hydra_args: str) -> None:
-    """Fire-and-forget: spawn a curation job from an already-pushed commit."""
-    hydra_args, submodules = pop_init_submodules(hydra_args)
+    """Fire-and-forget: spawn a DemInf curation job."""
+    hydra_args, _ = pop_init_submodules(hydra_args)
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
-        print(
-            "Warning: local repo has uncommitted changes. "
-            "Modal will run the last committed state only."
-        )
-    print(f"Submitting curation at commit {git_commit[:12]} from {git_remote}")
-    print(f"Submodules: {sorted(submodules) if submodules else 'none'}")
+        print("Warning: local repo has uncommitted changes.")
+
+    # Derive run_name from hydra args (name= key)
+    run_name = "deminf_v2"
+    for arg in hydra_args:
+        key, sep, val = arg.lstrip("+").partition("=")
+        if sep and key == "name":
+            run_name = val.strip()
+            break
+
+    print(f"Submitting DemInf curation: run_name={run_name} at commit {git_commit[:12]}")
     handle = run_curate.spawn(
-        tuple(hydra_args), git_remote, git_commit,
-        submodules=submodules,
+        tuple(hydra_args), git_remote, git_commit, run_name,
         hf_token=_local_hf_token(),
     )
     _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
     _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
-    print(f"Submitted Modal curation job: {handle.object_id}")
+    print(f"Submitted: {handle.object_id}")
     print(f"Monitor: https://modal.com/apps/mecka/{_env}/apps/{_app}")
 
 
 # ---------------------------------------------------------------------------
-# python egomimic/modal/curateModal.py name=my_run description=test [overrides…]
+# Resume: score-only (Phase 3) against pre-computed latents
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=8192,
+    timeout=CFG.timeout_seconds,
+    secrets=_SHARED_SECRETS,
+    volumes={CFG.output_mount_path: training_outputs_volume},
+)
+def run_score(
+    output_dir: str,
+    hydra_args: tuple[str, ...],
+    git_remote: str,
+    git_commit: str,
+    run_name: str,
+    score_task: str = "",
+    hf_token: str = "",
+) -> str:
+    """Resume: run ONLY Phase 3 (KSG scoring) against latents already in output_dir.
+
+    Discovers tasks under ``output_dir/latents/`` (or just ``score_task``) and
+    invokes ``_score_task`` per task — no shard build, no embedding.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit)
+    _sys.path.insert(0, CFG.remote_repo_dir)
+    os.chdir(CFG.remote_repo_dir)
+    os.environ["MODAL_IS_REMOTE"] = "1"
+
+    lat_root = _Path(output_dir) / "latents"
+    if not lat_root.is_dir():
+        print(f"No latents dir under {output_dir} — nothing to score")
+        return ""
+
+    if score_task:
+        tasks = [score_task]
+    else:
+        tasks = sorted(p.name for p in lat_root.iterdir() if p.is_dir())
+    print(f"Resume scoring {len(tasks)} task(s) from {output_dir}: {tasks}")
+
+    for task_name in tasks:
+        print(f"\n── [{task_name}] scoring …")
+        try:
+            _score_task.remote(
+                task_name, run_name, hydra_args,
+                [], [], output_dir, git_remote, git_commit, hf_token,
+            )
+        except Exception as exc:
+            print(f"[{task_name}] scoring FAILED: {exc}")
+
+    training_outputs_volume.commit()
+    print(f"\nResume scoring done — {output_dir}")
+    return output_dir
+
+
+@app.local_entrypoint()
+def submit_score(*args: str) -> None:
+    """Fire-and-forget: resume KSG scoring on an existing run's latents.
+
+    Required: ``score_output_dir=<output dir under /root/EgoVerse/logs>``
+    Optional: ``score_task=<task>`` (default: all tasks under latents/)
+    Remaining args are normal hydra overrides (model=…, data=…, language_conditioning…).
+    """
+    args, _ = pop_init_submodules(args)
+    output_dir = ""
+    score_task = ""
+    hydra_args: list[str] = []
+    for a in args:
+        key, sep, val = a.lstrip("+").partition("=")
+        if sep and key == "score_output_dir":
+            output_dir = val.strip()
+        elif sep and key == "score_task":
+            score_task = val.strip()
+        else:
+            hydra_args.append(a)
+    if not output_dir:
+        raise SystemExit("score_output_dir=<path> is required for score-only resume")
+
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo has uncommitted changes.")
+
+    run_name = "deminf_v2"
+    for a in hydra_args:
+        key, sep, val = a.lstrip("+").partition("=")
+        if sep and key == "name":
+            run_name = val.strip()
+            break
+
+    print(f"Resume scoring: output_dir={output_dir} at commit {git_commit[:12]}")
+    handle = run_score.spawn(
+        output_dir, tuple(hydra_args), git_remote, git_commit, run_name, score_task,
+        hf_token=_local_hf_token(),
+    )
+    _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
+    _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
+    print(f"Submitted: {handle.object_id}")
+    print(f"Monitor: https://modal.com/apps/mecka/{_env}/apps/{_app}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -904,17 +1038,13 @@ if __name__ == "__main__":
         else:
             hydra_args.append(arg)
 
-    modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(hydra_args)
-
-    task_compute = ModalCompute.from_mapping(
-        modal_env,
-        default_gpu="L40S",
-        default_cpu=16.0,
-        default_memory_mb=131072,
+    # Route to score-only resume when score_output_dir= is supplied.
+    entrypoint = (
+        "submit_score"
+        if any(a.startswith("score_output_dir=") for a in hydra_args)
+        else "submit_curate"
     )
-    print(f"Modal app:                                    {modal_env['MODAL_APP_NAME']}")
-    print(f"Modal curation orchestrator (fixed):          {CURATE_ORCHESTRATOR.summary()}")
-    print(f"Modal curation per-task CPU orchestrator:     {TASK_SCORE_COMPUTE.summary()}")
-    print(f"Modal curation embed-shard GPU worker:        {task_compute.summary()}")
 
-    launch_detached(Path(__file__).resolve(), "submit_curate", hydra_args, modal_env)
+    modal_env["MODAL_APP_NAME"] = app_name_from_hydra_args(hydra_args)
+    print(f"DemInf — app: {modal_env['MODAL_APP_NAME']} (entrypoint: {entrypoint})")
+    launch_detached(Path(__file__).resolve(), entrypoint, hydra_args, modal_env)

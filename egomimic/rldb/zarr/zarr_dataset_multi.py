@@ -2192,6 +2192,14 @@ class ZarrDataset(torch.utils.data.Dataset):
             )
             logical_valid = logical_valid[ok_pos]
 
+        # Stash the ORIGINAL zarr frame index of each surviving row so curation can
+        # align latents/annotation spans/preview frames exactly (some rows are dropped
+        # by pause removal and/or invalid-pose/transform filtering).
+        if self.keep_indices is not None:
+            self._curation_kept_indices = np.asarray(self.keep_indices)[logical_valid].astype(np.int64)
+        else:
+            self._curation_kept_indices = np.asarray(logical_valid, dtype=np.int64)
+
         actions = np.asarray(batched_out[action_key], dtype=np.float32)
         if actions.ndim < 2:
             return None, None, None

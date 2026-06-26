@@ -7,7 +7,7 @@ Each episode becomes exactly one shard pair:
 Shards are written to the egoverse-deminf-v2 volume at:
   /mnt/deminf-v2/{run_name}/shards/{task_name}/
 
-Usage (from curate_v2.py):
+Usage (from curateModal.py):
   shard_pairs = build_shards_for_task(episode_dirs, task_name, run_name, ...)
 """
 
@@ -141,7 +141,10 @@ def _build_shards_worker(
     resolver_cfg = cfg.data.train_datasets[ds_name].resolver
     key_map = _hydra.utils.instantiate(resolver_cfg.key_map)
     transform_list = _hydra.utils.instantiate(resolver_cfg.transform_list)
-    pause_eps = OmegaConf.select(resolver_cfg, "pause_removal_epsilon")
+    # Pause removal disabled for now: keep ALL frames so latent row index == original
+    # zarr frame index == annotation start/end_idx == preview MP4 frame index. This keeps
+    # provenance and span/video alignment exact across the store and the viewer.
+    pause_eps = None
     action_key, image_key = select_tensor_keys(cfg)
 
     out_dir = Path(DEMINF_V2_MOUNT) / run_name / "shards" / task_name
@@ -175,6 +178,21 @@ def _build_shards_worker(
                 image_key=image_key,
                 image_decode_workers=2,
             )
+            # Capture provenance + annotation spans while the store is open.
+            orig_frames = getattr(zarr_ds, "_curation_kept_indices", None)
+            try:
+                _anns = zarr_ds._load_annotations()
+            except Exception:
+                _anns = []
+            spans = [
+                {
+                    "text": str(a.get("text", "")),
+                    "start_idx": int(a.get("start_idx", -1)),
+                    "end_idx": int(a.get("end_idx", -1)),
+                }
+                for a in _anns
+                if isinstance(a, dict)
+            ]
         except Exception as exc:
             print(f"{tag} {ep_hash[:8]}: ZarrDataset load FAILED — {exc}")
             continue
@@ -199,12 +217,21 @@ def _build_shards_worker(
             print(f"{tag} {ep_hash[:8]}: MP4 encode FAILED — {exc}")
             continue
 
+        if orig_frames is None or len(orig_frames) != T:
+            orig_frames = _np.arange(T, dtype=_np.int64)
         flat_actions = actions.reshape(T, -1).astype(_np.float32)
         _np.savez_compressed(
             npz_path,
             action=flat_actions,
             episode_hash=_np.str_(ep_hash),
+            orig_frames=_np.asarray(orig_frames, dtype=_np.int64),
         )
+        # Provenance/annotation sidecar consumed by the latent-store assembly step.
+        import json as _json
+        with open(out_dir / f"{ep_hash}.meta.json", "w") as _mf:
+            _json.dump(
+                {"episode_hash": ep_hash, "n_frames": int(T), "spans": spans}, _mf
+            )
         done_flag.touch()
 
         elapsed = _time.perf_counter() - t_ep

@@ -212,15 +212,44 @@ def _cache_write(cache_dir: Path, ep_hash: str, arr: "np.ndarray", _np) -> None:
     _np.save(str(cache_dir / f"{ep_hash}.npy"), arr)
 
 
-def _cache_collect(cache_dir: Path, out_path: str, _np) -> int:
+def _cache_publish_flat(cache_dir: Path, out_dir: Path, mod: str, _np) -> int:
+    """Stream per-episode ``{hash}.npy`` into a flat ``_<mod>.npy`` + ``_<mod>_manifest.json``.
+
+    Rows are laid out in sorted-hash order; the flat array is filled via an
+    open_memmap so peak RAM stays flat regardless of run size. The orchestrator's
+    assemble step later merges the state/action flats into the canonical store.
+    Returns the episode count.
+    """
+    import json as _json
     import shutil
-    data = {}
-    for f in cache_dir.iterdir():
-        if f.suffix == ".npy":
-            data[f.stem] = _np.load(str(f))
-    _np.savez_compressed(out_path, **data)
+
+    files = sorted((f for f in cache_dir.iterdir() if f.suffix == ".npy"), key=lambda p: p.stem)
+    if not files:
+        return 0
+
+    eps: list[dict] = []
+    n_rows = 0
+    dim: int | None = None
+    for f in files:
+        a = _np.load(str(f), mmap_mode="r")
+        T, D = int(a.shape[0]), int(a.shape[1])
+        if dim is None:
+            dim = D
+        eps.append({"hash": f.stem, "row_start": n_rows, "n_frames": T})
+        n_rows += T
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    flat = _np.lib.format.open_memmap(
+        str(out_dir / f"_{mod}.npy"), mode="w+", dtype=_np.float32, shape=(n_rows, dim)
+    )
+    for ep, f in zip(eps, files):
+        flat[ep["row_start"] : ep["row_start"] + ep["n_frames"]] = _np.load(str(f))
+    flat.flush()
+    del flat
+    with open(out_dir / f"_{mod}_manifest.json", "w") as mf:
+        _json.dump({"dim": dim, "n_rows": n_rows, "episodes": eps}, mf)
     shutil.rmtree(str(cache_dir))
-    return len(data)
+    return len(eps)
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +433,9 @@ def _embed_state_shards(
 
     lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(lat_dir / "state.npz")
-    n_saved = _cache_collect(cache_dir, out_path, _np)
+    n_saved = _cache_publish_flat(cache_dir, lat_dir, "state", _np)
     training_outputs_volume.commit()
+    out_path = str(lat_dir / "_state.npy")
 
     _cum_busy = cum_wait + cum_decode + cum_embed
     _gpu_pct = 100.0 * cum_embed / _cum_busy if _cum_busy > 0 else 0.0
@@ -467,9 +496,12 @@ def _embed_action_shards(
         hydra_args, action_mean, action_std, device, _np, torch
     )
 
+    import tempfile as _tempfile
+
     tag = f"[{task_name}][action]"
     t_total = _time.perf_counter()
-    ep_to_action: dict = {}
+    cache_dir = Path(_tempfile.mkdtemp(prefix="action_lat_", dir=_local_cache_dir()))
+    n_emb = 0
 
     for _, npz_path in shard_pairs:
         try:
@@ -490,20 +522,20 @@ def _embed_action_shards(
             lats = action_embedder.embed(actions[start : start + batch_size])
             ep_latents.append(_np.asarray(lats))
 
-        ep_arr = _np.concatenate(ep_latents, axis=0)
-        ep_to_action[ep_hash] = ep_arr
+        _cache_write(cache_dir, ep_hash, _np.concatenate(ep_latents, axis=0), _np)
+        n_emb += 1
 
-    if not ep_to_action:
+    if n_emb == 0:
         print(f"{tag} WARNING: no episodes embedded")
 
     lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(lat_dir / "action.npz")
-    _np.savez_compressed(out_path, **ep_to_action)
+    n_saved = _cache_publish_flat(cache_dir, lat_dir, "action", _np)
     training_outputs_volume.commit()
+    out_path = str(lat_dir / "_action.npy")
 
     print(
-        f"{tag} done — {len(ep_to_action)} episodes, {out_path}, "
+        f"{tag} done — {n_saved} episodes, {out_path}, "
         f"total {_time.perf_counter() - t_total:.1f}s"
     )
     return out_path
@@ -629,9 +661,9 @@ def _embed_action_shards_gpu(
 
     lat_dir = Path(output_dir) / "latents" / task_name
     lat_dir.mkdir(parents=True, exist_ok=True)
-    out_path = str(lat_dir / "action.npz")
-    n_saved = _cache_collect(cache_dir, out_path, _np)
+    n_saved = _cache_publish_flat(cache_dir, lat_dir, "action", _np)
     training_outputs_volume.commit()
+    out_path = str(lat_dir / "_action.npy")
 
     print(
         f"{tag} done — {n_saved} episodes, {out_path}, "
