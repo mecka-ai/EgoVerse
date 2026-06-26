@@ -27,15 +27,19 @@ OUTPUTS_MOUNT = "/mnt/outputs"
 PREVIEW_MOUNT = "/mnt/previews"
 
 _HERE = Path(__file__).resolve().parent
-_BUILDER = _HERE.parent / "scripts" / "build_latent_viz.py"
-_VAL_JSON = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.json"
+_BUILDER         = _HERE.parent / "scripts" / "build_latent_viz.py"
+_SPAN_BUILDER    = _HERE.parent / "scripts" / "build_span_viz.py"
+_CLUSTER_BUILDER = _HERE.parent / "scripts" / "build_cluster_viz.py"
+_VAL_JSON        = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.json"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
     .pip_install("fastapi[standard]", "sqlalchemy", "psycopg2-binary")
-    .add_local_file(_BUILDER, remote_path="/root/build_latent_viz.py", copy=True)
-    .add_local_file(_VAL_JSON, remote_path="/root/mecka_d64_val.json", copy=True)
+    .add_local_file(_BUILDER,         remote_path="/root/build_latent_viz.py",  copy=True)
+    .add_local_file(_SPAN_BUILDER,    remote_path="/root/build_span_viz.py",    copy=True)
+    .add_local_file(_CLUSTER_BUILDER, remote_path="/root/build_cluster_viz.py", copy=True)
+    .add_local_file(_VAL_JSON,        remote_path="/root/mecka_d64_val.json",   copy=True)
 )
 
 app = modal.App("egoverse-viewer", image=image)
@@ -55,9 +59,35 @@ def _list_curation_runs(outputs_root: Path) -> list[str]:
     return sorted(set(runs), reverse=True)
 
 
-def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
+def _list_span_runs(outputs_root: Path) -> list[str]:
+    """Find clustered runs that have tsne3d/spans_tsne3d.json."""
+    if not outputs_root.is_dir():
+        return []
+    runs: list[str] = []
+    for p in outputs_root.rglob("tsne3d/spans_tsne3d.json"):
+        run_dir = p.parent.parent
+        runs.append(str(run_dir.relative_to(outputs_root)))
+    return sorted(set(runs), reverse=True)
+
+
+def _list_cluster_runs(outputs_root: Path) -> list[str]:
+    """Find runs that have scores_v2/*_clustered_scores.json."""
+    if not outputs_root.is_dir():
+        return []
+    runs: list[str] = []
+    for p in outputs_root.rglob("scores_v2/*_clustered_scores.json"):
+        run_dir = p.parent.parent
+        runs.append(str(run_dir.relative_to(outputs_root)))
+    return sorted(set(runs), reverse=True)
+
+
+def _landing_html(runs: list[str], default_run: str, error: str = "",
+                  span_runs: list[str] | None = None,
+                  cluster_runs: list[str] | None = None) -> str:
     import html
 
+    span_runs    = span_runs    or []
+    cluster_runs = cluster_runs or []
     safe_default = html.escape(default_run, quote=True)
     n_runs = len(runs)
     options = "\n".join(
@@ -82,6 +112,22 @@ def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
         f'<span class="run-date">{_run_date(r)}</span>'
         f'</div>'
         for r in runs[:60]
+    )
+    span_rows = "\n".join(
+        f'<div class="run-row" style="border-left:3px solid #7c3aed" '
+        f'onclick="window.location.href=\'/view_spans?run={html.escape(r, quote=True)}\'">'
+        f'<span class="run-name" style="color:#c4b5fd">{html.escape(r)}</span>'
+        f'<span class="run-date">{_run_date(r)}</span>'
+        f'</div>'
+        for r in span_runs[:20]
+    )
+    cluster_rows = "\n".join(
+        f'<div class="run-row" style="border-left:3px solid #06b6d4" '
+        f'onclick="window.location.href=\'/view_clusters?run={html.escape(r, quote=True)}\'">'
+        f'<span class="run-name" style="color:#67e8f9">{html.escape(r)}</span>'
+        f'<span class="run-date">{_run_date(r)}</span>'
+        f'</div>'
+        for r in cluster_runs[:20]
     )
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Meckaverse</title>
@@ -136,6 +182,8 @@ def _landing_html(runs: list[str], default_run: str, error: str = "") -> str:
     </div>
     <div id="run-list">
       {'<div class="empty">No curation runs found yet.</div>' if not runs else run_rows}
+      {(f'<div style="padding:6px 14px;font-size:11px;color:#7c3aed;font-weight:600;border-top:1px solid var(--line);margin-top:4px">SPAN RUNS ({len(span_runs)})</div>' + span_rows) if span_runs else ''}
+      {(f'<div style="padding:6px 14px;font-size:11px;color:#06b6d4;font-weight:600;border-top:1px solid var(--line);margin-top:4px">CLUSTER RUNS ({len(cluster_runs)})</div>' + cluster_rows) if cluster_runs else ''}
     </div>
   </div>
   <div id="detail">
@@ -237,16 +285,26 @@ def viewer():
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
     sys.path.insert(0, "/root")
-    from build_latent_viz import build_html
+    from build_latent_viz  import build_html
+    from build_span_viz    import build_span_html
+    from build_cluster_viz import build_cluster_html
 
     web = FastAPI(title="Meckaverse")
-    html_cache: dict[str, str] = {}
-    frame_cache: dict[str, bytes] = {}
+    html_cache:         dict[str, str]   = {}
+    span_html_cache:    dict[str, str]   = {}
+    cluster_html_cache: dict[str, str]   = {}
+    frame_cache:        dict[str, bytes] = {}
     val_list = json.load(open("/root/mecka_d64_val.json"))
 
     def _reload_volumes() -> None:
-        outputs_volume.reload()
-        previews_volume.reload()
+        try:
+            outputs_volume.reload()
+        except Exception as e:
+            print(f"[viewer] outputs volume reload skipped: {e}")
+        try:
+            previews_volume.reload()
+        except Exception as e:
+            print(f"[viewer] previews volume reload skipped: {e}")
 
     def _build_latent_html(run: str) -> str:
         run = run.strip().strip("/")
@@ -285,16 +343,75 @@ def viewer():
         error: str | None = Query(default=None),
     ):
         _reload_volumes()
-        runs = _list_curation_runs(Path(OUTPUTS_MOUNT))
-        default = (run or os.environ.get("LATENT_VIZ_RUN") or DEFAULT_RUN).strip()
+        runs         = _list_curation_runs(Path(OUTPUTS_MOUNT))
+        span_runs    = _list_span_runs(Path(OUTPUTS_MOUNT))
+        cluster_runs = _list_cluster_runs(Path(OUTPUTS_MOUNT))
+        default      = (run or os.environ.get("LATENT_VIZ_RUN") or DEFAULT_RUN).strip()
         if run:
             return RedirectResponse(url=f"/view?run={run}", status_code=302)
-        return HTMLResponse(_landing_html(runs, default, error or ""))
+        return HTMLResponse(_landing_html(runs, default, error or "", span_runs=span_runs, cluster_runs=cluster_runs))
 
     @web.get("/view", response_class=HTMLResponse)
     def view(run: str = Query(..., description="Volume-relative curation run path")):
         try:
             return _build_latent_html(run)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, str(exc)) from exc
+
+    def _build_span_cached(run: str) -> str:
+        run = run.strip().strip("/")
+        if not run:
+            raise HTTPException(400, "run path is required")
+        if run in span_html_cache:
+            return span_html_cache[run]
+        _reload_volumes()
+        json_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
+        if not json_path.is_file():
+            raise HTTPException(404, f"tsne3d/spans_tsne3d.json not found under {run!r}")
+        data = json.load(open(json_path))
+        body = build_span_html(data, video_base="/video/", frame_base="/frame/", run_label=run)
+        span_html_cache[run] = body
+        print(f"viewer: built span HTML {len(body)/1e6:.1f} MB for run={run} ({len(data.get('spans',[]))} spans)")
+        return body
+
+    @web.get("/view_spans", response_class=HTMLResponse)
+    def view_spans(run: str = Query(..., description="Volume-relative clustered run path")):
+        try:
+            return _build_span_cached(run)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, str(exc)) from exc
+
+    def _build_cluster_cached(run: str) -> str:
+        run = run.strip().strip("/")
+        if not run:
+            raise HTTPException(400, "run path is required")
+        if run in cluster_html_cache:
+            return cluster_html_cache[run]
+        _reload_volumes()
+        scores_v2_dir = Path(OUTPUTS_MOUNT) / run / "scores_v2"
+        if not scores_v2_dir.is_dir():
+            raise HTTPException(404, f"scores_v2/ not found under {run!r}")
+        # find *_clustered_scores.json — merge if multiple tasks
+        score_files = sorted(scores_v2_dir.glob("*_clustered_scores.json"))
+        if not score_files:
+            raise HTTPException(404, f"No *_clustered_scores.json found under {run}/scores_v2/")
+        clusters: dict = {}
+        for sf in score_files:
+            clusters.update(json.load(open(sf)))
+        body = build_cluster_html(clusters, video_base="/video/", frame_base="/frame/", run_label=run)
+        cluster_html_cache[run] = body
+        n_spans = sum(len(c.get("spans", {})) for c in clusters.values())
+        print(f"viewer: built cluster HTML {len(body)/1e6:.1f} MB for run={run} ({len(clusters)} clusters, {n_spans} spans)")
+        return body
+
+    @web.get("/view_clusters", response_class=HTMLResponse)
+    def view_clusters(run: str = Query(..., description="Volume-relative lang-cluster run path")):
+        try:
+            return _build_cluster_cached(run)
         except HTTPException:
             raise
         except Exception as exc:
@@ -308,9 +425,11 @@ def viewer():
     @web.get("/health", response_class=PlainTextResponse)
     def health():
         _reload_volumes()
-        n_runs = len(_list_curation_runs(Path(OUTPUTS_MOUNT)))
-        n_mp4 = len(list(Path(PREVIEW_MOUNT).glob("*.mp4")))
-        return f"ok runs={n_runs} mp4s={n_mp4} cached_html={len(html_cache)}"
+        n_runs         = len(_list_curation_runs(Path(OUTPUTS_MOUNT)))
+        n_span_runs    = len(_list_span_runs(Path(OUTPUTS_MOUNT)))
+        n_cluster_runs = len(_list_cluster_runs(Path(OUTPUTS_MOUNT)))
+        n_mp4          = len(list(Path(PREVIEW_MOUNT).glob("*.mp4")))
+        return f"ok runs={n_runs} span_runs={n_span_runs} cluster_runs={n_cluster_runs} mp4s={n_mp4} cached_html={len(html_cache)}"
 
     @web.get("/episodes", response_class=HTMLResponse)
     def episodes():
