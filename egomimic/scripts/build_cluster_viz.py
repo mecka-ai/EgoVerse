@@ -624,7 +624,14 @@ function loadSpan(cellId){
     (text?`<div class="ann">${text}</div>`:'');
   const vid=el.querySelector('video');
   vid.playbackRate=spd;
-  vid.addEventListener('loadedmetadata',()=>{ vid.currentTime=seekTo; },{once:true});
+  // Seek to the span start AND start playing (muted). A paused <video> after a
+  // programmatic seek does not paint the frame in most browsers (shows black),
+  // so we must play() to render the clip; it loops within [seekTo, stopAt].
+  vid.addEventListener('loadedmetadata',()=>{
+    vid.currentTime=seekTo;
+    vid.play().catch(()=>{});
+  },{once:true});
+  vid.addEventListener('seeked',()=>{ vid.play().catch(()=>{}); },{once:true});
   vid.addEventListener('timeupdate',()=>{
     if(vid.currentTime>=stopAt || vid.currentTime<seekTo-0.1){ vid.currentTime=seekTo; }
   });
