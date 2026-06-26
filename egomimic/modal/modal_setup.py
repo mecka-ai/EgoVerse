@@ -783,8 +783,23 @@ def _prepare_repo_light(
             ["git", "-C", str(repo_dir), "submodule", "update", "--init", f"external/{sm}"],
             check=True,
         )
+    # Register egomimic via a .pth instead of `pip install -e .`. The editable
+    # install runs setuptools' egg-info file walk from repo_dir, which contains
+    # `logs/` — the mounted training-outputs volume (hundreds of GB). setuptools
+    # walks with followlinks=True and crawls the whole volume, pinning a core for
+    # 15+ min before the container does any real work. A .pth on sys.path makes
+    # `import egomimic` resolve at interpreter startup with no file walk — the
+    # same approach _prepare_repo() uses. egomimic declares no entry points, so
+    # the editable install provided nothing else here.
     subprocess.run(
-        [CFG.python_bin, "-m", "pip", "install", "-e", ".", "--no-deps", "-q"],
-        cwd=str(repo_dir),
+        [
+            CFG.python_bin,
+            "-c",
+            "import sysconfig, os, sys; "
+            "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_egomimic.pth'); "
+            "open(p, 'w').write(sys.argv[1]); "
+            "print('registered egomimic path ->', sys.argv[1])",
+            CFG.remote_repo_dir,
+        ],
         check=True,
     )
