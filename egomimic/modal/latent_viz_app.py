@@ -366,11 +366,13 @@ def viewer():
         _reload_volumes()
         run_dir = Path(OUTPUTS_MOUNT) / run_clean
         tsne_dir = run_dir / "tsne3d"
-        # Cluster run: has spans_tsne3d.json but no per-task tsne3d_*.json files
-        has_task_tsne = tsne_dir.is_dir() and any(tsne_dir.glob("tsne3d_*.json"))
+        # Auto-detect language-cluster organization: a run is cluster-organized if it
+        # has spans_tsne3d.json or *_clustered_scores.json. Route to the cluster viewer
+        # (cluster selector + per-span video grid) even if a per-task tsne3d_*.json also
+        # exists — the curation pipeline emits both for clustered runs.
         has_span_tsne = (tsne_dir / "spans_tsne3d.json").is_file()
         has_cluster_scores = _cluster_scores_dir(run_dir) is not None
-        if not has_task_tsne and (has_span_tsne or has_cluster_scores):
+        if has_span_tsne or has_cluster_scores:
             return RedirectResponse(url=f"/view_clusters?run={run_clean}", status_code=302)
         try:
             return _build_latent_html(run_clean)
