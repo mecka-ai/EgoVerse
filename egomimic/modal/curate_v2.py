@@ -196,6 +196,48 @@ def _score_task_clustered(
     out_path = scores_dir / f"{task_name}_clustered_scores.json"
     with open(out_path, "w") as f:
         json.dump(clustered, f, indent=2)
+
+    # Per-span artifact for the latent viewer: pooled state/action latents, the
+    # Qwen3 language embedding, cluster id, score, and the (episode, start, end)
+    # needed to play each span's video clip. One row per span, aligned arrays.
+    span_cluster: dict[str, int] = {}
+    span_score: dict[str, float] = {}
+    cluster_labels: dict[str, str] = {}
+    for ck, cv in clustered.items():
+        cid = int(ck.split("_")[1])
+        cluster_labels[str(cid)] = cv["label"]
+        for sid, rec in cv["spans"].items():
+            span_cluster[sid] = cid
+            span_score[sid] = rec.get("score")
+
+    state_pool = _np.stack([s.mean(axis=0) for s in span_state]).astype(_np.float32)
+    action_pool = _np.stack([a.mean(axis=0) for a in span_action]).astype(_np.float32)
+    lang_emb = _np.asarray(text_embeddings, dtype=_np.float32)
+    cluster_ids = _np.asarray([span_cluster[s] for s in span_ids], dtype=_np.int32)
+    scores_arr = _np.asarray(
+        [(_np.nan if span_score[s] is None else span_score[s]) for s in span_ids],
+        dtype=_np.float32,
+    )
+    spans_npz = scores_dir / f"{task_name}_clustered_spans.npz"
+    _np.savez_compressed(
+        spans_npz,
+        span_ids=_np.asarray(span_ids, dtype=object),
+        episodes=_np.asarray([m["episode"] for m in span_meta], dtype=object),
+        starts=_np.asarray([m["start"] for m in span_meta], dtype=_np.int32),
+        ends=_np.asarray([m["end"] for m in span_meta], dtype=_np.int32),
+        texts=_np.asarray(span_texts, dtype=object),
+        cluster_ids=cluster_ids,
+        scores=scores_arr,
+        state_emb=state_pool,
+        action_emb=action_pool,
+        lang_emb=lang_emb,
+    )
+    with open(scores_dir / f"{task_name}_cluster_labels.json", "w") as f:
+        json.dump(cluster_labels, f, indent=2)
+    print(
+        f"{tag} wrote span viewer artifact → {spans_npz} "
+        f"(state{state_pool.shape} action{action_pool.shape} lang{lang_emb.shape})"
+    )
     training_outputs_volume.commit()
 
     flat = {
