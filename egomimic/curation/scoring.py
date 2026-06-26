@@ -53,6 +53,7 @@ def trajectory_scorer_from_cfg(cfg: Any) -> "TrajectoryScorer":
     """Build a TrajectoryScorer from a composed Hydra ``curate`` config."""
     ksg = OmegaConf.select(cfg, "model.ksg", default={}) or {}
     lang = select_language_conditioning_settings(cfg)
+    cscore = OmegaConf.select(cfg, "model.cluster_scoring", default={}) or {}
     return TrajectoryScorer(
         k_range=tuple(int(k) for k in ksg.get("k_range", [3, 7])),
         n_threads=int(ksg.get("n_threads", 12)),
@@ -66,6 +67,8 @@ def trajectory_scorer_from_cfg(cfg: Any) -> "TrajectoryScorer":
         n_clusters=lang.n_clusters,
         n_clusters_max=lang.n_clusters_max,
         clustered_min_spans=lang.clustered_min_spans,
+        cluster_score_algo=str(cscore.get("algo", "ksg")).lower().strip(),
+        centroid_space=str(cscore.get("centroid_space", "action")).lower().strip(),
     )
 
 
@@ -116,6 +119,8 @@ class TrajectoryScorer:
         n_clusters: int | str = "auto",
         n_clusters_max: int = 20,
         clustered_min_spans: int = 8,
+        cluster_score_algo: str = "ksg",
+        centroid_space: str = "action",
     ) -> None:
         self.k_range = k_range
         self.n_threads = n_threads
@@ -130,6 +135,8 @@ class TrajectoryScorer:
         self.n_clusters = n_clusters
         self.n_clusters_max = n_clusters_max
         self.clustered_min_spans = clustered_min_spans
+        self.cluster_score_algo = cluster_score_algo
+        self.centroid_space = centroid_space
 
     def score_latents(
         self,
@@ -318,6 +325,59 @@ class TrajectoryScorer:
         km = KMeans(n_clusters=k, random_state=self.seed, n_init=10)
         return km.fit_predict(emb)
 
+    # ------------------------------------------------------------------
+    # Modular per-cluster span scoring (selected by self.cluster_score_algo)
+    # ------------------------------------------------------------------
+
+    def _span_pooled(self, s: np.ndarray, a: np.ndarray) -> np.ndarray:
+        """Pool a span's per-frame latents to one vector in the configured space."""
+        space = self.centroid_space
+        if space == "state":
+            return np.asarray(s, dtype=np.float64).mean(axis=0)
+        if space == "joint":
+            return np.concatenate(
+                [np.asarray(s, dtype=np.float64).mean(axis=0),
+                 np.asarray(a, dtype=np.float64).mean(axis=0)]
+            )
+        return np.asarray(a, dtype=np.float64).mean(axis=0)  # default: action
+
+    def _cluster_scores_centroid(
+        self, cs_state: list[np.ndarray], cs_action: list[np.ndarray]
+    ) -> list[float]:
+        """Score each span by its distance to the cluster centroid (per-span pooled).
+
+        Centroid = mean of the cluster's pooled span vectors in ``centroid_space``;
+        each span's score is the Euclidean distance from its pooled vector to that
+        centroid (smaller = more representative of the cluster).
+        """
+        vecs = np.stack([self._span_pooled(s, a) for s, a in zip(cs_state, cs_action)])
+        centroid = vecs.mean(axis=0)
+        return [float(d) for d in np.linalg.norm(vecs - centroid, axis=1)]
+
+    def _cluster_scores_ksg(
+        self, cs_state: list[np.ndarray], cs_action: list[np.ndarray]
+    ) -> list[float]:
+        """Score each span by the mean per-frame KSG MI over its frames."""
+        s_cat = np.concatenate([np.asarray(s, dtype=np.float64) for s in cs_state], axis=0)
+        a_cat = np.concatenate([np.asarray(a, dtype=np.float64) for a in cs_action], axis=0)
+        mi = self._ksg_exact(s_cat, a_cat)
+        out: list[float] = []
+        start = 0
+        for s in cs_state:
+            length = len(s)
+            seg = mi[start : start + length]
+            out.append(float(np.nanmean(seg)) if length > 0 else float("nan"))
+            start += length
+        return out
+
+    def _score_cluster_spans(
+        self, cs_state: list[np.ndarray], cs_action: list[np.ndarray]
+    ) -> list[float]:
+        """Dispatch to the configured per-cluster scoring algorithm."""
+        if self.cluster_score_algo == "centroid":
+            return self._cluster_scores_centroid(cs_state, cs_action)
+        return self._cluster_scores_ksg(cs_state, cs_action)
+
     def score_clusters(
         self,
         span_state: list[np.ndarray],
@@ -388,27 +448,23 @@ class TrajectoryScorer:
                 )
                 continue
 
-            s_cat = np.concatenate([span_state[i] for i in idxs], axis=0).astype(np.float64)
-            a_cat = np.concatenate([span_action[i] for i in idxs], axis=0).astype(np.float64)
-            lengths = [len(span_state[i]) for i in idxs]
+            cs_state = [span_state[i] for i in idxs]
+            cs_action = [span_action[i] for i in idxs]
+            total_frames = sum(len(s) for s in cs_state)
 
-            if s_cat.shape[0] <= k_max:
+            # KSG needs more frames than k; centroid only needs the per-span vectors.
+            if self.cluster_score_algo != "centroid" and total_frames <= k_max:
                 result[cluster_key] = _dropped(
-                    idxs, label, f"only {s_cat.shape[0]} frames (<= k_max={k_max})"
+                    idxs, label, f"only {total_frames} frames (<= k_max={k_max})"
                 )
                 continue
 
-            mi = self._ksg_exact(s_cat, a_cat)
+            scores = self._score_cluster_spans(cs_state, cs_action)
 
             spans_out: dict[str, dict] = {}
-            start = 0
-            for i, length in zip(idxs, lengths):
-                span_mi = mi[start : start + length]
-                score = float(np.nanmean(span_mi)) if length > 0 else float("nan")
-                if not np.isfinite(score):
-                    score = None
+            for i, sc in zip(idxs, scores):
+                score = sc if (sc is not None and np.isfinite(sc)) else None
                 spans_out[span_ids[i]] = {**span_meta[i], "score": score}
-                start += length
 
             spans_out = dict(
                 sorted(
@@ -424,8 +480,8 @@ class TrajectoryScorer:
                 "spans": spans_out,
             }
             logger.info(
-                "Clustered KSG: %s scored %d spans (label=%r)",
-                cluster_key, len(idxs), label[:60],
+                "Clustered scoring (%s): %s scored %d spans (label=%r)",
+                self.cluster_score_algo, cluster_key, len(idxs), label[:60],
             )
 
         n_scored = sum(1 for v in result.values() if v["scored"])

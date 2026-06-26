@@ -115,11 +115,18 @@ class LanguageConditioningSettings:
     n_clusters: int | str = "auto"
     n_clusters_max: int = 20
     clustered_min_spans: int = 8
-    # Qwen3 instruction steering clustering toward verbs + handedness over objects.
+    # Qwen3 instruction steering clustering toward per-hand verb structure over objects.
     cluster_instruction: str = (
-        "Represent this manipulation instruction by the actions the hands perform — "
-        "the verbs and whether the left hand, right hand, or both hands are used — "
-        "and ignore the specific objects involved."
+        "Encode this bimanual manipulation instruction by ONLY its action verbs and "
+        "which hand performs each verb — left hand, right hand, or both hands. The "
+        "representation must depend solely on the (verb, hand) structure: map two "
+        "instructions to nearby vectors when they use the same verbs with the same hand "
+        "assignment, and to distant vectors when the verbs or the hand assignment differ. "
+        "For example, 'spray motorcycle with nozzle in right hand, hold hose with left "
+        "hand' and 'spray foam onto the wall with the right hand while the left hand holds "
+        "the rail' must be near-identical because both are right-hand=spray, "
+        "left-hand=hold. Completely ignore every object, tool, material, color, quantity, "
+        "location, and scene detail — represent only what each hand is doing."
     )
 
 

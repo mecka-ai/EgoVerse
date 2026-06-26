@@ -52,9 +52,9 @@ language_conditioning:
   n_clusters: auto        # "auto" (silhouette over 2..n_clusters_max) or an int
   n_clusters_max: 20      # upper bound for auto silhouette search
   clustered_min_spans: 8  # clusters with fewer spans are formed but not scored (logged)
-  # Qwen3 instruction that steers clustering toward verbs + handedness over objects.
+  # Qwen3 instruction that steers clustering toward per-hand verb structure over objects.
   # Set to "" to cluster on the raw annotation text (objects included).
-  cluster_instruction: "Represent this manipulation instruction by the actions the hands perform — the verbs and whether the left hand, right hand, or both hands are used — and ignore the specific objects involved."
+  cluster_instruction: "Encode this bimanual manipulation instruction by ONLY its action verbs and which hand performs each verb — left hand, right hand, or both hands. The representation must depend solely on the (verb, hand) structure: map two instructions to nearby vectors when they use the same verbs with the same hand assignment, and to distant vectors when the verbs or the hand assignment differ. For example, 'spray motorcycle with nozzle in right hand, hold hose with left hand' and 'spray foam onto the wall with the right hand while the left hand holds the rail' must be near-identical because both are right-hand=spray, left-hand=hold. Completely ignore every object, tool, material, color, quantity, location, and scene detail — represent only what each hand is doing."
   qwen3:
     model_name: Qwen/Qwen3-Embedding-0.6B
     max_length: 512
@@ -69,6 +69,14 @@ tsne:
   include_language: true
   include_state_by_lang: true
   state_color_by: auto  # auto | episode | time | language
+
+# Pass 3 (clustered mode): per-cluster span scoring algorithm (modular).
+#   ksg      — mean per-frame KSG mutual information I(state;action) over the span.
+#   centroid — Euclidean distance from the span's pooled latent to the cluster
+#              centroid (smaller = more representative); centroid_space ∈ {action,state,joint}.
+cluster_scoring:
+  algo: ksg
+  centroid_space: action
 
 # Pass 3: KSG on concatenated episode latents (CPU).
 ksg:
