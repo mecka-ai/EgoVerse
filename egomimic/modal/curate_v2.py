@@ -238,6 +238,64 @@ def _score_task_clustered(
         f"{tag} wrote span viewer artifact → {spans_npz} "
         f"(state{state_pool.shape} action{action_pool.shape} lang{lang_emb.shape})"
     )
+
+    # 3D t-SNE per modality → tsne3d/spans_tsne3d.json (consumed by the span viewer:
+    # egomimic/modal/latent_viz_app.py::view_spans and scripts/build_span_viz.py).
+    seed = select_seed(cfg)
+
+    def _tsne3d(X) -> "_np.ndarray":
+        from sklearn.decomposition import PCA
+        from sklearn.manifold import TSNE
+        Xf = _np.asarray(X, dtype=_np.float32)
+        if Xf.shape[1] > 50:
+            Xf = PCA(n_components=50, random_state=seed).fit_transform(Xf)
+        return TSNE(
+            n_components=3, init="pca", perplexity=30, random_state=seed
+        ).fit_transform(Xf)
+
+    coords = {}
+    for name, X in (("state", state_pool), ("action", action_pool), ("language", lang_emb)):
+        t_t = _time.perf_counter()
+        e = _tsne3d(X)
+        coords[name] = {
+            "x": e[:, 0].astype(float).tolist(),
+            "y": e[:, 1].astype(float).tolist(),
+            "z": e[:, 2].astype(float).tolist(),
+            "span_idx": list(range(len(e))),
+        }
+        print(f"{tag} t-SNE {name}: {len(e)} pts in {_time.perf_counter() - t_t:.1f}s")
+
+    spans_list = [
+        {
+            "id": span_ids[i],
+            "ep": span_meta[i]["episode"],
+            "start": int(span_meta[i]["start"]),
+            "end": int(span_meta[i]["end"]),
+            "text": span_texts[i],
+            "score": (None if not _np.isfinite(scores_arr[i]) else float(scores_arr[i])),
+            "cluster": int(cluster_ids[i]),
+        }
+        for i in range(len(span_ids))
+    ]
+    clusters_meta = {
+        str(cid): {
+            "label": cluster_labels[str(cid)],
+            "n_spans": int((cluster_ids == cid).sum()),
+        }
+        for cid in sorted(set(cluster_ids.tolist()))
+    }
+    spans_tsne = {
+        "n_clusters": len(clusters_meta),
+        "clusters": clusters_meta,
+        "spans": spans_list,
+        **coords,
+    }
+    tsne_dir = Path(output_dir) / "tsne3d"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+    with open(tsne_dir / "spans_tsne3d.json", "w") as f:
+        json.dump(spans_tsne, f)
+    print(f"{tag} wrote {tsne_dir / 'spans_tsne3d.json'} ({len(spans_list)} spans)")
+
     training_outputs_volume.commit()
 
     flat = {
