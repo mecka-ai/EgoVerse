@@ -35,7 +35,7 @@ _VAL_JSON        = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d6
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
-    .pip_install("fastapi[standard]", "sqlalchemy", "psycopg2-binary")
+    .pip_install("fastapi[standard]", "sqlalchemy", "psycopg2-binary", "scikit-learn")
     .add_local_file(_BUILDER,         remote_path="/root/build_latent_viz.py",  copy=True)
     .add_local_file(_SPAN_BUILDER,    remote_path="/root/build_span_viz.py",    copy=True)
     .add_local_file(_CLUSTER_BUILDER, remote_path="/root/build_cluster_viz.py", copy=True)
@@ -70,14 +70,24 @@ def _list_span_runs(outputs_root: Path) -> list[str]:
     return sorted(set(runs), reverse=True)
 
 
+def _cluster_scores_dir(run_dir: Path) -> Path | None:
+    """Return the directory containing *_clustered_scores.json, checking both scores/ and scores_v2/."""
+    for candidate in ("scores_v2", "scores"):
+        d = run_dir / candidate
+        if d.is_dir() and any(d.glob("*_clustered_scores.json")):
+            return d
+    return None
+
+
 def _list_cluster_runs(outputs_root: Path) -> list[str]:
-    """Find runs that have scores_v2/*_clustered_scores.json."""
+    """Find runs that have *_clustered_scores.json in scores/ or scores_v2/."""
     if not outputs_root.is_dir():
         return []
     runs: list[str] = []
-    for p in outputs_root.rglob("scores_v2/*_clustered_scores.json"):
-        run_dir = p.parent.parent
-        runs.append(str(run_dir.relative_to(outputs_root)))
+    for candidate in ("scores_v2", "scores"):
+        for p in outputs_root.rglob(f"{candidate}/*_clustered_scores.json"):
+            run_dir = p.parent.parent
+            runs.append(str(run_dir.relative_to(outputs_root)))
     return sorted(set(runs), reverse=True)
 
 
@@ -313,7 +323,6 @@ def viewer():
         if run in html_cache:
             return html_cache[run]
 
-        _reload_volumes()
         run_dir = Path(OUTPUTS_MOUNT) / run
         tsne_dir = run_dir / "tsne3d"
         scores_path = run_dir / "scores_by_task.json"
@@ -353,8 +362,18 @@ def viewer():
 
     @web.get("/view", response_class=HTMLResponse)
     def view(run: str = Query(..., description="Volume-relative curation run path")):
+        run_clean = run.strip().strip("/")
+        _reload_volumes()
+        run_dir = Path(OUTPUTS_MOUNT) / run_clean
+        tsne_dir = run_dir / "tsne3d"
+        # Cluster run: has spans_tsne3d.json but no per-task tsne3d_*.json files
+        has_task_tsne = tsne_dir.is_dir() and any(tsne_dir.glob("tsne3d_*.json"))
+        has_span_tsne = (tsne_dir / "spans_tsne3d.json").is_file()
+        has_cluster_scores = _cluster_scores_dir(run_dir) is not None
+        if not has_task_tsne and (has_span_tsne or has_cluster_scores):
+            return RedirectResponse(url=f"/view_clusters?run={run_clean}", status_code=302)
         try:
-            return _build_latent_html(run)
+            return _build_latent_html(run_clean)
         except HTTPException:
             raise
         except Exception as exc:
@@ -385,6 +404,35 @@ def viewer():
         except Exception as exc:
             raise HTTPException(500, str(exc)) from exc
 
+    def _load_cluster_tsne(run: str) -> dict:
+        """Load pre-computed t-SNE from tsne3d/spans_tsne3d.json (written by curate_v2).
+
+        Returns shared span metadata arrays (cid, score, start, end, ep, txt) plus
+        per-modality coordinate arrays (state/action/language → {x, y, z}).
+        All arrays are aligned: index k → the same span across all modalities.
+        Returns {} if the file is absent (viewer still works from cluster scores).
+        """
+        tsne_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
+        if not tsne_path.is_file():
+            return {}
+        data = json.load(open(tsne_path))
+        spans = data["spans"]
+        result: dict = {
+            "cid":   [s["cluster"]                        for s in spans],
+            "score": [s.get("score") or 0.0               for s in spans],
+            "start": [int(s.get("start", 0))              for s in spans],
+            "end":   [int(s.get("end",   s.get("start", 0) + 1)) for s in spans],
+            "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
+            "txt":   [str(s.get("text", ""))[:60]         for s in spans],
+        }
+        for mode in ("state", "action", "language"):
+            if mode in data:
+                t = data[mode]
+                result[mode] = {"x": t["x"], "y": t["y"], "z": t["z"]}
+        print(f"[viewer] loaded cluster t-SNE for {run} ({len(spans)} spans, "
+              f"modes={[m for m in ('state','action','language') if m in result]})")
+        return result
+
     def _build_cluster_cached(run: str) -> str:
         run = run.strip().strip("/")
         if not run:
@@ -392,20 +440,18 @@ def viewer():
         if run in cluster_html_cache:
             return cluster_html_cache[run]
         _reload_volumes()
-        scores_v2_dir = Path(OUTPUTS_MOUNT) / run / "scores_v2"
-        if not scores_v2_dir.is_dir():
-            raise HTTPException(404, f"scores_v2/ not found under {run!r}")
-        # find *_clustered_scores.json — merge if multiple tasks
-        score_files = sorted(scores_v2_dir.glob("*_clustered_scores.json"))
-        if not score_files:
-            raise HTTPException(404, f"No *_clustered_scores.json found under {run}/scores_v2/")
+        run_dir = Path(OUTPUTS_MOUNT) / run
+        scores_dir = _cluster_scores_dir(run_dir)
+        if scores_dir is None:
+            raise HTTPException(404, f"No *_clustered_scores.json found under {run!r} (checked scores/ and scores_v2/)")
         clusters: dict = {}
-        for sf in score_files:
+        for sf in sorted(scores_dir.glob("*_clustered_scores.json")):
             clusters.update(json.load(open(sf)))
-        body = build_cluster_html(clusters, video_base="/video/", frame_base="/frame/", run_label=run)
+        tsne = _load_cluster_tsne(run)
+        body = build_cluster_html(clusters, tsne, video_base="/video/", frame_base="/frame/", run_label=run)
         cluster_html_cache[run] = body
         n_spans = sum(len(c.get("spans", {})) for c in clusters.values())
-        print(f"viewer: built cluster HTML {len(body)/1e6:.1f} MB for run={run} ({len(clusters)} clusters, {n_spans} spans)")
+        print(f"[viewer] cluster HTML {len(body)/1e6:.1f} MB run={run} ({len(clusters)} clusters, {n_spans} spans, scores_dir={scores_dir.name}, tsne={'yes' if tsne else 'no'})")
         return body
 
     @web.get("/view_clusters", response_class=HTMLResponse)
