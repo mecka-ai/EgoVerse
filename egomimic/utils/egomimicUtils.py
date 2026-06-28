@@ -226,6 +226,14 @@ EXTRINSICS = {
         "left": np.eye(4),
         "right": np.eye(4),
     },
+    "yam": {
+        # TODO: replace with the measured YAM front-camera -> per-arm-base
+        # extrinsics. Identity is a placeholder so the yam_bimanual embodiment
+        # resolves; correct training/rollout REQUIRES real calibration here
+        # (mirror the x5Dec13_2 matrices below, measured on the YAM rig).
+        "left": np.eye(4),
+        "right": np.eye(4),
+    },
     "x5Dec13_2": {
         "left": np.array(
             [
@@ -250,11 +258,28 @@ EXTRINSICS = {
     },
 }
 
+# YAM front camera = Atlas (ATLASHX2952) cam3 ("Bottom SLAM", the down-looking
+# camera), double-sphere model RECTIFIED to a pinhole and then CENTER-CROPPED to
+# 75% of each dimension. cam3 is 640x480; rectification puts the principal point
+# at (320,240) with native fx,fy; the 75% center crop (-> 480x360, offset 80,60)
+# shifts the principal point to (240,180). 3x4 (K|0) to match every other
+# INTRINSICS entry (viz projection requires 3x4). Valid at the 480x360 output.
+# (See egomimic/robot/YAM/yam_cameras.py front_output_intrinsics; ported from
+# Downloads/rectify_6cam_videos.py + calibration_db cam3.)
+YAM_INTRINSICS = np.array(
+    [
+        [157.6039137245626, 0.0, 240.0, 0.0],
+        [0.0, 157.790966072419, 180.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+)
+
 INTRINSICS = {
     "base": ARIA_INTRINSICS,
     "base_half": ARIA_INTRINSICS_HALF,
     "mecka": MECKA_INTRINSICS,
     "scale": SCALE_INTRINSICS,
+    "yam": YAM_INTRINSICS,
 }
 
 ARIA_T_RGB_CPF = np.array(

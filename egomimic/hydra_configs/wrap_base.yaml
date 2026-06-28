@@ -1,0 +1,7 @@
+# Minimal compose root for wrap_base_to_ckpt.py — just the model (with its
+# pi0.5_base defaults) and the data schematic. No data/trainer needed since we
+# only instantiate the model and save a Lightning checkpoint.
+defaults:
+  - model: pi0.5_bc_yam
+  - data_schematic: pi
+  - _self_

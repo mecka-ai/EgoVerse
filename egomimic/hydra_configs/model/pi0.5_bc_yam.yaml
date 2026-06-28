@@ -1,0 +1,22 @@
+defaults:
+  - pi0.5_base
+  - _self_
+
+# YAM bimanual robot. Same 14-dim cartesian+gripper action space as Eva, so it
+# reuses the Eva-style converter; only the camera extrinsics differ (yam).
+robomimic_model:
+  camera_transforms:
+    _target_: egomimic.utils.egomimicUtils.CameraTransforms
+    intrinsics_key: "base"
+    extrinsics_key: "yam"
+  ac_keys:
+    yam_bimanual: "actions_cartesian"
+  domains: ["yam_bimanual"]
+
+  action_converters:
+    rules:
+      YAM_BIMANUAL:
+        _target_: egomimic.utils.action_utils.RobotBimanualCartesianEuler
+    # optional fallback if no match is found
+    fallback:
+      _target_: egomimic.utils.action_utils.BaseActionConverter
