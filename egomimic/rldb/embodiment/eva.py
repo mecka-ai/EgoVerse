@@ -30,6 +30,11 @@ from egomimic.utils.pose_utils import (
 
 
 class Eva(Embodiment):
+    # ABC-130k top camera (RealSense 640x480). Without this override Eva inherited
+    # Embodiment.VIZ_INTRINSICS_KEY="base" (Aria glasses, fx=266) which mis-scaled
+    # the eval overlay by ~1.6x. See INTRINSICS["eva"] in egomimicUtils.
+    VIZ_INTRINSICS_KEY = "eva"
+
     @staticmethod
     def get_transform_list(
         mode: Literal[
@@ -39,17 +44,34 @@ class Eva(Embodiment):
             "cartesian_wristframe_6d",
             "cartesian_wristframe_quat",
         ],
+        extrinsics_key: str = "x5Dec13_2",
     ) -> list[Transform]:
+        # extrinsics_key selects the cam<-base transform baked into the cartesian
+        # (head/cam-frame) action targets. Default x5Dec13_2 (an EVA-robot hand-eye
+        # calib) matches the trained ckpts; override to e.g. "mecka" (identity) to
+        # express GT in the world frame for a viz/calibration experiment. NOTE: the
+        # wrist-frame modes are extrinsic-invariant (it cancels), so this only
+        # changes the proprio/obs frame there, not the action target.
         if mode == "cartesian":
-            return _build_eva_bimanual_transform_list(is_quat=True)
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_6d":
-            return _build_eva_bimanual_transform_list(is_quat=True, rot_repr="6d")
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, rot_repr="6d", extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_ypr":
-            return _build_eva_bimanual_eef_frame_transform_list(is_quat=False)
+            return _build_eva_bimanual_eef_frame_transform_list(
+                is_quat=False, extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_6d":
-            return _build_eva_bimanual_eef_frame_transform_list(rot_repr="6d")
+            return _build_eva_bimanual_eef_frame_transform_list(
+                rot_repr="6d", extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_quat":
-            return _build_eva_bimanual_eef_frame_transform_list(is_quat=True)
+            return _build_eva_bimanual_eef_frame_transform_list(
+                is_quat=True, extrinsics_key=extrinsics_key
+            )
 
     @classmethod
     def _get_keymap(cls, keymap_mode: str):
