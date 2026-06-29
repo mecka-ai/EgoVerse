@@ -133,6 +133,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <span class="tab" id="tab-grid" onclick="showPage('grid')">Video grid</span>
   <label class="tool" style="margin-left:4px">Cluster
     <select id="csel" onchange="onCSelDrop()"><option value="">— all —</option></select></label>
+  <label class="tool" style="margin-left:4px">Episode
+    <select id="esel" onchange="onEpSel()"><option value="">— all —</option></select></label>
   <div id="info">Click a point to inspect</div>
   <div class="run-nav" id="runNav">__RUN_LABEL__</div>
 </div>
@@ -218,6 +220,7 @@ const TOTAL_SPANS = ALL_CID.reduce((s,c)=>s+CLUSTERS[c].spans.length,0);
 let COLOR_TABLES  = null;             // {cluster:[…], score:[…], time:[…]}
 let curCluster    = null;             // string "cluster_N" or null — drives the grid
 let selectedClusters = new Set();     // Set<int> — multi-highlight in scatter + grid
+let episodeFilter = '';               // '' = all; else only this episode's spans (scatter + grid)
 let hiddenMods    = new Set();
 let activeMods    = [];
 let camLock       = false;
@@ -278,6 +281,8 @@ function applyStyle(){
   const colors=new Array(N), sizes=new Array(N);
   for(let k=0;k<N;k++){
     const ci=TSNE.cid[k];
+    const passEp = !episodeFilter || TSNE.ep[k]===episodeFilter;
+    if(!passEp){ colors[k]=DIM; sizes[k]=0; continue; }   // episode-filtered out → hidden
     const passCl = selectedClusters.size===0 || selectedClusters.has(ci);
     const passHl = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
     if(passCl && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
@@ -473,6 +478,33 @@ function buildCSel(){
   });
 }
 
+/* ── episode dropdown ── */
+function buildESel(){
+  const sel=document.getElementById('esel');
+  if(!sel) return;
+  const cnt={};
+  ALL_CID.forEach(cid=>CLUSTERS[cid].spans.forEach(s=>{cnt[s.ep]=(cnt[s.ep]||0)+1;}));
+  Object.keys(cnt).sort().forEach(ep=>{
+    const o=document.createElement('option');
+    o.value=ep;
+    o.textContent=ep.slice(0,16)+'… ('+cnt[ep]+')';
+    sel.appendChild(o);
+  });
+}
+
+function onEpSel(){
+  episodeFilter=document.getElementById('esel').value||'';
+  applyStyle();          // scatter: hide points outside the episode (re-applied on every render)
+  if(HAS_TSNE){
+    const n = episodeFilter ? TSNE.ep.reduce((a,e)=>a+(e===episodeFilter?1:0),0) : TOTAL_SPANS;
+    const el=document.getElementById('tstats');
+    if(el) el.innerHTML = episodeFilter
+      ? `${n} spans &middot; episode ${esc(episodeFilter.slice(0,12))}… (of ${TOTAL_SPANS.toLocaleString()})`
+      : `${TOTAL_SPANS.toLocaleString()} spans`;
+  }
+  if(page==='grid') renderGrid();
+}
+
 function onCSelDrop(){
   const v=document.getElementById('csel').value;
   curCluster=v||null;
@@ -488,6 +520,7 @@ function resetTools(){
   document.getElementById('colorMode').value='cluster';
   selectedClusters.clear(); curCluster=null;
   document.getElementById('csel').value='';
+  episodeFilter=''; { const e=document.getElementById('esel'); if(e) e.value=''; }
   document.getElementById('hlOn').checked=false;
   document.getElementById('hlFrame').value=0;
   document.getElementById('hlWin').value=30;
@@ -560,6 +593,7 @@ function renderGrid(){
   const q=document.getElementById('gsearch').value.trim().toLowerCase();
 
   const filtered=spans.filter(s=>{
+    if(episodeFilter && s.ep!==episodeFilter) return false;
     const isTop=(rank[s.id]??0)<nTop;
     if(isTop&&!fTop) return false;
     if(!isTop&&!fBot) return false;
@@ -688,6 +722,7 @@ window.addEventListener('resize',()=>{
 
 /* ── init ── */
 buildCSel();
+buildESel();
 updateClusterDisplay();
 buildColorTables();
 renderTsne(false);      // renders panels synchronously (or shows no-data note)

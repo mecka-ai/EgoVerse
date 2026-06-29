@@ -344,22 +344,11 @@ def _score_task_clustered(
     )
     from egomimic.curation.embedders import LanguageEmbedder, TCNActionEmbedder
     from egomimic.curation.scoring import trajectory_scorer_from_cfg
-    from omegaconf import OmegaConf
 
     lang = select_language_conditioning_settings(cfg)
     src_dir = Path(latents_source) if latents_source else Path(output_dir)
     lat_dir = src_dir / "latents" / task_name
     state, action, manifest, spans = load_latent_store(lat_dir)
-
-    # Optional episode subset: ``score_episodes`` (comma-separated hashes or a list) scopes
-    # the run to those episodes' spans only — reuses the store/latents, no rebuild.
-    ep_filter = OmegaConf.select(cfg, "score_episodes", default=None)
-    if ep_filter:
-        ep_set = set(ep_filter.split(",")) if isinstance(ep_filter, str) else {str(e) for e in ep_filter}
-        ep_set = {e.strip() for e in ep_set if e.strip()}
-        n_before = len(spans)
-        spans = [sp for sp in spans if str(sp["episode"]) in ep_set]
-        print(f"{tag} score_episodes filter: {len(spans)}/{n_before} spans from {len(ep_set)} episodes")
 
     span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
     for sp in spans:
