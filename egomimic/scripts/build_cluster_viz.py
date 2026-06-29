@@ -213,6 +213,7 @@ const TSNE       = __TSNE__;          // {} if no spans_tsne3d.json; else {cid,s
 const VIDEO_BASE = "__VIDEO_BASE__";
 const FRAME_BASE = "__FRAME_BASE__";
 const FPS        = 30;
+const RUN_KEY    = "clusterviz:" + "__RUN_LABEL_ESCAPED__";   // localStorage key (per run)
 
 const HAS_TSNE = TSNE && TSNE.cid && TSNE.cid.length;
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
@@ -229,6 +230,29 @@ let hiddenMods    = new Set();
 let activeMods    = [];
 let camLock       = false;
 let page          = 'tsne';
+
+/* ── persist sidebar selection + color/select modes across reload (per run) ── */
+function saveState(){
+  try{ localStorage.setItem(RUN_KEY, JSON.stringify({
+    selMode:   document.getElementById('selMode').value,
+    colorMode: document.getElementById('colorMode').value,
+    clusters:  [...selectedClusters],
+    episodes:  [...selectedEpisodes],
+    curCluster,
+  })); }catch(e){}
+}
+function loadState(){
+  try{
+    const s=JSON.parse(localStorage.getItem(RUN_KEY)||'null'); if(!s) return;
+    const sm=document.getElementById('selMode'), cm=document.getElementById('colorMode');
+    if(s.selMode&&sm) sm.value=s.selMode;
+    if(s.colorMode&&cm) cm.value=s.colorMode;
+    selectedClusters = new Set((s.clusters||[]).map(Number));
+    selectedEpisodes = new Set(s.episodes||[]);
+    curCluster = s.curCluster||null;
+    const cs=document.getElementById('csel'); if(cs&&curCluster) cs.value=curCluster;
+  }catch(e){}
+}
 
 const MOD_ORDER  = ['state','action','language'];
 const MOD_LABELS = {state:'STATE', action:'ACTION', language:'LANGUAGE'};
@@ -302,6 +326,7 @@ function applyStyle(){
   activeMods.forEach(mod=>{
     Plotly.restyle('panel_'+mod,{'marker.color':[colors],'marker.size':[sizes]},[0]);
   });
+  saveState();
 }
 
 /* ── panels ── */
@@ -365,13 +390,13 @@ function renderTsne(preserveToggles){
     const N=t.x.length;
     const custom=new Array(N);
     for(let k=0;k<N;k++){
-      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||''];
+      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14)];
     }
     Plotly.newPlot(el,[
       {type:'scatter3d',mode:'markers',
        x:t.x,y:t.y,z:t.z,customdata:custom,
        marker:{size:u.size,color:base,line:{width:0}},
-       hovertemplate:'cluster %{customdata[1]} · f%{customdata[2]} · %{customdata[3]}<br>%{customdata[4]}<extra></extra>'},
+       hovertemplate:'cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>'},
       {type:'scatter3d',mode:'markers',name:'sel',
        x:[],y:[],z:[],hoverinfo:'skip',
        marker:{size:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}},
@@ -740,6 +765,7 @@ window.addEventListener('resize',()=>{
 
 /* ── init ── */
 buildCSel();
+loadState();            // restore persisted selection + color/select modes (per run)
 updateClusterDisplay();
 buildColorTables();
 renderTsne(false);      // renders panels synchronously (or shows no-data note)
