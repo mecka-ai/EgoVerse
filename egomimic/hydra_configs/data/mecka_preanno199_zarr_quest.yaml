@@ -13,7 +13,6 @@ train_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
       folder_path: /mnt/zarr-data
-      pause_removal_epsilon: 0.005
       allowed_episode_ids:
         - "68c3dbebe9e837b8eec3c2d6"
         - "68c3e30b9c65dfc2d3048ba8"
@@ -228,7 +227,6 @@ valid_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
       folder_path: /mnt/zarr-data
-      pause_removal_epsilon: 0.005
       allowed_episode_ids:
         - "68d435bc58ae90e8b2082295"
         - "68d435dc611c44ef88d9a37b"
@@ -249,7 +247,6 @@ train_viz_datasets:
     resolver:
       _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
       folder_path: /mnt/zarr-data
-      pause_removal_epsilon: 0.005
       allowed_episode_ids:
         - "68c3dbebe9e837b8eec3c2d6"
         - "68c3e30b9c65dfc2d3048ba8"
