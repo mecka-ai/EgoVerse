@@ -610,39 +610,57 @@ function renderGrid(){
    Mirrors the task viewer's loadVideo: clicking the placeholder swaps in a
    <video> element; the clip is bounded by a timeupdate handler that wraps back
    to the start frame, so it loops the span like the task viewer loops episodes. */
-function loadSpan(cellId){
-  const el=document.getElementById(cellId);
-  if(!el || el.dataset.loaded==='1') return;
+/* Throttled clip loader. Each cell loads the full episode MP4 and clips to
+   [start,end). Browsers cap concurrent media streams (~6/host), so loading every
+   cell at once (the old loadAll → ph.click() on all) stalls most to black, and
+   playAll's immediate play() ran before any clip had loaded/seeked. Load at most
+   _MAXC concurrently, starting the next as each settles; _autoplay gates whether
+   bulk-loaded clips play once ready. Single click still loads + plays instantly. */
+const _MAXC=6;
+let _vq=[], _vactive=0, _autoplay=false;
+function _vpump(){ while(_vactive<_MAXC && _vq.length){ _vactive++; (_vq.shift())(); } }
+function _vrelease(){ _vactive=Math.max(0,_vactive-1); _vpump(); }
+
+function _mountCell(el, play, onSettled){
+  // play: () => bool — whether to start playback once ready. A paused <video> after
+  // a programmatic seek does not paint in most browsers (shows black), so to render
+  // a still we still play() then pause; here we loop within [seekTo, stopAt].
   el.dataset.loaded='1';
   const ep=el.dataset.ep;
   const seekTo=(+el.dataset.start)/FPS, stopAt=(+el.dataset.end)/FPS;
   const text=el.dataset.text||'';
   const spd=parseFloat(document.getElementById('gspeed').value)||1;
-
   el.innerHTML=
     `<video src="${VIDEO_BASE}${ep}" controls loop muted playsinline preload="metadata"></video>`+
     (text?`<div class="ann">${text}</div>`:'');
   const vid=el.querySelector('video');
   vid.playbackRate=spd;
-  // Seek to the span start AND start playing (muted). A paused <video> after a
-  // programmatic seek does not paint the frame in most browsers (shows black),
-  // so we must play() to render the clip; it loops within [seekTo, stopAt].
-  vid.addEventListener('loadedmetadata',()=>{
-    vid.currentTime=seekTo;
-    vid.play().catch(()=>{});
-  },{once:true});
-  vid.addEventListener('seeked',()=>{ vid.play().catch(()=>{}); },{once:true});
+  let done=false; const settle=()=>{ if(!done){ done=true; if(onSettled) onSettled(); } };
+  vid.addEventListener('loadedmetadata',()=>{ vid.currentTime=seekTo; if(play()) vid.play().catch(()=>{}); settle(); },{once:true});
+  vid.addEventListener('error', settle, {once:true});
+  vid.addEventListener('seeked',()=>{ if(play()) vid.play().catch(()=>{}); },{once:true});
   vid.addEventListener('timeupdate',()=>{
     if(vid.currentTime>=stopAt || vid.currentTime<seekTo-0.1){ vid.currentTime=seekTo; }
   });
 }
 
-function loadAll(){ document.querySelectorAll('#grid .ph').forEach(ph=>ph.click()); }
-function playAll(){
-  loadAll(); setSpeed();
-  document.querySelectorAll('#grid video').forEach(v=>{v.muted=true;v.play().catch(()=>{});});
+/* single click → load now (bypass queue) + play, or replay if already loaded */
+function loadSpan(cellId){
+  const el=document.getElementById(cellId);
+  if(!el) return;
+  if(el.dataset.loaded==='1'){ const v=el.querySelector('video'); if(v) v.play().catch(()=>{}); return; }
+  _mountCell(el, ()=>true, null);
 }
-function pauseAll(){ document.querySelectorAll('#grid video').forEach(v=>v.pause()); }
+
+function _enqueueCell(el){
+  if(el.dataset.loaded==='1'){ if(_autoplay){ const v=el.querySelector('video'); if(v) v.play().catch(()=>{}); } return; }
+  el.dataset.loaded='1';                          // claim now so it can't double-enqueue
+  _vq.push(()=>_mountCell(el, ()=>_autoplay, _vrelease));
+  _vpump();
+}
+function loadAll(){ _autoplay=false; document.querySelectorAll('#grid .vid').forEach(_enqueueCell); }
+function playAll(){ _autoplay=true; setSpeed(); document.querySelectorAll('#grid .vid').forEach(_enqueueCell); }
+function pauseAll(){ _autoplay=false; _vq=[]; document.querySelectorAll('#grid video').forEach(v=>v.pause()); }
 function setSpeed(){
   const r=parseFloat(document.getElementById('gspeed').value);
   document.querySelectorAll('#grid video').forEach(v=>v.playbackRate=r);
