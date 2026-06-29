@@ -863,7 +863,9 @@ class CheckpointStateEmbedder:
     def fit(self, episodes: list | None = None) -> None:
         from egomimic.pl_utils.pl_model import ModelWrapper
         logger.info("CheckpointStateEmbedder: loading StateVAE from %s", self.checkpoint_path)
-        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        wrapper = ModelWrapper.load_from_checkpoint(
+            self.checkpoint_path, map_location=self.device, weights_only=False
+        )
         self._model = wrapper.model.to(self.device).eval()
         for p in self._model.parameters():
             p.requires_grad_(False)
@@ -927,7 +929,9 @@ class CheckpointActionEmbedder:
     def fit(self, episodes: list | None = None) -> None:
         from egomimic.pl_utils.pl_model import ModelWrapper
         logger.info("CheckpointActionEmbedder: loading ActionVAE from %s", self.checkpoint_path)
-        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        wrapper = ModelWrapper.load_from_checkpoint(
+            self.checkpoint_path, map_location=self.device, weights_only=False
+        )
         self._model = wrapper.model.to(self.device).eval()
         for p in self._model.parameters():
             p.requires_grad_(False)
@@ -1020,7 +1024,9 @@ class TCNActionEmbedder:
         from egomimic.pl_utils.pl_model import ModelWrapper
 
         logger.info("TCNActionEmbedder: loading TemporalCNNAutoencoder from %s", self.checkpoint_path)
-        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        wrapper = ModelWrapper.load_from_checkpoint(
+            self.checkpoint_path, map_location=self.device, weights_only=False
+        )
         self._model = wrapper.model.to(self.device).eval()
         for p in self._model.parameters():
             p.requires_grad_(False)
