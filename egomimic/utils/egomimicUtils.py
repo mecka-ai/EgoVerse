@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 from numbers import Number
@@ -59,6 +60,43 @@ cx, cy = cx0 * sx, cy0 * sy
 MECKA_INTRINSICS = np.array(
     [[fx, 0.0, cx, 0], [0.0, fy, cy, 0], [0.0, 0.0, 1.0, 0]], dtype=np.float64
 )
+
+# ABC-130k EVA top camera (RealSense, 640x480). Read from the source MCAP's
+# `/top-camera-info` (foxglove.CameraCalibration.K); representative values, per
+# physical station varies ~1%. NOTE: this is a plain pinhole K and only makes the
+# viz overlay correct if the action points are in the TRUE top-camera frame. The
+# eval action chunk is baked into the `x5Dec13_2 . world` frame (a hand-eye calib
+# from a DIFFERENT robot), so this K alone is only an approximation -- see the
+# fitted 3x4 projection note in the viz. Distortion (inverse_brown_conrady) is
+# ignored by cam_frame_to_cam_pixels.
+EVA_INTRINSICS = np.array(
+    [[436.26, 0.0, 310.10, 0], [0.0, 435.13, 241.93, 0], [0.0, 0.0, 1.0, 0]],
+    dtype=np.float64,
+)
+
+# Optional override: a fitted 3x4 projection matrix P (from fit_eva_projection.py)
+# that maps the baked x5Dec13_2 . world frame straight to pixels. When present it
+# REPLACES the plain pinhole K above, correcting both the GT and predicted overlay
+# (the bare K only fixes focal length, not the wrong/absent camera extrinsic).
+#   EGOMIMIC_EVA_PROJECTION=/abs/eva_projection.npy  (or a .json with {"P": 3x4})
+_eva_proj_path = os.environ.get("EGOMIMIC_EVA_PROJECTION")
+if _eva_proj_path and os.path.exists(_eva_proj_path):
+    try:
+        if _eva_proj_path.endswith(".npy"):
+            _P = np.asarray(np.load(_eva_proj_path), dtype=np.float64)
+        else:
+            with open(_eva_proj_path) as _f:
+                _P = np.asarray(json.load(_f)["P"], dtype=np.float64)
+        if _P.shape == (3, 4):
+            EVA_INTRINSICS = _P
+        else:
+            print(
+                f"[egomimicUtils] EGOMIMIC_EVA_PROJECTION must be 3x4, got {_P.shape}; ignoring"
+            )
+    except Exception as _e:  # never let a bad calib file break import
+        print(
+            f"[egomimicUtils] failed to load EGOMIMIC_EVA_PROJECTION ({_e!r}); using default K"
+        )
 
 # Cam to base extrinsics
 EXTRINSICS = {
@@ -256,6 +294,65 @@ EXTRINSICS = {
         "left": np.eye(4),
         "right": np.eye(4),
     },
+    # ABC-130k fold-clothes top camera, derived by solvePnP on the eval-viz click
+    # annotations (fit_eva_projection.py clicks) against the WORLD-frame EE poses ->
+    # ONE world->cam extrinsic for BOTH arms (ABC is one top camera over one world
+    # frame, unlike x5Dec13_2's per-arm matrices, whose right matrix threw the right
+    # arm off-screen). Stored as T_cam_base (pipeline applies inv() for base->cam).
+    # GENERAL least-squares fit over 112 clicks across 60 episodes / 7 tasks:
+    # ~26px median / 41px RMSE, 99% in-frame. Only ~10% of clicks fit one camera ->
+    # ABC is heavily multi-station, so this is a best-effort GLOBAL AVERAGE (dots
+    # on-screen, ~26px off on a typical episode). For crisp overlays, calibrate
+    # per-episode. Pair with INTRINSICS["eva"] real K so the wristframe eval viz uses
+    # this with NO projection-matrix hack (leave EGOMIMIC_EVA_PROJECTION unset).
+    "abc_fold_viz": {
+        "left": np.array(
+            [
+                [
+                    -0.005407286484020982,
+                    -0.9186439573519234,
+                    0.3950494157364081,
+                    -0.07230219027034056,
+                ],
+                [
+                    -0.9992410458993262,
+                    -0.010276052281315319,
+                    -0.03757306135427157,
+                    -0.23692835817344485,
+                ],
+                [
+                    0.03857581422212506,
+                    -0.3949527596691906,
+                    -0.9178911831948223,
+                    0.9778307002507973,
+                ],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+        "right": np.array(
+            [
+                [
+                    -0.005407286484020982,
+                    -0.9186439573519234,
+                    0.3950494157364081,
+                    -0.07230219027034056,
+                ],
+                [
+                    -0.9992410458993262,
+                    -0.010276052281315319,
+                    -0.03757306135427157,
+                    -0.23692835817344485,
+                ],
+                [
+                    0.03857581422212506,
+                    -0.3949527596691906,
+                    -0.9178911831948223,
+                    0.9778307002507973,
+                ],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+    },
 }
 
 # YAM front camera = Atlas (ATLASHX2952) cam3 ("Bottom SLAM", the down-looking
@@ -280,6 +377,7 @@ INTRINSICS = {
     "mecka": MECKA_INTRINSICS,
     "scale": SCALE_INTRINSICS,
     "yam": YAM_INTRINSICS,
+    "eva": EVA_INTRINSICS,
 }
 
 ARIA_T_RGB_CPF = np.array(
