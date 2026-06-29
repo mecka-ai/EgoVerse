@@ -962,6 +962,109 @@ class CheckpointActionEmbedder:
         return result
 
 
+class TCNActionEmbedder:
+    """Span-level action embedder backed by a trained TemporalCNNAutoencoder checkpoint.
+
+    Unlike the per-frame action embedders, this encodes one variable-length annotation
+    span at a time into a single fixed-dim latent, mirroring the span training path
+    (``SpanActionDataset`` + ``TemporalCNNAutoencoderTrainer``):
+
+        raw span trajectory ``(T, D)`` → ActionNorms (shape-normalize → ``(L, D)``)
+        → ``TemporalCNNAutoencoderTrainer.encode`` (DataSchematic per-channel
+        normalize + CNN bottleneck) → ``(latent_dim,)``.
+
+    ActionNorms must match the settings the checkpoint trained on (see the data
+    config's ``norms`` block). The DataSchematic stats are restored from the
+    checkpoint, so no external norm stats are needed.
+
+    Args:
+        checkpoint_path: Path to the TemporalCNNAutoencoderTrainer Lightning ``.ckpt``.
+        norms: ``ActionNormsSettings`` or a dict of its fields (``model.action_embedder.norms``).
+        device: Torch device for inference.
+        batch_size: Max spans per forward call.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        norms: Any = None,
+        device: str | torch.device = "cpu",
+        batch_size: int = 256,
+    ) -> None:
+        from egomimic.algo.action_norms import ActionNorms, ActionNormsSettings
+
+        self.checkpoint_path = checkpoint_path
+        self.device = torch.device(device)
+        self.batch_size = batch_size
+        if isinstance(norms, ActionNormsSettings):
+            ns = norms
+        elif isinstance(norms, dict):
+            ns = ActionNormsSettings(**norms)
+        else:
+            # No norms given → span shape-normalization ON with library defaults
+            # (arc-length resample to L=100, deltas, centroid-translate, path-scale).
+            ns = ActionNormsSettings(enabled=True)
+        self.norms = ActionNorms(ns)
+        self._norms_settings = ns
+        self._model = None
+        self._fitted = False
+        self.latent_dim: int | None = None
+
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        logger.debug(
+            "TCNActionEmbedder: ignoring external norm stats "
+            "(DataSchematic stats restored from checkpoint; ActionNorms applied upstream)"
+        )
+
+    def fit(self, episodes: list | None = None) -> None:
+        from egomimic.pl_utils.pl_model import ModelWrapper
+
+        logger.info("TCNActionEmbedder: loading TemporalCNNAutoencoder from %s", self.checkpoint_path)
+        wrapper = ModelWrapper.load_from_checkpoint(self.checkpoint_path, map_location=self.device)
+        self._model = wrapper.model.to(self.device).eval()
+        for p in self._model.parameters():
+            p.requires_grad_(False)
+        self.latent_dim = int(self._model.nets["autoencoder"].latent_dim)
+        self._fitted = True
+        logger.info(
+            "TCNActionEmbedder: ready, latent_dim=%d, norms=%s",
+            self.latent_dim, self._norms_settings,
+        )
+
+    def embed_spans(self, trajectories: list[np.ndarray]) -> np.ndarray:
+        """Encode raw per-span action trajectories into one latent each.
+
+        Args:
+            trajectories: list of ``(T_i, D)`` float arrays — one raw per-frame action
+                trajectory per annotation span (variable ``T_i``).
+
+        Returns:
+            ``(n_spans, latent_dim)`` float32 array, aligned to ``trajectories``.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed_spans()")
+        if not trajectories:
+            return np.empty((0, self.latent_dim or 0), dtype=np.float32)
+
+        # ActionNorms → fixed-length (L, D); all spans become the same shape so they batch.
+        normed = np.stack(
+            [self.norms.apply(np.asarray(t, dtype=np.float32)) for t in trajectories]
+        ).astype(np.float32)  # (n, L, D)
+
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, len(normed), self.batch_size):
+            batch = torch.from_numpy(normed[start : start + self.batch_size]).to(self.device)
+            z = self._model.encode(batch)  # (B, latent_dim); applies DataSchematic normalize
+            outputs.append(np.asarray(z.detach().cpu().numpy(), dtype=np.float32))
+        result = np.concatenate(outputs, axis=0)
+        logger.info(
+            "[actions] TCNActionEmbedder: %d spans → %s in %.2fs",
+            len(trajectories), result.shape, time.perf_counter() - t0,
+        )
+        return result
+
+
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.

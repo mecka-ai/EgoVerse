@@ -106,6 +106,64 @@ def _read_episode_spans(zarr_root: Path, ep_hash: str) -> list[dict]:
     return []
 
 
+def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list:
+    """Read the raw per-frame action trajectory for each annotation span from zarr.
+
+    For the TCN span action embedder: each span's ``actions_cartesian[start:end)`` is
+    read via the SAME transform path the span autoencoder trained on
+    (``SpanActionDataset`` → ``ZarrDataset._collect_curation_batched``), with pause
+    removal forced OFF so ``start``/``end`` index raw zarr frames (matching the curation
+    store, which hardcodes ``pause_eps=None``, and the TCN training config).
+
+    Returns a list of ``(T_i, action_dim)`` float32 arrays aligned to ``span_meta``.
+    """
+    import hydra as _hydra
+    import numpy as _np
+    from omegaconf import OmegaConf as _OC
+
+    ds_cfg = next(iter(cfg.data.train_datasets.values()))
+    resolver_cfg = _OC.create(_OC.to_container(ds_cfg.resolver, resolve=True))
+    resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match store + TCN training)
+    resolver = _hydra.utils.instantiate(resolver_cfg)
+    resolved = resolver.resolve()
+    episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
+    print(f"{tag} TCN span read: resolver returned {len(episodes)} episodes")
+
+    cache: dict[str, _np.ndarray] = {}
+
+    def _ep_actions(ep: str) -> _np.ndarray:
+        if ep in cache:
+            return cache[ep]
+        if ep not in episodes:
+            raise KeyError(
+                f"span episode {ep!r} not resolvable for TCN action read; "
+                f"available e.g. {list(episodes)[:3]}"
+            )
+        ds = episodes[ep]
+        actions, _, _ = ds._collect_curation_batched(
+            action_key="actions_cartesian",
+            image_key="observations.images.front_img_1",
+            image_decode_workers=0,
+            load_images=False,
+        )
+        a = _np.asarray(actions, dtype=_np.float32)
+        if a.ndim == 3:           # (T, horizon, D) → executed per-frame action = first step
+            a = a[:, 0, :]
+        elif a.ndim > 3:
+            a = a.reshape(a.shape[0], -1)
+        cache[ep] = a
+        return a
+
+    trajectories: list = []
+    for m in span_meta:
+        ep, s, e = m["episode"], int(m["start"]), int(m["end"])
+        full = _ep_actions(ep)
+        T = full.shape[0]
+        s2, e2 = max(0, min(s, T)), max(0, min(e, T))
+        trajectories.append(full[s2:e2] if e2 > s2 else full[:1])
+    return trajectories
+
+
 # ---------------------------------------------------------------------------
 # Latent store: flat memmap arrays + provenance manifest + annotation spans
 # ---------------------------------------------------------------------------
@@ -250,25 +308,39 @@ def _score_task_clustered(
     output_dir: str,
     tag: str,
     t_start: float,
+    latents_source: str = "",
 ) -> tuple[str, dict]:
-    """Span-granularity clustered KSG scoring (model.language_conditioning.mode=clustered).
+    """Span-granularity clustered scoring (model.language_conditioning.mode=clustered).
 
-    Reads the latent store (flat arrays + spans.json with row ranges), Qwen3-embeds
-    span text, K-means clusters spans, then KSG-scores each cluster independently.
-    Writes ``scores/<task>_clustered_scores.json`` and returns a flat
-    ``{span_id: score}`` map for scored spans.
+    Reads the latent store (flat arrays + spans.json with row ranges) — from
+    ``latents_source`` when given, else ``output_dir`` — clusters spans by language,
+    and scores each cluster. Two action representations are supported:
+
+    * default — pool the per-frame action latents from the store over each span;
+    * ``action_embedder.type=tcn`` — encode each span's raw action trajectory with a
+      trained temporal-CNN span autoencoder (ActionNorms → bottleneck), giving one
+      shape-preserving latent per span.
+
+    Language embeddings are reused from a prior run's ``<task>_clustered_spans.npz``
+    under ``latents_source`` when present (skips the Qwen3 pass). All fresh outputs
+    (scores, span npz, 3-D t-SNE) are written under ``output_dir``.
     """
     import time as _time
 
     import numpy as _np
     import torch as _torch
 
-    from egomimic.curation.config import select_language_conditioning_settings, select_seed
-    from egomimic.curation.embedders import LanguageEmbedder
+    from egomimic.curation.config import (
+        select_action_embedder_settings,
+        select_language_conditioning_settings,
+        select_seed,
+    )
+    from egomimic.curation.embedders import LanguageEmbedder, TCNActionEmbedder
     from egomimic.curation.scoring import trajectory_scorer_from_cfg
 
     lang = select_language_conditioning_settings(cfg)
-    lat_dir = Path(output_dir) / "latents" / task_name
+    src_dir = Path(latents_source) if latents_source else Path(output_dir)
+    lat_dir = src_dir / "latents" / task_name
     state, action, manifest, spans = load_latent_store(lat_dir)
 
     span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
@@ -287,28 +359,59 @@ def _score_task_clustered(
 
     print(
         f"{tag} clustered: {len(span_ids)} annotation spans "
-        f"from {len(manifest['episodes'])} episodes"
+        f"from {len(manifest['episodes'])} episodes (store: {src_dir})"
     )
     if not span_ids:
         print(f"{tag} no annotation spans found — skipping clustered scoring")
         return task_name, {}
 
     device = "cuda" if _torch.cuda.is_available() else "cpu"
-    lemb = LanguageEmbedder(
-        source="qwen3",
-        latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
-        device=device,
-        model_name=lang.model_name,
-        max_length=lang.max_length,
-        batch_size=lang.batch_size,
-        dtype=lang.dtype,
-        seed=select_seed(cfg),
-        instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
-    )
-    if lang.cluster_instruction:
-        print(f"{tag} clustering instruction: {lang.cluster_instruction}")
-    lemb.fit()
-    text_embeddings = lemb.embed(span_texts)
+
+    # Per-span action representation. With a trained temporal-CNN span autoencoder
+    # (action_embedder.type=tcn) encode each span's RAW action trajectory
+    # (ActionNorms-normalized) into one shape-preserving latent — instead of pooling the
+    # per-frame action latents from the store. State stays per-frame (pooled downstream).
+    ae = select_action_embedder_settings(cfg)
+    if ae.type == "tcn":
+        if not ae.checkpoint_path:
+            raise ValueError("action_embedder.type=tcn requires action_embedder.checkpoint_path")
+        print(f"{tag} TCN span action embedder: {ae.checkpoint_path} (norms={ae.norms})")
+        trajectories = _read_span_action_trajectories(cfg, span_meta, tag)
+        tcn = TCNActionEmbedder(ae.checkpoint_path, norms=ae.norms, device=device)
+        tcn.fit()
+        span_vecs = tcn.embed_spans(trajectories)  # (n_spans, tcn_latent_dim)
+        span_action = [span_vecs[i][None, :] for i in range(len(span_vecs))]
+        print(f"{tag} TCN span action latents: {span_vecs.shape}")
+
+    # Language embeddings for clustering. Reuse a prior run's Qwen3 embeddings when
+    # present (k-means re-runs deterministically → identical clusters), else embed now.
+    text_embeddings = None
+    reuse_npz = src_dir / "scores" / f"{task_name}_clustered_spans.npz"
+    if reuse_npz.exists():
+        z = _np.load(str(reuse_npz), allow_pickle=True)
+        if "span_ids" in z and "lang_emb" in z:
+            id2emb = {str(sid): z["lang_emb"][i] for i, sid in enumerate(z["span_ids"])}
+            if all(sid in id2emb for sid in span_ids):
+                text_embeddings = _np.stack([id2emb[sid] for sid in span_ids]).astype(_np.float32)
+                print(f"{tag} reusing language embeddings from {reuse_npz} → {text_embeddings.shape}")
+            else:
+                print(f"{tag} reuse npz span_ids mismatch — recomputing language embeddings")
+    if text_embeddings is None:
+        lemb = LanguageEmbedder(
+            source="qwen3",
+            latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
+            device=device,
+            model_name=lang.model_name,
+            max_length=lang.max_length,
+            batch_size=lang.batch_size,
+            dtype=lang.dtype,
+            seed=select_seed(cfg),
+            instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
+        )
+        if lang.cluster_instruction:
+            print(f"{tag} clustering instruction: {lang.cluster_instruction}")
+        lemb.fit()
+        text_embeddings = lemb.embed(span_texts)
 
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
@@ -467,8 +570,13 @@ def _score_task(
     git_remote: str,
     git_commit: str,
     hf_token: str = "",
+    latents_source: str = "",
 ) -> tuple[str, dict[str, float]]:
-    """Load pre-computed latents and run KSG scoring. Returns (task_name, scores)."""
+    """Load pre-computed latents and run scoring. Returns (task_name, scores).
+
+    Reads the latent store from ``latents_source`` (when given) and writes all fresh
+    outputs under ``output_dir`` — letting a run reuse an existing store non-destructively.
+    """
     import time as _time
     import numpy as _np
 
@@ -485,9 +593,10 @@ def _score_task(
     tag = f"[{task_name}][score]"
     t_start = _time.perf_counter()
 
-    lat_dir = Path(output_dir) / "latents" / task_name
+    src_dir = Path(latents_source) if latents_source else Path(output_dir)
+    lat_dir = src_dir / "latents" / task_name
     if not (lat_dir / "state.npy").exists() or not (lat_dir / "manifest.json").exists():
-        print(f"{tag} latent store not found — skipping KSG")
+        print(f"{tag} latent store not found at {lat_dir} — skipping scoring")
         return task_name, {}
 
     # Clustered mode: atomic unit is the annotation span, not the episode.
@@ -495,7 +604,7 @@ def _score_task(
 
     lang = select_language_conditioning_settings(cfg)
     if lang.enabled and lang.mode == "clustered":
-        return _score_task_clustered(task_name, cfg, output_dir, tag, t_start)
+        return _score_task_clustered(task_name, cfg, output_dir, tag, t_start, latents_source)
 
     state, action, manifest, _spans = load_latent_store(lat_dir)
     episodes = manifest["episodes"]
@@ -934,11 +1043,14 @@ def run_score(
     run_name: str,
     score_task: str = "",
     hf_token: str = "",
+    latents_source: str = "",
 ) -> str:
-    """Resume: run ONLY Phase 3 (KSG scoring) against latents already in output_dir.
+    """Resume: run ONLY Phase 3 (scoring) against pre-computed latents.
 
-    Discovers tasks under ``output_dir/latents/`` (or just ``score_task``) and
-    invokes ``_score_task`` per task — no shard build, no embedding.
+    Discovers tasks under ``<latents_source or output_dir>/latents/`` (or just
+    ``score_task``) and invokes ``_score_task`` per task — no shard build, no embedding.
+    When ``latents_source`` differs from ``output_dir`` the store is read from the source
+    and all fresh outputs are written under ``output_dir`` (non-destructive reuse).
     """
     import sys as _sys
     from pathlib import Path as _Path
@@ -950,23 +1062,26 @@ def run_score(
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
 
-    lat_root = _Path(output_dir) / "latents"
+    src_dir = latents_source or output_dir
+    lat_root = _Path(src_dir) / "latents"
     if not lat_root.is_dir():
-        print(f"No latents dir under {output_dir} — nothing to score")
+        print(f"No latents dir under {src_dir} — nothing to score")
         return ""
 
     if score_task:
         tasks = [score_task]
     else:
         tasks = sorted(p.name for p in lat_root.iterdir() if p.is_dir())
-    print(f"Resume scoring {len(tasks)} task(s) from {output_dir}: {tasks}")
+    print(
+        f"Resume scoring {len(tasks)} task(s): store={src_dir} → output={output_dir}: {tasks}"
+    )
 
     for task_name in tasks:
         print(f"\n── [{task_name}] scoring …")
         try:
             _score_task.remote(
                 task_name, run_name, hydra_args,
-                [], [], output_dir, git_remote, git_commit, hf_token,
+                [], [], output_dir, git_remote, git_commit, hf_token, latents_source,
             )
         except Exception as exc:
             print(f"[{task_name}] scoring FAILED: {exc}")
@@ -982,11 +1097,15 @@ def submit_score(*args: str) -> None:
 
     Required: ``score_output_dir=<output dir under /root/EgoVerse/logs>``
     Optional: ``score_task=<task>`` (default: all tasks under latents/)
+    Optional: ``score_latents_source=<dir>`` — read the latent store + reuse artifacts
+              (e.g. a prior run's language clusters) from this dir while writing fresh
+              outputs under ``score_output_dir`` (non-destructive reuse).
     Remaining args are normal hydra overrides (model=…, data=…, language_conditioning…).
     """
     args, _ = pop_init_submodules(args)
     output_dir = ""
     score_task = ""
+    latents_source = ""
     hydra_args: list[str] = []
     for a in args:
         key, sep, val = a.lstrip("+").partition("=")
@@ -994,6 +1113,8 @@ def submit_score(*args: str) -> None:
             output_dir = val.strip()
         elif sep and key == "score_task":
             score_task = val.strip()
+        elif sep and key == "score_latents_source":
+            latents_source = val.strip()
         else:
             hydra_args.append(a)
     if not output_dir:
@@ -1010,10 +1131,14 @@ def submit_score(*args: str) -> None:
             run_name = val.strip()
             break
 
-    print(f"Resume scoring: output_dir={output_dir} at commit {git_commit[:12]}")
+    print(
+        f"Resume scoring: output_dir={output_dir}"
+        + (f" (store from {latents_source})" if latents_source else "")
+        + f" at commit {git_commit[:12]}"
+    )
     handle = run_score.spawn(
         output_dir, tuple(hydra_args), git_remote, git_commit, run_name, score_task,
-        hf_token=_local_hf_token(),
+        hf_token=_local_hf_token(), latents_source=latents_source,
     )
     _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
     _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
