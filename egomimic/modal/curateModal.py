@@ -129,18 +129,18 @@ def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list
     episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
     print(f"{tag} TCN span read: resolver returned {len(episodes)} episodes")
 
-    cache: dict[str, _np.ndarray] = {}
+    from concurrent.futures import ThreadPoolExecutor
 
-    def _ep_actions(ep: str) -> _np.ndarray:
-        if ep in cache:
-            return cache[ep]
-        if ep not in episodes:
-            raise KeyError(
-                f"span episode {ep!r} not resolvable for TCN action read; "
-                f"available e.g. {list(episodes)[:3]}"
-            )
-        ds = episodes[ep]
-        actions, _, _ = ds._collect_curation_batched(
+    unique_eps = sorted({m["episode"] for m in span_meta})
+    missing = [ep for ep in unique_eps if ep not in episodes]
+    if missing:
+        raise KeyError(
+            f"{len(missing)} span episode(s) not resolvable for TCN action read, "
+            f"e.g. {missing[:3]}; available e.g. {list(episodes)[:3]}"
+        )
+
+    def _read_one(ep: str):
+        actions, _, _ = episodes[ep]._collect_curation_batched(
             action_key="actions_cartesian",
             image_key="observations.images.front_img_1",
             image_decode_workers=0,
@@ -151,13 +151,20 @@ def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list
             a = a[:, 0, :]
         elif a.ndim > 3:
             a = a.reshape(a.shape[0], -1)
-        cache[ep] = a
-        return a
+        return ep, a
+
+    # Read each unique episode's full action trajectory once, in parallel — zarr reads
+    # release the GIL (mirrors the curation episode loader's thread pool).
+    cache: dict[str, _np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ep, a in pool.map(_read_one, unique_eps):
+            cache[ep] = a
+    print(f"{tag} TCN span read: cached {len(cache)} episodes")
 
     trajectories: list = []
     for m in span_meta:
         ep, s, e = m["episode"], int(m["start"]), int(m["end"])
-        full = _ep_actions(ep)
+        full = cache[ep]
         T = full.shape[0]
         s2, e2 = max(0, min(s, T)), max(0, min(e, T))
         trajectories.append(full[s2:e2] if e2 > s2 else full[:1])

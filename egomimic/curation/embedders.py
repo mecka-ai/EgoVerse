@@ -1027,8 +1027,12 @@ class TCNActionEmbedder:
         wrapper = ModelWrapper.load_from_checkpoint(
             self.checkpoint_path, map_location=self.device, weights_only=False
         )
-        self._model = wrapper.model.to(self.device).eval()
-        for p in self._model.parameters():
+        # TemporalCNNAutoencoderTrainer is an Algo (not an nn.Module): its trainable
+        # submodules live in .nets (already on the trainer's device from __init__), and
+        # .encode() handles device placement + DataSchematic normalization internally.
+        self._model = wrapper.model
+        self._model.nets.eval()
+        for p in self._model.nets.parameters():
             p.requires_grad_(False)
         self.latent_dim = int(self._model.nets["autoencoder"].latent_dim)
         self._fitted = True
