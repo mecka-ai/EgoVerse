@@ -71,6 +71,16 @@ CAM3_COLS = slice(_CAM3_X0, _CAM3_X0 + AUX_CAM_W)           # [1184:1824]
 CAM3_ROWS = slice(0, 480)
 CAM3_W, CAM3_H = 640, 480
 
+# Main stream ("Altas Nexus2"): 4000x1200 side-by-side forward stereo.
+# cam0 (left) = cols [0:1920], cam1 (right) = cols [1920:3840], last 160px padding.
+ATLAS_MAIN_NAME = "Altas Nexus2"
+ATLAS_MAIN_W, ATLAS_MAIN_H = 4000, 1200
+STEREO_CAM0_COLS = slice(0, 1920)
+STEREO_CAM1_COLS = slice(1920, 3840)
+STEREO_CAM_ROWS = slice(0, 1200)
+STEREO_CAM_W, STEREO_CAM_H = 1920, 1200
+STEREO_CROP_FRACTION = 1.0   # no crop by default; pass crop_frac < 1 to trim black border
+
 
 # ---------------------------------------------------------------------------
 # Calibration lookup (sqlite, double-sphere)
@@ -101,7 +111,7 @@ def load_ds_intrinsics(serial=ATLAS_SERIAL, cam_index=FRONT_CAM_INDEX, db_path=_
     return dict(
         model="ds",
         fx=float(row[f"cam{i}_fx"]), fy=float(row[f"cam{i}_fy"]),
-        cx=float(row[f"cam{i}_cx"]), cy=float(row[f"cam{i}_cy"]),
+        cx=float(row[f"cam{i}_cx"]+150), cy=float(row[f"cam{i}_cy"]),
         xi=float(row[f"cam{i}_xi"]), alpha=float(row[f"cam{i}_alpha"]),
         width=int(row[f"cam{i}_w"]), height=int(row[f"cam{i}_h"]),
     )
@@ -180,10 +190,15 @@ def find_atlas_node(expected_name=ATLAS_AUX_NAME):
     return out
 
 
+def find_atlas_main_node():
+    """Return /dev/video* nodes for the Atlas main (stereo) stream, lowest first."""
+    return find_atlas_node(ATLAS_MAIN_NAME)
+
+
 class AtlasFrontCamera(threading.Thread):
-    """Streams the Atlas aux stream, crops cam3 (down-looking), rectifies +
-    center-crops to 75% -> front_img_1 (BGR). Recorder contract: get_image() / res
-    / wait_until_ready() / close(), shared with RealSenseRecorder."""
+    """Streams the Atlas aux stream and crops cam3 (down-looking) -> front_img_1
+    (BGR, raw fisheye, 640x480). No rectification. Recorder contract: get_image()
+    / res / wait_until_ready() / close(), shared with RealSenseRecorder."""
 
     NAME = "front_img_1"
 
@@ -198,12 +213,8 @@ class AtlasFrontCamera(threading.Thread):
                 f"cam{cam_index} is {self.cam['width']}x{self.cam['height']}, "
                 f"expected {CAM3_W}x{CAM3_H} (the aux SLAM cameras)"
             )
-        self.map1, self.map2 = build_ds_undistort_map(self.cam)
-        self.crop_frac = crop_frac
-        self._cx0, self._cy0, self.out_w, self.out_h = _crop_geometry(
-            CAM3_W, CAM3_H, crop_frac
-        )
-        self.intrinsics, _ = front_output_intrinsics(self.cam, crop_frac=crop_frac)
+        self.out_w, self.out_h = CAM3_W, CAM3_H
+        self.intrinsics = None  # raw fisheye — no pinhole intrinsics
 
         # Device node: explicit arg > ATLAS_VIDEO_NODE env > auto-discovery.
         self.device = device or os.getenv("ATLAS_VIDEO_NODE") or self._resolve_device()
@@ -266,10 +277,7 @@ class AtlasFrontCamera(threading.Thread):
                     time.sleep(0.005)
                     continue
                 cam3 = frame[CAM3_ROWS, CAM3_COLS]                       # 640x480 raw fisheye
-                rect = cv2.remap(cam3, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
-                cropped = rect[self._cy0:self._cy0 + self.out_h,
-                               self._cx0:self._cx0 + self.out_w]          # 75% center crop
-                self.latest_frame = np.ascontiguousarray(cropped)
+                self.latest_frame = np.ascontiguousarray(cam3)
                 self.frame_count += 1
             except Exception as e:  # noqa: BLE001 - thread must never die
                 self.error_count += 1
@@ -278,7 +286,7 @@ class AtlasFrontCamera(threading.Thread):
                 continue
 
     def get_frame(self):
-        """Latest rectified+cropped front frame (BGR uint8), or black until ready."""
+        """Latest raw front frame (BGR uint8, 640x480), or black until ready."""
         f = self.latest_frame
         if f is None:
             return np.zeros((self.out_h, self.out_w, 3), dtype=np.uint8)
@@ -303,6 +311,146 @@ class AtlasFrontCamera(threading.Thread):
                 return True
             time.sleep(0.05)
         print(f"[cameras] WARNING: Atlas front '{self.NAME}' no frame after {timeout}s "
+              f"(last_error={self.last_error}); continuing.")
+        return False
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.stop()
+        self.join(timeout=1.0)
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+
+class AtlasStereoCamera(threading.Thread):
+    """Streams the Atlas main stream (cam0 left + cam1 right, forward stereo).
+
+    Opens the "Altas Nexus2" V4L2 node at 4000x1200 MJPG, splits into cam0/cam1
+    (raw fisheye, no rectification), and concatenates them horizontally into one
+    BGR image (cam0 | cam1) at 3840x1200.
+
+    This replaces AtlasFrontCamera for demo collection: the forward-facing stereo
+    pair is the right view for manipulation tasks (cam3/SLAM is down-looking).
+
+    Recorder contract (shared with AtlasFrontCamera and RealSenseRecorder):
+        get_image() -> latest BGR uint8 frame (black until ready, never None)
+        res         -> (H, W)
+        frame_count / error_count / last_error  -> live stall monitoring
+        wait_until_ready(timeout) / close()
+    """
+
+    NAME = "front_img_1"
+
+    def __init__(self, serial=ATLAS_SERIAL, crop_frac=STEREO_CROP_FRACTION,
+                 fps=30, device=None):
+        super().__init__(daemon=True)
+        if cv2 is None:
+            raise ImportError("opencv (cv2) is required for the Atlas stereo camera")
+
+        # Validate calibration dimensions even though we don't rectify, so a
+        # mis-configured DB still raises early rather than silently mislabeling frames.
+        cam0 = load_ds_intrinsics(serial, 0)
+        cam1 = load_ds_intrinsics(serial, 1)
+        for i, c in ((0, cam0), (1, cam1)):
+            if (c["width"], c["height"]) != (STEREO_CAM_W, STEREO_CAM_H):
+                raise ValueError(
+                    f"cam{i} is {c['width']}x{c['height']}, "
+                    f"expected {STEREO_CAM_W}x{STEREO_CAM_H} (forward stereo)"
+                )
+
+        # Raw output: both cameras side-by-side, no crop.
+        self.out_w = STEREO_CAM_W * 2   # 3840
+        self.out_h = STEREO_CAM_H       # 1200
+
+        self.device = device or os.getenv("ATLAS_MAIN_NODE") or self._resolve_device()
+        self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            raise RuntimeError(
+                f"could not open Atlas main node {self.device} "
+                f"(is another app/PipeWire holding it?)"
+            )
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, ATLAS_MAIN_W)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ATLAS_MAIN_H)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+
+        ok, probe = False, None
+        for _ in range(15):
+            ok, probe = self.cap.read()
+            if ok and probe is not None:
+                break
+        if not ok or probe is None:
+            self.cap.release()
+            raise RuntimeError(f"Atlas main node {self.device} returned no frame at startup")
+        if probe.shape[1] < 3840 or probe.shape[0] < STEREO_CAM_H:
+            self.cap.release()
+            raise RuntimeError(
+                f"Atlas main node {self.device} delivered {probe.shape[1]}x{probe.shape[0]}, "
+                f"need >= 3840x{STEREO_CAM_H}. "
+                f"Check MJPG / USB3 link / another app holding the camera."
+            )
+
+        self.name = self.NAME
+        self.latest_frame = None
+        self.frame_count = 0
+        self.error_count = 0
+        self.last_error = None
+        self.running = True
+
+    def _resolve_device(self):
+        nodes = find_atlas_main_node()
+        if not nodes:
+            raise RuntimeError(
+                f"Atlas main node ('{ATLAS_MAIN_NAME}') not found in /dev/video*"
+            )
+        return nodes[0]
+
+    def run(self):
+        while self.running:
+            try:
+                ok, frame = self.cap.read()
+                if not ok or frame is None:
+                    time.sleep(0.005)
+                    continue
+                if frame.shape[1] < 3840 or frame.shape[0] < STEREO_CAM_H:
+                    self.error_count += 1
+                    self.last_error = f"unexpected main frame size {frame.shape}"
+                    time.sleep(0.005)
+                    continue
+                left = frame[STEREO_CAM_ROWS, STEREO_CAM0_COLS]
+                right = frame[STEREO_CAM_ROWS, STEREO_CAM1_COLS]
+                self.latest_frame = np.ascontiguousarray(np.hstack([left, right]))
+                self.frame_count += 1
+            except Exception as e:  # noqa: BLE001 - thread must never die
+                self.error_count += 1
+                self.last_error = repr(e)
+                time.sleep(0.005)
+                continue
+
+    def get_image(self):
+        f = self.latest_frame
+        if f is None:
+            return np.zeros((self.out_h, self.out_w, 3), dtype=np.uint8)
+        return f
+
+    # Alias so both the old (get_frame) and new (get_image) recorder APIs work.
+    get_frame = get_image
+
+    @property
+    def res(self):
+        return (self.out_h, self.out_w)
+
+    def wait_until_ready(self, timeout=10.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.latest_frame is not None:
+                return True
+            time.sleep(0.05)
+        print(f"[cameras] WARNING: Atlas stereo '{self.NAME}' no frame after {timeout}s "
               f"(last_error={self.last_error}); continuing.")
         return False
 
@@ -508,7 +656,12 @@ def create_camera_recorders(cameras_cfg=None, wrist_serial_to_name=None,
                         str(cc["serial_number"]), name,
                         cc.get("width", 640), cc.get("height", 480), cc.get("fps", 30),
                     )
-                elif cam_type == "atlas":
+                elif cam_type in ("atlas", "atlas_stereo"):
+                    rec = AtlasStereoCamera(serial=cc.get("serial", ATLAS_SERIAL),
+                                            crop_frac=cc.get("crop_frac", STEREO_CROP_FRACTION))
+                    rec.start()
+                    recorders[name] = rec
+                elif cam_type == "atlas_slam":
                     rec = AtlasFrontCamera(serial=cc.get("serial", ATLAS_SERIAL))
                     rec.start()
                     recorders[name] = rec
@@ -521,11 +674,11 @@ def create_camera_recorders(cameras_cfg=None, wrist_serial_to_name=None,
     # Auto-discovery path.
     if use_front:
         try:
-            front = AtlasFrontCamera(serial=front_serial or ATLAS_SERIAL)
+            front = AtlasStereoCamera(serial=front_serial or ATLAS_SERIAL)
             front.start()
             recorders[front.NAME] = front
         except Exception as e:  # noqa: BLE001
-            print(f"[cameras] WARNING: Atlas front camera unavailable ({e}); "
+            print(f"[cameras] WARNING: Atlas stereo camera unavailable ({e}); "
                   f"continuing without front_img_1.")
     recorders.update(
         discover_realsense_recorders(wrist_serial_to_name or DEFAULT_CAMERA_NAMES)

@@ -14,8 +14,8 @@ This tool:
   * optionally center-crops each to drop the black fisheye-rectification border,
   * concatenates them into ONE image (cam0 | cam1) and shows it live.
 
-Layout from Downloads/split.py; rectify math from Downloads/rectify_6cam_videos.py
-(same DS->pinhole map as yam_cameras.build_ds_undistort_map).
+Layout from Downloads/split.py; rectify math from cam_stream_test_rectified.py
+(DS->pinhole map with FoV validity masking and zoom_out_factor hook).
 
 Examples:
     # live window, both cameras rectified, full size:
@@ -36,13 +36,52 @@ import time
 import numpy as np
 import cv2
 
-# Reuse the verified DS calibration loader + undistort map from yam_cameras.
+# Reuse the verified DS calibration loader from yam_cameras.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from yam_cameras import (  # noqa: E402
     ATLAS_SERIAL,
     load_ds_intrinsics,
-    build_ds_undistort_map,
 )
+
+
+def build_undistort_map(cam, zoom_out_factor=1.0):
+    """Return (map1, map2) for cv2.remap that turns a raw fisheye frame into pinhole.
+
+    Supports 'kb4' (OpenCV fisheye) and 'ds' (Double Sphere) models.
+    Pixels outside the lens FoV are set to -1 so cv2.remap renders them black.
+    zoom_out_factor < 1.0 zooms out the output (show more of the scene, smaller).
+    """
+    w, h = cam["width"], cam["height"]
+    K = np.array([[cam["fx"], 0, cam["cx"]], [0, cam["fy"], cam["cy"]], [0, 0, 1]], np.float64)
+
+    if cam["model"] == "kb4":
+        D = np.array([cam["k1"], cam["k2"], cam["k3"], cam["k4"]], np.float64)
+        return cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K, (w, h), cv2.CV_32FC1)
+
+    # Double Sphere -> pinhole
+    cx_out, cy_out = w / 2.0, h / 2.0
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+
+    fx_virtual = cam["fx"] * zoom_out_factor
+    fy_virtual = cam["fy"] * zoom_out_factor
+
+    mx = (u - cx_out) / fx_virtual
+    my = (v - cy_out) / fy_virtual
+    x, y, z = mx, my, np.ones_like(mx)
+    xi, alpha = cam["xi"], cam["alpha"]
+    d1 = np.sqrt(x * x + y * y + z * z)
+    zxi = xi * d1 + z
+    d2 = np.sqrt(x * x + y * y + zxi * zxi)
+    div = alpha * d2 + (1 - alpha) * zxi
+    map1 = (cam["fx"] * x / div + cam["cx"]).astype(np.float32)
+    map2 = (cam["fy"] * y / div + cam["cy"]).astype(np.float32)
+    # Mark pixels outside the lens FoV as invalid (-> black after remap).
+    w1 = alpha / (1 - alpha) if alpha <= 0.5 else (1 - alpha) / alpha
+    w2 = w1 + xi / np.sqrt(2 * w1 * xi + xi * xi + 1)
+    invalid = z <= -w2 * d1
+    map1[invalid] = -1.0
+    map2[invalid] = -1.0
+    return map1, map2
 
 MAIN_CAM_NAME = "Altas Nexus2"   # firmware spells it "Altas" (sic); matched case-insensitively
 MAIN_W, MAIN_H = 4000, 1200
@@ -130,12 +169,14 @@ def main():
     # Per-camera DS intrinsics + undistort maps (cam0 left, cam1 right).
     cam0 = load_ds_intrinsics(args.serial, 0)
     cam1 = load_ds_intrinsics(args.serial, 1)
+    cam0["cx"] += 150
+    cam1["cx"] += 150
     for i, c in ((0, cam0), (1, cam1)):
         if (c["width"], c["height"]) != (1920, 1200):
             raise ValueError(f"cam{i} is {c['width']}x{c['height']}, expected 1920x1200 "
                              f"(forward stereo)")
-    map0 = build_ds_undistort_map(cam0)
-    map1 = build_ds_undistort_map(cam1)
+    map0 = build_undistort_map(cam0)
+    map1 = build_undistort_map(cam1)
     print(f"[stereo] cam0 fx={cam0['fx']:.1f} cx={cam0['cx']:.1f} | "
           f"cam1 fx={cam1['fx']:.1f} cx={cam1['cx']:.1f}")
 
