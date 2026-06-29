@@ -1,0 +1,9 @@
+# Validation evaluator for the span action autoencoder (temporal_cnn_autoencoder).
+# Required for any Valid/ logging: ModelWrapper.validation_step only logs the
+# held-out reconstruction loss when an evaluator is present. Also renders
+# GT-vs-reconstruction per-channel span plots to W&B each validation pass.
+#
+# Pair with: model=temporal_cnn_autoencoder data=span_action_zarr
+# (no train_viz_evaluator — the span data config has no train_viz datasets).
+_target_: egomimic.eval.eval_span_reconstruction.SpanReconstructionEval
+num_spans: 4
