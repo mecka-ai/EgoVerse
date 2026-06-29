@@ -72,6 +72,9 @@ class ActionEmbedderSettings:
     oat_encoder_cfg: dict | None = None
     oat_decoder_cfg: dict | None = None
     oat_quantizer_cfg: dict | None = None
+    # Optional ActionNorms layer (model.action_embedder.norms) applied to actions
+    # before embedding. None / {} / {enabled:false} → no-op. See egomimic.algo.action_norms.
+    norms: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +268,7 @@ def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
         oat_encoder_cfg=_to_dict(oat_enc),
         oat_decoder_cfg=_to_dict(oat_dec),
         oat_quantizer_cfg=_to_dict(oat_qtz),
+        norms=_to_dict(block.get("norms", None)),
     )
 
 
