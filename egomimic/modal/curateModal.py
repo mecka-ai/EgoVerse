@@ -380,13 +380,27 @@ def _score_task_clustered(
     # per-frame action latents from the store. State stays per-frame (pooled downstream).
     ae = select_action_embedder_settings(cfg)
     if ae.type == "tcn":
-        if not ae.checkpoint_path:
-            raise ValueError("action_embedder.type=tcn requires action_embedder.checkpoint_path")
-        print(f"{tag} TCN span action embedder: {ae.checkpoint_path} (norms={ae.norms})")
-        trajectories = _read_span_action_trajectories(cfg, span_meta, tag)
-        tcn = TCNActionEmbedder(ae.checkpoint_path, norms=ae.norms, device=device)
-        tcn.fit()
-        span_vecs = tcn.embed_spans(trajectories)  # (n_spans, tcn_latent_dim)
+        span_vecs = None
+        # Reuse precomputed TCN span latents from a prior run when provided — the action
+        # shapes don't change between re-cluster runs, so this skips the episode resolve +
+        # zarr read + encode entirely.
+        if ae.reuse_latents_npz and Path(ae.reuse_latents_npz).exists():
+            z = _np.load(ae.reuse_latents_npz, allow_pickle=True)
+            if "span_ids" in z and "action_emb" in z:
+                id2vec = {str(sid): z["action_emb"][i] for i, sid in enumerate(z["span_ids"])}
+                if all(sid in id2vec for sid in span_ids):
+                    span_vecs = _np.stack([id2vec[sid] for sid in span_ids]).astype(_np.float32)
+                    print(f"{tag} reusing TCN action latents from {ae.reuse_latents_npz} → {span_vecs.shape}")
+                else:
+                    print(f"{tag} reuse npz action span_ids mismatch — re-encoding from zarr")
+        if span_vecs is None:
+            if not ae.checkpoint_path:
+                raise ValueError("action_embedder.type=tcn requires action_embedder.checkpoint_path")
+            print(f"{tag} TCN span action embedder: {ae.checkpoint_path} (norms={ae.norms})")
+            trajectories = _read_span_action_trajectories(cfg, span_meta, tag)
+            tcn = TCNActionEmbedder(ae.checkpoint_path, norms=ae.norms, device=device)
+            tcn.fit()
+            span_vecs = tcn.embed_spans(trajectories)  # (n_spans, tcn_latent_dim)
         span_action = [span_vecs[i][None, :] for i in range(len(span_vecs))]
         print(f"{tag} TCN span action latents: {span_vecs.shape}")
 
@@ -394,7 +408,7 @@ def _score_task_clustered(
     # present (k-means re-runs deterministically → identical clusters), else embed now.
     text_embeddings = None
     reuse_npz = src_dir / "scores" / f"{task_name}_clustered_spans.npz"
-    if reuse_npz.exists():
+    if lang.reuse_clusters and reuse_npz.exists():
         z = _np.load(str(reuse_npz), allow_pickle=True)
         if "span_ids" in z and "lang_emb" in z:
             id2emb = {str(sid): z["lang_emb"][i] for i, sid in enumerate(z["span_ids"])}

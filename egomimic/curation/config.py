@@ -75,6 +75,10 @@ class ActionEmbedderSettings:
     # Optional ActionNorms layer (model.action_embedder.norms) applied to actions
     # before embedding. None / {} / {enabled:false} → no-op. See egomimic.algo.action_norms.
     norms: dict | None = None
+    # Reuse precomputed span action latents from a prior run's <task>_clustered_spans.npz
+    # (its ``action_emb`` array, aligned by span id) instead of re-encoding from zarr.
+    # Lets a re-cluster relaunch skip the episode resolve + TCN encode. None → encode.
+    reuse_latents_npz: str | None = None
 
 
 @dataclass(frozen=True)
@@ -118,18 +122,25 @@ class LanguageConditioningSettings:
     n_clusters: int | str = "auto"
     n_clusters_max: int = 20
     clustered_min_spans: int = 8
+    # Reuse a prior run's Qwen3 span embeddings (from <task>_clustered_spans.npz under
+    # the latents source) instead of re-embedding. Set false to force a fresh embed
+    # (e.g. after changing cluster_instruction or n_clusters).
+    reuse_clusters: bool = True
     # Qwen3 instruction steering clustering toward per-hand verb structure over objects.
     cluster_instruction: str = (
-        "Encode this bimanual manipulation instruction by ONLY its action verbs and "
-        "which hand performs each verb — left hand, right hand, or both hands. The "
-        "representation must depend solely on the (verb, hand) structure: map two "
-        "instructions to nearby vectors when they use the same verbs with the same hand "
-        "assignment, and to distant vectors when the verbs or the hand assignment differ. "
-        "For example, 'spray motorcycle with nozzle in right hand, hold hose with left "
-        "hand' and 'spray foam onto the wall with the right hand while the left hand holds "
-        "the rail' must be near-identical because both are right-hand=spray, "
-        "left-hand=hold. Completely ignore every object, tool, material, color, quantity, "
-        "location, and scene detail — represent only what each hand is doing."
+        "You are embedding a bimanual manipulation instruction so clips can be clustered "
+        "PURELY by motion type. The ONLY thing that may influence the vector is the pair "
+        "(left-hand verb, right-hand verb): the action each hand performs and which hand "
+        "performs it. Map two instructions to almost identical vectors when both hands "
+        "perform the same kind of action — treat synonyms as the SAME verb (cut/slice/chop, "
+        "hold/grip/steady/support, wipe/scrub/rub, pick up/grab/lift, place/put/set down, "
+        "screw/tighten, twist/turn). Map them to clearly separated vectors whenever either "
+        "hand's verb differs OR the left/right assignment is swapped. Example: 'hold garlic "
+        "with left hand, cut garlic with knife in right hand' and 'steady the box with the "
+        "left hand while slicing tape with a blade in the right hand' must be NEAR-IDENTICAL "
+        "(left=hold, right=cut). Aggressively erase everything else: objects, tools, "
+        "materials, colors, counts, locations, surfaces, and all scene detail must have ZERO "
+        "influence on the vector. Encode only what each hand is doing."
     )
 
 
@@ -269,6 +280,9 @@ def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
         oat_decoder_cfg=_to_dict(oat_dec),
         oat_quantizer_cfg=_to_dict(oat_qtz),
         norms=_to_dict(block.get("norms", None)),
+        reuse_latents_npz=(
+            str(block.get("reuse_latents_npz")) if block.get("reuse_latents_npz") else None
+        ),
     )
 
 
@@ -333,6 +347,7 @@ def select_language_conditioning_settings(cfg: Any) -> LanguageConditioningSetti
         clustered_min_spans=int(
             block.get("clustered_min_spans", defaults.clustered_min_spans)
         ),
+        reuse_clusters=bool(block.get("reuse_clusters", defaults.reuse_clusters)),
         cluster_instruction=str(
             block.get("cluster_instruction", defaults.cluster_instruction)
         ),
