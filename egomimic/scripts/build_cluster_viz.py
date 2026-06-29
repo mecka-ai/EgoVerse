@@ -296,7 +296,7 @@ function applyStyle(){
     const passSel = sel.size===0 || sel.has(selEp ? TSNE.ep[k] : ci);
     const passHl = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
     if(passSel && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
-    else if(!passSel){ colors[k]=DIM; sizes[k]=u.size*0.4; }
+    else if(!passSel){ colors[k]='rgba(0,0,0,0)'; sizes[k]=0; }   // selection active → hide non-selected entirely
     else { colors[k]=DIM; sizes[k]=u.size; }
   }
   activeMods.forEach(mod=>{
