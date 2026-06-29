@@ -140,11 +140,16 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div id="tsnepage">
   <div id="tools">
     <span class="tool"><label>Color</label>
-      <select id="colorMode" onchange="applyStyle();buildLegend()">
+      <select id="colorMode" onchange="applyStyle()">
         <option value="cluster">cluster</option>
         <option value="episode">episode</option>
         <option value="score">MI score</option>
         <option value="time">time (light&rarr;dark)</option>
+      </select></span>
+    <span class="tool"><label>Select</label>
+      <select id="selMode" onchange="onSelMode()">
+        <option value="cluster">cluster</option>
+        <option value="episode">episode</option>
       </select></span>
     <span class="tool"><label>Clusters</label>
       <span id="cCount" style="background:#26272f;padding:3px 8px;border-radius:5px;font-size:12px;color:#cdd">all</span>
@@ -284,11 +289,11 @@ function applyStyle(){
   const N=TSNE.cid.length;
   const base=COLOR_TABLES[u.mode]||COLOR_TABLES.cluster;
   const colors=new Array(N), sizes=new Array(N);
-  const epMode = u.mode==='episode';
-  const sel = epMode ? selectedEpisodes : selectedClusters;   // highlight by the active dimension
+  const selEp = document.getElementById('selMode').value==='episode';  // selection dim (decoupled from color)
+  const sel = selEp ? selectedEpisodes : selectedClusters;
   for(let k=0;k<N;k++){
     const ci=TSNE.cid[k];
-    const passSel = sel.size===0 || sel.has(epMode ? TSNE.ep[k] : ci);
+    const passSel = sel.size===0 || sel.has(selEp ? TSNE.ep[k] : ci);
     const passHl = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
     if(passSel && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
     else if(!passSel){ colors[k]=DIM; sizes[k]=u.size*0.4; }
@@ -415,7 +420,7 @@ function crossHighlight(k){
 /* ── legend (clusters, multi-select) ── */
 function buildLegend(){
   const el=document.getElementById('legend');
-  const epMode=document.getElementById('colorMode').value==='episode';
+  const epMode=document.getElementById('selMode').value==='episode';
   if(epMode){
     el.innerHTML=
       `<div class="lg-head">episodes <span style="color:#666;font-weight:400">(click to select)</span></div>`+
@@ -469,7 +474,7 @@ function legendClick(ci){
 
 function markLegend(){
   document.querySelectorAll('#legend .lg-row').forEach(r=>r.classList.remove('active'));
-  const epMode=document.getElementById('colorMode').value==='episode';
+  const epMode=document.getElementById('selMode').value==='episode';
   const sz = epMode ? selectedEpisodes.size : selectedClusters.size;
   if(sz===0){ const el=document.getElementById('lg_all'); if(el) el.classList.add('active'); return; }
   if(epMode) selectedEpisodes.forEach(ep=>{const el=document.getElementById('lg_ep_'+EP_IDX[ep]); if(el) el.classList.add('active');});
@@ -484,9 +489,17 @@ function epLegendClick(ep){
   if(page==='grid') renderGrid();
 }
 
+function onSelMode(){
+  buildLegend();          // switch sidebar between clusters and episodes
+  updateClusterDisplay();
+  applyStyle();           // re-highlight by the new selection dimension
+  if(page==='grid') renderGrid();
+}
+
 function updateClusterDisplay(){
   const el=document.getElementById('cCount');
-  if(el) el.textContent=selectedClusters.size===0?'all':selectedClusters.size+' selected';
+  const sz=document.getElementById('selMode').value==='episode'?selectedEpisodes.size:selectedClusters.size;
+  if(el) el.textContent=sz===0?'all':sz+' selected';
 }
 
 function clearClusterSel(){
@@ -521,6 +534,7 @@ function hlChanged(){document.getElementById('hlOn').checked=true; applyStyle();
 
 function resetTools(){
   document.getElementById('colorMode').value='cluster';
+  document.getElementById('selMode').value='cluster';
   selectedClusters.clear(); curCluster=null;
   document.getElementById('csel').value='';
   selectedEpisodes.clear();
@@ -569,8 +583,9 @@ function histoSVG(scores){
 }
 
 function renderGrid(){
+  const selEp=document.getElementById('selMode').value==='episode';
   let spans=[];
-  if(curCluster && CLUSTERS[curCluster]){
+  if(!selEp && curCluster && CLUSTERS[curCluster]){   // cluster-mode: one cluster's spans
     spans=CLUSTERS[curCluster].spans.map(s=>({...s,_cid:curCluster}));
   } else {
     ALL_CID.forEach(cid=>spans.push(...CLUSTERS[cid].spans.map(s=>({...s,_cid:cid}))));
@@ -596,7 +611,7 @@ function renderGrid(){
   const q=document.getElementById('gsearch').value.trim().toLowerCase();
 
   const filtered=spans.filter(s=>{
-    if(selectedEpisodes.size && !selectedEpisodes.has(s.ep)) return false;
+    if(selEp && selectedEpisodes.size && !selectedEpisodes.has(s.ep)) return false;
     const isTop=(rank[s.id]??0)<nTop;
     if(isTop&&!fTop) return false;
     if(!isTop&&!fBot) return false;
