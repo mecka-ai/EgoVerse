@@ -34,17 +34,32 @@ class Yam(Eva):
     def get_transform_list(
         cls,
         mode: Literal[
-            "cartesian", "cartesian_wristframe_ypr", "cartesian_wristframe_quat"
+            "cartesian",
+            "cartesian_6d",
+            "cartesian_wristframe_ypr",
+            "cartesian_wristframe_6d",
+            "cartesian_wristframe_quat",
         ],
     ) -> list[Transform]:
-        # Same pipeline as Eva, but with the YAM extrinsics.
+        # Same pipeline as Eva, but with the YAM extrinsics. The ``_6d`` modes
+        # emit the continuous 6D rotation representation (so per-dimension
+        # normalization runs on the 6D columns, not wrapped Euler angles); see
+        # the rot_repr="6d" branches in the Eva builders.
         if mode == "cartesian":
             return _build_eva_bimanual_transform_list(
                 is_quat=True, extrinsics_key=cls.EXTRINSICS_KEY
             )
+        elif mode == "cartesian_6d":
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, rot_repr="6d", extrinsics_key=cls.EXTRINSICS_KEY
+            )
         elif mode == "cartesian_wristframe_ypr":
             return _build_eva_bimanual_eef_frame_transform_list(
                 is_quat=False, extrinsics_key=cls.EXTRINSICS_KEY
+            )
+        elif mode == "cartesian_wristframe_6d":
+            return _build_eva_bimanual_eef_frame_transform_list(
+                rot_repr="6d", extrinsics_key=cls.EXTRINSICS_KEY
             )
         elif mode == "cartesian_wristframe_quat":
             return _build_eva_bimanual_eef_frame_transform_list(

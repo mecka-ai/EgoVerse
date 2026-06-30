@@ -1,0 +1,59 @@
+# 6D-rotation YAM training data config (the 6D analogue of mecka_all_zarr_6d).
+# The transform_list emits the continuous 6D rotation representation in the
+# WRIST frame (20-dim bimanual cartesian: [L: xyz c1 c2 g | R: xyz c1 c2 g]).
+# Pair with model=pi0.5_bc_yam (action_converters → RobotBimanualCartesian6D).
+#
+# Why this fixes the normalize-before-6D bug: the 6D columns are produced HERE,
+# in the data pipeline, so the model's normalize step (PI.process_batch) acts on
+# the bounded 6D columns rather than on wrapped Euler ypr angles. The converter's
+# to32/from32 then just repack/pad — no trig — so nothing rotation-related is
+# normalized in the wrong representation.
+#
+# key_map uses keymap_mode="cartesian" (Yam inherits Embodiment.get_keymap; the
+# Eva/Yam keymap ignores the mode and always exposes the raw cmd/obs ee_pose +
+# gripper keys). Only the transform_list rotation encoding differs from the ypr
+# variant.
+#
+# TODO: point folder_path at your actual YAM zarr volume. This mirrors the Modal
+# resolver used by mecka_all_zarr_6d; if your YAM episodes live on local disk,
+# swap ModalEpisodeResolver → LocalEpisodeResolver and set folder_path to the
+# local dataset root.
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  yam_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_transform_list
+        mode: cartesian_wristframe_6d
+    mode: train
+
+valid_datasets:
+  yam_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_transform_list
+        mode: cartesian_wristframe_6d
+    mode: valid
+
+train_dataloader_params:
+  yam_bimanual:
+    batch_size: 32
+    num_workers: 30
+
+valid_dataloader_params:
+  yam_bimanual:
+    batch_size: 32
+    num_workers: 30
