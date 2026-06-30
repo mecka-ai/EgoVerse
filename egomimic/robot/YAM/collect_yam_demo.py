@@ -327,6 +327,7 @@ def collect_yam_demo(
     gripper=GripperType.LINEAR_4310,
     strict_cameras=False,
     debug_buttons=False,
+    front_raw=False,
 ):
     demo_dir = Path(demo_dir)
     demo_dir.mkdir(parents=True, exist_ok=True)
@@ -344,6 +345,7 @@ def collect_yam_demo(
         gripper_type=gripper,
         zero_gravity_mode=False,  # hold commanded poses during teleop
         camera_names=serial_to_name,  # interface opens & owns the cameras
+        front_raw=front_raw,  # raw un-rectified front fisheye (for calibration)
     )
 
     # --- Leaders (teaching handles) -----------------------------------------
@@ -584,6 +586,12 @@ def main():
         "--debug-buttons", action="store_true",
         help="Print each leader's raw io_inputs once, to identify the sync-button index.",
     )
+    parser.add_argument(
+        "--raw-front", action="store_true",
+        help="Record the Atlas front camera RAW (un-rectified side-by-side fisheye "
+             "pair, no rectify/re-aim/fuse/crop). For camera calibration; default is "
+             "the rectified front_img_1 used for training.",
+    )
     parser.add_argument("--frequency", type=float, default=DEFAULT_FREQUENCY)
     parser.add_argument("--demo-dir", default=DEFAULT_DEMO_DIR)
     parser.add_argument("--episode-id-start", type=int, default=0)
@@ -621,6 +629,7 @@ def main():
         bilateral_kp=args.bilateral_kp,
         strict_cameras=args.strict_cameras,
         debug_buttons=args.debug_buttons,
+        front_raw=args.raw_front,
     )
 
 

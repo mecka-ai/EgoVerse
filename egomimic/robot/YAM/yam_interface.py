@@ -70,6 +70,7 @@ class YAMInterface(Robot_Interface):
         gripper_limits_override=None,
         camera_names=None,
         cameras_cfg=None,
+        front_raw=False,
     ):
         """
         Args:
@@ -87,6 +88,10 @@ class YAMInterface(Robot_Interface):
             cameras_cfg (dict | None): optional ARX-style explicit camera config
                 ``{name: {type, enabled, ...}}``. None -> auto-discovery (Atlas front
                 + connected D405 wrists).
+            front_raw (bool): if True (auto-discovery only), capture the Atlas front
+                camera RAW — the un-rectified side-by-side fisheye pair, no
+                rectify/re-aim/fuse/crop. For (intrinsic) camera calibration; leave
+                False for normal rollout/data collection.
 
         The interface ALWAYS opens its own cameras and raises if none are
         available (a rollout — or black-frame demos — must not run blind).
@@ -102,10 +107,14 @@ class YAMInterface(Robot_Interface):
         # Controllers: one YAM robot + kinematics solver per arm.
         self.controller = {}
         self.kinematics = {}
+        # Per-arm convergence flag from the last solve_ik; set_pose refuses to
+        # command an arm whose IK did not converge (see set_pose / solve_ik).
+        self._last_ik_success = {}
         self._create_controllers(cfg={})
         self._create_cam_recorders(
             cameras_cfg=cameras_cfg,
             wrist_serial_to_name=camera_names,
+            front_raw=front_raw,
         )
 
     # ------------------------------------------------------------------
@@ -131,11 +140,34 @@ class YAMInterface(Robot_Interface):
                 zero_gravity_mode=self._zero_gravity_mode,
                 gripper_limits_override=self._gripper_limits_override,
             )
+
+            # === TEMP: soften the follower PD for safe rollout bring-up ========
+            # Lower the ARM-joint kp/kd (NOT the gripper, kept full so grasps
+            # still hold) so an off prediction nudges instead of slamming. This
+            # is a temporary bring-up aid — set YAM_PD_SCALE=1.0 to restore the
+            # SDK defaults, or delete this block. Applied live via update_kp_kd
+            # (control loop reads self._kp/_kd each tick).
+            _pd_scale = float(os.environ.get("YAM_PD_SCALE", "0.5"))
+            if _pd_scale != 1.0:
+                ctrl = self.controller[arm]
+                new_kp = np.asarray(ctrl._kp, dtype=float).copy()
+                new_kd = np.asarray(ctrl._kd, dtype=float).copy()
+                new_kp[:6] *= _pd_scale  # arm joints only; leave gripper [6] as-is
+                new_kd[:6] *= _pd_scale
+                ctrl.update_kp_kd(new_kp, new_kd)
+                print(
+                    f"[YAM][TEMP] {arm}: scaled arm PD by {_pd_scale} -> "
+                    f"kp[:6]={np.round(new_kp[:6], 2)} kd[:6]={np.round(new_kd[:6], 2)} "
+                    f"(YAM_PD_SCALE=1.0 to disable)"
+                )
+            # === END TEMP =====================================================
+
             # Each arm gets its own solver: mink.Configuration holds internal
             # state, so sharing one across arms would race.
             self.kinematics[arm] = Kinematics(kin_model_path, _GRASP_SITE)
 
-    def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None):
+    def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None,
+                              front_raw=False):
         """Build per-camera recorders into ``self.recorders`` / ``self.camera_res``.
 
         Mirrors ``ARXInterface.__create_cam_recorders``: ALL camera setup lives
@@ -155,7 +187,8 @@ class YAMInterface(Robot_Interface):
         from yam_cameras import create_camera_recorders
 
         self.recorders = create_camera_recorders(
-            cameras_cfg=cameras_cfg, wrist_serial_to_name=wrist_serial_to_name
+            cameras_cfg=cameras_cfg, wrist_serial_to_name=wrist_serial_to_name,
+            front_raw=front_raw,
         )
         if not self.recorders:
             raise RuntimeError(
@@ -192,19 +225,30 @@ class YAMInterface(Robot_Interface):
         # motor space internally.
         self.controller[arm].command_joint_pos(desired_position)
 
-    def set_pose(self, pose, arm):
+    def set_pose(self, pose, arm, skip_on_ik_failure=True):
         """Command an end-effector pose for one arm via IK.
 
         Args:
             pose (np.ndarray): shape (7,) = xyz + ZYX euler (rad) + gripper [0, 1].
             arm (str): "left" or "right".
+            skip_on_ik_failure (bool): SAFETY DEFAULT. If True and IK does not
+                converge, DO NOT command the arm (return None) — the SDK's
+                "best-effort" joints for an unreachable target can fling the arm.
+                Set False only if you explicitly want the best-effort command.
         Returns:
-            np.ndarray: the (7,) joint command that was sent.
+            np.ndarray | None: the (7,) joint command that was sent, or None if
+                IK failed and skip_on_ik_failure is True (no command sent).
         """
         pose = np.asarray(pose, dtype=np.float64)
         if pose.shape != (7,):
             raise ValueError(f"YAM expected pose of shape (7,), got {pose.shape}")
         arm_joints = self.solve_ik(pose[:6], arm)
+        if skip_on_ik_failure and not self._last_ik_success.get(arm, True):
+            print(
+                f"[YAMInterface] IK did not converge for arm '{arm}'; "
+                f"NOT commanding (target likely unreachable). Holding."
+            )
+            return None
         joints = np.concatenate([arm_joints, [pose[6]]])
         self.set_joints(joints, arm)
         return joints
@@ -313,10 +357,78 @@ class YAMInterface(Robot_Interface):
         target[:3, 3] = ee_pose[:3]
 
         init_q = self.get_joints(arm)[: self.N_ARM_JOINTS]
-        success, q = self.kinematics[arm].ik(target, _GRASP_SITE, init_q=init_q)
+        # IK robustness near wrist singularities (gripper ~vertical, pitch~88).
+        # The i2rt defaults (pos 1e-4 m, ori 1e-4 rad ~= 0.006 deg, damping 1e-4)
+        # are far tighter than execution needs: at a singularity differential IK
+        # cannot null the orientation error to 0.006 deg in the uncontrollable
+        # direction, so it burns all max_iters and returns success=False even
+        # though it is sitting well under 1 mm / 1 deg. The tiny damping also lets
+        # joint velocities blow up in the singular direction -> the wrist flip.
+        # Loosen to execution tolerances (mm / deg) and add real DLS damping so the
+        # solver stops early near the seed and stays in-branch. Env-tunable.
+        pos_tol = float(os.environ.get("YAM_IK_POS_TOL_MM", "2.0")) / 1000.0
+        ori_tol = np.deg2rad(float(os.environ.get("YAM_IK_ORI_TOL_DEG", "2.0")))
+        ik_damping = float(os.environ.get("YAM_IK_DAMPING", "1e-1"))
+        success, q = self.kinematics[arm].ik(
+            target,
+            _GRASP_SITE,
+            init_q=init_q,
+            pos_threshold=pos_tol,
+            ori_threshold=ori_tol,
+            damping=ik_damping,
+        )
+        self._last_ik_success[arm] = bool(success)
         if not success:
-            print(f"[YAMInterface] IK did not converge for arm '{arm}'; using best effort.")
-        return np.asarray(q, dtype=np.float64)[: self.N_ARM_JOINTS]
+            # Detail per failure: rejected target vs current (reachable) pose.
+            # Large dpos => target positionally out of reach (frame/extrinsic/
+            # cross-embodiment workspace); small dpos => orientation/singularity.
+            T_cur = self.kinematics[arm].fk(init_q)
+            cur_xyz = T_cur[:3, 3]
+            cur_ypr = R.from_matrix(T_cur[:3, :3]).as_euler("ZYX", degrees=True)
+            dpos = float(np.linalg.norm(np.asarray(ee_pose[:3]) - cur_xyz) * 1000)
+            # |target| / |current| are distances from the ARM BASE (FK origin).
+            # YAM reach ~= 400-500 mm. If |target| >> reach => commanded pose is
+            # OUT OF WORKSPACE (model/data reaches where the arm can't). If
+            # |target| ~ |current| (both ~reach) and dpos small => the position is
+            # fine and IK is choking on the near-vertical (pitch~88) orientation.
+            tgt_reach = float(np.linalg.norm(np.asarray(ee_pose[:3])) * 1000)
+            cur_reach = float(np.linalg.norm(cur_xyz) * 1000)
+            print(
+                f"[YAMInterface][ik-fail] {arm}: |target|={tgt_reach:.0f}mm "
+                f"|current|={cur_reach:.0f}mm dpos={dpos:.0f}mm  "
+                f"(reach~400-500mm; |target|>>reach=>OUT OF WORKSPACE; "
+                f"|target|~|current| & small dpos=>orientation/singularity) | "
+                f"TARGET xyz={np.round(ee_pose[:3], 3)} "
+                f"ypr={np.round(np.rad2deg(ee_pose[3:6]), 1)} | "
+                f"CURRENT xyz={np.round(cur_xyz, 3)} ypr={np.round(cur_ypr, 1)}"
+            )
+        q = np.asarray(q, dtype=np.float64)[: self.N_ARM_JOINTS]
+        # Flag IK branch flips: a large joint jump from the warm-start seed for a
+        # (gradual) EE target means the solver landed in a different/flipped branch
+        # — the usual cause of the wrist physically flipping even when the commanded
+        # EE pose is sane (common near wrist singularities, e.g. gripper vertical).
+        dq = np.abs(((q - init_q + np.pi) % (2 * np.pi)) - np.pi)
+        reject_jump = np.deg2rad(float(os.environ.get("YAM_IK_MAX_JUMP_DEG", "90")))
+        if dq.max() > np.deg2rad(45):
+            j = int(np.argmax(dq))
+            print(
+                f"[YAMInterface][ik-jump] {arm}: joint {j} "
+                f"{np.rad2deg(init_q[j]):+.0f}->{np.rad2deg(q[j]):+.0f} deg "
+                f"(|dq|={np.rad2deg(dq).round(0)}) for a target that should be near "
+                f"the seed — IK picked a flipped branch."
+            )
+            # A jump this large for a target ~at the seed is a branch flip, not a
+            # real motion. Commanding it IS the visible wrist flip. Treat as an IK
+            # failure so set_pose holds instead of flinging the arm. Tunable via
+            # YAM_IK_MAX_JUMP_DEG (raise to allow large legitimate reconfigs).
+            if dq.max() > reject_jump:
+                print(
+                    f"[YAMInterface][ik-jump] {arm}: jump exceeds "
+                    f"{np.rad2deg(reject_jump):.0f} deg -> rejecting (holding) to "
+                    f"avoid commanding a flip."
+                )
+                self._last_ik_success[arm] = False
+        return q
 
     # ------------------------------------------------------------------
     # Lifecycle

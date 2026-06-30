@@ -30,6 +30,7 @@ Downloads/calibration_db (serial-indexed sqlite, schema v1).
 """
 
 import glob
+import json
 import os
 import sqlite3
 import threading
@@ -62,7 +63,7 @@ _CALIB_DB = os.path.join(os.path.dirname(__file__), "calibration", "calibrations
 # Aux stream ("Altas Nexus4"): leftmost data tile + cam2,cam3,cam4,cam5 each 640
 # wide. Width 3104 = 544 (data) + 4*640. cam3 is the 2nd of the four camera tiles
 # (3rd tile overall counting the data tile) -> the down-looking view.
-ATLAS_AUX_NAME = "Altas Nexus4"   # firmware spells it "Altas" (sic); matched case-insensitively
+ATLAS_AUX_NAME = "Nexus4"   # match invariant token: firmware ships both "Atlas"/"Altas" (sic) spellings
 AUX_W, AUX_H = 3104, 480
 AUX_CAM_W = 640                   # per-camera tile width in the aux stream (cam2..5)
 AUX_DATA_W = AUX_W - 4 * AUX_CAM_W  # 544: leftmost non-camera data tile
@@ -73,7 +74,7 @@ CAM3_W, CAM3_H = 640, 480
 
 # Main stream ("Altas Nexus2"): 4000x1200 side-by-side forward stereo.
 # cam0 (left) = cols [0:1920], cam1 (right) = cols [1920:3840], last 160px padding.
-ATLAS_MAIN_NAME = "Altas Nexus2"
+ATLAS_MAIN_NAME = "Nexus2"   # match invariant token (firmware "Atlas"/"Altas" sic)
 ATLAS_MAIN_W, ATLAS_MAIN_H = 4000, 1200
 STEREO_CAM0_COLS = slice(0, 1920)
 STEREO_CAM1_COLS = slice(1920, 3840)
@@ -111,7 +112,7 @@ def load_ds_intrinsics(serial=ATLAS_SERIAL, cam_index=FRONT_CAM_INDEX, db_path=_
     return dict(
         model="ds",
         fx=float(row[f"cam{i}_fx"]), fy=float(row[f"cam{i}_fy"]),
-        cx=float(row[f"cam{i}_cx"]+150), cy=float(row[f"cam{i}_cy"]),
+        cx=float(row[f"cam{i}_cx"]), cy=float(row[f"cam{i}_cy"]),
         xi=float(row[f"cam{i}_xi"]), alpha=float(row[f"cam{i}_alpha"]),
         width=int(row[f"cam{i}_w"]), height=int(row[f"cam{i}_h"]),
     )
@@ -120,19 +121,27 @@ def load_ds_intrinsics(serial=ATLAS_SERIAL, cam_index=FRONT_CAM_INDEX, db_path=_
 # ---------------------------------------------------------------------------
 # Double-sphere -> pinhole undistort map (ported verbatim from rectify_6cam_videos.py)
 # ---------------------------------------------------------------------------
-def build_ds_undistort_map(cam):
+def build_ds_undistort_map(cam, R=None, zoom_out_factor=1.0):
     """Return (map1, map2) for cv2.remap: raw double-sphere frame -> pinhole frame.
 
     Output is a pinhole image with the camera's native fx,fy and the principal
-    point recentered to the image center. Pixels outside the lens FOV map to -1
+    point recentered to the image center. ``R`` (3x3) re-aims the virtual camera
+    by rotating the OUTPUT rays before the DS forward-projection (identity = look
+    straight along the true optical axis). Pixels outside the lens FOV map to -1
     (rendered black by cv2.remap).
     """
     w, h = cam["width"], cam["height"]
     cx_out, cy_out = w / 2.0, h / 2.0
     u, v = np.meshgrid(np.arange(w), np.arange(h))
-    mx = (u - cx_out) / cam["fx"]
-    my = (v - cy_out) / cam["fy"]
-    x, y, z = mx, my, np.ones_like(mx)
+    fx_v = cam["fx"] * zoom_out_factor
+    fy_v = cam["fy"] * zoom_out_factor
+    x = (u - cx_out) / fx_v
+    y = (v - cy_out) / fy_v
+    z = np.ones_like(x)
+    if R is not None:
+        x, y, z = (R[0, 0] * x + R[0, 1] * y + R[0, 2] * z,
+                   R[1, 0] * x + R[1, 1] * y + R[1, 2] * z,
+                   R[2, 0] * x + R[2, 1] * y + R[2, 2] * z)
     xi, alpha = cam["xi"], cam["alpha"]
     d1 = np.sqrt(x * x + y * y + z * z)
     zxi = xi * d1 + z
@@ -141,11 +150,210 @@ def build_ds_undistort_map(cam):
     map1 = (cam["fx"] * x / div + cam["cx"]).astype(np.float32)
     map2 = (cam["fy"] * y / div + cam["cy"]).astype(np.float32)
     w1 = alpha / (1 - alpha) if alpha <= 0.5 else (1 - alpha) / alpha
-    w2 = w1 + xi / np.sqrt(2 * w1 * xi + xi * xi + 1)
+    w2 = (w1 + xi) / np.sqrt(2 * w1 * xi + xi * xi + 1)
     invalid = z <= -w2 * d1
     map1[invalid] = -1.0
     map2[invalid] = -1.0
     return map1, map2
+
+
+def ds_valid_mask(map_pair, cam):
+    """Boolean HxW mask of output pixels that sample INSIDE the source tile.
+
+    Catches both the FoV-invalid (-1) flag AND out-of-frame sampling (the black
+    border that appears when the re-aim looks past the sensor edge)."""
+    m1, m2 = map_pair
+    W, H = cam["width"], cam["height"]
+    return (m1 >= 0) & (m1 <= W - 1) & (m2 >= 0) & (m2 <= H - 1)
+
+
+# ---------------------------------------------------------------------------
+# Forward-stereo re-aim + fusion pipeline (SINGLE SOURCE OF TRUTH).
+# Shared by the live viewer (stream_stereo.py) AND the recorded observation
+# (AtlasStereoCamera) so the saved rig_aim.json propagates identically to
+# streaming, data collection, and rollout.
+# ---------------------------------------------------------------------------
+# Persisted per-serial rig config: re-aim angles (deg) + an ROI crop (px/edge).
+DEFAULT_RIG_CONFIG = os.path.join(os.path.dirname(_CALIB_DB), "rig_aim.json")
+RIG_DEFAULTS = {"pitch_deg": 0.0, "yaw_deg": 0.0, "roll_deg": 0.0,
+                "crop_left": 0, "crop_right": 0, "crop_top": 0, "crop_bottom": 0}
+_DEG_KEYS = ("pitch_deg", "yaw_deg", "roll_deg")
+
+
+def load_rig_aim(serial=ATLAS_SERIAL, path=DEFAULT_RIG_CONFIG):
+    """Return the rig config (re-aim angles + ROI crop) for ``serial`` (defaults
+    if the file or the serial entry is absent)."""
+    out = dict(RIG_DEFAULTS)
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return out
+    entry = data.get(str(serial), {})
+    for k in RIG_DEFAULTS:
+        if k in entry:
+            out[k] = float(entry[k]) if k in _DEG_KEYS else int(entry[k])
+    return out
+
+
+def save_rig_aim(serial, cfg, path=DEFAULT_RIG_CONFIG):
+    """Merge ``cfg`` (any of the angle/crop keys) for ``serial`` into the JSON."""
+    data = {}
+    if path and os.path.isfile(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    entry = dict(data.get(str(serial), {}))      # keep keys not being updated
+    for k in RIG_DEFAULTS:
+        if k in cfg:
+            entry[k] = round(float(cfg[k]), 4) if k in _DEG_KEYS else int(cfg[k])
+    data[str(serial)] = entry
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    print(f"[cameras] saved rig config for serial {serial} -> {path}: {entry}")
+    return entry
+
+
+def reaim_rotation(pitch_deg=0.0, yaw_deg=0.0, roll_deg=0.0):
+    """Virtual-camera re-aim rotation applied to output rays before projection.
+
+    R = Ry(yaw) @ Rx(pitch) @ Rz(roll). +pitch aims the axis UP, -yaw aims LEFT,
+    +roll rolls the image. Identity when all angles are 0."""
+    p, y, r = np.deg2rad([pitch_deg, yaw_deg, roll_deg])
+    Rx = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    Ry = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    Rz = np.array([[np.cos(r), -np.sin(r), 0], [np.sin(r), np.cos(r), 0], [0, 0, 1]])
+    return Ry @ Rx @ Rz
+
+
+def stereo_rectify_rotations(serial=ATLAS_SERIAL, db_path=_CALIB_DB):
+    """Symmetric row-alignment rotations (R0, R1) for the forward stereo pair,
+    from the calibrated cam0->cam1 relative rotation (split in half so both eyes
+    meet at the bisector). ~0.3deg on this rig; compose with the re-aim."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT cam1_qx,cam1_qy,cam1_qz,cam1_qw FROM calibrations WHERE serial=?",
+            (int(serial),)).fetchone()
+    finally:
+        conn.close()
+    qx, qy, qz, qw = (row["cam1_qx"], row["cam1_qy"], row["cam1_qz"], row["cam1_qw"])
+    n = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    R_rel = np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+        [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+        [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)]])
+    rvec, _ = cv2.Rodrigues(R_rel)
+    R_half, _ = cv2.Rodrigues(rvec * 0.5)
+    return R_half, R_rel.T @ R_half
+
+
+def fuse_eyes(left, right, mask0, mask1, mode="fill"):
+    """Combine the two rectified eyes (same virtual camera) into ONE image.
+
+    'fill': cam0 base, cam1 fills only cam0's out-of-FoV border -> no parallax
+    ghosting. 'blend': average where both eyes are valid (classic fused look)."""
+    if mode == "fill":
+        out = left.copy()
+        holes = mask1 & ~mask0
+        out[holes] = right[holes]
+        return out
+    out = np.zeros_like(left)
+    out[mask0] = left[mask0]
+    only1 = mask1 & ~mask0
+    out[only1] = right[only1]
+    both = mask0 & mask1
+    out[both] = ((left[both].astype(np.uint16) + right[both]) // 2).astype(np.uint8)
+    return out
+
+
+def edge_crop(img, left=0, right=0, top=0, bottom=0):
+    """Trim left/right/top/bottom px to isolate an ROI (e.g. the table+arms)."""
+    h, w = img.shape[:2]
+    x0 = min(max(left, 0), w - 1)
+    x1 = max(x0 + 1, w - max(right, 0))
+    y0 = min(max(top, 0), h - 1)
+    y1 = max(y0 + 1, h - max(bottom, 0))
+    return img[y0:y1, x0:x1]
+
+
+class StereoFrontProcessor:
+    """Rectify + re-aim + fuse + crop the Atlas forward stereo pair into ONE
+    pinhole front image (``front_img_1``).
+
+    The single source of truth shared by the live viewer (stream_stereo.py) and
+    the recorded observation (AtlasStereoCamera). Loads the per-serial re-aim +
+    crop from ``rig_aim.json`` (CLI/ctor args override), so the SAME processing
+    reaches streaming, data collection, and rollout. ``intrinsics`` is the 3x4
+    pinhole K valid at the cropped output resolution."""
+
+    def __init__(self, serial=ATLAS_SERIAL, rig_config_path=DEFAULT_RIG_CONFIG,
+                 pitch_deg=None, yaw_deg=None, roll_deg=None,
+                 crop_left=None, crop_right=None, crop_top=None, crop_bottom=None,
+                 fuse_mode="fill", stereo_rectify=False):
+        if cv2 is None:
+            raise ImportError("opencv (cv2) is required for stereo rectification")
+        cfg = load_rig_aim(serial, rig_config_path)
+        ov = {"pitch_deg": pitch_deg, "yaw_deg": yaw_deg, "roll_deg": roll_deg,
+              "crop_left": crop_left, "crop_right": crop_right,
+              "crop_top": crop_top, "crop_bottom": crop_bottom}
+        for k, v in ov.items():
+            if v is not None:
+                cfg[k] = v
+        self.cfg = cfg
+        self.fuse_mode = fuse_mode
+        self.stereo_rectify = stereo_rectify
+
+        self.cam0 = load_ds_intrinsics(serial, 0)
+        self.cam1 = load_ds_intrinsics(serial, 1)
+        for i, c in ((0, self.cam0), (1, self.cam1)):
+            if (c["width"], c["height"]) != (STEREO_CAM_W, STEREO_CAM_H):
+                raise ValueError(
+                    f"cam{i} is {c['width']}x{c['height']}, expected "
+                    f"{STEREO_CAM_W}x{STEREO_CAM_H} (forward stereo)")
+
+        R = reaim_rotation(cfg["pitch_deg"], cfg["yaw_deg"], cfg["roll_deg"])
+        if stereo_rectify:
+            R0r, R1r = stereo_rectify_rotations(serial)
+            R0, R1 = R @ R0r, R @ R1r
+        else:
+            R0 = R1 = R
+        self.map0 = build_ds_undistort_map(self.cam0, R0)
+        self.map1 = build_ds_undistort_map(self.cam1, R1)
+        self.mask0 = ds_valid_mask(self.map0, self.cam0)
+        self.mask1 = ds_valid_mask(self.map1, self.cam1)
+
+        w, h = self.cam0["width"], self.cam0["height"]
+        cl, cr = int(cfg["crop_left"]), int(cfg["crop_right"])
+        ct, cb = int(cfg["crop_top"]), int(cfg["crop_bottom"])
+        self.crop = (cl, cr, ct, cb)
+        self.out_w = max(1, w - cl - cr)
+        self.out_h = max(1, h - ct - cb)
+        # Pinhole K after re-aim (principal point at output center) + ROI crop.
+        cx = w / 2.0 - cl
+        cy = h / 2.0 - ct
+        self.intrinsics = np.array([[self.cam0["fx"], 0.0, cx, 0.0],
+                                    [0.0, self.cam0["fy"], cy, 0.0],
+                                    [0.0, 0.0, 1.0, 0.0]], dtype=np.float64)
+
+    def process_split(self, left, right):
+        """left/right = the two raw fisheye tiles (1920x1200 each) -> fused image."""
+        left = cv2.remap(left, self.map0[0], self.map0[1], cv2.INTER_LINEAR)
+        right = cv2.remap(right, self.map1[0], self.map1[1], cv2.INTER_LINEAR)
+        fused = fuse_eyes(left, right, self.mask0, self.mask1, self.fuse_mode)
+        return edge_crop(fused, *self.crop)
+
+    def process_frame(self, frame):
+        """frame = the full 4000x1200 main-stream frame -> fused front image."""
+        left = frame[STEREO_CAM_ROWS, STEREO_CAM0_COLS]
+        right = frame[STEREO_CAM_ROWS, STEREO_CAM1_COLS]
+        return self.process_split(left, right)
 
 
 def _crop_geometry(w, h, frac):
@@ -327,44 +535,53 @@ class AtlasFrontCamera(threading.Thread):
 
 
 class AtlasStereoCamera(threading.Thread):
-    """Streams the Atlas main stream (cam0 left + cam1 right, forward stereo).
+    """The Atlas forward stereo pair (cam0 left + cam1 right) -> ONE front image.
 
-    Opens the "Altas Nexus2" V4L2 node at 4000x1200 MJPG, splits into cam0/cam1
-    (raw fisheye, no rectification), and concatenates them horizontally into one
-    BGR image (cam0 | cam1) at 3840x1200.
+    Opens the "Nexus2" V4L2 node at 4000x1200 MJPG, splits into cam0/cam1, and
+    runs the shared ``StereoFrontProcessor`` pipeline: double-sphere -> pinhole
+    rectify + re-aim (pitch/yaw/roll) + fuse + ROI crop, configured from
+    ``rig_aim.json`` (keyed by serial). This is ``front_img_1`` for BOTH rollout
+    (YAMInterface.get_obs) and data collection — so the saved rig config
+    propagates everywhere through this one recorder.
 
-    This replaces AtlasFrontCamera for demo collection: the forward-facing stereo
-    pair is the right view for manipulation tasks (cam3/SLAM is down-looking).
+    Pass ``raw=True`` for the legacy un-rectified side-by-side (cam0 | cam1).
 
     Recorder contract (shared with AtlasFrontCamera and RealSenseRecorder):
         get_image() -> latest BGR uint8 frame (black until ready, never None)
-        res         -> (H, W)
-        frame_count / error_count / last_error  -> live stall monitoring
+        res / intrinsics (3x4 pinhole K) / frame_count / error_count / last_error
         wait_until_ready(timeout) / close()
     """
 
     NAME = "front_img_1"
 
     def __init__(self, serial=ATLAS_SERIAL, crop_frac=STEREO_CROP_FRACTION,
-                 fps=30, device=None):
+                 fps=30, device=None, raw=False, rig_config_path=DEFAULT_RIG_CONFIG,
+                 fuse_mode="fill", stereo_rectify=False):
         super().__init__(daemon=True)
         if cv2 is None:
             raise ImportError("opencv (cv2) is required for the Atlas stereo camera")
 
-        # Validate calibration dimensions even though we don't rectify, so a
-        # mis-configured DB still raises early rather than silently mislabeling frames.
-        cam0 = load_ds_intrinsics(serial, 0)
-        cam1 = load_ds_intrinsics(serial, 1)
-        for i, c in ((0, cam0), (1, cam1)):
-            if (c["width"], c["height"]) != (STEREO_CAM_W, STEREO_CAM_H):
-                raise ValueError(
-                    f"cam{i} is {c['width']}x{c['height']}, "
-                    f"expected {STEREO_CAM_W}x{STEREO_CAM_H} (forward stereo)"
-                )
-
-        # Raw output: both cameras side-by-side, no crop.
-        self.out_w = STEREO_CAM_W * 2   # 3840
-        self.out_h = STEREO_CAM_H       # 1200
+        self.raw = raw
+        if raw:
+            # Legacy: validate dims, output both eyes side-by-side, no rectify.
+            cam0 = load_ds_intrinsics(serial, 0)
+            cam1 = load_ds_intrinsics(serial, 1)
+            for i, c in ((0, cam0), (1, cam1)):
+                if (c["width"], c["height"]) != (STEREO_CAM_W, STEREO_CAM_H):
+                    raise ValueError(
+                        f"cam{i} is {c['width']}x{c['height']}, "
+                        f"expected {STEREO_CAM_W}x{STEREO_CAM_H} (forward stereo)"
+                    )
+            self.proc = None
+            self.out_w, self.out_h = STEREO_CAM_W * 2, STEREO_CAM_H   # 3840x1200
+            self.intrinsics = None
+        else:
+            # Processed: rectify + re-aim + fuse + crop, per rig_aim.json.
+            self.proc = StereoFrontProcessor(
+                serial=serial, rig_config_path=rig_config_path,
+                fuse_mode=fuse_mode, stereo_rectify=stereo_rectify)
+            self.out_w, self.out_h = self.proc.out_w, self.proc.out_h
+            self.intrinsics = self.proc.intrinsics
 
         self.device = device or os.getenv("ATLAS_MAIN_NODE") or self._resolve_device()
         self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
@@ -421,9 +638,13 @@ class AtlasStereoCamera(threading.Thread):
                     self.last_error = f"unexpected main frame size {frame.shape}"
                     time.sleep(0.005)
                     continue
-                left = frame[STEREO_CAM_ROWS, STEREO_CAM0_COLS]
-                right = frame[STEREO_CAM_ROWS, STEREO_CAM1_COLS]
-                self.latest_frame = np.ascontiguousarray(np.hstack([left, right]))
+                if self.raw:
+                    left = frame[STEREO_CAM_ROWS, STEREO_CAM0_COLS]
+                    right = frame[STEREO_CAM_ROWS, STEREO_CAM1_COLS]
+                    out = np.hstack([left, right])
+                else:
+                    out = self.proc.process_frame(frame)   # rectify+re-aim+fuse+crop
+                self.latest_frame = np.ascontiguousarray(out)
                 self.frame_count += 1
             except Exception as e:  # noqa: BLE001 - thread must never die
                 self.error_count += 1
@@ -628,16 +849,23 @@ def discover_realsense_recorders(serial_to_name=None, width=640, height=480,
 
 
 def create_camera_recorders(cameras_cfg=None, wrist_serial_to_name=None,
-                            use_front=True, front_serial=None):
+                            use_front=True, front_serial=None, front_raw=False):
     """Build a ``{friendly_name: recorder}`` dict — the YAM analogue of
     ``ARXInterface.__create_cam_recorders``.
 
     Two modes:
       * ``cameras_cfg`` (ARX-style dict ``{name: {type, enabled, ...}}``): explicit
         per-camera config. ``type`` is "d405"/"d435"/"realsense" (needs
-        ``serial_number``) or "atlas" (the front cam).
+        ``serial_number``) or "atlas" (the front cam); an atlas entry may set
+        ``raw: true`` for the un-rectified side-by-side fisheye pair.
       * otherwise auto-discovery: the Atlas front cam (``front_img_1``) plus every
         connected D405 wrist (``wrist_serial_to_name`` -> friendly names).
+
+    ``front_raw`` (auto-discovery only): if True, build the Atlas front camera in
+    RAW mode — the un-rectified side-by-side fisheye pair (cam0 | cam1, 3840x1200),
+    with NO double-sphere->pinhole rectify / re-aim / fuse / crop. Use this for
+    (intrinsic) camera calibration, which needs the distorted source frames; leave
+    it False for normal data collection and rollout (rectified ``front_img_1``).
 
     Camera failures are warned-about and skipped — a bad camera never crashes the
     session (matches the "warn, continue" requirement). Callers that REQUIRE
@@ -658,7 +886,8 @@ def create_camera_recorders(cameras_cfg=None, wrist_serial_to_name=None,
                     )
                 elif cam_type in ("atlas", "atlas_stereo"):
                     rec = AtlasStereoCamera(serial=cc.get("serial", ATLAS_SERIAL),
-                                            crop_frac=cc.get("crop_frac", STEREO_CROP_FRACTION))
+                                            crop_frac=cc.get("crop_frac", STEREO_CROP_FRACTION),
+                                            raw=cc.get("raw", False))
                     rec.start()
                     recorders[name] = rec
                 elif cam_type == "atlas_slam":
@@ -674,9 +903,12 @@ def create_camera_recorders(cameras_cfg=None, wrist_serial_to_name=None,
     # Auto-discovery path.
     if use_front:
         try:
-            front = AtlasStereoCamera(serial=front_serial or ATLAS_SERIAL)
+            front = AtlasStereoCamera(serial=front_serial or ATLAS_SERIAL, raw=front_raw)
             front.start()
             recorders[front.NAME] = front
+            if front_raw:
+                print("[cameras] Atlas front in RAW mode "
+                      "(un-rectified side-by-side fisheye; for calibration).")
         except Exception as e:  # noqa: BLE001
             print(f"[cameras] WARNING: Atlas stereo camera unavailable ({e}); "
                   f"continuing without front_img_1.")

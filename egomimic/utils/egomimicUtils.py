@@ -265,12 +265,36 @@ EXTRINSICS = {
         "right": np.eye(4),
     },
     "yam": {
-        # TODO: replace with the measured YAM front-camera -> per-arm-base
-        # extrinsics. Identity is a placeholder so the yam_bimanual embodiment
-        # resolves; correct training/rollout REQUIRES real calibration here
-        # (mirror the x5Dec13_2 matrices below, measured on the YAM rig).
-        "left": np.eye(4),
-        "right": np.eye(4),
+        # front_img_1 (re-aimed Atlas stereo) -> per-arm-base, applied as
+        # base = T_cam_base @ cam (see cam_frame_to_base_frame).
+        #
+        # These bake in the rig_aim.json digital re-aim (pitch -0.25, yaw 17.75,
+        # roll 0 deg). Derived from the UN-re-aimed hand-eye calibration T0 by
+        # right-composing the re-aim rotation R = reaim_rotation(pitch,yaw,roll):
+        # since the warp maps output ray_C1 -> ray_C0 = R @ ray_C1, a point's
+        # p_C0 = R @ p_C1, so base = T0 @ blkdiag(R,1) @ p_C1  =>  T = T0 @ R.
+        # Translation (optical center) is preserved; only the rotation rotates.
+        # REGENERATE after any rig_aim.json angle change (intrinsics only change
+        # if the CROP changes -> regen YAM_INTRINSICS from StereoFrontProcessor).
+        # The pre-re-aim T0 (yaw17.75 source) was:
+        #   left  rot rows [0.10781224,-0.86856751,0.48370136] ...
+        #   right rot rows [0.074985,-0.89368126,0.44239243] ...
+        "left": np.array(
+            [
+                [-0.04478335, -0.87071272, 0.48974872, 0.11429783],
+                [-0.99742794, 0.06643469, 0.02690639, -0.34963458],
+                [-0.05596404, -0.48728409, -0.87144836, 1.01078516],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+        "right": np.array(
+            [
+                [-0.06345426, -0.89561090, 0.44028931, 0.12621833],
+                [-0.99794232, 0.06101066, -0.01971857, 0.64589818],
+                [-0.00920218, -0.44063456, -0.89763941, 1.43613881],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
     },
     "x5Dec13_2": {
         "left": np.array(
@@ -355,18 +379,25 @@ EXTRINSICS = {
     },
 }
 
-# YAM front camera = Atlas (ATLASHX2952) cam3 ("Bottom SLAM", the down-looking
-# camera), double-sphere model RECTIFIED to a pinhole and then CENTER-CROPPED to
-# 75% of each dimension. cam3 is 640x480; rectification puts the principal point
-# at (320,240) with native fx,fy; the 75% center crop (-> 480x360, offset 80,60)
-# shifts the principal point to (240,180). 3x4 (K|0) to match every other
-# INTRINSICS entry (viz projection requires 3x4). Valid at the 480x360 output.
-# (See egomimic/robot/YAM/yam_cameras.py front_output_intrinsics; ported from
-# Downloads/rectify_6cam_videos.py + calibration_db cam3.)
+# YAM front camera = Atlas (ATLASHX2952) FORWARD STEREO (cam0 left + cam1 right),
+# double-sphere RECTIFIED to a pinhole, RE-AIMED (pitch/yaw/roll), FUSED into one
+# image, then ROI-CROPPED — exactly the front_img_1 that AtlasStereoCamera produces
+# for rollout + data collection. Native fx,fy with the principal point at the
+# re-aimed output center, shifted by the crop offset (cx = 960 - crop_left,
+# cy = 600 - crop_top). 3x4 (K|0) to match every other INTRINSICS entry. Valid at
+# the cropped output resolution.
+#
+# These values track egomimic/robot/YAM/calibration/rig_aim.json (serial 2952,
+# crop left/right/top/bottom = 250/250/320/0 -> 1420x880). REGENERATE after any
+# rig_aim.json change with:
+#     python -c "import sys; sys.path.insert(0,'egomimic/robot/YAM'); \
+#                from yam_cameras import StereoFrontProcessor; \
+#                print(StereoFrontProcessor(2952).intrinsics)"
+# (StereoFrontProcessor.intrinsics is the single source of truth.)
 YAM_INTRINSICS = np.array(
     [
-        [157.6039137245626, 0.0, 240.0, 0.0],
-        [0.0, 157.790966072419, 180.0, 0.0],
+        [482.0812950643657, 0.0, 710.0, 0.0],
+        [0.0, 482.0473315598244, 280.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
     ]
 )
