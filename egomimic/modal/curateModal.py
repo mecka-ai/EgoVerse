@@ -222,6 +222,8 @@ def _build_quest_token_tsne(
     import numpy as _np
     from egomimic.curation.embedders import QuestTokenEmbedder
 
+    from omegaconf import OmegaConf as _OCq
+    H = int(_OCq.select(cfg, "model.action_embedder.quest_horizon", default=100))  # block size fed to QueST
     ep_chunks = _read_episode_action_chunks(cfg, [m["episode"] for m in span_meta], tag)
 
     chunk_list, owner = [], []
@@ -229,12 +231,17 @@ def _build_quest_token_tsne(
         arr = ep_chunks.get(m["episode"])
         if arr is None or len(arr) == 0:
             continue
-        T, H = arr.shape[0], arr.shape[1]                       # frames, horizon
-        for idx in range(int(m["start"]), min(int(m["end"]), T), H):   # non-overlapping chunks
-            chunk_list.append(arr[idx]); owner.append(i)
+        executed = arr[:, 0, :] if arr.ndim == 3 else arr      # executed per-frame trajectory (T, D)
+        T = executed.shape[0]
+        for idx in range(int(m["start"]), min(int(m["end"]), T), H):  # non-overlapping H-frame windows
+            w = executed[idx : idx + H]
+            if len(w) < H:                                     # pad short/last window to H (repeat last frame)
+                w = _np.concatenate([w, _np.repeat(w[-1:], H - len(w), axis=0)], axis=0)
+            chunk_list.append(w); owner.append(i)
     if not chunk_list:
         print(f"{tag} QueST: no chunks found — skipping"); return
     chunks = _np.stack(chunk_list).astype(_np.float32)         # (Nc, H, D)
+    print(f"{tag} QueST: horizon={H}, {len(chunks)} chunks from {len(span_meta)} spans")
 
     qt = QuestTokenEmbedder(ae.checkpoint_path, device=device); qt.fit()
     tok = qt.embed_chunks(chunks)                              # (Nc, ntok, Denc)
