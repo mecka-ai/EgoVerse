@@ -171,6 +171,108 @@ def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list
     return trajectories
 
 
+def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dict:
+    """Read per-episode action CHUNKS ``(T, horizon, action_dim)`` from zarr.
+
+    Unlike ``_read_span_action_trajectories`` (which reduces to the executed per-frame
+    action), this keeps the full 3-D chunks — one ``horizon``-frame action chunk per frame,
+    the exact input the QueST tokenizer was trained on. pause removal forced OFF.
+    Returns ``{episode_hash: (T, horizon, action_dim) float32}``.
+    """
+    import hydra as _hydra
+    import numpy as _np
+    from concurrent.futures import ThreadPoolExecutor
+    from omegaconf import OmegaConf as _OC
+
+    ds_cfg = next(iter(cfg.data.train_datasets.values()))
+    resolver_cfg = _OC.create(_OC.to_container(ds_cfg.resolver, resolve=True))
+    resolver_cfg["pause_removal_epsilon"] = None
+    resolver = _hydra.utils.instantiate(resolver_cfg)
+    resolved = resolver.resolve()
+    episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
+    unique_eps = sorted(set(episode_hashes))
+    print(f"{tag} QueST chunk read: resolver has {len(episodes)} eps; reading {len(unique_eps)}")
+
+    def _read_one(ep: str):
+        actions, _, _ = episodes[ep]._collect_curation_batched(
+            action_key="actions_cartesian",
+            image_key="observations.images.front_img_1",
+            image_decode_workers=0,
+            load_images=False,
+        )
+        a = _np.asarray(actions, dtype=_np.float32)  # (T, horizon, action_dim)
+        return ep, a
+
+    cache: dict = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ep, a in pool.map(_read_one, [e for e in unique_eps if e in episodes]):
+            cache[ep] = a
+    print(f"{tag} QueST chunk read: cached {len(cache)} episodes")
+    return cache
+
+
+def _build_quest_token_tsne(
+    cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
+    output_dir, task_name, tag, device, seed, cap: int = 60000,
+):
+    """QueST token-level t-SNE: tile each span into non-overlapping horizon-length action
+    chunks, QueST-encode each into tokens, plot one point per token colored by the span's
+    language cluster. Writes tsne3d/spans_tsne3d.json (action mode) for the cluster viewer.
+    """
+    import numpy as _np
+    from egomimic.curation.embedders import QuestTokenEmbedder
+
+    ep_chunks = _read_episode_action_chunks(cfg, [m["episode"] for m in span_meta], tag)
+
+    chunk_list, owner = [], []
+    for i, m in enumerate(span_meta):
+        arr = ep_chunks.get(m["episode"])
+        if arr is None or len(arr) == 0:
+            continue
+        T, H = arr.shape[0], arr.shape[1]                       # frames, horizon
+        for idx in range(int(m["start"]), min(int(m["end"]), T), H):   # non-overlapping chunks
+            chunk_list.append(arr[idx]); owner.append(i)
+    if not chunk_list:
+        print(f"{tag} QueST: no chunks found — skipping"); return
+    chunks = _np.stack(chunk_list).astype(_np.float32)         # (Nc, H, D)
+
+    qt = QuestTokenEmbedder(ae.checkpoint_path, device=device); qt.fit()
+    tok = qt.embed_chunks(chunks)                              # (Nc, ntok, Denc)
+    ntok = tok.shape[1]
+    X = tok.reshape(-1, tok.shape[2]).astype(_np.float32)      # (Nc*ntok, Denc)
+    owner_tok = _np.repeat(_np.asarray(owner), ntok)
+    M = len(X)
+    print(f"{tag} QueST: {len(chunks)} chunks × {ntok} tok = {M} tokens from {len(span_meta)} spans")
+
+    rng = _np.random.default_rng(seed)
+    sel = _np.sort(rng.choice(M, cap, replace=False)) if M > cap else _np.arange(M)
+
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    Xs = X[sel]
+    if Xs.shape[1] > 50:
+        Xs = PCA(n_components=50, random_state=seed).fit_transform(Xs)
+    emb = TSNE(n_components=3, init="pca", perplexity=30, random_state=seed).fit_transform(Xs)
+    coords = {"x": emb[:, 0].astype(float).tolist(), "y": emb[:, 1].astype(float).tolist(),
+              "z": emb[:, 2].astype(float).tolist(), "span_idx": list(range(len(emb)))}
+
+    def _o(k):  # owner span meta for token index k
+        return span_meta[owner_tok[k]], span_ids[owner_tok[k]]
+    spans_list, cids = [], []
+    for j, k in enumerate(sel):
+        m, sid = _o(k); cid = int(span_cluster.get(sid, -1)); cids.append(cid)
+        spans_list.append({"id": f"{sid}#t{int(k)}", "ep": m["episode"], "start": int(m["start"]),
+                           "end": int(m["end"]), "text": m["text"], "score": None, "cluster": cid})
+    cids = _np.asarray(cids)
+    clusters_meta = {str(c): {"label": cluster_labels.get(str(c), ""), "n_spans": int((cids == c).sum())}
+                     for c in sorted(set(cids.tolist()))}
+    out = {"n_clusters": len(clusters_meta), "clusters": clusters_meta, "spans": spans_list, "action": coords}
+    tsne_dir = Path(output_dir) / "tsne3d"; tsne_dir.mkdir(parents=True, exist_ok=True)
+    with open(tsne_dir / "spans_tsne3d.json", "w") as f:
+        json.dump(out, f)
+    print(f"{tag} QueST: wrote token t-SNE → {tsne_dir/'spans_tsne3d.json'} ({len(sel)} tokens plotted)")
+
+
 # ---------------------------------------------------------------------------
 # Latent store: flat memmap arrays + provenance manifest + annotation spans
 # ---------------------------------------------------------------------------
@@ -435,7 +537,7 @@ def _score_task_clustered(
         text_embeddings = lemb.embed(span_texts)
 
     from omegaconf import OmegaConf as _OC2
-    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False))
+    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type == "quest_tokens"
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
     clustered = scorer.score_clusters(
@@ -465,6 +567,20 @@ def _score_task_clustered(
         for sid, rec in cv["spans"].items():
             span_cluster[sid] = cid
             span_score[sid] = rec.get("score")
+
+    with open(scores_dir / f"{task_name}_cluster_labels.json", "w") as f:
+        json.dump(cluster_labels, f, indent=2)
+
+    # QueST token mode: one point per QueST token (multiple per span, variable by span
+    # length), colored by the span's language cluster. Distinct token-level t-SNE artifact.
+    if ae.type == "quest_tokens":
+        _build_quest_token_tsne(
+            cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
+            output_dir, task_name, tag, device, select_seed(cfg),
+        )
+        training_outputs_volume.commit()
+        print(f"{tag} quest_tokens total: {_time.perf_counter() - t_start:.1f}s")
+        return task_name, {}
 
     state_pool = _np.stack([s.mean(axis=0) for s in span_state]).astype(_np.float32)
     action_pool = _np.stack([a.mean(axis=0) for a in span_action]).astype(_np.float32)
@@ -616,6 +732,22 @@ def _score_task(
 
     tag = f"[{task_name}][score]"
     t_start = _time.perf_counter()
+
+    # QueST token embedder needs the external/quest submodule (SkillVAE); the score
+    # worker boots without submodules, so init it on demand here.
+    from egomimic.curation.config import select_action_embedder_settings as _sae
+    if _sae(cfg).type == "quest_tokens":
+        import subprocess as _sp
+        print(f"{tag} initializing external/quest submodule for QueST tokenizer…")
+        _sp.run(["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
+                 "external/quest"], check=True)
+        _qd = f"{CFG.remote_repo_dir}/external/quest"
+        if Path(_qd).is_dir():
+            _sp.run([CFG.python_bin, "-c",
+                     "import sysconfig,os,sys; "
+                     "p=os.path.join(sysconfig.get_paths()['purelib'],'egoverse_quest.pth'); "
+                     "open(p,'w').write(sys.argv[1]); print('registered quest ->',sys.argv[1])",
+                     _qd], check=True)
 
     src_dir = Path(latents_source) if latents_source else Path(output_dir)
     lat_dir = src_dir / "latents" / task_name

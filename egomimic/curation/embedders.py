@@ -1075,6 +1075,76 @@ class TCNActionEmbedder:
         return result
 
 
+class QuestTokenEmbedder:
+    """Per-chunk QueST tokenizer for token-level span visualization.
+
+    Loads a ``QuestTokenizerTrainer`` (SkillVAE) checkpoint and encodes each action chunk
+    ``(T_chunk, action_dim)`` into ``num_tokens`` continuous pre-quantization token
+    embeddings (``encoder_dim`` each) via ``SkillVAE.encode`` — the same path training used,
+    so chunks must be the training horizon length (Mecka keymap: 30). DataSchematic
+    normalization (restored from the checkpoint) is applied before encoding, matching
+    ``QuestTokenizerTrainer.process_batch_for_training``.
+    """
+
+    def __init__(self, checkpoint_path: str, device: str | torch.device = "cpu", batch_size: int = 256) -> None:
+        self.checkpoint_path = checkpoint_path
+        self.device = torch.device(device)
+        self.batch_size = batch_size
+        self._model = None
+        self._eid = None
+        self._ac_key = None
+        self.num_tokens: int | None = None
+        self.encoder_dim: int | None = None
+        self._fitted = False
+
+    def fit(self, episodes: list | None = None) -> None:
+        from egomimic.pl_utils.pl_model import ModelWrapper
+
+        logger.info("QuestTokenEmbedder: loading QueST tokenizer from %s", self.checkpoint_path)
+        wrapper = ModelWrapper.load_from_checkpoint(
+            self.checkpoint_path, map_location=self.device, weights_only=False
+        )
+        self._model = wrapper.model  # QuestTokenizerTrainer (Algo): submodules in .nets
+        self._model.nets.eval()
+        for p in self._model.nets.parameters():
+            p.requires_grad_(False)
+        self._eid = next(iter(self._model.ac_keys_by_id))
+        self._ac_key = self._model.ac_keys_by_id[self._eid]
+        self._fitted = True
+
+    def embed_chunks(self, chunks: np.ndarray) -> np.ndarray:
+        """Encode action chunks into per-token embeddings.
+
+        Args:
+            chunks: ``(N, T_chunk, action_dim)`` float array (T_chunk = training horizon).
+
+        Returns:
+            ``(N, num_tokens, encoder_dim)`` float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed_chunks()")
+        chunks = np.asarray(chunks, dtype=np.float32)
+        if len(chunks) == 0:
+            return np.empty((0, self.num_tokens or 0, self.encoder_dim or 0), dtype=np.float32)
+        vae = self._model.nets["tokenizer"]
+        ds = self._model.data_schematic
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            for start in range(0, len(chunks), self.batch_size):
+                b = torch.from_numpy(chunks[start : start + self.batch_size]).to(self.device).float()
+                normed = ds.normalize_data({self._ac_key: b}, self._eid)[self._ac_key]
+                z = vae.encode(normed.to(self.device))  # (B, num_tokens, encoder_dim)
+                outputs.append(np.asarray(z.detach().cpu().numpy(), dtype=np.float32))
+        out = np.concatenate(outputs, axis=0)
+        self.num_tokens, self.encoder_dim = int(out.shape[1]), int(out.shape[2])
+        logger.info(
+            "[actions] QuestTokenEmbedder: %d chunks → %s (%d tok/chunk) in %.2fs",
+            len(chunks), out.shape, self.num_tokens, time.perf_counter() - t0,
+        )
+        return out
+
+
 class ActionEmbedder:
     """
     Embed actions: Gaussian normalisation → random orthogonal linear projection.
