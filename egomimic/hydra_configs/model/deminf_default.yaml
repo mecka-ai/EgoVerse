@@ -77,6 +77,8 @@ tsne:
 cluster_scoring:
   algo: ksg
   centroid_space: action
+  # disable=true: cluster + write t-SNE/viewer artifact but skip per-cluster scoring (faster).
+  disable: false
 
 # Pass 3: KSG on concatenated episode latents (CPU).
 ksg:
