@@ -216,6 +216,7 @@ const FPS        = 30;
 const RUN_KEY    = "clusterviz:" + "__RUN_LABEL_ESCAPED__";   // localStorage key (per run)
 
 const HAS_TSNE = TSNE && TSNE.cid && TSNE.cid.length;
+const IS2D = (TSNE && TSNE.dims || 3) === 2;   // 2-D vs 3-D scatter
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
   parseInt(a.replace('cluster_','')) - parseInt(b.replace('cluster_',''))
 );
@@ -336,6 +337,12 @@ const LAYOUT = title=>({
   scene:{xaxis:{visible:false},yaxis:{visible:false},zaxis:{visible:false},bgcolor:'#101014'},
   showlegend:false, margin:{l:0,r:0,t:28,b:0},
 });
+const LAYOUT2D = title=>({
+  title:{text:title,font:{color:'#ddd',size:12},pad:{t:2}},
+  paper_bgcolor:'#101014', plot_bgcolor:'#101014',
+  xaxis:{visible:false}, yaxis:{visible:false,scaleanchor:'x'},   // square aspect
+  showlegend:false, margin:{l:0,r:0,t:28,b:0}, hovermode:'closest',
+});
 
 function buildModToggles(){
   const avail=MOD_ORDER.filter(m=>TSNE&&TSNE[m]);
@@ -392,15 +399,14 @@ function renderTsne(preserveToggles){
     for(let k=0;k<N;k++){
       custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14)];
     }
-    Plotly.newPlot(el,[
-      {type:'scatter3d',mode:'markers',
-       x:t.x,y:t.y,z:t.z,customdata:custom,
-       marker:{size:u.size,color:base,line:{width:0}},
-       hovertemplate:'cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>'},
-      {type:'scatter3d',mode:'markers',name:'sel',
-       x:[],y:[],z:[],hoverinfo:'skip',
-       marker:{size:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}},
-    ],LAYOUT(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
+    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>';
+    const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large 2-D point clouds
+    const main = {type:tType,mode:'markers',x:t.x,y:t.y,customdata:custom,
+                  marker:{size:u.size,color:base,line:{width:0}},hovertemplate:hov};
+    const selT = {type:tType,mode:'markers',name:'sel',x:[],y:[],hoverinfo:'skip',
+                  marker:{size:IS2D?13:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}};
+    if(!IS2D){ main.z=t.z; selT.z=[]; }
+    Plotly.newPlot(el,[main,selT],(IS2D?LAYOUT2D:LAYOUT)(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
 
     el.onpointerdown=e=>{el._px=e.clientX;el._py=e.clientY;};
     el.onpointerup=e=>{el._drag=Math.hypot(e.clientX-(el._px??e.clientX),e.clientY-(el._py??e.clientY))>5;};
@@ -432,7 +438,7 @@ function renderTsne(preserveToggles){
   const projName=(TSNE.method||'tsne').toUpperCase();
   document.getElementById('tstats').innerHTML=
     `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${hidden}`;
-  const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+' 3-D';
+  const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+(IS2D?' 2-D':' 3-D');
   buildLegend();
   applyStyle();
 }
@@ -440,7 +446,8 @@ function renderTsne(preserveToggles){
 function crossHighlight(k){
   for(const mod of activeMods){
     const t=TSNE[mod]; if(!t) continue;
-    Plotly.restyle('panel_'+mod,{x:[[t.x[k]]],y:[[t.y[k]]],z:[[t.z[k]]]},[1]);
+    const upd = IS2D ? {x:[[t.x[k]]],y:[[t.y[k]]]} : {x:[[t.x[k]]],y:[[t.y[k]]],z:[[t.z[k]]]};
+    Plotly.restyle('panel_'+mod, upd, [1]);
   }
 }
 

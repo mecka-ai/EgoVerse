@@ -3,8 +3,9 @@
 latent_dim: 32
 device: cuda
 
-# 3-D projection for t-SNE/UMAP viewer exports: tsne | umap
+# projection for viewer exports: method (tsne | umap | pca) and dims (2 or 3)
 projection: tsne
+projection_dims: 3
 
 keys:
   action: actions_cartesian

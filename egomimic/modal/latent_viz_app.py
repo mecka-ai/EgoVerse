@@ -454,10 +454,14 @@ def viewer():
             "txt":   [str(s.get("text", ""))[:60]         for s in spans],
         }
         result["method"] = str(data.get("method", "tsne"))
+        result["dims"] = int(data.get("dims", 3))
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]
-                result[mode] = {"x": t["x"], "y": t["y"], "z": t["z"]}
+                m = {"x": t["x"], "y": t["y"]}
+                if "z" in t:
+                    m["z"] = t["z"]
+                result[mode] = m
         print(f"[viewer] loaded cluster t-SNE for {run} ({len(spans)} spans, "
               f"modes={[m for m in ('state','action','language') if m in result]})")
         return result

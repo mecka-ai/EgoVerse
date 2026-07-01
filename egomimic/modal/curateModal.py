@@ -211,14 +211,14 @@ def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dic
     return cache
 
 
-def _project3d(X, method: str = "tsne", seed: int = 0):
-    """Project high-dim embeddings to 3-D. method: 'tsne' (default), 'umap', or 'pca'.
+def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
+    """Project high-dim embeddings to ``dims``-D (2 or 3). method: 'tsne'|'umap'|'pca'.
     tsne/umap PCA→50 first when wider; umap-learn is pip-installed on demand."""
     import numpy as _np
     from sklearn.decomposition import PCA
     X = _np.asarray(X, dtype=_np.float32)
     if method == "pca":
-        return PCA(n_components=3, random_state=seed).fit_transform(X)
+        return PCA(n_components=dims, random_state=seed).fit_transform(X)
     if X.shape[1] > 50:
         X = PCA(n_components=50, random_state=seed).fit_transform(X)
     if method == "umap":
@@ -229,9 +229,9 @@ def _project3d(X, method: str = "tsne", seed: int = 0):
             print("[project3d] installing umap-learn…")
             _sp2.run([_s2.executable, "-m", "pip", "install", "-q", "umap-learn"], check=True)
             import umap
-        return umap.UMAP(n_components=3, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
+        return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
     from sklearn.manifold import TSNE
-    return TSNE(n_components=3, init="pca", perplexity=30, random_state=seed).fit_transform(X)
+    return TSNE(n_components=dims, init="pca", perplexity=30, random_state=seed).fit_transform(X)
 
 
 def _build_quest_token_tsne(
@@ -278,10 +278,13 @@ def _build_quest_token_tsne(
     sel = _np.sort(rng.choice(M, cap, replace=False)) if M > cap else _np.arange(M)
 
     method = str(_OCq.select(cfg, "model.projection", default="tsne")).lower()
-    print(f"{tag} QueST: projecting {len(sel)} tokens with {method}")
-    emb = _project3d(X[sel], method, seed)
+    dims = int(_OCq.select(cfg, "model.projection_dims", default=3))
+    print(f"{tag} QueST: projecting {len(sel)} tokens with {method} ({dims}D)")
+    emb = _project3d(X[sel], method, seed, dims=dims)
     coords = {"x": emb[:, 0].astype(float).tolist(), "y": emb[:, 1].astype(float).tolist(),
-              "z": emb[:, 2].astype(float).tolist(), "span_idx": list(range(len(emb)))}
+              "span_idx": list(range(len(emb)))}
+    if dims >= 3:
+        coords["z"] = emb[:, 2].astype(float).tolist()
 
     def _o(k):  # owner span meta for token index k
         return span_meta[owner_tok[k]], span_ids[owner_tok[k]]
@@ -294,7 +297,7 @@ def _build_quest_token_tsne(
     clusters_meta = {str(c): {"label": cluster_labels.get(str(c), ""), "n_spans": int((cids == c).sum())}
                      for c in sorted(set(cids.tolist()))}
     out = {"n_clusters": len(clusters_meta), "clusters": clusters_meta, "spans": spans_list,
-           "action": coords, "method": method}
+           "action": coords, "method": method, "dims": dims}
     tsne_dir = Path(output_dir) / "tsne3d"; tsne_dir.mkdir(parents=True, exist_ok=True)
     with open(tsne_dir / "spans_tsne3d.json", "w") as f:
         json.dump(out, f)
