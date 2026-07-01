@@ -434,14 +434,17 @@ def _score_task_clustered(
         lemb.fit()
         text_embeddings = lemb.embed(span_texts)
 
+    from omegaconf import OmegaConf as _OC2
+    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False))
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
     clustered = scorer.score_clusters(
-        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings
+        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings,
+        score=not disable_scoring,
     )
     print(
-        f"{tag} clustered KSG done in {_time.perf_counter() - t_ksg:.1f}s — "
-        f"{len(clustered)} clusters"
+        f"{tag} clustered {'(scoring DISABLED) ' if disable_scoring else ''}"
+        f"done in {_time.perf_counter() - t_ksg:.1f}s — {len(clustered)} clusters"
     )
 
     scores_dir = Path(output_dir) / "scores"
