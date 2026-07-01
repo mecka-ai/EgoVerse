@@ -212,12 +212,14 @@ def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dic
 
 
 def _project3d(X, method: str = "tsne", seed: int = 0):
-    """Project high-dim embeddings to 3-D. method: 'tsne' (default) or 'umap'.
-    PCA→50 first when wider; umap-learn is pip-installed on demand (not in the base image)."""
+    """Project high-dim embeddings to 3-D. method: 'tsne' (default), 'umap', or 'pca'.
+    tsne/umap PCA→50 first when wider; umap-learn is pip-installed on demand."""
     import numpy as _np
+    from sklearn.decomposition import PCA
     X = _np.asarray(X, dtype=_np.float32)
+    if method == "pca":
+        return PCA(n_components=3, random_state=seed).fit_transform(X)
     if X.shape[1] > 50:
-        from sklearn.decomposition import PCA
         X = PCA(n_components=50, random_state=seed).fit_transform(X)
     if method == "umap":
         try:
