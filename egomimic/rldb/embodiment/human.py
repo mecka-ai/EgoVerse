@@ -330,21 +330,27 @@ class Mecka(Human):
     @classmethod
     def get_transform_list(
         cls,
-        mode: Literal["cartesian",],
+        mode: Literal["cartesian", "cartesian_wristframe"],
     ) -> list[Transform]:
         if mode == "cartesian":
             return _build_aria_cartesian_bimanual_transform_list(
+                stride=cls.ACTION_STRIDE,
+            )
+        elif mode == "cartesian_wristframe":
+            return _build_mecka_cartesian_wristframe_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
             )
 
     @classmethod
     def get_keymap(
         cls,
-        mode: Literal["cartesian", "keypoints"],
+        mode: Literal["cartesian", "cartesian_wristframe", "keypoints"],
         annotations: bool = False,
         norm_mode: bool = False,
     ):
-        if mode == "cartesian":
+        # cartesian_wristframe consumes the same raw keys as cartesian (action/obs
+        # ee poses + head pose); only the transform frame differs.
+        if mode in ("cartesian", "cartesian_wristframe"):
             key_map = {
                 cls.VIZ_IMAGE_KEY: {
                     "key_type": "camera_keys",
@@ -1032,6 +1038,128 @@ def _build_aria_cartesian_bimanual_transform_list(
         [
             ConcatKeys(
                 key_list=[left_action_headframe, right_action_headframe],
+                new_key_name=actions_key,
+                delete_old_keys=True,
+            ),
+            ConcatKeys(
+                key_list=[left_obs_headframe, right_obs_headframe],
+                new_key_name=obs_key,
+                delete_old_keys=True,
+            ),
+            DeleteKeys(keys_to_delete=keys_to_delete),
+        ]
+    )
+    return transform_list
+
+
+def _build_mecka_cartesian_wristframe_bimanual_transform_list(
+    *,
+    target_world: str = "obs_head_pose",
+    target_world_ypr: str = "obs_head_pose_ypr",
+    target_world_is_quat: bool = True,
+    left_action_world: str = "left.action_ee_pose",
+    right_action_world: str = "right.action_ee_pose",
+    left_obs_pose: str = "left.obs_ee_pose",
+    right_obs_pose: str = "right.obs_ee_pose",
+    left_action_wristframe: str = "left.action_ee_pose_wristframe",
+    right_action_wristframe: str = "right.action_ee_pose_wristframe",
+    left_obs_headframe: str = "left.obs_ee_pose_headframe",
+    right_obs_headframe: str = "right.obs_ee_pose_headframe",
+    actions_key: str = "actions_cartesian",
+    obs_key: str = "observations.state.ee_pose",
+    chunk_length: int = 100,
+    stride: int = 3,
+    delete_target_world: bool = True,
+) -> list[Transform]:
+    """Cartesian bimanual pipeline with actions in the WRIST frame (delta pose).
+
+    Identical to ``_build_aria_cartesian_bimanual_transform_list`` except each arm's
+    action ee-pose chunk is expressed relative to THAT arm's current ee pose
+    (``left/right.obs_ee_pose``) instead of the head pose. The result is a per-step
+    delta pose in the wrist frame: step 0 is ~identity (zero delta, since the chunk
+    starts at the current frame) and later steps are the relative transform from the
+    current ee pose. ``actions_cartesian`` stays (chunk_length, 12) — xyz+ypr per arm —
+    so the tokenizer model config is unchanged.
+
+    Proprio (``observations.state.ee_pose``) is kept in the HEAD frame, matching the
+    cartesian pipeline, so it stays informative and non-degenerate for norm stats
+    (a self-referential wrist-frame obs would be all-zeros).
+    """
+    keys_to_delete = list(
+        {
+            left_action_world,
+            right_action_world,
+            left_obs_pose,
+            right_obs_pose,
+        }
+    )
+    target_pose_key = target_world
+    if delete_target_world:
+        keys_to_delete.append(target_world)
+        if target_world_is_quat:
+            keys_to_delete.append(target_world_ypr)
+
+    transform_list: list[Transform] = [
+        # ACTION chunk → each arm's OWN current ee frame (wrist frame / delta pose).
+        # inverse=True (default) computes target^{-1} @ chunk, i.e. each future ee
+        # pose expressed relative to the current ee pose.
+        ActionChunkCoordinateFrameTransform(
+            target_world=left_obs_pose,
+            chunk_world=left_action_world,
+            transformed_key_name=left_action_wristframe,
+            mode="xyzwxyz",
+        ),
+        ActionChunkCoordinateFrameTransform(
+            target_world=right_obs_pose,
+            chunk_world=right_action_world,
+            transformed_key_name=right_action_wristframe,
+            mode="xyzwxyz",
+        ),
+        # PROPRIO stays in head frame (unchanged from the cartesian pipeline).
+        PoseCoordinateFrameTransform(
+            target_world=target_pose_key,
+            pose_world=left_obs_pose,
+            transformed_key_name=left_obs_headframe,
+            mode="xyzwxyz",
+        ),
+        PoseCoordinateFrameTransform(
+            target_world=target_pose_key,
+            pose_world=right_obs_pose,
+            transformed_key_name=right_obs_headframe,
+            mode="xyzwxyz",
+        ),
+        InterpolatePose(
+            new_chunk_length=chunk_length,
+            action_key=left_action_wristframe,
+            output_action_key=left_action_wristframe,
+            stride=stride,
+            mode="xyzwxyz",
+        ),
+        InterpolatePose(
+            new_chunk_length=chunk_length,
+            action_key=right_action_wristframe,
+            output_action_key=right_action_wristframe,
+            stride=stride,
+            mode="xyzwxyz",
+        ),
+    ]
+
+    if target_world_is_quat:
+        transform_list.append(
+            XYZWXYZ_to_XYZYPR(
+                keys=[
+                    left_action_wristframe,
+                    right_action_wristframe,
+                    left_obs_headframe,
+                    right_obs_headframe,
+                ]
+            )
+        )
+
+    transform_list.extend(
+        [
+            ConcatKeys(
+                key_list=[left_action_wristframe, right_action_wristframe],
                 new_key_name=actions_key,
                 delete_old_keys=True,
             ),
