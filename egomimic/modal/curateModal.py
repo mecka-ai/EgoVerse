@@ -742,12 +742,9 @@ def _score_task(
         _sp.run(["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
                  "external/quest"], check=True)
         _qd = f"{CFG.remote_repo_dir}/external/quest"
-        if Path(_qd).is_dir():
-            _sp.run([CFG.python_bin, "-c",
-                     "import sysconfig,os,sys; "
-                     "p=os.path.join(sysconfig.get_paths()['purelib'],'egoverse_quest.pth'); "
-                     "open(p,'w').write(sys.argv[1]); print('registered quest ->',sys.argv[1])",
-                     _qd], check=True)
+        if Path(_qd).is_dir() and _qd not in sys.path:
+            sys.path.insert(0, _qd)  # make 'quest' importable in THIS process (.pth only helps next start)
+            print(f"{tag} added {_qd} to sys.path")
 
     src_dir = Path(latents_source) if latents_source else Path(output_dir)
     lat_dir = src_dir / "latents" / task_name
