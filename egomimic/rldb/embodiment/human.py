@@ -340,17 +340,27 @@ class Mecka(Human):
             return _build_mecka_cartesian_wristframe_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
             )
+        elif mode == "cartesian_wristframe_nointerp":
+            # No interpolation: the keymap reads a full chunk_length (100) horizon of
+            # real frames, so the wrist-frame action chunk is used as read.
+            return _build_mecka_cartesian_wristframe_bimanual_transform_list(
+                interpolate=False,
+            )
 
     @classmethod
     def get_keymap(
         cls,
-        mode: Literal["cartesian", "cartesian_wristframe", "keypoints"],
+        mode: Literal[
+            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp", "keypoints"
+        ],
         annotations: bool = False,
         norm_mode: bool = False,
     ):
-        # cartesian_wristframe consumes the same raw keys as cartesian (action/obs
-        # ee poses + head pose); only the transform frame differs.
-        if mode in ("cartesian", "cartesian_wristframe"):
+        # cartesian variants consume the same raw keys (action/obs ee poses + head
+        # pose); only the transform frame + horizon differ. The _nointerp variant
+        # reads a full 100-frame horizon (no InterpolatePose upsamples 30 -> 100).
+        if mode in ("cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp"):
+            action_horizon = 100 if mode == "cartesian_wristframe_nointerp" else 30
             key_map = {
                 cls.VIZ_IMAGE_KEY: {
                     "key_type": "camera_keys",
@@ -359,12 +369,12 @@ class Mecka(Human):
                 "right.action_ee_pose": {
                     "key_type": "action_keys",
                     "zarr_key": "right.obs_ee_pose",
-                    "horizon": 30,
+                    "horizon": action_horizon,
                 },
                 "left.action_ee_pose": {
                     "key_type": "action_keys",
                     "zarr_key": "left.obs_ee_pose",
-                    "horizon": 30,
+                    "horizon": action_horizon,
                 },
                 "right.obs_ee_pose": {
                     "key_type": "proprio_keys",
@@ -1069,6 +1079,7 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
     obs_key: str = "observations.state.ee_pose",
     chunk_length: int = 100,
     stride: int = 3,
+    interpolate: bool = True,
     delete_target_world: bool = True,
 ) -> list[Transform]:
     """Cartesian bimanual pipeline with actions in the WRIST frame (delta pose).
@@ -1084,6 +1095,11 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
     Proprio (``observations.state.ee_pose``) is kept in the HEAD frame, matching the
     cartesian pipeline, so it stays informative and non-degenerate for norm stats
     (a self-referential wrist-frame obs would be all-zeros).
+
+    ``interpolate``: when True (default), the raw action horizon (post-``stride``) is
+    resampled to ``chunk_length`` via ``InterpolatePose``. When False, no resampling is
+    done — the action chunk is used as read, so the keymap MUST supply a horizon of
+    exactly ``chunk_length`` real frames (i.e. ``action_ee_pose`` horizon == chunk_length).
     """
     keys_to_delete = list(
         {
@@ -1128,21 +1144,29 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
             transformed_key_name=right_obs_headframe,
             mode="xyzwxyz",
         ),
-        InterpolatePose(
-            new_chunk_length=chunk_length,
-            action_key=left_action_wristframe,
-            output_action_key=left_action_wristframe,
-            stride=stride,
-            mode="xyzwxyz",
-        ),
-        InterpolatePose(
-            new_chunk_length=chunk_length,
-            action_key=right_action_wristframe,
-            output_action_key=right_action_wristframe,
-            stride=stride,
-            mode="xyzwxyz",
-        ),
     ]
+
+    if interpolate:
+        # Resample the (post-stride) raw horizon to chunk_length. When False, the
+        # action chunk is used as-is (keymap must read exactly chunk_length frames).
+        transform_list.extend(
+            [
+                InterpolatePose(
+                    new_chunk_length=chunk_length,
+                    action_key=left_action_wristframe,
+                    output_action_key=left_action_wristframe,
+                    stride=stride,
+                    mode="xyzwxyz",
+                ),
+                InterpolatePose(
+                    new_chunk_length=chunk_length,
+                    action_key=right_action_wristframe,
+                    output_action_key=right_action_wristframe,
+                    stride=stride,
+                    mode="xyzwxyz",
+                ),
+            ]
+        )
 
     if target_world_is_quat:
         transform_list.append(
