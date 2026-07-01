@@ -732,8 +732,10 @@ DEFAULT_CAMERA_NAMES = {
 
 # Per-camera RealSense resolution overrides, keyed by friendly name ->
 # (width, height, fps). The D405 wrists are on USB 2.0, so they stay 640x480@30
-# (the only mode all wrist cams share at 30fps). Empty = all use 640x480@30.
-DEFAULT_CAMERA_RESOLUTIONS = {}
+# (the only mode all wrist cams share at 30fps). Empty (per-camera) = 640x480@30.
+DEFAULT_CAMERA_RESOLUTIONS = {
+    "front_img_1": (848, 480, 30),
+}
 
 
 def parse_camera_names(pairs):

@@ -119,7 +119,7 @@ class YAMInterface(Robot_Interface):
         gripper_limits_override=None,
         camera_names=None,
         cameras_cfg=None,
-        front_raw=False,
+        use_realsense_front=False,
     ):
         """
         Args:
@@ -133,14 +133,17 @@ class YAMInterface(Robot_Interface):
             gripper_limits_override (np.ndarray | None): [closed, open] limits to
                 skip auto-calibration on startup.
             camera_names (dict[str, str] | None): serial->name map for the wrist
-                cameras. Defaults to yam_cameras.DEFAULT_CAMERA_NAMES.
+                cameras. Defaults to yam_cameras.DEFAULT_CAMERA_NAMES. When
+                ``use_realsense_front=True``, also map that RealSense's serial to
+                "front_img_1" here — it's then picked up by the same RealSense
+                auto-discovery that finds the wrist cams.
             cameras_cfg (dict | None): optional ARX-style explicit camera config
                 ``{name: {type, enabled, ...}}``. None -> auto-discovery (Atlas front
-                + connected D405 wrists).
-            front_raw (bool): if True (auto-discovery only), capture the Atlas front
-                camera RAW — the un-rectified side-by-side fisheye pair, no
-                rectify/re-aim/fuse/crop. For (intrinsic) camera calibration; leave
-                False for normal rollout/data collection.
+                + connected D405 wrists). Ignored when set (``use_realsense_front``
+                only applies to auto-discovery).
+            use_realsense_front (bool): auto-discovery only — skip the Atlas rig
+                for "front_img_1" and let a RealSense (e.g. D435i) fill that slot
+                instead, via ``camera_names``.
 
         The interface ALWAYS opens its own cameras and raises if none are
         available (a rollout — or black-frame demos — must not run blind).
@@ -163,7 +166,7 @@ class YAMInterface(Robot_Interface):
         self._create_cam_recorders(
             cameras_cfg=cameras_cfg,
             wrist_serial_to_name=camera_names,
-            front_raw=front_raw,
+            use_front=not use_realsense_front,
         )
 
     # ------------------------------------------------------------------
@@ -190,15 +193,7 @@ class YAMInterface(Robot_Interface):
                 gripper_limits_override=self._gripper_limits_override,
             )
 
-            # Each arm gets its own solver: mink.Configuration holds internal
-            # state, so sharing one across arms would race. The model is patched
-            # PER ARM (joint-6 fix for both; left additionally gets the 180deg
-            # grasp_site z-roll -> x-up/y-right vs right's stock x-down/y-left).
-            self.kinematics[arm] = Kinematics(
-                _patch_kinematics_xml(base_xml, arm), _GRASP_SITE)
-
-    def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None,
-                              front_raw=False):
+    def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None, use_front=True):
         """Build per-camera recorders into ``self.recorders`` / ``self.camera_res``.
 
         Mirrors ``ARXInterface.__create_cam_recorders``: ALL camera setup lives
@@ -219,7 +214,7 @@ class YAMInterface(Robot_Interface):
 
         self.recorders = create_camera_recorders(
             cameras_cfg=cameras_cfg, wrist_serial_to_name=wrist_serial_to_name,
-            front_raw=front_raw,
+            use_front=use_front,
         )
         if not self.recorders:
             raise RuntimeError(

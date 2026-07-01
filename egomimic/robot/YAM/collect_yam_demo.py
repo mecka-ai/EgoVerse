@@ -335,7 +335,7 @@ def collect_yam_demo(
     gripper=GripperType.LINEAR_4310,
     strict_cameras=False,
     debug_buttons=False,
-    front_raw=False,
+    use_realsense_front=False,
 ):
     demo_dir = Path(demo_dir)
     demo_dir.mkdir(parents=True, exist_ok=True)
@@ -353,7 +353,7 @@ def collect_yam_demo(
         gripper_type=gripper,
         zero_gravity_mode=False,  # hold commanded poses during teleop
         camera_names=serial_to_name,  # interface opens & owns the cameras
-        front_raw=front_raw,  # raw un-rectified front fisheye (for calibration)
+        use_realsense_front=use_realsense_front,
     )
 
     # --- Leaders (teaching handles) -----------------------------------------
@@ -586,6 +586,11 @@ def main():
              "this. e.g. --camera-name 420222073106=front_img_1",
     )
     parser.add_argument(
+        "--use-realsense-front", action="store_true",
+        help="Use a RealSense (e.g. D435i) for front_img_1 instead of the Atlas "
+             "rig. Map its serial with --camera-name SERIAL=front_img_1.",
+    )
+    parser.add_argument(
         "--strict-cameras", action="store_true",
         help="Abort (don't save) an episode if any camera shows >100 consecutive "
              "identical frames. Default: warn but save anyway.",
@@ -637,7 +642,7 @@ def main():
         bilateral_kp=args.bilateral_kp,
         strict_cameras=args.strict_cameras,
         debug_buttons=args.debug_buttons,
-        front_raw=args.raw_front,
+        use_realsense_front=args.use_realsense_front,
     )
 
 
