@@ -453,6 +453,7 @@ def viewer():
             "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
             "txt":   [str(s.get("text", ""))[:60]         for s in spans],
         }
+        result["method"] = str(data.get("method", "tsne"))
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]

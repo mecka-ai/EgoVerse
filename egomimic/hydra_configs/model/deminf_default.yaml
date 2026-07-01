@@ -3,6 +3,9 @@
 latent_dim: 32
 device: cuda
 
+# 3-D projection for t-SNE/UMAP viewer exports: tsne | umap
+projection: tsne
+
 keys:
   action: actions_cartesian
   image: observations.images.front_img_1

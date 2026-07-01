@@ -429,8 +429,10 @@ function renderTsne(preserveToggles){
   }
 
   const hidden=hiddenMods.size?` &middot; <span style="color:#f87">${hiddenMods.size} hidden</span>`:'';
+  const projName=(TSNE.method||'tsne').toUpperCase();
   document.getElementById('tstats').innerHTML=
-    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes${hidden}`;
+    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${hidden}`;
+  const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+' 3-D';
   buildLegend();
   applyStyle();
 }
