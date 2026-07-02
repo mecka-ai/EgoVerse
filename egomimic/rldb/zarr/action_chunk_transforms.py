@@ -673,12 +673,12 @@ class RotatePoseLocal(Transform):
 
     ``T -> T @ E`` with ``E`` a pure rotation: the pose's position is unchanged
     and its orientation axes are remapped in its OWN frame. Used to unify the
-    left/right hand frame conventions: the raw mecka/aria wrist frames are
-    anatomically mirrored (+y out of the palm on BOTH hands), so a local
-    Rz(pi) on the LEFT hand makes both hands share the right hand's native
-    spatial convention — +y right, +x down, +z back through the wrist when
-    the hands are vertical. Applied BEFORE any frame composition the
-    correction propagates exactly: left-compositions commute
+    left/right hand frame conventions: the raw mecka/aria RIGHT wrist frame is
+    anatomically mirrored relative to the left (+y out of the palm on both
+    hands), so a local Rz(pi) on the right makes both hands share one spatial
+    convention — +y right, +x down, +z back through the wrist when the hands
+    are vertical (palms facing each other). Applied BEFORE any frame
+    composition the correction propagates exactly: left-compositions commute
     (``inv(H) @ (T @ E) = (inv(H) @ T) @ E``), SLERP is right-invariant, and
     the wrist-frame chunk becomes ``inv(E) @ chunk @ E``.
 

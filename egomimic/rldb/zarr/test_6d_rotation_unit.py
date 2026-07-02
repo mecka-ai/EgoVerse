@@ -557,11 +557,10 @@ def _human_random_cartesian_batch(T=5, seed=7):
     }
 
 
-def test_unify_hand_frames_conjugates_left_wrist_chunk_by_rz_pi():
-    """unify_hand_frames must equal an EXACT local Rz(pi) change of the LEFT
-    frame (the right hand's native convention is the unified one): left wrist
-    chunk conjugated (inv(E) @ chunk @ E), left headframe proprio
-    post-multiplied (obs @ E), right hand untouched."""
+def test_unify_right_hand_frame_conjugates_right_wrist_chunk_by_rz_pi():
+    """unify_right_hand_frame must equal an EXACT local Rz(pi) change of the
+    right frame: wrist chunk conjugated (inv(E) @ chunk @ E), headframe proprio
+    post-multiplied (obs @ E), left hand untouched."""
     from egomimic.rldb.embodiment.human import (
         _build_human_cartesian_eef_frame_transform_list,
     )
@@ -573,7 +572,7 @@ def test_unify_hand_frames_conjugates_left_wrist_chunk_by_rz_pi():
     )
     unified = _run(
         _build_human_cartesian_eef_frame_transform_list(
-            stride=1, rot_repr="6d", unify_hand_frames=True
+            stride=1, rot_repr="6d", unify_right_hand_frame=True
         ),
         batch,
     )
@@ -581,22 +580,22 @@ def test_unify_hand_frames_conjugates_left_wrist_chunk_by_rz_pi():
     E[:3, :3] = np.diag([-1.0, -1.0, 1.0])  # Rz(pi)
 
     np.testing.assert_allclose(
-        unified["actions_cartesian"][:, 9:],
-        plain["actions_cartesian"][:, 9:],
+        unified["actions_cartesian"][:, :9],
+        plain["actions_cartesian"][:, :9],
         atol=1e-12,
     )
     np.testing.assert_allclose(
-        unified["observations.state.ee_pose"][9:],
-        plain["observations.state.ee_pose"][9:],
+        unified["observations.state.ee_pose"][:9],
+        plain["observations.state.ee_pose"][:9],
         atol=1e-12,
     )
 
-    plain_l = _xyz6d_to_matrix(plain["actions_cartesian"][:, :9])
-    unified_l = _xyz6d_to_matrix(unified["actions_cartesian"][:, :9])
-    np.testing.assert_allclose(unified_l, np.linalg.inv(E) @ plain_l @ E, atol=1e-9)
+    plain_r = _xyz6d_to_matrix(plain["actions_cartesian"][:, 9:])
+    unified_r = _xyz6d_to_matrix(unified["actions_cartesian"][:, 9:])
+    np.testing.assert_allclose(unified_r, np.linalg.inv(E) @ plain_r @ E, atol=1e-9)
 
-    plain_o = _xyz6d_to_matrix(plain["observations.state.ee_pose"][None, :9])[0]
-    unified_o = _xyz6d_to_matrix(unified["observations.state.ee_pose"][None, :9])[0]
+    plain_o = _xyz6d_to_matrix(plain["observations.state.ee_pose"][None, 9:])[0]
+    unified_o = _xyz6d_to_matrix(unified["observations.state.ee_pose"][None, 9:])[0]
     np.testing.assert_allclose(unified_o, plain_o @ E, atol=1e-9)
 
 
