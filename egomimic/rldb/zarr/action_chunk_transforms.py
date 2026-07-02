@@ -181,7 +181,7 @@ class ActionChunkCoordinateFrameTransform(Transform):
         chunk_world: str,
         transformed_key_name: str,
         extra_batch_key: dict = None,
-        mode: Literal["xyz", "xyzwxyz", "xyzypr"] = "xyzwxyz",
+        mode: Literal["xyz", "xyzwxyz", "xyzypr", "xyz6d"] = "xyzwxyz",
         inverse: bool = True,
     ):
         """
@@ -228,14 +228,24 @@ class ActionChunkCoordinateFrameTransform(Transform):
             to_matrix_fn = _xyzwxyz_to_matrix
         elif self.mode == "xyzypr":
             to_matrix_fn = _xyzypr_to_matrix
+        elif self.mode == "xyz6d":
+            # Gram-Schmidt re-orthonormalization happens here when reverting a
+            # (possibly non-orthonormal) model 6D prediction back to a frame.
+            to_matrix_fn = _xyz6d_to_matrix
         elif self.mode == "xyz":
             to_matrix_fn = _xyz_to_matrix
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
-        target_world_to_matrix_fn = (
-            _xyzwxyz_to_matrix if target_world.shape[-1] == 7 else _xyzypr_to_matrix
-        )
+        # Dispatch the target-world parser by its width: 7 -> xyz+quat(wxyz),
+        # 9 -> xyz+6D columns, else xyz+ypr.
+        target_width = target_world.shape[-1]
+        if target_width == 7:
+            target_world_to_matrix_fn = _xyzwxyz_to_matrix
+        elif target_width == 9:
+            target_world_to_matrix_fn = _xyz6d_to_matrix
+        else:
+            target_world_to_matrix_fn = _xyzypr_to_matrix
         # Convert to SE3 for transformation
         target_se3 = SE3.from_matrix(
             target_world_to_matrix_fn(target_world[None, :])[0]
@@ -255,6 +265,8 @@ class ActionChunkCoordinateFrameTransform(Transform):
             chunk_in_target_frame = _matrix_to_xyzwxyz(chunk_mats)
         elif self.mode == "xyzypr":
             chunk_in_target_frame = _matrix_to_xyzypr(chunk_mats)
+        elif self.mode == "xyz6d":
+            chunk_in_target_frame = _matrix_to_xyz6d(chunk_mats)
         elif self.mode == "xyz":
             chunk_in_target_frame = _matrix_to_xyz(chunk_mats)
         else:
@@ -558,6 +570,50 @@ class XYZWXYZ_to_XYZ6D(Transform):
                 raise ValueError(
                     f"XYZWXYZ_to_XYZ6D.transform_batch: key '{key}' shape {value.shape} "
                     f"— expected (B, 7) or (B, H, 7)"
+                )
+        return batch
+
+
+class XYZ6D_to_XYZYPR(Transform):
+    """Convert listed keys from xyz+6D-columns to xyz+ypr in-place.
+
+    Runs Gram-Schmidt (via ``_xyz6d_to_matrix``) to re-orthonormalize the two
+    columns, then reads Euler angles off the matrix. Used at the tail of the
+    revert pipeline so viz keeps seeing ypr while the model predicts 6D. Ported
+    from pi-6d.
+    """
+
+    def __init__(self, keys: list[str]):
+        self.keys = list(keys)
+
+    def transform(self, batch: dict) -> dict:
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 1 and value.shape[0] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value[None, :]))[0]
+            elif value.ndim == 2 and value.shape[1] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value))
+            else:
+                raise ValueError(
+                    f"XYZ6D_to_XYZYPR expects key '{key}' to have shape (9,) "
+                    f"or (T, 9), got {value.shape}"
+                )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: (B, 9) obs → (B, 6), (B, H, 9) chunks → (B, H, 6)."""
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 2 and value.shape[-1] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value))  # (B, 6)
+            elif value.ndim == 3 and value.shape[-1] == 9:
+                B, H = value.shape[:2]
+                flat = _matrix_to_xyzypr(_xyz6d_to_matrix(value.reshape(B * H, 9)))
+                batch[key] = flat.reshape(B, H, 6)
+            else:
+                raise ValueError(
+                    f"XYZ6D_to_XYZYPR.transform_batch: key '{key}' shape {value.shape} "
+                    f"— expected (B, 9) or (B, H, 9)"
                 )
         return batch
 

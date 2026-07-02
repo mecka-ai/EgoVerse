@@ -1,0 +1,33 @@
+# Visualization for 6D wrist-frame cartesian actions. Same as cartesian.yaml, but
+# mecka_bimanual passes a revert transform_list to viz_gt_preds: it re-composes the
+# 6D wrist-frame action chunk with the current ee pose (obs, head frame) back to
+# head/camera frame and collapses 6D -> ypr, so the GT (green) and reconstruction
+# (red) overlays project correctly onto the ego image. Pair with a run whose actions
+# are cartesian_wristframe_6d (18-dim), e.g. data=mecka_preanno199_zarr_quest_wf6d.
+eva_bimanual:
+  _target_: egomimic.rldb.embodiment.eva.Eva.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+aria_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Aria.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+mecka_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Mecka.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+  transform_list:
+    _target_: egomimic.rldb.embodiment.human._build_mecka_cartesian_revert_wristframe_transform_list
+    rot_repr: "6d"
+scale_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Scale.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj

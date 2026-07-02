@@ -15,6 +15,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     Reshape,
     SplitKeys,
     Transform,
+    XYZ6D_to_XYZYPR,
     XYZWXYZ_to_XYZ6D,
     XYZWXYZ_to_XYZYPR,
 )
@@ -1216,5 +1217,79 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
             ),
             DeleteKeys(keys_to_delete=keys_to_delete),
         ]
+    )
+    return transform_list
+
+
+def _build_mecka_cartesian_revert_wristframe_transform_list(
+    *,
+    action_key: str = "actions_cartesian",
+    obs_key: str = "observations.state.ee_pose",
+    left_action_wristframe: str = "left.action_ee_pose_wristframe",
+    right_action_wristframe: str = "right.action_ee_pose_wristframe",
+    left_obs_headframe: str = "left.obs_ee_pose_headframe",
+    right_obs_headframe: str = "right.obs_ee_pose_headframe",
+    left_action_headframe: str = "left.action_ee_pose_headframe",
+    right_action_headframe: str = "right.action_ee_pose_headframe",
+    is_quat: bool = False,
+    rot_repr: str = "ypr",
+) -> list[Transform]:
+    """Revert wrist-frame cartesian actions back to head (camera) frame for viz.
+
+    Inverse of ``_build_mecka_cartesian_wristframe_bimanual_transform_list``: the
+    action chunk lives in each arm's wrist frame, the proprio ee-poses live in head
+    frame. Re-composes ``obs_headframe @ action_wristframe`` (inverse=False) so the
+    action chunk is back in head/camera frame, which ``viz_gt_preds`` can project.
+    ``rot_repr="6d"`` reverts a model 6D prediction (per-arm width 9, ``xyz6d`` with
+    Gram-Schmidt) then collapses to ypr. Wired via the visualization config's
+    ``transform_list`` (viz_gt_preds applies it to both GT and prediction). Ported
+    from pi-6d's ``_build_human_cartesian_revert_eef_frame_transform_list``.
+    """
+    if rot_repr == "6d":
+        pose_shape = 9
+        mode = "xyz6d"
+    else:
+        pose_shape = 7 if is_quat else 6
+        mode = "xyzwxyz" if is_quat else "xyzypr"
+    transform_list = [
+        SplitKeys(
+            input_key=obs_key,
+            output_key_list=[
+                (left_obs_headframe, pose_shape),
+                (right_obs_headframe, pose_shape),
+            ],
+        ),
+        SplitKeys(
+            input_key=action_key,
+            output_key_list=[
+                (left_action_wristframe, pose_shape),
+                (right_action_wristframe, pose_shape),
+            ],
+        ),
+        ActionChunkCoordinateFrameTransform(
+            target_world=left_obs_headframe,
+            chunk_world=left_action_wristframe,
+            transformed_key_name=left_action_headframe,
+            mode=mode,
+            inverse=False,
+        ),
+        ActionChunkCoordinateFrameTransform(
+            target_world=right_obs_headframe,
+            chunk_world=right_action_wristframe,
+            transformed_key_name=right_action_headframe,
+            mode=mode,
+            inverse=False,
+        ),
+    ]
+    if rot_repr == "6d":
+        transform_list.append(
+            XYZ6D_to_XYZYPR(keys=[left_action_headframe, right_action_headframe])
+        )
+    transform_list.append(
+        ConcatKeys(
+            key_list=[left_action_headframe, right_action_headframe],
+            new_key_name=action_key,
+            delete_old_keys=True,
+        ),
     )
     return transform_list
