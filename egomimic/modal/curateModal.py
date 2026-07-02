@@ -231,7 +231,8 @@ def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
             import umap
         return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
     from sklearn.manifold import TSNE
-    return TSNE(n_components=dims, init="pca", perplexity=30, random_state=seed).fit_transform(X)
+    perplexity = min(50, max(5, len(X) // 100))
+    return TSNE(n_components=dims, init="pca", perplexity=perplexity, random_state=seed).fit_transform(X)
 
 
 def _build_quest_token_tsne(
@@ -254,13 +255,23 @@ def _build_quest_token_tsne(
         arr = ep_chunks.get(m["episode"])
         if arr is None or len(arr) == 0:
             continue
-        executed = arr[:, 0, :] if arr.ndim == 3 else arr      # executed per-frame trajectory (T, D)
-        T = executed.shape[0]
-        for idx in range(int(m["start"]), min(int(m["end"]), T), H):  # non-overlapping H-frame windows
-            w = executed[idx : idx + H]
-            if len(w) < H:                                     # pad short/last window to H (repeat last frame)
-                w = _np.concatenate([w, _np.repeat(w[-1:], H - len(w), axis=0)], axis=0)
-            chunk_list.append(w); owner.append(i)
+        if arr.ndim == 3:
+            # arr is (T, H, D) — pre-computed wristframe chunks from the transform pipeline.
+            # Each arr[idx] is already (H, D) in the exact format the tokenizer was trained on.
+            # Using arr[:, 0, :] would extract step-0 (always near-zero identity delta in wrist
+            # frame) and produce degenerate near-identical embeddings.
+            T = arr.shape[0]
+            for idx in range(int(m["start"]), min(int(m["end"]), T), H):
+                chunk_list.append(arr[idx])  # (H, D) — pre-computed chunk
+                owner.append(i)
+        else:
+            # arr is (T, D) — per-step actions; create windows manually
+            T = arr.shape[0]
+            for idx in range(int(m["start"]), min(int(m["end"]), T), H):
+                w = arr[idx : idx + H]
+                if len(w) < H:
+                    w = _np.concatenate([w, _np.repeat(w[-1:], H - len(w), axis=0)], axis=0)
+                chunk_list.append(w); owner.append(i)
     if not chunk_list:
         print(f"{tag} QueST: no chunks found — skipping"); return
     chunks = _np.stack(chunk_list).astype(_np.float32)         # (Nc, H, D)
