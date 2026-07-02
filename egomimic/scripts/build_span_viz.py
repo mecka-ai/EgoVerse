@@ -457,7 +457,7 @@ function renderGrid(){
       </div>
       <div class="ann-text" title="${escHtml(s.text)}">${escHtml((s.text||'').length>80?(s.text||'').slice(0,80)+'…':s.text||'')}</div>
       <div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>
-      <div class="vid" id="${cid}">
+      <div class="vid" id="${cid}" data-ep="${s.ep}" data-start="${s.start}" data-end="${s.end}">
         <div class="ph" onclick="loadSpanVideo('${cid}','${s.ep}',${s.start},${s.end})">
           <div class="play">▶</div>
           <div style="font-size:11px">f${s.start}–${s.end} (${dur}s)</div>
@@ -472,20 +472,54 @@ function renderGrid(){
   document.getElementById('span-grid').innerHTML = cards.join('');
 }
 
-function loadSpanVideo(cellId, ep, start, end){
-  const el = document.getElementById(cellId);
+/* Throttled span-video loader. Each cell loads the full episode MP4 and clips to
+   [start,end); browsers cap concurrent media streams (~6/host), so loading every
+   cell at once stalls most to black. Load at most _MAXC at a time, starting the
+   next as each finishes. _autoplay gates whether bulk-loaded clips play on ready. */
+const _MAXC = 6;
+let _vq = [], _vactive = 0, _autoplay = false;
+function _vpump(){ while(_vactive < _MAXC && _vq.length){ _vactive++; (_vq.shift())(); } }
+function _vrelease(){ _vactive = Math.max(0, _vactive - 1); _vpump(); }
+
+function _mountSpanVideo(el, play){
+  // play: () => bool — whether to start playback once metadata is ready.
+  el.dataset.loaded = '1';
+  const ep = el.dataset.ep, seekTo = (+el.dataset.start) / FPS, stopAt = (+el.dataset.end) / FPS;
   el.innerHTML = `<video src="${VIDEO_BASE}${ep}" controls muted playsinline preload="metadata"></video>`;
   const vid = el.querySelector('video');
-  const seekTo = start / FPS;
-  const stopAt  = end   / FPS;
-  vid.addEventListener('loadedmetadata', () => { vid.currentTime = seekTo; vid.play().catch(()=>{}); });
+  let released = false;
+  const release = () => { if(!released){ released = true; _vrelease(); } };
+  vid.addEventListener('loadedmetadata', () => {
+    try { vid.currentTime = seekTo; } catch(e){}
+    if(play()) vid.play().catch(()=>{});
+    release();
+  });
+  vid.addEventListener('error', release);
   vid.addEventListener('timeupdate', () => {
     if(vid.currentTime >= stopAt){ vid.pause(); vid.currentTime = seekTo; }
   });
 }
-function loadAll(){ document.querySelectorAll('#span-grid .ph').forEach(ph=>ph.click()); }
-function playAll(){ loadAll(); document.querySelectorAll('#span-grid video').forEach(v=>v.play().catch(()=>{})); }
-function pauseAll(){ document.querySelectorAll('#span-grid video').forEach(v=>v.pause()); }
+
+/* single click → load immediately (bypass queue) and play, or replay if already loaded */
+function loadSpanVideo(cellId){
+  const el = document.getElementById(cellId);
+  if(!el) return;
+  if(el.dataset.loaded){ const v = el.querySelector('video'); if(v) v.play().catch(()=>{}); return; }
+  _mountSpanVideo(el, () => true);
+}
+
+function _enqueueCell(el){
+  if(el.dataset.loaded){
+    if(_autoplay){ const v = el.querySelector('video'); if(v) v.play().catch(()=>{}); }
+    return;
+  }
+  el.dataset.loaded = '1';                       // claim now so it can't double-enqueue
+  _vq.push(() => _mountSpanVideo(el, () => _autoplay));
+  _vpump();
+}
+function loadAll(){ _autoplay = false; document.querySelectorAll('#span-grid .vid').forEach(_enqueueCell); }
+function playAll(){ _autoplay = true;  document.querySelectorAll('#span-grid .vid').forEach(_enqueueCell); }
+function pauseAll(){ _autoplay = false; _vq = []; document.querySelectorAll('#span-grid video').forEach(v=>v.pause()); }
 
 /* ── init cluster selector ── */
 (()=>{

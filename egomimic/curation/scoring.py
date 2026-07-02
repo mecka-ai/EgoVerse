@@ -386,6 +386,7 @@ class TrajectoryScorer:
         span_texts: list[str],
         span_meta: list[dict],
         text_embeddings: np.ndarray,
+        score: bool = True,
     ) -> dict[str, dict]:
         """
         Cluster annotation spans by language, then KSG-score each cluster.
@@ -437,6 +438,12 @@ class TrajectoryScorer:
             texts = [span_texts[i] for i in idxs]
             label = Counter(texts).most_common(1)[0][0] if texts else ""
             cluster_key = f"cluster_{c}"
+
+            if not score:
+                # tsne-only mode: keep clustering (for coloring) but skip the expensive
+                # per-cluster scoring; spans recorded with score=None.
+                result[cluster_key] = _dropped(idxs, label, "scoring disabled")
+                continue
 
             if len(idxs) < min_spans:
                 logger.info(

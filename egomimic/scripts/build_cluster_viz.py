@@ -140,10 +140,16 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div id="tsnepage">
   <div id="tools">
     <span class="tool"><label>Color</label>
-      <select id="colorMode" onchange="applyStyle();buildLegend()">
+      <select id="colorMode" onchange="applyStyle()">
         <option value="cluster">cluster</option>
+        <option value="episode">episode</option>
         <option value="score">MI score</option>
         <option value="time">time (light&rarr;dark)</option>
+      </select></span>
+    <span class="tool"><label>Select</label>
+      <select id="selMode" onchange="onSelMode()">
+        <option value="cluster">cluster</option>
+        <option value="episode">episode</option>
       </select></span>
     <span class="tool"><label>Clusters</label>
       <span id="cCount" style="background:#26272f;padding:3px 8px;border-radius:5px;font-size:12px;color:#cdd">all</span>
@@ -207,8 +213,10 @@ const TSNE       = __TSNE__;          // {} if no spans_tsne3d.json; else {cid,s
 const VIDEO_BASE = "__VIDEO_BASE__";
 const FRAME_BASE = "__FRAME_BASE__";
 const FPS        = 30;
+const RUN_KEY    = "clusterviz:" + "__RUN_LABEL_ESCAPED__";   // localStorage key (per run)
 
 const HAS_TSNE = TSNE && TSNE.cid && TSNE.cid.length;
+const IS2D = (TSNE && TSNE.dims || 3) === 2;   // 2-D vs 3-D scatter
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
   parseInt(a.replace('cluster_','')) - parseInt(b.replace('cluster_',''))
 );
@@ -217,11 +225,35 @@ const TOTAL_SPANS = ALL_CID.reduce((s,c)=>s+CLUSTERS[c].spans.length,0);
 /* ── runtime state ── */
 let COLOR_TABLES  = null;             // {cluster:[…], score:[…], time:[…]}
 let curCluster    = null;             // string "cluster_N" or null — drives the grid
-let selectedClusters = new Set();     // Set<int> — multi-highlight in scatter + grid
+let selectedClusters = new Set();     // Set<int> — multi-highlight in scatter + grid (cluster mode)
+let selectedEpisodes = new Set();     // Set<str> — multi-highlight in scatter + grid (episode mode)
 let hiddenMods    = new Set();
 let activeMods    = [];
 let camLock       = false;
 let page          = 'tsne';
+
+/* ── persist sidebar selection + color/select modes across reload (per run) ── */
+function saveState(){
+  try{ localStorage.setItem(RUN_KEY, JSON.stringify({
+    selMode:   document.getElementById('selMode').value,
+    colorMode: document.getElementById('colorMode').value,
+    clusters:  [...selectedClusters],
+    episodes:  [...selectedEpisodes],
+    curCluster,
+  })); }catch(e){}
+}
+function loadState(){
+  try{
+    const s=JSON.parse(localStorage.getItem(RUN_KEY)||'null'); if(!s) return;
+    const sm=document.getElementById('selMode'), cm=document.getElementById('colorMode');
+    if(s.selMode&&sm) sm.value=s.selMode;
+    if(s.colorMode&&cm) cm.value=s.colorMode;
+    selectedClusters = new Set((s.clusters||[]).map(Number));
+    selectedEpisodes = new Set(s.episodes||[]);
+    curCluster = s.curCluster||null;
+    const cs=document.getElementById('csel'); if(cs&&curCluster) cs.value=curCluster;
+  }catch(e){}
+}
 
 const MOD_ORDER  = ['state','action','language'];
 const MOD_LABELS = {state:'STATE', action:'ACTION', language:'LANGUAGE'};
@@ -241,6 +273,11 @@ function cidHue(ci){return(ci*137.508)%360/360;}
 function cidColor(ci){return rgb(hsv2rgb(cidHue(ci),0.85,0.9));}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
+/* ── episode index + colors (for the 'episode' color mode + episode legend) ── */
+const EP_LIST = (()=>{const cnt={}; ALL_CID.forEach(cid=>CLUSTERS[cid].spans.forEach(s=>{cnt[s.ep]=(cnt[s.ep]||0)+1;})); return Object.keys(cnt).sort().map((ep,i)=>({ep,count:cnt[ep],idx:i}));})();
+const EP_IDX = Object.fromEntries(EP_LIST.map(e=>[e.ep,e.idx]));
+function epColor(ep){const i=EP_IDX[ep]??0; return rgb(hsv2rgb((i*137.508)%360/360,0.85,0.9));}
+
 /* ── color tables (built once) ── */
 function buildColorTables(){
   if(!HAS_TSNE) return;
@@ -249,9 +286,10 @@ function buildColorTables(){
   const finite=scores.filter(s=>isFinite(s));
   const mn=finite.length?Math.min(...finite):0, mx=finite.length?Math.max(...finite):1;
   const s0=Math.min(...starts), s1=Math.max(...starts)||1;
-  const ct={cluster:new Array(N), score:new Array(N), time:new Array(N)};
+  const ct={cluster:new Array(N), episode:new Array(N), score:new Array(N), time:new Array(N)};
   for(let k=0;k<N;k++){
     ct.cluster[k]=cidColor(TSNE.cid[k]);
+    ct.episode[k]=epColor(TSNE.ep[k]);
     ct.score[k]=rgb(redGreen(mx>mn?(scores[k]-mn)/(mx-mn):0.5));
     ct.time[k]=rgb(lerp3([170,215,255],[10,40,90],(starts[k]-s0)/Math.max(1,s1-s0)));
   }
@@ -276,17 +314,20 @@ function applyStyle(){
   const N=TSNE.cid.length;
   const base=COLOR_TABLES[u.mode]||COLOR_TABLES.cluster;
   const colors=new Array(N), sizes=new Array(N);
+  const selEp = document.getElementById('selMode').value==='episode';  // selection dim (decoupled from color)
+  const sel = selEp ? selectedEpisodes : selectedClusters;
   for(let k=0;k<N;k++){
     const ci=TSNE.cid[k];
-    const passCl = selectedClusters.size===0 || selectedClusters.has(ci);
+    const passSel = sel.size===0 || sel.has(selEp ? TSNE.ep[k] : ci);
     const passHl = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
-    if(passCl && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
-    else if(!passCl){ colors[k]=DIM; sizes[k]=u.size*0.4; }
+    if(passSel && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
+    else if(!passSel){ colors[k]='rgba(0,0,0,0)'; sizes[k]=0; }   // selection active → hide non-selected entirely
     else { colors[k]=DIM; sizes[k]=u.size; }
   }
   activeMods.forEach(mod=>{
     Plotly.restyle('panel_'+mod,{'marker.color':[colors],'marker.size':[sizes]},[0]);
   });
+  saveState();
 }
 
 /* ── panels ── */
@@ -295,6 +336,12 @@ const LAYOUT = title=>({
   paper_bgcolor:'#101014', plot_bgcolor:'#101014',
   scene:{xaxis:{visible:false},yaxis:{visible:false},zaxis:{visible:false},bgcolor:'#101014'},
   showlegend:false, margin:{l:0,r:0,t:28,b:0},
+});
+const LAYOUT2D = title=>({
+  title:{text:title,font:{color:'#ddd',size:12},pad:{t:2}},
+  paper_bgcolor:'#101014', plot_bgcolor:'#101014',
+  xaxis:{visible:false}, yaxis:{visible:false,scaleanchor:'x'},   // square aspect
+  showlegend:false, margin:{l:0,r:0,t:28,b:0}, hovermode:'closest',
 });
 
 function buildModToggles(){
@@ -350,17 +397,16 @@ function renderTsne(preserveToggles){
     const N=t.x.length;
     const custom=new Array(N);
     for(let k=0;k<N;k++){
-      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||''];
+      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14)];
     }
-    Plotly.newPlot(el,[
-      {type:'scatter3d',mode:'markers',
-       x:t.x,y:t.y,z:t.z,customdata:custom,
-       marker:{size:u.size,color:base,line:{width:0}},
-       hovertemplate:'cluster %{customdata[1]} · f%{customdata[2]} · %{customdata[3]}<br>%{customdata[4]}<extra></extra>'},
-      {type:'scatter3d',mode:'markers',name:'sel',
-       x:[],y:[],z:[],hoverinfo:'skip',
-       marker:{size:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}},
-    ],LAYOUT(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
+    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>';
+    const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large 2-D point clouds
+    const main = {type:tType,mode:'markers',x:t.x,y:t.y,customdata:custom,
+                  marker:{size:u.size,color:base,line:{width:0}},hovertemplate:hov};
+    const selT = {type:tType,mode:'markers',name:'sel',x:[],y:[],hoverinfo:'skip',
+                  marker:{size:IS2D?13:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}};
+    if(!IS2D){ main.z=t.z; selT.z=[]; }
+    Plotly.newPlot(el,[main,selT],(IS2D?LAYOUT2D:LAYOUT)(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
 
     el.onpointerdown=e=>{el._px=e.clientX;el._py=e.clientY;};
     el.onpointerup=e=>{el._drag=Math.hypot(e.clientX-(el._px??e.clientX),e.clientY-(el._py??e.clientY))>5;};
@@ -389,8 +435,10 @@ function renderTsne(preserveToggles){
   }
 
   const hidden=hiddenMods.size?` &middot; <span style="color:#f87">${hiddenMods.size} hidden</span>`:'';
+  const projName=(TSNE.method||'tsne').toUpperCase();
   document.getElementById('tstats').innerHTML=
-    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes${hidden}`;
+    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${hidden}`;
+  const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+(IS2D?' 2-D':' 3-D');
   buildLegend();
   applyStyle();
 }
@@ -398,29 +446,47 @@ function renderTsne(preserveToggles){
 function crossHighlight(k){
   for(const mod of activeMods){
     const t=TSNE[mod]; if(!t) continue;
-    Plotly.restyle('panel_'+mod,{x:[[t.x[k]]],y:[[t.y[k]]],z:[[t.z[k]]]},[1]);
+    const upd = IS2D ? {x:[[t.x[k]]],y:[[t.y[k]]]} : {x:[[t.x[k]]],y:[[t.y[k]]],z:[[t.z[k]]]};
+    Plotly.restyle('panel_'+mod, upd, [1]);
   }
 }
 
 /* ── legend (clusters, multi-select) ── */
 function buildLegend(){
   const el=document.getElementById('legend');
-  el.innerHTML=
-    `<div class="lg-head">clusters <span style="color:#666;font-weight:400">(click to select)</span></div>`+
-    `<div class="lg-row" id="lg_all" onclick="legendClick(null)">
-       <span class="lg-dot" style="background:#888"></span>
-       <span class="lg-lbl">show all</span></div>`+
-    ALL_CID.map(cid=>{
-      const ci=parseInt(cid.replace('cluster_',''));
-      const c=CLUSTERS[cid];
-      const lbl=c.label.length>22?c.label.slice(0,21)+'…':c.label;
-      const active=selectedClusters.has(ci);
-      return`<div class="lg-row${active?' active':''}" id="lg_${ci}" onclick="legendClick(${ci})" title="${esc(c.label)}">
-        <span class="lg-dot" style="background:${cidColor(ci)}"></span>
-        <span class="lg-lbl">${esc(lbl)}</span>
-        <span class="lg-cnt">${c.spans.length}</span>
-      </div>`;
-    }).join('');
+  const epMode=document.getElementById('selMode').value==='episode';
+  if(epMode){
+    el.innerHTML=
+      `<div class="lg-head">episodes <span style="color:#666;font-weight:400">(click to select)</span></div>`+
+      `<div class="lg-row" id="lg_all" onclick="epLegendClick(null)">
+         <span class="lg-dot" style="background:#888"></span>
+         <span class="lg-lbl">show all</span></div>`+
+      EP_LIST.map(e=>{
+        const active=selectedEpisodes.has(e.ep);
+        return`<div class="lg-row${active?' active':''}" id="lg_ep_${e.idx}" onclick="epLegendClick('${e.ep}')" title="${esc(e.ep)}">
+          <span class="lg-dot" style="background:${epColor(e.ep)}"></span>
+          <span class="lg-lbl">${esc(e.ep.slice(0,16))}…</span>
+          <span class="lg-cnt">${e.count}</span>
+        </div>`;
+      }).join('');
+  } else {
+    el.innerHTML=
+      `<div class="lg-head">clusters <span style="color:#666;font-weight:400">(click to select)</span></div>`+
+      `<div class="lg-row" id="lg_all" onclick="legendClick(null)">
+         <span class="lg-dot" style="background:#888"></span>
+         <span class="lg-lbl">show all</span></div>`+
+      ALL_CID.map(cid=>{
+        const ci=parseInt(cid.replace('cluster_',''));
+        const c=CLUSTERS[cid];
+        const lbl=c.label.length>22?c.label.slice(0,21)+'…':c.label;
+        const active=selectedClusters.has(ci);
+        return`<div class="lg-row${active?' active':''}" id="lg_${ci}" onclick="legendClick(${ci})" title="${esc(c.label)}">
+          <span class="lg-dot" style="background:${cidColor(ci)}"></span>
+          <span class="lg-lbl">${esc(lbl)}</span>
+          <span class="lg-cnt">${c.spans.length}</span>
+        </div>`;
+      }).join('');
+  }
   markLegend();
 }
 
@@ -442,16 +508,32 @@ function legendClick(ci){
 
 function markLegend(){
   document.querySelectorAll('#legend .lg-row').forEach(r=>r.classList.remove('active'));
-  if(selectedClusters.size===0){
-    const el=document.getElementById('lg_all'); if(el) el.classList.add('active');
-  } else {
-    selectedClusters.forEach(ci=>{const el=document.getElementById('lg_'+ci);if(el)el.classList.add('active');});
-  }
+  const epMode=document.getElementById('selMode').value==='episode';
+  const sz = epMode ? selectedEpisodes.size : selectedClusters.size;
+  if(sz===0){ const el=document.getElementById('lg_all'); if(el) el.classList.add('active'); return; }
+  if(epMode) selectedEpisodes.forEach(ep=>{const el=document.getElementById('lg_ep_'+EP_IDX[ep]); if(el) el.classList.add('active');});
+  else selectedClusters.forEach(ci=>{const el=document.getElementById('lg_'+ci); if(el) el.classList.add('active');});
+}
+
+function epLegendClick(ep){
+  if(ep===null||ep===''){ selectedEpisodes.clear(); }
+  else if(selectedEpisodes.has(ep)){ selectedEpisodes.delete(ep); }
+  else { selectedEpisodes.add(ep); }
+  applyStyle(); markLegend();
+  if(page==='grid') renderGrid();
+}
+
+function onSelMode(){
+  buildLegend();          // switch sidebar between clusters and episodes
+  updateClusterDisplay();
+  applyStyle();           // re-highlight by the new selection dimension
+  if(page==='grid') renderGrid();
 }
 
 function updateClusterDisplay(){
   const el=document.getElementById('cCount');
-  if(el) el.textContent=selectedClusters.size===0?'all':selectedClusters.size+' selected';
+  const sz=document.getElementById('selMode').value==='episode'?selectedEpisodes.size:selectedClusters.size;
+  if(el) el.textContent=sz===0?'all':sz+' selected';
 }
 
 function clearClusterSel(){
@@ -486,8 +568,10 @@ function hlChanged(){document.getElementById('hlOn').checked=true; applyStyle();
 
 function resetTools(){
   document.getElementById('colorMode').value='cluster';
+  document.getElementById('selMode').value='cluster';
   selectedClusters.clear(); curCluster=null;
   document.getElementById('csel').value='';
+  selectedEpisodes.clear();
   document.getElementById('hlOn').checked=false;
   document.getElementById('hlFrame').value=0;
   document.getElementById('hlWin').value=30;
@@ -533,8 +617,9 @@ function histoSVG(scores){
 }
 
 function renderGrid(){
+  const selEp=document.getElementById('selMode').value==='episode';
   let spans=[];
-  if(curCluster && CLUSTERS[curCluster]){
+  if(!selEp && curCluster && CLUSTERS[curCluster]){   // cluster-mode: one cluster's spans
     spans=CLUSTERS[curCluster].spans.map(s=>({...s,_cid:curCluster}));
   } else {
     ALL_CID.forEach(cid=>spans.push(...CLUSTERS[cid].spans.map(s=>({...s,_cid:cid}))));
@@ -560,6 +645,7 @@ function renderGrid(){
   const q=document.getElementById('gsearch').value.trim().toLowerCase();
 
   const filtered=spans.filter(s=>{
+    if(selEp && selectedEpisodes.size && !selectedEpisodes.has(s.ep)) return false;
     const isTop=(rank[s.id]??0)<nTop;
     if(isTop&&!fTop) return false;
     if(!isTop&&!fBot) return false;
@@ -610,39 +696,57 @@ function renderGrid(){
    Mirrors the task viewer's loadVideo: clicking the placeholder swaps in a
    <video> element; the clip is bounded by a timeupdate handler that wraps back
    to the start frame, so it loops the span like the task viewer loops episodes. */
-function loadSpan(cellId){
-  const el=document.getElementById(cellId);
-  if(!el || el.dataset.loaded==='1') return;
+/* Throttled clip loader. Each cell loads the full episode MP4 and clips to
+   [start,end). Browsers cap concurrent media streams (~6/host), so loading every
+   cell at once (the old loadAll → ph.click() on all) stalls most to black, and
+   playAll's immediate play() ran before any clip had loaded/seeked. Load at most
+   _MAXC concurrently, starting the next as each settles; _autoplay gates whether
+   bulk-loaded clips play once ready. Single click still loads + plays instantly. */
+const _MAXC=6;
+let _vq=[], _vactive=0, _autoplay=false;
+function _vpump(){ while(_vactive<_MAXC && _vq.length){ _vactive++; (_vq.shift())(); } }
+function _vrelease(){ _vactive=Math.max(0,_vactive-1); _vpump(); }
+
+function _mountCell(el, play, onSettled){
+  // play: () => bool — whether to start playback once ready. A paused <video> after
+  // a programmatic seek does not paint in most browsers (shows black), so to render
+  // a still we still play() then pause; here we loop within [seekTo, stopAt].
   el.dataset.loaded='1';
   const ep=el.dataset.ep;
   const seekTo=(+el.dataset.start)/FPS, stopAt=(+el.dataset.end)/FPS;
   const text=el.dataset.text||'';
   const spd=parseFloat(document.getElementById('gspeed').value)||1;
-
   el.innerHTML=
     `<video src="${VIDEO_BASE}${ep}" controls loop muted playsinline preload="metadata"></video>`+
     (text?`<div class="ann">${text}</div>`:'');
   const vid=el.querySelector('video');
   vid.playbackRate=spd;
-  // Seek to the span start AND start playing (muted). A paused <video> after a
-  // programmatic seek does not paint the frame in most browsers (shows black),
-  // so we must play() to render the clip; it loops within [seekTo, stopAt].
-  vid.addEventListener('loadedmetadata',()=>{
-    vid.currentTime=seekTo;
-    vid.play().catch(()=>{});
-  },{once:true});
-  vid.addEventListener('seeked',()=>{ vid.play().catch(()=>{}); },{once:true});
+  let done=false; const settle=()=>{ if(!done){ done=true; if(onSettled) onSettled(); } };
+  vid.addEventListener('loadedmetadata',()=>{ vid.currentTime=seekTo; if(play()) vid.play().catch(()=>{}); settle(); },{once:true});
+  vid.addEventListener('error', settle, {once:true});
+  vid.addEventListener('seeked',()=>{ if(play()) vid.play().catch(()=>{}); },{once:true});
   vid.addEventListener('timeupdate',()=>{
     if(vid.currentTime>=stopAt || vid.currentTime<seekTo-0.1){ vid.currentTime=seekTo; }
   });
 }
 
-function loadAll(){ document.querySelectorAll('#grid .ph').forEach(ph=>ph.click()); }
-function playAll(){
-  loadAll(); setSpeed();
-  document.querySelectorAll('#grid video').forEach(v=>{v.muted=true;v.play().catch(()=>{});});
+/* single click → load now (bypass queue) + play, or replay if already loaded */
+function loadSpan(cellId){
+  const el=document.getElementById(cellId);
+  if(!el) return;
+  if(el.dataset.loaded==='1'){ const v=el.querySelector('video'); if(v) v.play().catch(()=>{}); return; }
+  _mountCell(el, ()=>true, null);
 }
-function pauseAll(){ document.querySelectorAll('#grid video').forEach(v=>v.pause()); }
+
+function _enqueueCell(el){
+  if(el.dataset.loaded==='1'){ if(_autoplay){ const v=el.querySelector('video'); if(v) v.play().catch(()=>{}); } return; }
+  el.dataset.loaded='1';                          // claim now so it can't double-enqueue
+  _vq.push(()=>_mountCell(el, ()=>_autoplay, _vrelease));
+  _vpump();
+}
+function loadAll(){ _autoplay=false; document.querySelectorAll('#grid .vid').forEach(_enqueueCell); }
+function playAll(){ _autoplay=true; setSpeed(); document.querySelectorAll('#grid .vid').forEach(_enqueueCell); }
+function pauseAll(){ _autoplay=false; _vq=[]; document.querySelectorAll('#grid video').forEach(v=>v.pause()); }
 function setSpeed(){
   const r=parseFloat(document.getElementById('gspeed').value);
   document.querySelectorAll('#grid video').forEach(v=>v.playbackRate=r);
@@ -670,6 +774,7 @@ window.addEventListener('resize',()=>{
 
 /* ── init ── */
 buildCSel();
+loadState();            // restore persisted selection + color/select modes (per run)
 updateClusterDisplay();
 buildColorTables();
 renderTsne(false);      // renders panels synchronously (or shows no-data note)

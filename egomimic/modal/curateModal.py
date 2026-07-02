@@ -106,6 +106,204 @@ def _read_episode_spans(zarr_root: Path, ep_hash: str) -> list[dict]:
     return []
 
 
+def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list:
+    """Read the raw per-frame action trajectory for each annotation span from zarr.
+
+    For the TCN span action embedder: each span's ``actions_cartesian[start:end)`` is
+    read via the SAME transform path the span autoencoder trained on
+    (``SpanActionDataset`` → ``ZarrDataset._collect_curation_batched``), with pause
+    removal forced OFF so ``start``/``end`` index raw zarr frames (matching the curation
+    store, which hardcodes ``pause_eps=None``, and the TCN training config).
+
+    Returns a list of ``(T_i, action_dim)`` float32 arrays aligned to ``span_meta``.
+    """
+    import hydra as _hydra
+    import numpy as _np
+    from omegaconf import OmegaConf as _OC
+
+    ds_cfg = next(iter(cfg.data.train_datasets.values()))
+    resolver_cfg = _OC.create(_OC.to_container(ds_cfg.resolver, resolve=True))
+    resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match store + TCN training)
+    resolver = _hydra.utils.instantiate(resolver_cfg)
+    resolved = resolver.resolve()
+    episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
+    print(f"{tag} TCN span read: resolver returned {len(episodes)} episodes")
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    unique_eps = sorted({m["episode"] for m in span_meta})
+    missing = [ep for ep in unique_eps if ep not in episodes]
+    if missing:
+        raise KeyError(
+            f"{len(missing)} span episode(s) not resolvable for TCN action read, "
+            f"e.g. {missing[:3]}; available e.g. {list(episodes)[:3]}"
+        )
+
+    def _read_one(ep: str):
+        actions, _, _ = episodes[ep]._collect_curation_batched(
+            action_key="actions_cartesian",
+            image_key="observations.images.front_img_1",
+            image_decode_workers=0,
+            load_images=False,
+        )
+        a = _np.asarray(actions, dtype=_np.float32)
+        if a.ndim == 3:           # (T, horizon, D) → executed per-frame action = first step
+            a = a[:, 0, :]
+        elif a.ndim > 3:
+            a = a.reshape(a.shape[0], -1)
+        return ep, a
+
+    # Read each unique episode's full action trajectory once, in parallel — zarr reads
+    # release the GIL (mirrors the curation episode loader's thread pool).
+    cache: dict[str, _np.ndarray] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ep, a in pool.map(_read_one, unique_eps):
+            cache[ep] = a
+    print(f"{tag} TCN span read: cached {len(cache)} episodes")
+
+    trajectories: list = []
+    for m in span_meta:
+        ep, s, e = m["episode"], int(m["start"]), int(m["end"])
+        full = cache[ep]
+        T = full.shape[0]
+        s2, e2 = max(0, min(s, T)), max(0, min(e, T))
+        trajectories.append(full[s2:e2] if e2 > s2 else full[:1])
+    return trajectories
+
+
+def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dict:
+    """Read per-episode action CHUNKS ``(T, horizon, action_dim)`` from zarr.
+
+    Unlike ``_read_span_action_trajectories`` (which reduces to the executed per-frame
+    action), this keeps the full 3-D chunks — one ``horizon``-frame action chunk per frame,
+    the exact input the QueST tokenizer was trained on. pause removal forced OFF.
+    Returns ``{episode_hash: (T, horizon, action_dim) float32}``.
+    """
+    import hydra as _hydra
+    import numpy as _np
+    from concurrent.futures import ThreadPoolExecutor
+    from omegaconf import OmegaConf as _OC
+
+    ds_cfg = next(iter(cfg.data.train_datasets.values()))
+    resolver_cfg = _OC.create(_OC.to_container(ds_cfg.resolver, resolve=True))
+    resolver_cfg["pause_removal_epsilon"] = None
+    resolver = _hydra.utils.instantiate(resolver_cfg)
+    resolved = resolver.resolve()
+    episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
+    unique_eps = sorted(set(episode_hashes))
+    print(f"{tag} QueST chunk read: resolver has {len(episodes)} eps; reading {len(unique_eps)}")
+
+    def _read_one(ep: str):
+        actions, _, _ = episodes[ep]._collect_curation_batched(
+            action_key="actions_cartesian",
+            image_key="observations.images.front_img_1",
+            image_decode_workers=0,
+            load_images=False,
+        )
+        a = _np.asarray(actions, dtype=_np.float32)  # (T, horizon, action_dim)
+        return ep, a
+
+    cache: dict = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for ep, a in pool.map(_read_one, [e for e in unique_eps if e in episodes]):
+            cache[ep] = a
+    print(f"{tag} QueST chunk read: cached {len(cache)} episodes")
+    return cache
+
+
+def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
+    """Project high-dim embeddings to ``dims``-D (2 or 3). method: 'tsne'|'umap'|'pca'.
+    tsne/umap PCA→50 first when wider; umap-learn is pip-installed on demand."""
+    import numpy as _np
+    from sklearn.decomposition import PCA
+    X = _np.asarray(X, dtype=_np.float32)
+    if method == "pca":
+        return PCA(n_components=dims, random_state=seed).fit_transform(X)
+    if X.shape[1] > 50:
+        X = PCA(n_components=50, random_state=seed).fit_transform(X)
+    if method == "umap":
+        try:
+            import umap
+        except ImportError:
+            import subprocess as _sp2, sys as _s2
+            print("[project3d] installing umap-learn…")
+            _sp2.run([_s2.executable, "-m", "pip", "install", "-q", "umap-learn"], check=True)
+            import umap
+        return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
+    from sklearn.manifold import TSNE
+    return TSNE(n_components=dims, init="pca", perplexity=30, random_state=seed).fit_transform(X)
+
+
+def _build_quest_token_tsne(
+    cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
+    output_dir, task_name, tag, device, seed, cap: int = 60000,
+):
+    """QueST token-level t-SNE: tile each span into non-overlapping horizon-length action
+    chunks, QueST-encode each into tokens, plot one point per token colored by the span's
+    language cluster. Writes tsne3d/spans_tsne3d.json (action mode) for the cluster viewer.
+    """
+    import numpy as _np
+    from egomimic.curation.embedders import QuestTokenEmbedder
+
+    from omegaconf import OmegaConf as _OCq
+    H = int(_OCq.select(cfg, "model.action_embedder.quest_horizon", default=100))  # block size fed to QueST
+    ep_chunks = _read_episode_action_chunks(cfg, [m["episode"] for m in span_meta], tag)
+
+    chunk_list, owner = [], []
+    for i, m in enumerate(span_meta):
+        arr = ep_chunks.get(m["episode"])
+        if arr is None or len(arr) == 0:
+            continue
+        executed = arr[:, 0, :] if arr.ndim == 3 else arr      # executed per-frame trajectory (T, D)
+        T = executed.shape[0]
+        for idx in range(int(m["start"]), min(int(m["end"]), T), H):  # non-overlapping H-frame windows
+            w = executed[idx : idx + H]
+            if len(w) < H:                                     # pad short/last window to H (repeat last frame)
+                w = _np.concatenate([w, _np.repeat(w[-1:], H - len(w), axis=0)], axis=0)
+            chunk_list.append(w); owner.append(i)
+    if not chunk_list:
+        print(f"{tag} QueST: no chunks found — skipping"); return
+    chunks = _np.stack(chunk_list).astype(_np.float32)         # (Nc, H, D)
+    print(f"{tag} QueST: horizon={H}, {len(chunks)} chunks from {len(span_meta)} spans")
+
+    qt = QuestTokenEmbedder(ae.checkpoint_path, device=device); qt.fit()
+    tok = qt.embed_chunks(chunks)                              # (Nc, ntok, Denc)
+    ntok = tok.shape[1]
+    X = tok.reshape(-1, tok.shape[2]).astype(_np.float32)      # (Nc*ntok, Denc)
+    owner_tok = _np.repeat(_np.asarray(owner), ntok)
+    M = len(X)
+    print(f"{tag} QueST: {len(chunks)} chunks × {ntok} tok = {M} tokens from {len(span_meta)} spans")
+
+    rng = _np.random.default_rng(seed)
+    sel = _np.sort(rng.choice(M, cap, replace=False)) if M > cap else _np.arange(M)
+
+    method = str(_OCq.select(cfg, "model.projection", default="tsne")).lower()
+    dims = int(_OCq.select(cfg, "model.projection_dims", default=3))
+    print(f"{tag} QueST: projecting {len(sel)} tokens with {method} ({dims}D)")
+    emb = _project3d(X[sel], method, seed, dims=dims)
+    coords = {"x": emb[:, 0].astype(float).tolist(), "y": emb[:, 1].astype(float).tolist(),
+              "span_idx": list(range(len(emb)))}
+    if dims >= 3:
+        coords["z"] = emb[:, 2].astype(float).tolist()
+
+    def _o(k):  # owner span meta for token index k
+        return span_meta[owner_tok[k]], span_ids[owner_tok[k]]
+    spans_list, cids = [], []
+    for j, k in enumerate(sel):
+        m, sid = _o(k); cid = int(span_cluster.get(sid, -1)); cids.append(cid)
+        spans_list.append({"id": f"{sid}#t{int(k)}", "ep": m["episode"], "start": int(m["start"]),
+                           "end": int(m["end"]), "text": m["text"], "score": None, "cluster": cid})
+    cids = _np.asarray(cids)
+    clusters_meta = {str(c): {"label": cluster_labels.get(str(c), ""), "n_spans": int((cids == c).sum())}
+                     for c in sorted(set(cids.tolist()))}
+    out = {"n_clusters": len(clusters_meta), "clusters": clusters_meta, "spans": spans_list,
+           "action": coords, "method": method, "dims": dims}
+    tsne_dir = Path(output_dir) / "tsne3d"; tsne_dir.mkdir(parents=True, exist_ok=True)
+    with open(tsne_dir / "spans_tsne3d.json", "w") as f:
+        json.dump(out, f)
+    print(f"{tag} QueST: wrote token t-SNE → {tsne_dir/'spans_tsne3d.json'} ({len(sel)} tokens plotted)")
+
+
 # ---------------------------------------------------------------------------
 # Latent store: flat memmap arrays + provenance manifest + annotation spans
 # ---------------------------------------------------------------------------
@@ -250,25 +448,39 @@ def _score_task_clustered(
     output_dir: str,
     tag: str,
     t_start: float,
+    latents_source: str = "",
 ) -> tuple[str, dict]:
-    """Span-granularity clustered KSG scoring (model.language_conditioning.mode=clustered).
+    """Span-granularity clustered scoring (model.language_conditioning.mode=clustered).
 
-    Reads the latent store (flat arrays + spans.json with row ranges), Qwen3-embeds
-    span text, K-means clusters spans, then KSG-scores each cluster independently.
-    Writes ``scores/<task>_clustered_scores.json`` and returns a flat
-    ``{span_id: score}`` map for scored spans.
+    Reads the latent store (flat arrays + spans.json with row ranges) — from
+    ``latents_source`` when given, else ``output_dir`` — clusters spans by language,
+    and scores each cluster. Two action representations are supported:
+
+    * default — pool the per-frame action latents from the store over each span;
+    * ``action_embedder.type=tcn`` — encode each span's raw action trajectory with a
+      trained temporal-CNN span autoencoder (ActionNorms → bottleneck), giving one
+      shape-preserving latent per span.
+
+    Language embeddings are reused from a prior run's ``<task>_clustered_spans.npz``
+    under ``latents_source`` when present (skips the Qwen3 pass). All fresh outputs
+    (scores, span npz, 3-D t-SNE) are written under ``output_dir``.
     """
     import time as _time
 
     import numpy as _np
     import torch as _torch
 
-    from egomimic.curation.config import select_language_conditioning_settings, select_seed
-    from egomimic.curation.embedders import LanguageEmbedder
+    from egomimic.curation.config import (
+        select_action_embedder_settings,
+        select_language_conditioning_settings,
+        select_seed,
+    )
+    from egomimic.curation.embedders import LanguageEmbedder, TCNActionEmbedder
     from egomimic.curation.scoring import trajectory_scorer_from_cfg
 
     lang = select_language_conditioning_settings(cfg)
-    lat_dir = Path(output_dir) / "latents" / task_name
+    src_dir = Path(latents_source) if latents_source else Path(output_dir)
+    lat_dir = src_dir / "latents" / task_name
     state, action, manifest, spans = load_latent_store(lat_dir)
 
     span_state, span_action, span_ids, span_texts, span_meta = [], [], [], [], []
@@ -287,37 +499,85 @@ def _score_task_clustered(
 
     print(
         f"{tag} clustered: {len(span_ids)} annotation spans "
-        f"from {len(manifest['episodes'])} episodes"
+        f"from {len(manifest['episodes'])} episodes (store: {src_dir})"
     )
     if not span_ids:
         print(f"{tag} no annotation spans found — skipping clustered scoring")
         return task_name, {}
 
     device = "cuda" if _torch.cuda.is_available() else "cpu"
-    lemb = LanguageEmbedder(
-        source="qwen3",
-        latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
-        device=device,
-        model_name=lang.model_name,
-        max_length=lang.max_length,
-        batch_size=lang.batch_size,
-        dtype=lang.dtype,
-        seed=select_seed(cfg),
-        instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
-    )
-    if lang.cluster_instruction:
-        print(f"{tag} clustering instruction: {lang.cluster_instruction}")
-    lemb.fit()
-    text_embeddings = lemb.embed(span_texts)
 
+    # Per-span action representation. With a trained temporal-CNN span autoencoder
+    # (action_embedder.type=tcn) encode each span's RAW action trajectory
+    # (ActionNorms-normalized) into one shape-preserving latent — instead of pooling the
+    # per-frame action latents from the store. State stays per-frame (pooled downstream).
+    ae = select_action_embedder_settings(cfg)
+    if ae.type == "tcn":
+        span_vecs = None
+        # Reuse precomputed TCN span latents from a prior run when provided — the action
+        # shapes don't change between re-cluster runs, so this skips the episode resolve +
+        # zarr read + encode entirely.
+        if ae.reuse_latents_npz and Path(ae.reuse_latents_npz).exists():
+            z = _np.load(ae.reuse_latents_npz, allow_pickle=True)
+            if "span_ids" in z and "action_emb" in z:
+                id2vec = {str(sid): z["action_emb"][i] for i, sid in enumerate(z["span_ids"])}
+                if all(sid in id2vec for sid in span_ids):
+                    span_vecs = _np.stack([id2vec[sid] for sid in span_ids]).astype(_np.float32)
+                    print(f"{tag} reusing TCN action latents from {ae.reuse_latents_npz} → {span_vecs.shape}")
+                else:
+                    print(f"{tag} reuse npz action span_ids mismatch — re-encoding from zarr")
+        if span_vecs is None:
+            if not ae.checkpoint_path:
+                raise ValueError("action_embedder.type=tcn requires action_embedder.checkpoint_path")
+            print(f"{tag} TCN span action embedder: {ae.checkpoint_path} (norms={ae.norms})")
+            trajectories = _read_span_action_trajectories(cfg, span_meta, tag)
+            tcn = TCNActionEmbedder(ae.checkpoint_path, norms=ae.norms, device=device)
+            tcn.fit()
+            span_vecs = tcn.embed_spans(trajectories)  # (n_spans, tcn_latent_dim)
+        span_action = [span_vecs[i][None, :] for i in range(len(span_vecs))]
+        print(f"{tag} TCN span action latents: {span_vecs.shape}")
+
+    # Language embeddings for clustering. Reuse a prior run's Qwen3 embeddings when
+    # present (k-means re-runs deterministically → identical clusters), else embed now.
+    text_embeddings = None
+    reuse_npz = src_dir / "scores" / f"{task_name}_clustered_spans.npz"
+    if lang.reuse_clusters and reuse_npz.exists():
+        z = _np.load(str(reuse_npz), allow_pickle=True)
+        if "span_ids" in z and "lang_emb" in z:
+            id2emb = {str(sid): z["lang_emb"][i] for i, sid in enumerate(z["span_ids"])}
+            if all(sid in id2emb for sid in span_ids):
+                text_embeddings = _np.stack([id2emb[sid] for sid in span_ids]).astype(_np.float32)
+                print(f"{tag} reusing language embeddings from {reuse_npz} → {text_embeddings.shape}")
+            else:
+                print(f"{tag} reuse npz span_ids mismatch — recomputing language embeddings")
+    if text_embeddings is None:
+        lemb = LanguageEmbedder(
+            source="qwen3",
+            latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
+            device=device,
+            model_name=lang.model_name,
+            max_length=lang.max_length,
+            batch_size=lang.batch_size,
+            dtype=lang.dtype,
+            seed=select_seed(cfg),
+            instruction=lang.cluster_instruction,  # steer toward verbs + handedness, not objects
+        )
+        if lang.cluster_instruction:
+            print(f"{tag} clustering instruction: {lang.cluster_instruction}")
+        lemb.fit()
+        text_embeddings = lemb.embed(span_texts)
+
+    from omegaconf import OmegaConf as _OC2
+    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type == "quest_tokens"
     t_ksg = _time.perf_counter()
     scorer = trajectory_scorer_from_cfg(cfg)
     clustered = scorer.score_clusters(
-        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings
+        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings,
+        score=not disable_scoring,
     )
     print(
-        f"{tag} clustered KSG done in {_time.perf_counter() - t_ksg:.1f}s — "
-        f"{len(clustered)} clusters"
+        f"{tag} clustered {'(scoring DISABLED) ' if disable_scoring else ''}"
+        f"done in {_time.perf_counter() - t_ksg:.1f}s — {len(clustered)} clusters"
     )
 
     scores_dir = Path(output_dir) / "scores"
@@ -338,6 +598,20 @@ def _score_task_clustered(
         for sid, rec in cv["spans"].items():
             span_cluster[sid] = cid
             span_score[sid] = rec.get("score")
+
+    with open(scores_dir / f"{task_name}_cluster_labels.json", "w") as f:
+        json.dump(cluster_labels, f, indent=2)
+
+    # QueST token mode: one point per QueST token (multiple per span, variable by span
+    # length), colored by the span's language cluster. Distinct token-level t-SNE artifact.
+    if ae.type == "quest_tokens":
+        _build_quest_token_tsne(
+            cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
+            output_dir, task_name, tag, device, select_seed(cfg),
+        )
+        training_outputs_volume.commit()
+        print(f"{tag} quest_tokens total: {_time.perf_counter() - t_start:.1f}s")
+        return task_name, {}
 
     state_pool = _np.stack([s.mean(axis=0) for s in span_state]).astype(_np.float32)
     action_pool = _np.stack([a.mean(axis=0) for a in span_action]).astype(_np.float32)
@@ -467,8 +741,13 @@ def _score_task(
     git_remote: str,
     git_commit: str,
     hf_token: str = "",
+    latents_source: str = "",
 ) -> tuple[str, dict[str, float]]:
-    """Load pre-computed latents and run KSG scoring. Returns (task_name, scores)."""
+    """Load pre-computed latents and run scoring. Returns (task_name, scores).
+
+    Reads the latent store from ``latents_source`` (when given) and writes all fresh
+    outputs under ``output_dir`` — letting a run reuse an existing store non-destructively.
+    """
     import time as _time
     import numpy as _np
 
@@ -485,9 +764,23 @@ def _score_task(
     tag = f"[{task_name}][score]"
     t_start = _time.perf_counter()
 
-    lat_dir = Path(output_dir) / "latents" / task_name
+    # QueST token embedder needs the external/quest submodule (SkillVAE); the score
+    # worker boots without submodules, so init it on demand here.
+    from egomimic.curation.config import select_action_embedder_settings as _sae
+    if _sae(cfg).type == "quest_tokens":
+        import subprocess as _sp
+        print(f"{tag} initializing external/quest submodule for QueST tokenizer…")
+        _sp.run(["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
+                 "external/quest"], check=True)
+        _qd = f"{CFG.remote_repo_dir}/external/quest"
+        if Path(_qd).is_dir() and _qd not in sys.path:
+            sys.path.insert(0, _qd)  # make 'quest' importable in THIS process (.pth only helps next start)
+            print(f"{tag} added {_qd} to sys.path")
+
+    src_dir = Path(latents_source) if latents_source else Path(output_dir)
+    lat_dir = src_dir / "latents" / task_name
     if not (lat_dir / "state.npy").exists() or not (lat_dir / "manifest.json").exists():
-        print(f"{tag} latent store not found — skipping KSG")
+        print(f"{tag} latent store not found at {lat_dir} — skipping scoring")
         return task_name, {}
 
     # Clustered mode: atomic unit is the annotation span, not the episode.
@@ -495,7 +788,7 @@ def _score_task(
 
     lang = select_language_conditioning_settings(cfg)
     if lang.enabled and lang.mode == "clustered":
-        return _score_task_clustered(task_name, cfg, output_dir, tag, t_start)
+        return _score_task_clustered(task_name, cfg, output_dir, tag, t_start, latents_source)
 
     state, action, manifest, _spans = load_latent_store(lat_dir)
     episodes = manifest["episodes"]
@@ -686,18 +979,25 @@ def run_curate(
         return ""
 
     # ── 3. Load norm stats ────────────────────────────────────────────────────
+    from egomimic.curation.config import select_action_embedder_settings as _sae_cfg
+    _ae_type = _sae_cfg(cfg).type
     action_key, _ = select_tensor_keys(cfg)
-    try:
-        action_mean_arr, action_std_arr = load_action_norm_stats(
-            cfg,
-            action_key,
-            search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load norm stats: {exc}") from exc
-
-    action_mean = action_mean_arr.tolist()
-    action_std = action_std_arr.tolist()
+    if _ae_type == "quest_tokens":
+        # QueST encoder normalises internally — no external norm stats needed.
+        print(f"action_embedder.type=quest_tokens — skipping norm stats load")
+        action_mean: list = []
+        action_std: list = []
+    else:
+        try:
+            action_mean_arr, action_std_arr = load_action_norm_stats(
+                cfg,
+                action_key,
+                search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load norm stats: {exc}") from exc
+        action_mean = action_mean_arr.tolist()
+        action_std = action_std_arr.tolist()
 
     # ── 4. Output directory ───────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -764,7 +1064,13 @@ def run_curate(
             continue
         training_outputs_volume.commit()
 
-        # Phase 3: KSG scoring
+        # Phase 3: KSG scoring (skipped for quest_tokens — embedding-only run)
+        if _ae_type == "quest_tokens":
+            print(f"[{task_name}] Phase 3: skipped (quest_tokens embedding-only)")
+            scores_by_task[task_name] = {}
+            print(f"[{task_name}] complete in {_time.perf_counter() - t_task:.1f}s")
+            continue
+
         print(f"[{task_name}] Phase 3: KSG scoring …")
         try:
             _, task_scores = _score_task.remote(
@@ -934,11 +1240,14 @@ def run_score(
     run_name: str,
     score_task: str = "",
     hf_token: str = "",
+    latents_source: str = "",
 ) -> str:
-    """Resume: run ONLY Phase 3 (KSG scoring) against latents already in output_dir.
+    """Resume: run ONLY Phase 3 (scoring) against pre-computed latents.
 
-    Discovers tasks under ``output_dir/latents/`` (or just ``score_task``) and
-    invokes ``_score_task`` per task — no shard build, no embedding.
+    Discovers tasks under ``<latents_source or output_dir>/latents/`` (or just
+    ``score_task``) and invokes ``_score_task`` per task — no shard build, no embedding.
+    When ``latents_source`` differs from ``output_dir`` the store is read from the source
+    and all fresh outputs are written under ``output_dir`` (non-destructive reuse).
     """
     import sys as _sys
     from pathlib import Path as _Path
@@ -950,23 +1259,26 @@ def run_score(
     os.chdir(CFG.remote_repo_dir)
     os.environ["MODAL_IS_REMOTE"] = "1"
 
-    lat_root = _Path(output_dir) / "latents"
+    src_dir = latents_source or output_dir
+    lat_root = _Path(src_dir) / "latents"
     if not lat_root.is_dir():
-        print(f"No latents dir under {output_dir} — nothing to score")
+        print(f"No latents dir under {src_dir} — nothing to score")
         return ""
 
     if score_task:
         tasks = [score_task]
     else:
         tasks = sorted(p.name for p in lat_root.iterdir() if p.is_dir())
-    print(f"Resume scoring {len(tasks)} task(s) from {output_dir}: {tasks}")
+    print(
+        f"Resume scoring {len(tasks)} task(s): store={src_dir} → output={output_dir}: {tasks}"
+    )
 
     for task_name in tasks:
         print(f"\n── [{task_name}] scoring …")
         try:
             _score_task.remote(
                 task_name, run_name, hydra_args,
-                [], [], output_dir, git_remote, git_commit, hf_token,
+                [], [], output_dir, git_remote, git_commit, hf_token, latents_source,
             )
         except Exception as exc:
             print(f"[{task_name}] scoring FAILED: {exc}")
@@ -982,11 +1294,15 @@ def submit_score(*args: str) -> None:
 
     Required: ``score_output_dir=<output dir under /root/EgoVerse/logs>``
     Optional: ``score_task=<task>`` (default: all tasks under latents/)
+    Optional: ``score_latents_source=<dir>`` — read the latent store + reuse artifacts
+              (e.g. a prior run's language clusters) from this dir while writing fresh
+              outputs under ``score_output_dir`` (non-destructive reuse).
     Remaining args are normal hydra overrides (model=…, data=…, language_conditioning…).
     """
     args, _ = pop_init_submodules(args)
     output_dir = ""
     score_task = ""
+    latents_source = ""
     hydra_args: list[str] = []
     for a in args:
         key, sep, val = a.lstrip("+").partition("=")
@@ -994,6 +1310,8 @@ def submit_score(*args: str) -> None:
             output_dir = val.strip()
         elif sep and key == "score_task":
             score_task = val.strip()
+        elif sep and key == "score_latents_source":
+            latents_source = val.strip()
         else:
             hydra_args.append(a)
     if not output_dir:
@@ -1010,10 +1328,14 @@ def submit_score(*args: str) -> None:
             run_name = val.strip()
             break
 
-    print(f"Resume scoring: output_dir={output_dir} at commit {git_commit[:12]}")
+    print(
+        f"Resume scoring: output_dir={output_dir}"
+        + (f" (store from {latents_source})" if latents_source else "")
+        + f" at commit {git_commit[:12]}"
+    )
     handle = run_score.spawn(
         output_dir, tuple(hydra_args), git_remote, git_commit, run_name, score_task,
-        hf_token=_local_hf_token(),
+        hf_token=_local_hf_token(), latents_source=latents_source,
     )
     _env = os.environ.get("MODAL_ENVIRONMENT", "robotics")
     _app = os.environ.get("MODAL_APP_NAME", "egomimic-training")
