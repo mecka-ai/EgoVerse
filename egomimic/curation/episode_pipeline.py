@@ -76,6 +76,21 @@ def build_embedders(
             seed=seed,
         )
         action_embedder.fit([])
+    elif ae_type == "quest_tokens":
+        if ae_cfg is None or not ae_cfg.checkpoint_path:
+            raise ValueError(
+                "action_embedder.type=quest_tokens requires action_embedder.checkpoint_path"
+            )
+        from egomimic.curation.embedders import QuestTokenEmbedder
+        action_embedder = QuestTokenEmbedder(
+            checkpoint_path=ae_cfg.checkpoint_path,
+            device=device,
+            quest_horizon=ae_cfg.oat_action_chunk_size,  # skill_block_size (e.g. 100)
+            action_dim=ae_cfg.oat_action_dim,            # per-step action dim (e.g. 18)
+            latent_dim=embed_cfg.latent_dim,
+            seed=seed,
+        )
+        action_embedder.fit([])
     else:
         # Default: gaussian Gaussian normalisation + random projection
         action_embedder = ActionEmbedder(

@@ -1086,31 +1086,124 @@ class QuestTokenEmbedder:
     ``QuestTokenizerTrainer.process_batch_for_training``.
     """
 
-    def __init__(self, checkpoint_path: str, device: str | torch.device = "cpu", batch_size: int = 256) -> None:
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str | torch.device = "cpu",
+        batch_size: int = 256,
+        quest_horizon: int = 100,
+        action_dim: int = 18,
+        latent_dim: int = 32,
+        seed: int = 42,
+    ) -> None:
         self.checkpoint_path = checkpoint_path
         self.device = torch.device(device)
         self.batch_size = batch_size
+        self.quest_horizon = quest_horizon
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim
+        self._seed = seed
         self._model = None
         self._eid = None
         self._ac_key = None
         self.num_tokens: int | None = None
         self.encoder_dim: int | None = None
+        self._proj: np.ndarray | None = None
         self._fitted = False
 
+    def set_precomputed_stats(self, mean: np.ndarray, std: np.ndarray) -> None:
+        """No-op: QueST encoder normalises via data_schematic from checkpoint."""
+        logger.debug("QuestTokenEmbedder: ignoring external norm stats")
+
     def fit(self, episodes: list | None = None) -> None:
+        import re as _re
+        import subprocess as _sp
+        import sys as _sys
+        from pathlib import Path as _Path
         from egomimic.pl_utils.pl_model import ModelWrapper
 
-        logger.info("QuestTokenEmbedder: loading QueST tokenizer from %s", self.checkpoint_path)
+        # Auto-select the latest .ckpt if a directory was passed.
+        ckpt_path = str(self.checkpoint_path)
+        _cp = _Path(ckpt_path)
+        if _cp.is_dir():
+            _ckpts = sorted(
+                _cp.glob("*.ckpt"),
+                key=lambda f: int(m.group(1)) if (m := _re.search(r"epoch=(\d+)", f.name)) else 0,
+            )
+            if not _ckpts:
+                raise FileNotFoundError(f"No *.ckpt files in {_cp}")
+            ckpt_path = str(_ckpts[-1])
+            logger.info("QuestTokenEmbedder: auto-selected checkpoint %s", ckpt_path)
+
+        # Ensure external/quest is on sys.path (submodule may not be initialized yet).
+        try:
+            import quest  # noqa: F401
+        except ImportError:
+            try:
+                from egomimic.modal.modal_setup import CFG as _CFG
+                _qd = f"{_CFG.remote_repo_dir}/external/quest"
+                _sp.run(
+                    ["git", "-C", _CFG.remote_repo_dir, "submodule", "update", "--init", "external/quest"],
+                    check=True,
+                )
+                if _Path(_qd).is_dir() and _qd not in _sys.path:
+                    _sys.path.insert(0, _qd)
+            except Exception:
+                pass  # best-effort; load below will fail if quest is still not importable
+
+        logger.info("QuestTokenEmbedder: loading QueST tokenizer from %s", ckpt_path)
         wrapper = ModelWrapper.load_from_checkpoint(
-            self.checkpoint_path, map_location=self.device, weights_only=False
+            ckpt_path, map_location=self.device, weights_only=False
         )
         self._model = wrapper.model  # QuestTokenizerTrainer (Algo): submodules in .nets
         self._model.nets.eval()
-        for p in self._model.nets.parameters():
-            p.requires_grad_(False)
+        for _param in self._model.nets.parameters():
+            _param.requires_grad_(False)
         self._eid = next(iter(self._model.ac_keys_by_id))
         self._ac_key = self._model.ac_keys_by_id[self._eid]
         self._fitted = True
+
+    def embed(self, data: np.ndarray) -> np.ndarray:
+        """Embed flat per-frame actions into per-frame latent vectors.
+
+        Tiles consecutive frames into non-overlapping ``quest_horizon``-step windows,
+        encodes each window through the QueST encoder (mean-pooled over token dim),
+        then up-samples back to per-frame by repeating each window embedding.
+
+        Args:
+            data: ``(N, flat_dim)`` float32 array. The first ``action_dim`` columns are
+                  the per-frame executed action (index-0 step of the stored chunk).
+
+        Returns:
+            ``(N, latent_dim)`` float32 array.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call fit() before embed()")
+        data = np.asarray(data, dtype=np.float32)
+        N = len(data)
+        if N == 0:
+            return np.empty((0, self.latent_dim), dtype=np.float32)
+
+        # Extract per-step action (first action_dim cols handle both per-step and
+        # flattened-chunk formats: for flat_dim==action_dim this is a no-op copy).
+        per_step = data[:, : self.action_dim]  # (N, action_dim)
+
+        H = self.quest_horizon
+        pad = (H - N % H) % H
+        if pad > 0:
+            per_step = np.concatenate([per_step, np.repeat(per_step[-1:], pad, axis=0)], axis=0)
+        n_chunks = len(per_step) // H
+        windows = per_step.reshape(n_chunks, H, self.action_dim)
+
+        tok_emb = self.embed_chunks(windows)  # (n_chunks, num_tokens, encoder_dim)
+        pooled = tok_emb.mean(axis=1)  # (n_chunks, encoder_dim)
+
+        if self._proj is None:
+            self._proj = _build_random_projection(pooled.shape[1], self.latent_dim, seed=self._seed)
+        projected = (pooled @ self._proj).astype(np.float32)
+
+        # Up-sample: each chunk embedding repeated H times, trim to original N.
+        return np.repeat(projected, H, axis=0)[:N]
 
     def embed_chunks(self, chunks: np.ndarray) -> np.ndarray:
         """Encode action chunks into per-token embeddings.

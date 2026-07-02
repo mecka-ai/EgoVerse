@@ -979,18 +979,25 @@ def run_curate(
         return ""
 
     # ── 3. Load norm stats ────────────────────────────────────────────────────
+    from egomimic.curation.config import select_action_embedder_settings as _sae_cfg
+    _ae_type = _sae_cfg(cfg).type
     action_key, _ = select_tensor_keys(cfg)
-    try:
-        action_mean_arr, action_std_arr = load_action_norm_stats(
-            cfg,
-            action_key,
-            search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load norm stats: {exc}") from exc
-
-    action_mean = action_mean_arr.tolist()
-    action_std = action_std_arr.tolist()
+    if _ae_type == "quest_tokens":
+        # QueST encoder normalises internally — no external norm stats needed.
+        print(f"action_embedder.type=quest_tokens — skipping norm stats load")
+        action_mean: list = []
+        action_std: list = []
+    else:
+        try:
+            action_mean_arr, action_std_arr = load_action_norm_stats(
+                cfg,
+                action_key,
+                search_roots=[CFG.output_mount_path, CFG.remote_repo_dir, Path.cwd()],
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load norm stats: {exc}") from exc
+        action_mean = action_mean_arr.tolist()
+        action_std = action_std_arr.tolist()
 
     # ── 4. Output directory ───────────────────────────────────────────────────
     timestamp = _time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -1057,7 +1064,13 @@ def run_curate(
             continue
         training_outputs_volume.commit()
 
-        # Phase 3: KSG scoring
+        # Phase 3: KSG scoring (skipped for quest_tokens — embedding-only run)
+        if _ae_type == "quest_tokens":
+            print(f"[{task_name}] Phase 3: skipped (quest_tokens embedding-only)")
+            scores_by_task[task_name] = {}
+            print(f"[{task_name}] complete in {_time.perf_counter() - t_task:.1f}s")
+            continue
+
         print(f"[{task_name}] Phase 3: KSG scoring …")
         try:
             _, task_scores = _score_task.remote(
