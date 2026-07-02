@@ -112,7 +112,7 @@ class InterpolatePose(Transform):
     def transform_batch(self, batch: dict) -> dict:
         """Vectorized: (B, H, D) → (B, new_chunk_length, D) after stride."""
         actions = np.asarray(batch[self.action_key])  # (B, H, D)
-        actions = actions[:, :: self.stride, :]  # (B, H//stride, D)
+        actions = actions[:, :: self.stride, :]        # (B, H//stride, D)
         if self.mode == "xyzwxyz":
             if actions.shape[-1] != 7:
                 raise ValueError(
@@ -293,9 +293,7 @@ class ActionChunkCoordinateFrameTransform(Transform):
         """
         batch.update(self.extra_batch_key or {})
         target_world = np.asarray(batch[self.target_world], dtype=np.float64)  # (B, D)
-        chunk_world = np.asarray(
-            batch[self.chunk_world], dtype=np.float64
-        )  # (B, H, D) or (B, D)
+        chunk_world  = np.asarray(batch[self.chunk_world],  dtype=np.float64)  # (B, H, D) or (B, D)
         B = target_world.shape[0]
 
         chunk_3d = chunk_world.ndim == 3
@@ -326,15 +324,15 @@ class ActionChunkCoordinateFrameTransform(Transform):
 
         # SE3 inverse: [[R, t], [0,1]]^{-1} = [[R^T, -R^T t], [0, 1]]
         tgt_mats = _tgt_to_mat(target_world)  # (B, 4, 4)
-        R = tgt_mats[:, :3, :3]  # (B, 3, 3)
-        t = tgt_mats[:, :3, 3:]  # (B, 3, 1)
-        R_T = R.swapaxes(-1, -2)  # (B, 3, 3)
+        R   = tgt_mats[:, :3, :3]             # (B, 3, 3)
+        t   = tgt_mats[:, :3, 3:]             # (B, 3, 1)
+        R_T = R.swapaxes(-1, -2)              # (B, 3, 3)
         tgt_inv = np.zeros_like(tgt_mats)
         tgt_inv[:, :3, :3] = R_T
         tgt_inv[:, :3, 3:] = -(R_T @ t)
-        tgt_inv[:, 3, 3] = 1.0
+        tgt_inv[:, 3, 3]   = 1.0
 
-        chunk_mats = _to_mat(chunk_2d)  # (B*H, 4, 4) or (B, 4, 4)
+        chunk_mats = _to_mat(chunk_2d)        # (B*H, 4, 4) or (B, 4, 4)
 
         if chunk_3d:
             chunk_mats = chunk_mats.reshape(B, H, 4, 4)
@@ -343,9 +341,7 @@ class ActionChunkCoordinateFrameTransform(Transform):
             else:
                 result_mats = (tgt_mats[:, None] @ chunk_mats).reshape(B * H, 4, 4)
         else:
-            result_mats = (
-                (tgt_inv @ chunk_mats) if self.inverse else (tgt_mats @ chunk_mats)
-            )
+            result_mats = (tgt_inv @ chunk_mats) if self.inverse else (tgt_mats @ chunk_mats)
 
         result_flat = _from_mat(result_mats)  # (B*H, D) or (B, D)
 
@@ -480,10 +476,7 @@ class PoseCoordinateFrameTransform(Transform):
 
     def transform_batch(self, batch: dict) -> dict:
         """Vectorized: target (B, 7), pose (B, D) → transformed pose (B, D)."""
-        sub = {
-            self.target_world: batch[self.target_world],
-            self.pose_world: batch[self.pose_world],
-        }
+        sub = {self.target_world: batch[self.target_world], self.pose_world: batch[self.pose_world]}
         result = self._chunk_transform.transform_batch(sub)
         batch[self.transformed_key_name] = result[self.transformed_key_name]
         return batch
@@ -665,43 +658,6 @@ class BatchQuaternionPoseToXYZ6D(Transform):
                 f"for key '{self.pose_key}'"
             )
         batch[self.output_key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(pose))
-        return batch
-
-
-class RotatePoseLocal(Transform):
-    """Post-multiply xyz+quat(wxyz) pose keys by a fixed LOCAL rotation.
-
-    ``T -> T @ E`` with ``E`` a pure rotation: the pose's position is unchanged
-    and its orientation axes are remapped in its OWN frame. Used to unify the
-    left/right hand frame conventions: the raw mecka/aria RIGHT wrist frame is
-    anatomically mirrored relative to the left (+y out of the palm on both
-    hands), so a local Rz(pi) on the right makes both hands share one spatial
-    convention — +y right, +x down, +z back through the wrist when the hands
-    are vertical (palms facing each other). Applied BEFORE any frame
-    composition the correction propagates exactly: left-compositions commute
-    (``inv(H) @ (T @ E) = (inv(H) @ T) @ E``), SLERP is right-invariant, and
-    the wrist-frame chunk becomes ``inv(E) @ chunk @ E``.
-
-    Handles single poses ``(7,)`` and chunks ``(T, 7)``.
-    """
-
-    def __init__(self, keys: list[str], quat_wxyz=(0.0, 0.0, 0.0, 1.0)):
-        self.keys = list(keys)
-        pose = np.concatenate([np.zeros(3), np.asarray(quat_wxyz, dtype=np.float64)])
-        self._local = _xyzwxyz_to_matrix(pose[None, :])[0]  # (4, 4) pure rotation
-
-    def transform(self, batch: dict) -> dict:
-        for key in self.keys:
-            value = np.asarray(batch[key])
-            single = value.ndim == 1
-            arr = value[None, :] if single else value
-            if arr.ndim != 2 or arr.shape[-1] != 7:
-                raise ValueError(
-                    f"RotatePoseLocal expects key '{key}' to have shape (7,) or "
-                    f"(T, 7), got {value.shape}"
-                )
-            out = _matrix_to_xyzwxyz(_xyzwxyz_to_matrix(arr) @ self._local)
-            batch[key] = out[0] if single else out
         return batch
 
 

@@ -13,7 +13,6 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     PoseCoordinateFrameTransform,
     QuaternionPoseToYPR,
     Reshape,
-    RotatePoseLocal,
     SplitKeys,
     Transform,
     XYZ6D_to_XYZYPR,
@@ -145,7 +144,7 @@ class Aria(Human):
             )
         elif mode == "cartesian_wristframe_6d":
             return _build_human_cartesian_eef_frame_transform_list(
-                stride=cls.ACTION_STRIDE, rot_repr="6d", unify_right_hand_frame=True
+                stride=cls.ACTION_STRIDE, rot_repr="6d"
             )
         elif mode == "keypoints_headframe_ypr":
             return _build_human_keypoints_bimanual_transform_list(
@@ -370,7 +369,7 @@ class Mecka(Human):
             # the identical obs_head_pose / *.action_ee_pose keys); only the
             # action stride differs.
             return _build_human_cartesian_eef_frame_transform_list(
-                stride=cls.ACTION_STRIDE, rot_repr="6d", unify_right_hand_frame=True
+                stride=cls.ACTION_STRIDE, rot_repr="6d"
             )
         # An unknown mode must fail here, not surface later as a dataset with no
         # transforms (missing actions_cartesian) after silently returning None.
@@ -1069,7 +1068,6 @@ def _build_human_cartesian_eef_frame_transform_list(
     stride: int = 3,
     delete_target_world: bool = True,
     rot_repr: str = "ypr",
-    unify_right_hand_frame: bool = False,
 ) -> list[Transform]:
     """ARIA bimanual cartesian pipeline expressed in the current wrist frame.
 
@@ -1078,14 +1076,6 @@ def _build_human_cartesian_eef_frame_transform_list(
     ``*.obs_ee_pose_headframe`` for each side). Proprio ee-poses remain in
     headframe (wristframe of the wrist itself is identity). All retained poses
     are converted to xyz-ypr, or to continuous 6D columns when ``rot_repr="6d"``.
-
-    ``unify_right_hand_frame`` rotates the RIGHT hand's ee frame by 180° about
-    its local z before any composition, so both hands share one spatial axis
-    convention instead of the raw data's mirrored per-hand frames: with the
-    hands vertical (palms facing each other), +y points right and +x points
-    down on BOTH hands (+z stays back through the wrist; the left hand already
-    satisfies this natively). Wrist-frame deltas then mean the same thing for
-    both arms.
     """
     keys_to_delete = list(
         {
@@ -1102,16 +1092,7 @@ def _build_human_cartesian_eef_frame_transform_list(
         if target_world_is_quat:
             keys_to_delete.append(target_world_ypr)
 
-    transform_list: list[Transform] = []
-    if unify_right_hand_frame:
-        transform_list.append(
-            # Rz(pi) local: negates the right frame's x/y columns, keeps z.
-            RotatePoseLocal(
-                keys=[right_action_world, right_obs_pose],
-                quat_wxyz=(0.0, 0.0, 0.0, 1.0),
-            )
-        )
-    transform_list += [
+    transform_list: list[Transform] = [
         ActionChunkCoordinateFrameTransform(
             target_world=target_world,
             chunk_world=left_action_world,
