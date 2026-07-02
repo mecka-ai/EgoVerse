@@ -542,3 +542,74 @@ def test_human6d_converter_preserves_data_pipeline_output():
     conv = HumanBimanualCartesian6D()
     round_tripped = conv.from32(conv.to32(native))
     torch.testing.assert_close(round_tripped, native)
+
+
+# ---------------------------------------------------------------------------
+# G. unified right-hand frame (wristframe modes)
+# ---------------------------------------------------------------------------
+def _human_random_cartesian_batch(T=5, seed=7):
+    return {
+        "obs_head_pose": _matrix_to_xyzwxyz(_random_se3(1, seed + 4))[0],
+        "left.action_ee_pose": _matrix_to_xyzwxyz(_random_se3(T, seed)),
+        "right.action_ee_pose": _matrix_to_xyzwxyz(_random_se3(T, seed + 1)),
+        "left.obs_ee_pose": _matrix_to_xyzwxyz(_random_se3(1, seed + 2))[0],
+        "right.obs_ee_pose": _matrix_to_xyzwxyz(_random_se3(1, seed + 3))[0],
+    }
+
+
+def test_unify_right_hand_frame_conjugates_right_wrist_chunk_by_rz_pi():
+    """unify_right_hand_frame must equal an EXACT local Rz(pi) change of the
+    right frame: wrist chunk conjugated (inv(E) @ chunk @ E), headframe proprio
+    post-multiplied (obs @ E), left hand untouched."""
+    from egomimic.rldb.embodiment.human import (
+        _build_human_cartesian_eef_frame_transform_list,
+    )
+
+    batch = _human_random_cartesian_batch()
+    plain = _run(
+        _build_human_cartesian_eef_frame_transform_list(stride=1, rot_repr="6d"),
+        batch,
+    )
+    unified = _run(
+        _build_human_cartesian_eef_frame_transform_list(
+            stride=1, rot_repr="6d", unify_right_hand_frame=True
+        ),
+        batch,
+    )
+    E = np.eye(4)
+    E[:3, :3] = np.diag([-1.0, -1.0, 1.0])  # Rz(pi)
+
+    np.testing.assert_allclose(
+        unified["actions_cartesian"][:, :9],
+        plain["actions_cartesian"][:, :9],
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        unified["observations.state.ee_pose"][:9],
+        plain["observations.state.ee_pose"][:9],
+        atol=1e-12,
+    )
+
+    plain_r = _xyz6d_to_matrix(plain["actions_cartesian"][:, 9:])
+    unified_r = _xyz6d_to_matrix(unified["actions_cartesian"][:, 9:])
+    np.testing.assert_allclose(unified_r, np.linalg.inv(E) @ plain_r @ E, atol=1e-9)
+
+    plain_o = _xyz6d_to_matrix(plain["observations.state.ee_pose"][None, 9:])[0]
+    unified_o = _xyz6d_to_matrix(unified["observations.state.ee_pose"][None, 9:])[0]
+    np.testing.assert_allclose(unified_o, plain_o @ E, atol=1e-9)
+
+
+def test_mecka_wristframe_first_pose_is_identity_with_unified_frame():
+    """cmd[0] == obs must still map to the identity wrist pose on both arms:
+    inv(obs @ E) @ (cmd0 @ E) == I, so the frame unification does not shift the
+    'no motion' point of the action space."""
+    batch = _human_random_cartesian_batch(seed=11)
+    batch["left.action_ee_pose"][0] = batch["left.obs_ee_pose"]
+    batch["right.action_ee_pose"][0] = batch["right.obs_ee_pose"]
+    out = _run(Mecka.get_transform_list("cartesian_wristframe_6d"), batch)
+    first = out["actions_cartesian"][0]
+    identity_6d = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    np.testing.assert_allclose(first[:3], 0.0, atol=1e-9)
+    np.testing.assert_allclose(first[3:9], identity_6d, atol=1e-9)
+    np.testing.assert_allclose(first[9:12], 0.0, atol=1e-9)
+    np.testing.assert_allclose(first[12:18], identity_6d, atol=1e-9)

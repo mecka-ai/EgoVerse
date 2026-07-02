@@ -34,6 +34,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 import zarr
+from scipy.spatial.transform import Rotation as SciR
 
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.embodiment.human import (
@@ -113,7 +114,24 @@ def main():
             d = t.transform(d)
         reverted = np.asarray(d["actions_cartesian"])  # (100, 12) head-frame ypr
         cart = np.asarray(ds_cart[int(a)]["actions_cartesian"], dtype=np.float64)
-        err = np.abs(reverted - cart).max()
+        # Positions and the left rotation must match directly. The RIGHT hand
+        # carries the deliberate local Rz(pi) frame unification
+        # (unify_right_hand_frame in the wristframe mode; plain "cartesian"
+        # keeps the raw mirrored frame), so its rotation is compared modulo E.
+        E3 = np.diag([-1.0, -1.0, 1.0])
+        pos_err = max(
+            np.abs(reverted[:, 0:3] - cart[:, 0:3]).max(),
+            np.abs(reverted[:, 6:9] - cart[:, 6:9]).max(),
+        )
+        rl_rev = SciR.from_euler("ZYX", reverted[:, 3:6]).as_matrix()
+        rl_cart = SciR.from_euler("ZYX", cart[:, 3:6]).as_matrix()
+        rr_rev = SciR.from_euler("ZYX", reverted[:, 9:12]).as_matrix()
+        rr_cart = SciR.from_euler("ZYX", cart[:, 9:12]).as_matrix()
+        rot_err = max(
+            np.abs(rl_rev - rl_cart).max(),
+            np.abs(rr_rev - rr_cart @ E3).max(),
+        )
+        err = max(pos_err, rot_err)
         max_err = max(max_err, err)
         assert err < 1e-5, f"revert mismatch at frame {a}: {err}"
 
