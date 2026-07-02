@@ -28,9 +28,11 @@ from egomimic.utils.pose_utils import (
     _interpolate_quat_wxyz_batch,
     _interpolate_xyz,
     _matrix_to_xyz,
+    _matrix_to_xyz6d,
     _matrix_to_xyzwxyz,
     _matrix_to_xyzypr,
     _xyz_to_matrix,
+    _xyz6d_to_matrix,
     _xyzwxyz_to_matrix,
     _xyzypr_to_matrix,
     wxyz_to_xyzw,
@@ -512,6 +514,49 @@ class XYZWXYZ_to_XYZYPR(Transform):
             else:
                 raise ValueError(
                     f"XYZWXYZ_to_XYZYPR.transform_batch: key '{key}' shape {value.shape} "
+                    f"— expected (B, 7) or (B, H, 7)"
+                )
+        return batch
+
+
+class XYZWXYZ_to_XYZ6D(Transform):
+    """Convert listed keys from xyz+quat(wxyz) to xyz+6D-columns in-place.
+
+    The 6D representation (Zhou et al. / 6DRepNet) is the first two columns of
+    the rotation matrix and is continuous everywhere (no ±pi wraparound), which
+    is what makes per-dimension normalization meaningful. Ported from pi-6d.
+    """
+
+    def __init__(self, keys: list[str]):
+        self.keys = list(keys)
+
+    def transform(self, batch: dict) -> dict:
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 1 and value.shape[0] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value[None, :]))[0]
+            elif value.ndim == 2 and value.shape[1] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value))
+            else:
+                raise ValueError(
+                    f"XYZWXYZ_to_XYZ6D expects key '{key}' to have shape (7,) "
+                    f"or (T, 7), got {value.shape}"
+                )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: (B, 7) obs → (B, 9), (B, H, 7) chunks → (B, H, 9)."""
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 2 and value.shape[-1] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value))  # (B, 9)
+            elif value.ndim == 3 and value.shape[-1] == 7:
+                B, H = value.shape[:2]
+                flat = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value.reshape(B * H, 7)))
+                batch[key] = flat.reshape(B, H, 9)
+            else:
+                raise ValueError(
+                    f"XYZWXYZ_to_XYZ6D.transform_batch: key '{key}' shape {value.shape} "
                     f"— expected (B, 7) or (B, H, 7)"
                 )
         return batch

@@ -303,6 +303,76 @@ def _matrix_to_xyz(mats: np.ndarray) -> np.ndarray:
     return mats[:, :3, 3].astype(dtype, copy=False)
 
 
+# ---------------------------------------------------------------------------
+# Continuous 6D rotation representation (Zhou et al. / 6DRepNet).
+# Ported from the pi-6d branch so train / eval / deploy agree bit-for-bit.
+# ---------------------------------------------------------------------------
+
+
+def _matrix_to_xyz6d(mats: np.ndarray) -> np.ndarray:
+    """Continuous 6D rotation representation (Zhou et al. / 6DRepNet).
+
+    Takes the first two columns of each rotation matrix and prepends the
+    translation:
+
+    args:
+        mats: (B, 4, 4) array of SE3 transformation matrices
+    returns:
+        (B, 9) np.array of [[x, y, z, c1x, c1y, c1z, c2x, c2y, c2z]] where
+        c1 / c2 are the first / second columns of the rotation matrix.
+    """
+    if mats.ndim != 3 or mats.shape[-2:] != (4, 4):
+        raise ValueError(f"Expected (B, 4, 4) array, got shape {mats.shape}")
+
+    mats = np.asarray(mats)
+    dtype = mats.dtype if np.issubdtype(mats.dtype, np.floating) else np.float64
+
+    xyz = mats[:, :3, 3]
+    c1 = mats[:, :3, 0]
+    c2 = mats[:, :3, 1]
+
+    return np.concatenate([xyz, c1, c2], axis=-1).astype(dtype, copy=False)
+
+
+def _xyz6d_to_matrix(xyz6d: np.ndarray) -> np.ndarray:
+    """Inverse of :func:`_matrix_to_xyz6d`.
+
+    Reconstructs a proper rotation matrix from the first two (possibly
+    non-orthonormal) columns via Gram-Schmidt (``eps = 1e-8`` floor, column
+    order, ``c3 = c1 x c2``).
+
+    args:
+        xyz6d: (B, 9) np.array of [[x, y, z, c1(3), c2(3)]]
+    returns:
+        (B, 4, 4) array of SE3 transformation matrices
+    """
+    if xyz6d.ndim != 2 or xyz6d.shape[-1] != 9:
+        raise ValueError(f"Expected (B, 9) array, got shape {xyz6d.shape}")
+
+    B = xyz6d.shape[0]
+    dtype = xyz6d.dtype if np.issubdtype(xyz6d.dtype, np.floating) else np.float64
+    xyz6d = xyz6d.astype(dtype, copy=False)
+
+    eps = 1e-8
+    xyz = xyz6d[:, :3]
+    c1 = xyz6d[:, 3:6]
+    c2 = xyz6d[:, 6:9]
+
+    # Gram-Schmidt (matches torch _reconstruct_R_from_cols).
+    c1n = c1 / np.clip(np.linalg.norm(c1, axis=-1, keepdims=True), eps, None)
+    proj = np.sum(c2 * c1n, axis=-1, keepdims=True) * c1n
+    c2o = c2 - proj
+    c2n = c2o / np.clip(np.linalg.norm(c2o, axis=-1, keepdims=True), eps, None)
+    c3n = np.cross(c1n, c2n)
+
+    mats = np.broadcast_to(np.eye(4, dtype=dtype), (B, 4, 4)).copy()
+    mats[:, :3, 0] = c1n
+    mats[:, :3, 1] = c2n
+    mats[:, :3, 2] = c3n
+    mats[:, :3, 3] = xyz
+    return mats
+
+
 def _split_action_pose(actions):
     # 14D layout: [L xyz ypr g, R xyz ypr g]
     # 12D layout: [L xyz ypr, R xyz ypr]

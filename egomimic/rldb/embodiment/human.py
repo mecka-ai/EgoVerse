@@ -15,6 +15,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     Reshape,
     SplitKeys,
     Transform,
+    XYZWXYZ_to_XYZ6D,
     XYZWXYZ_to_XYZYPR,
 )
 from egomimic.utils.viz_utils import (
@@ -330,7 +331,10 @@ class Mecka(Human):
     @classmethod
     def get_transform_list(
         cls,
-        mode: Literal["cartesian", "cartesian_wristframe"],
+        mode: Literal[
+            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
+            "cartesian_wristframe_6d",
+        ],
     ) -> list[Transform]:
         if mode == "cartesian":
             return _build_aria_cartesian_bimanual_transform_list(
@@ -346,12 +350,20 @@ class Mecka(Human):
             return _build_mecka_cartesian_wristframe_bimanual_transform_list(
                 interpolate=False,
             )
+        elif mode == "cartesian_wristframe_6d":
+            # Wrist-frame delta pose with continuous 6D rotation (pi-6d parity):
+            # single-anchor wrist frame + xyz + 6D columns → 9 per arm, 18 bimanual.
+            return _build_mecka_cartesian_wristframe_bimanual_transform_list(
+                stride=cls.ACTION_STRIDE,
+                rot_repr="6d",
+            )
 
     @classmethod
     def get_keymap(
         cls,
         mode: Literal[
-            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp", "keypoints"
+            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
+            "cartesian_wristframe_6d", "keypoints"
         ],
         annotations: bool = False,
         norm_mode: bool = False,
@@ -359,7 +371,10 @@ class Mecka(Human):
         # cartesian variants consume the same raw keys (action/obs ee poses + head
         # pose); only the transform frame + horizon differ. The _nointerp variant
         # reads a full 100-frame horizon (no InterpolatePose upsamples 30 -> 100).
-        if mode in ("cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp"):
+        if mode in (
+            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
+            "cartesian_wristframe_6d",
+        ):
             action_horizon = 100 if mode == "cartesian_wristframe_nointerp" else 30
             key_map = {
                 cls.VIZ_IMAGE_KEY: {
@@ -1080,6 +1095,7 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
     chunk_length: int = 100,
     stride: int = 3,
     interpolate: bool = True,
+    rot_repr: str = "ypr",
     delete_target_world: bool = True,
 ) -> list[Transform]:
     """Cartesian bimanual pipeline with actions in the WRIST frame (delta pose).
@@ -1100,6 +1116,11 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
     resampled to ``chunk_length`` via ``InterpolatePose``. When False, no resampling is
     done — the action chunk is used as read, so the keymap MUST supply a horizon of
     exactly ``chunk_length`` real frames (i.e. ``action_ee_pose`` horizon == chunk_length).
+
+    ``rot_repr``: ``"ypr"`` → xyz + Euler (6 per arm, 12 bimanual); ``"6d"`` → xyz +
+    continuous 6D rotation columns (9 per arm, 18 bimanual; Zhou et al.). The frame
+    math is identical to pi-6d's ``cartesian_wristframe_6d`` (single-anchor: each action
+    relative to the current ee pose); only the rotation encoding differs.
     """
     keys_to_delete = list(
         {
@@ -1169,8 +1190,9 @@ def _build_mecka_cartesian_wristframe_bimanual_transform_list(
         )
 
     if target_world_is_quat:
+        rot_encoder = XYZWXYZ_to_XYZ6D if rot_repr == "6d" else XYZWXYZ_to_XYZYPR
         transform_list.append(
-            XYZWXYZ_to_XYZYPR(
+            rot_encoder(
                 keys=[
                     left_action_wristframe,
                     right_action_wristframe,
