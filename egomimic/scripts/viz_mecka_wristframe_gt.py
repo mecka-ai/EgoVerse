@@ -21,6 +21,14 @@ Usage (repo root, emimic venv):
 
 import argparse
 import os
+import sys
+
+# Anchor imports to the repo this script lives in. Invoked as
+# `python egomimic/scripts/viz_mecka_wristframe_gt.py`, sys.path[0] is the
+# scripts/ dir, so `import egomimic` would otherwise resolve through the venv's
+# editable install — possibly a DIFFERENT checkout/worktree missing the
+# wristframe-6d code.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 import imageio.v2 as imageio
 import numpy as np
@@ -36,10 +44,18 @@ from egomimic.rldb.zarr.zarr_dataset_multi import ZarrDataset
 
 
 def _make_dataset(episode, mode):
+    transform_list = Mecka.get_transform_list(mode=mode)
+    if transform_list is None:
+        raise SystemExit(
+            f"Mecka.get_transform_list returned None for mode={mode!r} — the "
+            f"egomimic you imported ({os.path.dirname(sys.modules['egomimic'].__file__)}) "
+            "does not support this mode. Run from a checkout of the "
+            "aidan/wristframe-6d branch (or cherry-pick its mecka commit)."
+        )
     return ZarrDataset(
         episode,
         key_map=Mecka.get_keymap(mode="cartesian"),
-        transform_list=Mecka.get_transform_list(mode=mode),
+        transform_list=transform_list,
     )
 
 

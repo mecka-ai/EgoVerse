@@ -365,6 +365,9 @@ class Mecka(Human):
             return _build_human_cartesian_eef_frame_transform_list(
                 stride=cls.ACTION_STRIDE, rot_repr="6d"
             )
+        # An unknown mode must fail here, not surface later as a dataset with no
+        # transforms (missing actions_cartesian) after silently returning None.
+        raise ValueError(f"Unknown Mecka transform mode: {mode!r}")
 
     @classmethod
     def get_keymap(
