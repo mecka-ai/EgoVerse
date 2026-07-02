@@ -347,7 +347,7 @@ class Mecka(Human):
     @classmethod
     def get_transform_list(
         cls,
-        mode: Literal["cartesian", "cartesian_6d"],
+        mode: Literal["cartesian", "cartesian_6d", "cartesian_wristframe_6d"],
     ) -> list[Transform]:
         if mode == "cartesian":
             return _build_human_cartesian_bimanual_transform_list(
@@ -357,6 +357,13 @@ class Mecka(Human):
             return _build_human_cartesian_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
                 rot_repr="6d",
+            )
+        elif mode == "cartesian_wristframe_6d":
+            # Same wrist-frame pipeline as Aria (the mecka cartesian keymap uses
+            # the identical obs_head_pose / *.action_ee_pose keys); only the
+            # action stride differs.
+            return _build_human_cartesian_eef_frame_transform_list(
+                stride=cls.ACTION_STRIDE, rot_repr="6d"
             )
 
     @classmethod
