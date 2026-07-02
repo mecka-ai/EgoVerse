@@ -111,8 +111,9 @@ def main():
         }
         for t in revert:
             d = t.transform(d)
+        reverted = np.asarray(d["actions_cartesian"])  # (100, 12) head-frame ypr
         cart = np.asarray(ds_cart[int(a)]["actions_cartesian"], dtype=np.float64)
-        err = np.abs(np.asarray(d["actions_cartesian"]) - cart).max()
+        err = np.abs(reverted - cart).max()
         max_err = max(max_err, err)
         assert err < 1e-5, f"revert mismatch at frame {a}: {err}"
 
@@ -133,8 +134,12 @@ def main():
             transform_list=revert,
             mode="traj",
         )
+        # Overlay the wrist orientation as positive x/y/z axis arrows (mode
+        # "axes": rot column * axis_len from each arm's anchor pose, x=red
+        # y=green z=blue legend) using the reverted head-frame GT chunk.
+        frame = Mecka.viz(ims[0], reverted, mode="axes")
         out_path = os.path.join(args.out, f"frame_{int(a):05d}.png")
-        imageio.imwrite(out_path, ims[0].astype(np.uint8))
+        imageio.imwrite(out_path, frame.astype(np.uint8))
         print(f"  frame {a}: revert err {err:.2e} -> {out_path}")
 
     print(
