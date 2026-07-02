@@ -1920,17 +1920,17 @@ class ZarrDataset(torch.utils.data.Dataset):
         if cache is None:
             return np.array([], dtype=np.int64)
 
-        required = {
-            "obs_head_pose",
-            "left.obs_ee_pose",
-            "right.obs_ee_pose",
-        }
-        if not required.issubset(cache.keys()):
+        if "obs_head_pose" not in cache:
+            return np.array([], dtype=np.int64)
+        # keypoints keymap uses obs_wrist_pose; cartesian keymap uses obs_ee_pose
+        left_key = "left.obs_ee_pose" if "left.obs_ee_pose" in cache else "left.obs_wrist_pose"
+        right_key = "right.obs_ee_pose" if "right.obs_ee_pose" in cache else "right.obs_wrist_pose"
+        if left_key not in cache or right_key not in cache:
             return np.array([], dtype=np.int64)
 
         head = np.asarray(cache["obs_head_pose"])
-        left = np.asarray(cache["left.obs_ee_pose"])
-        right = np.asarray(cache["right.obs_ee_pose"])
+        left = np.asarray(cache[left_key])
+        right = np.asarray(cache[right_key])
         head_ok = self._pose_rows_valid(
             head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
         )

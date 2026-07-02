@@ -200,13 +200,16 @@ def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dic
             image_decode_workers=0,
             load_images=False,
         )
+        if actions is None:
+            return ep, None
         a = _np.asarray(actions, dtype=_np.float32)  # (T, horizon, action_dim)
         return ep, a
 
     cache: dict = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         for ep, a in pool.map(_read_one, [e for e in unique_eps if e in episodes]):
-            cache[ep] = a
+            if a is not None:
+                cache[ep] = a
     print(f"{tag} QueST chunk read: cached {len(cache)} episodes")
     return cache
 
@@ -253,7 +256,7 @@ def _build_quest_token_tsne(
     chunk_list, owner = [], []
     for i, m in enumerate(span_meta):
         arr = ep_chunks.get(m["episode"])
-        if arr is None or len(arr) == 0:
+        if arr is None or getattr(arr, "ndim", 0) == 0 or len(arr) == 0:
             continue
         if arr.ndim == 3:
             # arr is (T, H, D) — pre-computed wristframe chunks from the transform pipeline.
