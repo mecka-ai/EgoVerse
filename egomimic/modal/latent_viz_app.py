@@ -367,20 +367,109 @@ def render_all_frames(only: list[str] | None = None):
     return {"rendered": done, "skipped": skipped, "failed": failed}
 
 
+# Image for the language-tSNE regen job: Qwen3 text embedder (same model the
+# curation used) + sklearn. Kept separate from the viewer image so the ASGI app
+# stays lean (no torch/transformers).
+_lang_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch", "transformers", "scikit-learn", "numpy", "hf_transfer")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+)
+
+
+@app.function(
+    image=_lang_image,
+    gpu="A10G",
+    volumes={OUTPUTS_MOUNT: outputs_volume},
+    timeout=1800,
+)
+def regen_language_tsne(run: str, dims: int | None = None) -> dict:
+    """Compute a language t-SNE for a cluster run and merge it into
+    tsne3d/spans_tsne3d.json (adds the ``language`` block the viewer panel needs).
+
+    The run's spans only carry action embeddings; the language space is
+    reconstructed from each span's annotation text with the same Qwen3 embedder
+    the curation used. Only the unique texts are embedded (usually a few thousand)
+    then t-SNE'd and broadcast back to every span, so identical annotations share
+    a language coordinate. Run with:
+      MODAL_ENVIRONMENT=robotics modal run egomimic/modal/latent_viz_app.py::regen_language_tsne --run <run>
+    """
+    import json
+    import numpy as np
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE as SkTSNE
+
+    run = run.strip().strip("/")
+    outputs_volume.reload()
+    tsne_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
+    if not tsne_path.is_file():
+        raise FileNotFoundError(f"tsne3d/spans_tsne3d.json not found under {run!r}")
+    data = json.load(open(tsne_path))
+    spans = data["spans"]
+    dims = int(dims or data.get("dims", 3))
+
+    texts = [str(s.get("text", "")) for s in spans]
+    uniq = sorted(set(texts))
+    uidx = {t: i for i, t in enumerate(uniq)}
+    print(f"[lang] {run}: {len(spans)} spans, {len(uniq)} unique texts, dims={dims}")
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", padding_side="left")
+    model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", dtype=torch.float16).to("cuda").eval()
+
+    def _pool(h, mask):
+        left = bool((mask[:, -1].sum() == mask.shape[0]).item())
+        if left:
+            return h[:, -1]
+        sl = mask.sum(dim=1) - 1
+        return h[torch.arange(h.size(0), device=h.device), sl]
+
+    embs = []
+    with torch.no_grad():
+        for st in range(0, len(uniq), 64):
+            batch = uniq[st : st + 64]
+            t = tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to("cuda")
+            h = model(**t).last_hidden_state
+            p = torch.nn.functional.normalize(_pool(h, t["attention_mask"]).float(), p=2, dim=1)
+            embs.append(p.cpu().numpy().astype(np.float32))
+    U = np.concatenate(embs, axis=0)
+    print(f"[lang] embedded {U.shape}")
+
+    X = PCA(n_components=50, random_state=42).fit_transform(U) if U.shape[1] > 50 else U
+    perp = max(5.0, min(30.0, (len(U) - 1) / 3.0))
+    coords = SkTSNE(n_components=dims, perplexity=perp, init="pca", random_state=42).fit_transform(X)
+
+    # broadcast unique-text coords back to every span
+    def _col(axis):
+        return [round(float(coords[uidx[texts[k]], axis]), 3) for k in range(len(spans))]
+
+    lang = {"x": _col(0), "y": _col(1)}
+    if dims == 3:
+        lang["z"] = _col(2)
+    data["language"] = lang
+    with open(tsne_path, "w") as f:
+        json.dump(data, f)
+    outputs_volume.commit()
+    print(f"[lang] wrote language block ({len(spans)} pts, dims={dims}) → {tsne_path}")
+    return {"run": run, "spans": len(spans), "unique_texts": len(uniq), "dims": dims}
+
+
 @app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
     secrets=[modal.Secret.from_name("egoverse-sql")],
     cpu=16.0,
-    memory=16384,
-    min_containers=1,
-    scaledown_window=600,
+    memory=32768,
+    min_containers=2,
+    scaledown_window=1200,
 )
-@modal.concurrent(max_inputs=50)
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def viewer():
     import sys
 
-    from fastapi import FastAPI, HTTPException, Query
+    from fastapi import FastAPI, HTTPException, Query, Request
+    from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
     sys.path.insert(0, "/root")
@@ -389,6 +478,32 @@ def viewer():
     from build_cluster_viz import build_cluster_html
 
     web = FastAPI(title="Meckaverse")
+
+    class SelectiveGZipMiddleware(GZipMiddleware):
+        """Gzip everything EXCEPT media paths. Compressing /video responses breaks
+        the browser's byte-range seek model (ranges address compressed bytes) and
+        media stacks fire a hard <video> error on Content-Encoding'd MP4; /frame
+        JPEGs are already compressed. HTML/JSON still gzips ~5x."""
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and scope.get("path", "").startswith(("/video/", "/frame/")):
+                await self.app(scope, receive, send)
+                return
+            await super().__call__(scope, receive, send)
+
+    # The viewer HTML embeds megabytes of JSON that compresses ~5x — gzip is the
+    # single biggest page-load win.
+    web.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+
+    @web.middleware("http")
+    async def _no_stale_html(request: Request, call_next):
+        # HTML is rebuilt server-side when run outputs change; force browsers to
+        # revalidate so a stale viewer page can never linger after a redeploy.
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     # run path → (mtime stamp, HTML); rebuilt when the run's outputs change.
     html_cache:         dict[str, tuple[float, str]] = {}
     span_html_cache:    dict[str, tuple[float, str]] = {}
@@ -519,7 +634,7 @@ def viewer():
             "start": [int(s.get("start", 0))              for s in spans],
             "end":   [int(s.get("end",   s.get("start", 0) + 1)) for s in spans],
             "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
-            "txt":   [str(s.get("text", ""))[:60]         for s in spans],
+            "txt":   [str(s.get("text", ""))[:200]        for s in spans],
         }
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))

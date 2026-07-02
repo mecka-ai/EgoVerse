@@ -6,13 +6,19 @@ spinners, no failure modes. Clusters take the role that tasks/episodes play in
 the task viewer.
 
   * Same CSS variables, top bar (tabs / dropdown / info / run-nav)
-  * Same t-SNE tools: Color (cluster/score/time), Cluster multi-select, frame
-    highlight, size slider, sync cameras, panel toggles, reset, tstats
-  * Same 3-panel layout (STATE | ACTION | LANGUAGE) with Plotly scatter3d
-  * Same legend sidebar — clusters replace episodes (clickable, multi-select)
-  * Same frame-preview popup
+  * Same t-SNE tools: Color (cluster/episode/score/time), cluster/episode
+    multi-select, frame highlight, size slider, sync cameras, panel toggles
+  * Same 2/3-panel layout (STATE | ACTION | LANGUAGE) with Plotly scatter
+  * Same legend sidebar — clusters (or episodes) with multi-select
+  * Clicking a scatter dot opens a popup that PLAYS the span's action-horizon
+    clip (media-fragment URI #t=start,end — verified reliable; manual
+    currentTime+play() stalls in Chrome), looping within the window
   * Same grid page: sort, TOP/BOT filters, Find, Load-all / Play-all / Pause /
-    Speed — adapted to play each span clip (looping within its [start,end])
+    Speed — each card plays its span clip
+
+Payload layout: episode hashes and annotation texts are deduplicated into the
+shared ``EPS`` / ``TXTS`` tables; spans and t-SNE points store integer indices
+(``ei`` / ``ti``). For a 60k-span run this halves the embedded-JSON size.
 """
 from __future__ import annotations
 
@@ -112,17 +118,20 @@ _TEMPLATE = r"""<!DOCTYPE html>
   .ph .play { font-size:28px; }
   .clinks { padding:6px 10px; font-size:11px; display:flex; gap:10px; }
   .clinks a { color:#7fd4ff; text-decoration:none; }
-  #preview { position:fixed; right:14px; bottom:14px; width:400px; background:#17181d;
+  #preview { position:fixed; right:14px; bottom:14px; width:440px; background:#17181d;
              border:1px solid #34363f; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.7);
              display:none; z-index:50; overflow:hidden; }
-  #preview img { width:100%; display:block; background:#000; }
+  #pv-media { position:relative; width:100%; background:#000; aspect-ratio:16/10; }
+  #pv-media video { position:absolute; inset:0; width:100%; height:100%;
+             object-fit:contain; background:#000; display:block; }
+  #pv-txt { font-size:12px; padding:6px 10px 0; color:#c9b8ff; line-height:1.4; }
   #pv-cap { font-size:12px; padding:6px 10px; color:#ccc; display:flex; gap:6px;
             align-items:center; flex-wrap:wrap; }
   #pv-cap b { color:#7fd4ff; }
   #pv-cap button { padding:2px 7px; font-size:12px; }
   #pv-close { position:absolute; top:5px; right:7px; cursor:pointer; color:#aaa; font-size:14px;
               background:rgba(0,0,0,.6); border-radius:50%; width:20px; height:20px;
-              text-align:center; line-height:20px; }
+              text-align:center; line-height:20px; z-index:2; }
   #pv-close:hover { color:#fff; }
 </style>
 </head>
@@ -133,7 +142,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
   <span class="tab" id="tab-grid" onclick="showPage('grid')">Video grid</span>
   <label class="tool" style="margin-left:4px">Cluster
     <select id="csel" onchange="onCSelDrop()"><option value="">— all —</option></select></label>
-  <div id="info">Click a point to inspect</div>
+  <div id="info">Click a point to play its clip</div>
   <div class="run-nav" id="runNav">__RUN_LABEL__</div>
 </div>
 
@@ -153,7 +162,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
       </select></span>
     <span class="tool"><label>Clusters</label>
       <span id="cCount" style="background:#26272f;padding:3px 8px;border-radius:5px;font-size:12px;color:#cdd">all</span>
-      <button onclick="clearClusterSel()">clear</button></span>
+      <button onclick="clearSel()">clear</button></span>
     <div class="sep"></div>
     <span class="tool"><label class="chk"><input type="checkbox" id="hlOn" onchange="applyStyle()"> frame</label>
       <input type="number" id="hlFrame" value="0" min="0" step="10" onchange="hlChanged()">
@@ -202,37 +211,50 @@ _TEMPLATE = r"""<!DOCTYPE html>
 
 <div id="preview">
   <div id="pv-close" onclick="hidePreview()">&times;</div>
-  <img id="pv-img" alt="">
+  <div id="pv-media"></div>
+  <div id="pv-txt"></div>
   <div id="pv-cap"></div>
 </div>
 
 <script>
-/* ── embedded data ── */
-const CLUSTERS   = __CLUSTERS__;
-const TSNE       = __TSNE__;          // {} if no spans_tsne3d.json; else {cid,score,start,end,ep,txt, state:{x,y,z}, …}
+/* ── embedded data ──
+   EPS/TXTS are shared dedup tables; spans + t-SNE points reference them by
+   integer index (ei/ti) to keep the page small. */
+const EPS        = __EPS__;           // unique episode hashes (sorted)
+const TXTS       = __TXTS__;          // unique annotation texts
+const CLUSTERS   = __CLUSTERS__;      // cluster_N → {label, spans:[{ei,ti,start,end,score}]}
+const TSNE       = __TSNE__;          // {} or {cid,score,start,end,ei,ti,dims,method, state/action/language:{x,y[,z]}}
 const VIDEO_BASE = "__VIDEO_BASE__";
 const FRAME_BASE = "__FRAME_BASE__";
 const FPS        = 30;
 const RUN_KEY    = "clusterviz:" + "__RUN_LABEL_ESCAPED__";   // localStorage key (per run)
 
-const HAS_TSNE = TSNE && TSNE.cid && TSNE.cid.length;
-const IS2D = (TSNE && TSNE.dims || 3) === 2;   // 2-D vs 3-D scatter
+const epOf  = ei => EPS[ei]  || '';
+const txtOf = ti => TXTS[ti] || '';
+
+const HAS_TSNE = !!(TSNE && TSNE.cid && TSNE.cid.length);
+const IS2D = ((TSNE && TSNE.dims) || 3) === 2;
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
   parseInt(a.replace('cluster_','')) - parseInt(b.replace('cluster_',''))
 );
 const TOTAL_SPANS = ALL_CID.reduce((s,c)=>s+CLUSTERS[c].spans.length,0);
 
+const MOD_ORDER  = ['state','action','language'];
+const MOD_LABELS = {state:'STATE', action:'ACTION', language:'LANGUAGE'};
+const DIM        = 'rgba(110,110,120,0.05)';
+
 /* ── runtime state ── */
-let COLOR_TABLES  = null;             // {cluster:[…], score:[…], time:[…]}
-let curCluster    = null;             // string "cluster_N" or null — drives the grid
-let selectedClusters = new Set();     // Set<int> — multi-highlight in scatter + grid (cluster mode)
-let selectedEpisodes = new Set();     // Set<str> — multi-highlight in scatter + grid (episode mode)
+let COLOR_TABLES  = null;
+let CUSTOM        = null;             // per-point hover payload (shared across panels)
+let curCluster    = null;             // "cluster_N" or null — drives the grid
+let selectedClusters = new Set();     // Set<int> cluster ids
+let selectedEpisodes = new Set();     // Set<int> episode indices (into EPS)
 let hiddenMods    = new Set();
 let activeMods    = [];
 let camLock       = false;
 let page          = 'tsne';
 
-/* ── persist sidebar selection + color/select modes across reload (per run) ── */
+/* ── persist selection + modes across reload (per run) ── */
 function saveState(){
   try{ localStorage.setItem(RUN_KEY, JSON.stringify({
     selMode:   document.getElementById('selMode').value,
@@ -249,15 +271,13 @@ function loadState(){
     if(s.selMode&&sm) sm.value=s.selMode;
     if(s.colorMode&&cm) cm.value=s.colorMode;
     selectedClusters = new Set((s.clusters||[]).map(Number));
-    selectedEpisodes = new Set(s.episodes||[]);
+    // older saves stored episode hashes; map them into EPS indices
+    selectedEpisodes = new Set((s.episodes||[])
+      .map(e=>typeof e==='string'?EPS.indexOf(e):e).filter(i=>i>=0));
     curCluster = s.curCluster||null;
     const cs=document.getElementById('csel'); if(cs&&curCluster) cs.value=curCluster;
   }catch(e){}
 }
-
-const MOD_ORDER  = ['state','action','language'];
-const MOD_LABELS = {state:'STATE', action:'ACTION', language:'LANGUAGE'};
-const DIM        = 'rgba(110,110,120,0.05)';
 
 /* ── color helpers ── */
 function hsv2rgb(h,s,v){
@@ -269,29 +289,48 @@ function hsv2rgb(h,s,v){
 function rgb(c){return`rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`;}
 function lerp3(a,b,t){return[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t,a[2]+(b[2]-a[2])*t];}
 const redGreen = t=>lerp3([224,85,85],[84,196,108],Math.max(0,Math.min(1,t)));
-function cidHue(ci){return(ci*137.508)%360/360;}
-function cidColor(ci){return rgb(hsv2rgb(cidHue(ci),0.85,0.9));}
+const goldenColor = i=>rgb(hsv2rgb((i*137.508)%360/360,0.85,0.9));
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-/* ── episode index + colors (for the 'episode' color mode + episode legend) ── */
-const EP_LIST = (()=>{const cnt={}; ALL_CID.forEach(cid=>CLUSTERS[cid].spans.forEach(s=>{cnt[s.ep]=(cnt[s.ep]||0)+1;})); return Object.keys(cnt).sort().map((ep,i)=>({ep,count:cnt[ep],idx:i}));})();
-const EP_IDX = Object.fromEntries(EP_LIST.map(e=>[e.ep,e.idx]));
-function epColor(ep){const i=EP_IDX[ep]??0; return rgb(hsv2rgb((i*137.508)%360/360,0.85,0.9));}
+/* ── per-episode span counts (episode legend) ── */
+const EP_COUNTS=(()=>{const c=new Array(EPS.length).fill(0);
+  ALL_CID.forEach(cid=>CLUSTERS[cid].spans.forEach(s=>{c[s.ei]++;})); return c;})();
 
-/* ── color tables (built once) ── */
+/* ── flattened span list (built once; renderGrid reuses it) ── */
+const ALL_SPANS=[];
+ALL_CID.forEach(cid=>CLUSTERS[cid].spans.forEach(s=>{ALL_SPANS.push({...s,_cid:cid});}));
+
+/* ── wrap long hover text (Plotly only breaks on <br>) ── */
+function wrapText(s,w){
+  s=String(s||''); if(!s) return '';
+  const words=s.split(/\s+/); let line='', out=[];
+  for(const wd of words){
+    if(line && (line.length+1+wd.length)>w){ out.push(line); line=wd; }
+    else line=line?line+' '+wd:wd;
+  }
+  if(line) out.push(line);
+  return out.join('<br>');
+}
+
+/* ── color tables + shared hover customdata (built once) ── */
 function buildColorTables(){
   if(!HAS_TSNE) return;
   const N=TSNE.cid.length;
   const scores=TSNE.score, starts=TSNE.start;
-  const finite=scores.filter(s=>isFinite(s));
+  const finite=scores.filter(isFinite);
   const mn=finite.length?Math.min(...finite):0, mx=finite.length?Math.max(...finite):1;
   const s0=Math.min(...starts), s1=Math.max(...starts)||1;
+  const wrapped=TXTS.map(t=>wrapText(t,44));   // wrap each unique text once
   const ct={cluster:new Array(N), episode:new Array(N), score:new Array(N), time:new Array(N)};
+  CUSTOM=new Array(N);
   for(let k=0;k<N;k++){
-    ct.cluster[k]=cidColor(TSNE.cid[k]);
-    ct.episode[k]=epColor(TSNE.ep[k]);
+    ct.cluster[k]=goldenColor(TSNE.cid[k]);
+    ct.episode[k]=goldenColor(TSNE.ei[k]);
     ct.score[k]=rgb(redGreen(mx>mn?(scores[k]-mn)/(mx-mn):0.5));
     ct.time[k]=rgb(lerp3([170,215,255],[10,40,90],(starts[k]-s0)/Math.max(1,s1-s0)));
+    CUSTOM[k]=[k, TSNE.cid[k], TSNE.start[k],
+               isFinite(scores[k])?scores[k].toFixed(3):'?',
+               wrapped[TSNE.ti[k]]||'', epOf(TSNE.ei[k]).slice(0,14)];
   }
   COLOR_TABLES=ct;
 }
@@ -306,26 +345,33 @@ function uiState(){
     size: +document.getElementById('psize').value,
   };
 }
+function epMode(){ return document.getElementById('selMode').value==='episode'; }
 
-/* ── applyStyle ── */
+/* ── applyStyle ── partition points into the ACTIVE trace (0, hoverable) and the
+   CONTEXT trace (1, dim + hover-skipped) so only selected dots can be hovered. */
 function applyStyle(){
   if(!HAS_TSNE||!COLOR_TABLES) return;
   const u=uiState();
   const N=TSNE.cid.length;
   const base=COLOR_TABLES[u.mode]||COLOR_TABLES.cluster;
-  const colors=new Array(N), sizes=new Array(N);
-  const selEp = document.getElementById('selMode').value==='episode';  // selection dim (decoupled from color)
+  const selEp=epMode();
   const sel = selEp ? selectedEpisodes : selectedClusters;
+
+  const aC=[],aS=[],aCust=[],aIdx=[],cIdx=[];
   for(let k=0;k<N;k++){
-    const ci=TSNE.cid[k];
-    const passSel = sel.size===0 || sel.has(selEp ? TSNE.ep[k] : ci);
-    const passHl = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
-    if(passSel && passHl){ colors[k]=base[k]; sizes[k]=u.hlOn?u.size*2.2:u.size; }
-    else if(!passSel){ colors[k]='rgba(0,0,0,0)'; sizes[k]=0; }   // selection active → hide non-selected entirely
-    else { colors[k]=DIM; sizes[k]=u.size; }
+    const passSel = sel.size===0 || sel.has(selEp ? TSNE.ei[k] : TSNE.cid[k]);
+    const passHl  = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
+    if(passSel && passHl){ aC.push(base[k]); aS.push(u.hlOn?u.size*2.2:u.size); aCust.push(CUSTOM[k]); aIdx.push(k); }
+    else cIdx.push(k);
   }
   activeMods.forEach(mod=>{
-    Plotly.restyle('panel_'+mod,{'marker.color':[colors],'marker.size':[sizes]},[0]);
+    const t=TSNE[mod];
+    const up0 = {x:[aIdx.map(k=>t.x[k])],y:[aIdx.map(k=>t.y[k])],
+                 customdata:[aCust],'marker.color':[aC],'marker.size':[aS]};
+    const up1 = {x:[cIdx.map(k=>t.x[k])],y:[cIdx.map(k=>t.y[k])]};
+    if(!IS2D){ up0.z=[aIdx.map(k=>t.z[k])]; up1.z=[cIdx.map(k=>t.z[k])]; }
+    Plotly.restyle('panel_'+mod, up0, [0]);
+    Plotly.restyle('panel_'+mod, up1, [1]);
   });
   saveState();
 }
@@ -340,7 +386,7 @@ const LAYOUT = title=>({
 const LAYOUT2D = title=>({
   title:{text:title,font:{color:'#ddd',size:12},pad:{t:2}},
   paper_bgcolor:'#101014', plot_bgcolor:'#101014',
-  xaxis:{visible:false}, yaxis:{visible:false,scaleanchor:'x'},   // square aspect
+  xaxis:{visible:false}, yaxis:{visible:false,scaleanchor:'x'},
   showlegend:false, margin:{l:0,r:0,t:28,b:0}, hovermode:'closest',
 });
 
@@ -372,7 +418,7 @@ function ensurePanels(mods){
         <div id="panel_${mod}" class="panel"></div>
       </div>`).join('')+'</div>'
   ).join('');
-  grid.getBoundingClientRect();          // force synchronous layout for Plotly height
+  grid.getBoundingClientRect();          // force layout so Plotly reads real heights
 }
 
 function renderTsne(preserveToggles){
@@ -394,32 +440,34 @@ function renderTsne(preserveToggles){
     const t=TSNE[mod];
     const el=document.getElementById('panel_'+mod);
     if(!t||!el) continue;
-    const N=t.x.length;
-    const custom=new Array(N);
-    for(let k=0;k<N;k++){
-      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14)];
-    }
     const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>';
-    const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large 2-D point clouds
-    const main = {type:tType,mode:'markers',x:t.x,y:t.y,customdata:custom,
-                  marker:{size:u.size,color:base,line:{width:0}},hovertemplate:hov};
-    const selT = {type:tType,mode:'markers',name:'sel',x:[],y:[],hoverinfo:'skip',
-                  marker:{size:IS2D?13:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}};
-    if(!IS2D){ main.z=t.z; selT.z=[]; }
-    Plotly.newPlot(el,[main,selT],(IS2D?LAYOUT2D:LAYOUT)(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
+    const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large point clouds
+    // trace 0 = ACTIVE (hoverable + clickable); trace 1 = CONTEXT (dim, hover skipped);
+    // trace 2 = SELECTION diamond. applyStyle() partitions points between 0 and 1.
+    const active  = {type:tType,mode:'markers',x:t.x,y:t.y,customdata:CUSTOM,
+                     marker:{size:u.size,color:base,line:{width:0}},
+                     hovertemplate:hov,hoverlabel:{align:'left',bgcolor:'#17181d',
+                       bordercolor:'#34363f',font:{size:12,color:'#e8e8ea'}}};
+    const context = {type:tType,mode:'markers',x:[],y:[],hoverinfo:'skip',
+                     marker:{size:Math.max(1,u.size*0.7),color:DIM,line:{width:0}}};
+    const selT    = {type:tType,mode:'markers',name:'sel',x:[],y:[],hoverinfo:'skip',
+                     marker:{size:IS2D?13:12,color:'rgba(255,200,0,0.95)',symbol:'diamond',line:{width:0}}};
+    if(!IS2D){ active.z=t.z; context.z=[]; selT.z=[]; }
+    Plotly.newPlot(el,[active,context,selT],(IS2D?LAYOUT2D:LAYOUT)(MOD_LABELS[mod]+' — cluster view'),{responsive:true});
 
     el.onpointerdown=e=>{el._px=e.clientX;el._py=e.clientY;};
     el.onpointerup=e=>{el._drag=Math.hypot(e.clientX-(el._px??e.clientX),e.clientY-(el._py??e.clientY))>5;};
     el.on('plotly_click',ev=>{
       if(el._drag) return;
-      const p=ev.points[0]; if(!p||p.curveNumber!==0) return;
-      const [k,ci,frame,sc,txt]=p.customdata;
-      const ep=TSNE.ep[k]||'';
+      const p=ev.points[0]; if(!p||p.curveNumber!==0) return;   // only ACTIVE trace is clickable
+      const k=p.customdata[0];
+      const ep=epOf(TSNE.ei[k]), start=TSNE.start[k], end=TSNE.end[k], txt=txtOf(TSNE.ti[k]);
+      const sc=isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?';
       document.getElementById('info').innerHTML=
-        `<b>cluster_${ci}</b> &middot; f<b>${frame}</b> &middot; ${sc}`+
+        `<b>cluster_${TSNE.cid[k]}</b> &middot; f<b>${start}&ndash;${end}</b> &middot; ${sc}`+
         (txt?` &middot; <span style="color:#c9b8ff">${esc(txt)}</span>`:'');
-      document.getElementById('hlFrame').value=frame;
-      showFrame(ep,frame);
+      document.getElementById('hlFrame').value=start;
+      showClip(ep,start,end,txt);
       crossHighlight(k);
     });
     el.on('plotly_relayout',ev=>{
@@ -447,26 +495,25 @@ function crossHighlight(k){
   for(const mod of activeMods){
     const t=TSNE[mod]; if(!t) continue;
     const upd = IS2D ? {x:[[t.x[k]]],y:[[t.y[k]]]} : {x:[[t.x[k]]],y:[[t.y[k]]],z:[[t.z[k]]]};
-    Plotly.restyle('panel_'+mod, upd, [1]);
+    Plotly.restyle('panel_'+mod, upd, [2]);   // trace 2 = selection diamond
   }
 }
 
-/* ── legend (clusters, multi-select) ── */
+/* ── legend (clusters or episodes, multi-select) ── */
 function buildLegend(){
   const el=document.getElementById('legend');
-  const epMode=document.getElementById('selMode').value==='episode';
-  if(epMode){
+  if(epMode()){
     el.innerHTML=
       `<div class="lg-head">episodes <span style="color:#666;font-weight:400">(click to select)</span></div>`+
       `<div class="lg-row" id="lg_all" onclick="epLegendClick(null)">
          <span class="lg-dot" style="background:#888"></span>
          <span class="lg-lbl">show all</span></div>`+
-      EP_LIST.map(e=>{
-        const active=selectedEpisodes.has(e.ep);
-        return`<div class="lg-row${active?' active':''}" id="lg_ep_${e.idx}" onclick="epLegendClick('${e.ep}')" title="${esc(e.ep)}">
-          <span class="lg-dot" style="background:${epColor(e.ep)}"></span>
-          <span class="lg-lbl">${esc(e.ep.slice(0,16))}…</span>
-          <span class="lg-cnt">${e.count}</span>
+      EPS.map((ep,ei)=>{
+        const active=selectedEpisodes.has(ei);
+        return`<div class="lg-row${active?' active':''}" id="lg_ep_${ei}" onclick="epLegendClick(${ei})" title="${esc(ep)}">
+          <span class="lg-dot" style="background:${goldenColor(ei)}"></span>
+          <span class="lg-lbl">${esc(ep.slice(0,16))}…</span>
+          <span class="lg-cnt">${EP_COUNTS[ei]}</span>
         </div>`;
       }).join('');
   } else {
@@ -481,7 +528,7 @@ function buildLegend(){
         const lbl=c.label.length>22?c.label.slice(0,21)+'…':c.label;
         const active=selectedClusters.has(ci);
         return`<div class="lg-row${active?' active':''}" id="lg_${ci}" onclick="legendClick(${ci})" title="${esc(c.label)}">
-          <span class="lg-dot" style="background:${cidColor(ci)}"></span>
+          <span class="lg-dot" style="background:${goldenColor(ci)}"></span>
           <span class="lg-lbl">${esc(lbl)}</span>
           <span class="lg-cnt">${c.spans.length}</span>
         </div>`;
@@ -502,45 +549,46 @@ function legendClick(ci){
     curCluster='cluster_'+ci;
     document.getElementById('csel').value='cluster_'+ci;
   }
-  updateClusterDisplay(); applyStyle(); markLegend();
+  afterSelChange();
+}
+
+function epLegendClick(ei){
+  if(ei===null){ selectedEpisodes.clear(); }
+  else if(selectedEpisodes.has(ei)){ selectedEpisodes.delete(ei); }
+  else { selectedEpisodes.add(ei); }
+  afterSelChange();
+}
+
+function afterSelChange(){
+  updateSelCount(); applyStyle(); markLegend();
   if(page==='grid') renderGrid();
 }
 
 function markLegend(){
   document.querySelectorAll('#legend .lg-row').forEach(r=>r.classList.remove('active'));
-  const epMode=document.getElementById('selMode').value==='episode';
-  const sz = epMode ? selectedEpisodes.size : selectedClusters.size;
-  if(sz===0){ const el=document.getElementById('lg_all'); if(el) el.classList.add('active'); return; }
-  if(epMode) selectedEpisodes.forEach(ep=>{const el=document.getElementById('lg_ep_'+EP_IDX[ep]); if(el) el.classList.add('active');});
-  else selectedClusters.forEach(ci=>{const el=document.getElementById('lg_'+ci); if(el) el.classList.add('active');});
-}
-
-function epLegendClick(ep){
-  if(ep===null||ep===''){ selectedEpisodes.clear(); }
-  else if(selectedEpisodes.has(ep)){ selectedEpisodes.delete(ep); }
-  else { selectedEpisodes.add(ep); }
-  applyStyle(); markLegend();
-  if(page==='grid') renderGrid();
+  const em=epMode();
+  const sel=em?selectedEpisodes:selectedClusters;
+  if(sel.size===0){ const el=document.getElementById('lg_all'); if(el) el.classList.add('active'); return; }
+  sel.forEach(v=>{const el=document.getElementById((em?'lg_ep_':'lg_')+v); if(el) el.classList.add('active');});
 }
 
 function onSelMode(){
-  buildLegend();          // switch sidebar between clusters and episodes
-  updateClusterDisplay();
-  applyStyle();           // re-highlight by the new selection dimension
+  buildLegend();
+  updateSelCount();
+  applyStyle();
   if(page==='grid') renderGrid();
 }
 
-function updateClusterDisplay(){
+function updateSelCount(){
   const el=document.getElementById('cCount');
-  const sz=document.getElementById('selMode').value==='episode'?selectedEpisodes.size:selectedClusters.size;
+  const sz=epMode()?selectedEpisodes.size:selectedClusters.size;
   if(el) el.textContent=sz===0?'all':sz+' selected';
 }
 
-function clearClusterSel(){
-  selectedClusters.clear(); curCluster=null;
-  document.getElementById('csel').value='';
-  updateClusterDisplay(); applyStyle(); markLegend();
-  if(page==='grid') renderGrid();
+function clearSel(){
+  if(epMode()) selectedEpisodes.clear();
+  else { selectedClusters.clear(); curCluster=null; document.getElementById('csel').value=''; }
+  afterSelChange();
 }
 
 /* ── cluster dropdown ── */
@@ -560,8 +608,7 @@ function onCSelDrop(){
   curCluster=v||null;
   selectedClusters.clear();
   if(curCluster) selectedClusters.add(parseInt(curCluster.replace('cluster_','')));
-  updateClusterDisplay(); applyStyle(); markLegend();
-  if(page==='grid') renderGrid();
+  afterSelChange();
 }
 
 function hlChanged(){document.getElementById('hlOn').checked=true; applyStyle();}
@@ -569,40 +616,79 @@ function hlChanged(){document.getElementById('hlOn').checked=true; applyStyle();
 function resetTools(){
   document.getElementById('colorMode').value='cluster';
   document.getElementById('selMode').value='cluster';
-  selectedClusters.clear(); curCluster=null;
+  selectedClusters.clear(); selectedEpisodes.clear(); curCluster=null;
   document.getElementById('csel').value='';
-  selectedEpisodes.clear();
   document.getElementById('hlOn').checked=false;
   document.getElementById('hlFrame').value=0;
   document.getElementById('hlWin').value=30;
   document.getElementById('psize').value=3;
   hiddenMods.clear();
-  updateClusterDisplay();
+  updateSelCount();
   if(HAS_TSNE){buildModToggles(); renderTsne(false);}
   if(page==='grid') renderGrid();
 }
 
-/* ── frame-preview popup ── */
-let pvHash=null, pvFrame=0;
-function showFrame(ep,frame){
-  pvHash=ep; pvFrame=frame;
+/* ── clip playback core ──────────────────────────────────────────────────────
+   One shared mount function for the popup AND the grid cards. The media-
+   fragment URI (#t=start,end) makes the browser natively seek to the segment
+   start — a manual currentTime=…;play() after loadedmetadata frequently stalls
+   in Chrome without ever firing 'seeked'/'playing' (verified headless). The
+   poster shows the span's mid frame instantly while the video buffers, and the
+   timeupdate handler re-loops within [start,end). */
+function clipVideoHTML(ep,start,end,extraAttrs){
+  const seekTo=start/FPS, stopAt=end/FPS, mid=Math.round((start+end)/2);
+  // ?v=2 busts browser media caches poisoned by the (since-fixed) gzip'd video
+  // responses — stale gzip bytes fed to the demuxer cause MEDIA_ERR_DECODE.
+  return `<video ${extraAttrs||''} muted playsinline controls preload="auto" `+
+         `poster="${FRAME_BASE}${ep}/${mid}" `+
+         `src="${VIDEO_BASE}${ep}?v=3#t=${seekTo.toFixed(3)},${stopAt.toFixed(3)}"></video>`;
+}
+function bindClipLoop(vid,start,end){
+  const seekTo=start/FPS, stopAt=end/FPS;
+  vid.addEventListener('timeupdate',()=>{
+    if(vid.currentTime>=stopAt-0.03 || vid.currentTime<seekTo-0.1){
+      vid.currentTime=seekTo;
+      if(!vid.paused) vid.play().catch(()=>{});
+    }
+  });
+}
+function seekAndPlay(vid,start){
+  const go=()=>{ vid.currentTime=start/FPS; vid.play().catch(()=>{}); };
+  if(vid.readyState>=1) go(); else vid.addEventListener('loadedmetadata',go,{once:true});
+}
+
+/* ── clip popup — clicking a scatter dot plays that span's action horizon ── */
+let pvEp=null, pvStart=0, pvEnd=0;
+function showClip(ep,start,end,txt){
+  pvEp=ep; pvStart=start; pvEnd=end;
   document.getElementById('preview').style.display='block';
-  document.getElementById('pv-img').src=FRAME_BASE+ep+'/'+frame;
-  updateCap();
-}
-function updateCap(){
+  document.getElementById('pv-txt').textContent=txt||'';
+  const media=document.getElementById('pv-media');
+  media.innerHTML=clipVideoHTML(ep,start,end,'autoplay');
+  const vid=media.querySelector('video');
+  bindClipLoop(vid,start,end);
+  // The autoplay attribute gives up silently if the fragment seek stalls while
+  // buffering; kick playback explicitly once data is decodable.
+  vid.play().catch(()=>{});
+  vid.addEventListener('canplay',()=>{ if(vid.paused) vid.play().catch(()=>{}); });
+  vid.addEventListener('error',()=>{
+    const code=vid.error?vid.error.code:'?';   // 1=abort 2=network 3=decode 4=unsupported
+    document.getElementById('pv-txt').textContent=
+      `clip failed to load (media error ${code}) — `+(txt||'');
+  },{once:true});
   document.getElementById('pv-cap').innerHTML=
-    `<b>${pvHash?pvHash.slice(0,12):''}</b> &middot; f<b>${pvFrame}</b>`+
-    ` <button onclick="stepFrame(-1)">&minus;1f</button>`+
-    ` <button onclick="stepFrame(1)">+1f</button>`+
-    ` <a href="${VIDEO_BASE}${pvHash}" target="_blank" style="color:#7fd4ff">open&nearr;</a>`;
+    `<button class="primary" onclick="playClip()">&#9654; play clip</button>`+
+    `<b>${ep.slice(0,12)}</b> &middot; f<b>${start}&ndash;${end}</b> (${((end-start)/FPS).toFixed(1)}s)`+
+    ` <a href="${VIDEO_BASE}${ep}" target="_blank" style="color:#7fd4ff">open&nearr;</a>`;
 }
-function stepFrame(d){
-  pvFrame=Math.max(0,pvFrame+d);
-  document.getElementById('pv-img').src=FRAME_BASE+pvHash+'/'+pvFrame;
-  updateCap();
+function playClip(){
+  const v=document.querySelector('#pv-media video');
+  if(v) seekAndPlay(v,pvStart);
 }
-function hidePreview(){document.getElementById('preview').style.display='none';}
+function hidePreview(){
+  const v=document.querySelector('#pv-media video'); if(v) v.pause();
+  document.getElementById('preview').style.display='none';
+}
 
 /* ── video grid ── */
 function histoSVG(scores){
@@ -617,45 +703,42 @@ function histoSVG(scores){
 }
 
 function renderGrid(){
-  const selEp=document.getElementById('selMode').value==='episode';
-  let spans=[];
-  if(!selEp && curCluster && CLUSTERS[curCluster]){   // cluster-mode: one cluster's spans
-    spans=CLUSTERS[curCluster].spans.map(s=>({...s,_cid:curCluster}));
-  } else {
-    ALL_CID.forEach(cid=>spans.push(...CLUSTERS[cid].spans.map(s=>({...s,_cid:cid}))));
-  }
+  const selEp=epMode();
+  const spans=(!selEp && curCluster && CLUSTERS[curCluster])
+    ? CLUSTERS[curCluster].spans.map(s=>({...s,_cid:curCluster}))
+    : ALL_SPANS;
 
   const n=spans.length, nTop=Math.ceil(0.6*n);
-  const allScores=spans.map(s=>s.score).filter(v=>isFinite(v));
+  const allScores=spans.map(s=>s.score).filter(isFinite);
   const mn=allScores.length?Math.min(...allScores):0;
   const mx=allScores.length?Math.max(...allScores):1;
   const mean=allScores.reduce((a,b)=>a+b,0)/Math.max(1,allScores.length);
 
-  // rank by score desc for TOP/BOT, regardless of display sort
-  const byScore=spans.slice().sort((a,b)=>b.score-a.score);
-  const rank={}; byScore.forEach((s,i)=>rank[s.id]=i);
+  // rank by score desc for TOP/BOT badges, regardless of display sort
+  const rank=new Map();
+  spans.slice().sort((a,b)=>b.score-a.score).forEach((s,i)=>rank.set(s,i));
 
+  const sorted=spans.slice();
   const sort=document.getElementById('gsort').value;
-  if(sort==='desc') spans.sort((a,b)=>b.score-a.score);
-  else if(sort==='asc') spans.sort((a,b)=>a.score-b.score);
-  else spans.sort((a,b)=>a.ep===b.ep?a.start-b.start:a.ep<b.ep?-1:1);
+  if(sort==='desc') sorted.sort((a,b)=>b.score-a.score);
+  else if(sort==='asc') sorted.sort((a,b)=>a.score-b.score);
+  else sorted.sort((a,b)=>a.ei===b.ei?a.start-b.start:a.ei-b.ei);
 
   const fTop=document.getElementById('fTop').checked;
   const fBot=document.getElementById('fBot').checked;
   const q=document.getElementById('gsearch').value.trim().toLowerCase();
 
-  const filtered=spans.filter(s=>{
-    if(selEp && selectedEpisodes.size && !selectedEpisodes.has(s.ep)) return false;
-    const isTop=(rank[s.id]??0)<nTop;
+  const filtered=sorted.filter(s=>{
+    if(selEp && selectedEpisodes.size && !selectedEpisodes.has(s.ei)) return false;
+    const isTop=(rank.get(s)??0)<nTop;
     if(isTop&&!fTop) return false;
     if(!isTop&&!fBot) return false;
-    if(q && !s.ep.toLowerCase().startsWith(q) && !s.text.toLowerCase().includes(q)) return false;
+    if(q && !epOf(s.ei).toLowerCase().startsWith(q) && !txtOf(s.ti).toLowerCase().includes(q)) return false;
     return true;
   });
 
-  // Cap DOM cards — runs can have tens of thousands of spans; rendering every
-  // card freezes the browser. Show the top MAX_CARDS (by current sort) and note
-  // how many are hidden so it's never a silent truncation.
+  // Cap DOM cards — rendering tens of thousands freezes the browser; the cap
+  // is announced in the header so it's never a silent truncation.
   const MAX_CARDS=400;
   const shown=filtered.slice(0,MAX_CARDS);
   const capNote=filtered.length>MAX_CARDS
@@ -667,31 +750,29 @@ function renderGrid(){
     `mean ${mean.toFixed(3)} &middot; [${mn.toFixed(3)}, ${mx.toFixed(3)}]${capNote} `+
     histoSVG(allScores);
 
-  let idc=0;
-  const cards=shown.map(s=>{
-    const ri=rank[s.id]??0;
+  const cards=shown.map((s,i)=>{
+    const ri=rank.get(s)??0;
+    const ep=epOf(s.ei), text=txtOf(s.ti);
     const pct=mx>mn?(s.score-mn)/(mx-mn):0.5;
-    const isTop=ri<nTop;
-    const badge=isTop?'<span class="badge b-top">TOP 60%</span>':'<span class="badge b-bot">BOT 40%</span>';
+    const badge=ri<nTop?'<span class="badge b-top">TOP 60%</span>':'<span class="badge b-bot">BOT 40%</span>';
     const mid=Math.round((s.start+s.end)/2);
-    const cid='vc_'+(idc++);
     return`<div class="card">
       <div class="hdr">
         <span class="rank">#${ri+1}</span>
-        <span class="hash">${s.ep.slice(0,14)}&hellip;</span>${badge}
+        <span class="hash">${ep.slice(0,14)}&hellip;</span>${badge}
         <span class="score">${isFinite(s.score)?s.score.toFixed(4):'?'}</span>
       </div>
       <div class="pct"><div style="width:${Math.round(pct*100)}%"></div></div>
-      <div class="vid" id="${cid}"
-           data-ep="${s.ep}" data-start="${s.start}" data-end="${s.end}" data-text="${esc(s.text)}">
-        <div class="ph" onclick="loadSpan('${cid}')">
-          <img src="${FRAME_BASE}${s.ep}/${mid}" loading="lazy" onerror="this.style.display='none'">
+      <div class="vid" id="vc_${i}"
+           data-ep="${ep}" data-start="${s.start}" data-end="${s.end}" data-text="${esc(text)}">
+        <div class="ph" onclick="loadSpan('vc_${i}')">
+          <img src="${FRAME_BASE}${ep}/${mid}" loading="lazy" onerror="this.style.display='none'">
           <div class="play">&#9654;</div>
           <div style="font-size:12px">load clip · f${s.start}&ndash;${s.end}</div>
         </div>
       </div>
       <div class="clinks">
-        <a href="${VIDEO_BASE}${s.ep}" target="_blank">open&nearr;</a>
+        <a href="${VIDEO_BASE}${ep}" target="_blank">open&nearr;</a>
         <span style="color:#555">${s._cid}</span>
       </div>
     </div>`;
@@ -700,49 +781,35 @@ function renderGrid(){
     '<div style="padding:20px;color:#555">No spans match the current filters.</div>';
 }
 
-/* ── span clip playback (loops within [start,end]) ──
-   Mirrors the task viewer's loadVideo: clicking the placeholder swaps in a
-   <video> element; the clip is bounded by a timeupdate handler that wraps back
-   to the start frame, so it loops the span like the task viewer loops episodes. */
-/* Throttled clip loader. Each cell loads the full episode MP4 and clips to
-   [start,end). Browsers cap concurrent media streams (~6/host), so loading every
-   cell at once (the old loadAll → ph.click() on all) stalls most to black, and
-   playAll's immediate play() ran before any clip had loaded/seeked. Load at most
-   _MAXC concurrently, starting the next as each settles; _autoplay gates whether
-   bulk-loaded clips play once ready. Single click still loads + plays instantly. */
+/* ── grid clip loader — throttled to _MAXC concurrent media streams ──
+   Browsers cap concurrent media connections (~6/host); mounting every cell at
+   once stalls most to black. _autoplay gates whether bulk-loaded clips play. */
 const _MAXC=6;
 let _vq=[], _vactive=0, _autoplay=false;
 function _vpump(){ while(_vactive<_MAXC && _vq.length){ _vactive++; (_vq.shift())(); } }
 function _vrelease(){ _vactive=Math.max(0,_vactive-1); _vpump(); }
 
 function _mountCell(el, play, onSettled){
-  // play: () => bool — whether to start playback once ready. A paused <video> after
-  // a programmatic seek does not paint in most browsers (shows black), so to render
-  // a still we still play() then pause; here we loop within [seekTo, stopAt].
   el.dataset.loaded='1';
-  const ep=el.dataset.ep;
-  const seekTo=(+el.dataset.start)/FPS, stopAt=(+el.dataset.end)/FPS;
+  const ep=el.dataset.ep, start=+el.dataset.start, end=+el.dataset.end;
   const text=el.dataset.text||'';
-  const spd=parseFloat(document.getElementById('gspeed').value)||1;
-  el.innerHTML=
-    `<video src="${VIDEO_BASE}${ep}" controls loop muted playsinline preload="metadata"></video>`+
-    (text?`<div class="ann">${text}</div>`:'');
+  el.innerHTML=clipVideoHTML(ep,start,end)+(text?`<div class="ann">${text}</div>`:'');
   const vid=el.querySelector('video');
-  vid.playbackRate=spd;
+  vid.playbackRate=parseFloat(document.getElementById('gspeed').value)||1;
   let done=false; const settle=()=>{ if(!done){ done=true; if(onSettled) onSettled(); } };
-  vid.addEventListener('loadedmetadata',()=>{ vid.currentTime=seekTo; if(play()) vid.play().catch(()=>{}); settle(); },{once:true});
+  vid.addEventListener('loadeddata',()=>{ if(play()) vid.play().catch(()=>{}); settle(); },{once:true});
   vid.addEventListener('error', settle, {once:true});
-  vid.addEventListener('seeked',()=>{ if(play()) vid.play().catch(()=>{}); },{once:true});
-  vid.addEventListener('timeupdate',()=>{
-    if(vid.currentTime>=stopAt || vid.currentTime<seekTo-0.1){ vid.currentTime=seekTo; }
-  });
+  bindClipLoop(vid,start,end);
 }
 
 /* single click → load now (bypass queue) + play, or replay if already loaded */
 function loadSpan(cellId){
   const el=document.getElementById(cellId);
   if(!el) return;
-  if(el.dataset.loaded==='1'){ const v=el.querySelector('video'); if(v) v.play().catch(()=>{}); return; }
+  if(el.dataset.loaded==='1'){
+    const v=el.querySelector('video'); if(v) seekAndPlay(v,+el.dataset.start);
+    return;
+  }
   _mountCell(el, ()=>true, null);
 }
 
@@ -768,7 +835,6 @@ function showPage(p){
   document.getElementById('tab-tsne').classList.toggle('active',p==='tsne');
   document.getElementById('tab-grid').classList.toggle('active',p==='grid');
   if(p==='tsne'&&HAS_TSNE){
-    // Plotly needs a resize once the page becomes visible again
     activeMods.forEach(m=>{const e=document.getElementById('panel_'+m);if(e)Plotly.relayout(e,{autosize:true});});
     applyStyle();
   }
@@ -780,16 +846,28 @@ window.addEventListener('resize',()=>{
     activeMods.forEach(m=>{const el=document.getElementById('panel_'+m);if(el)Plotly.relayout(el,{autosize:true});});
 });
 
-/* ── init ── */
+/* ── init ──
+   The grid renders lazily on first tab switch (showPage) — rendering it while
+   hidden defeats loading="lazy", so 400 thumbnail fetches would race the page
+   load and starve clip-video range requests. */
 buildCSel();
-loadState();            // restore persisted selection + color/select modes (per run)
-updateClusterDisplay();
+loadState();
+updateSelCount();
 buildColorTables();
-renderTsne(false);      // renders panels synchronously (or shows no-data note)
-renderGrid();
+renderTsne(false);
 </script>
 </body>
 </html>"""
+
+
+def _index_of(table: list, index: dict, value) -> int:
+    """Append-once index into a dedup table."""
+    i = index.get(value)
+    if i is None:
+        i = len(table)
+        index[value] = i
+        table.append(value)
+    return i
 
 
 def build_cluster_html(
@@ -800,29 +878,46 @@ def build_cluster_html(
     frame_base: str,
     run_label: str,
 ) -> str:
+    # Shared dedup tables — episode hashes and annotation texts each appear in
+    # thousands of spans; storing integer indices halves the embedded payload.
+    eps: list[str] = []
+    eps_idx: dict[str, int] = {}
+    txts: list[str] = []
+    txts_idx: dict[str, int] = {}
+
     clusters_js: dict = {}
     for cluster_id, c in clusters_raw.items():
         spans_list = []
-        scores = []
-        for span_key, s in c.get("spans", {}).items():
+        for s in c.get("spans", {}).values():
             raw = s.get("score")
             score_f = float(raw) if raw is not None else float("nan")
             spans_list.append({
-                "id":    span_key,
-                "ep":    s["episode"],
+                "ei":    _index_of(eps, eps_idx, s["episode"]),
+                "ti":    _index_of(txts, txts_idx, str(s.get("text", ""))[:200]),
                 "start": int(s["start"]),
                 "end":   int(s["end"]),
-                "text":  s.get("text", ""),
                 "score": score_f if score_f == score_f else 0.0,  # nan→0 for JSON
             })
-            if score_f == score_f:
-                scores.append(score_f)
         clusters_js[cluster_id] = {
-            "label":    c.get("label", cluster_id),
-            "spans":    sorted(spans_list, key=lambda x: -x["score"]),
-            "minScore": min(scores) if scores else 0.0,
-            "maxScore": max(scores) if scores else 1.0,
+            "label": c.get("label", cluster_id),
+            "spans": sorted(spans_list, key=lambda x: -x["score"]),
         }
+
+    tsne_js: dict = {}
+    if tsne:
+        tsne_js = {
+            "cid":    tsne["cid"],
+            "score":  tsne["score"],
+            "start":  tsne["start"],
+            "end":    tsne["end"],
+            "ei":     [_index_of(eps, eps_idx, e) for e in tsne["ep"]],
+            "ti":     [_index_of(txts, txts_idx, t) for t in tsne["txt"]],
+            "dims":   tsne.get("dims", 3),
+            "method": tsne.get("method", "tsne"),
+        }
+        for mode in ("state", "action", "language"):
+            if mode in tsne:
+                tsne_js[mode] = tsne[mode]
 
     run_escaped = run_label.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
     run_nav = (
@@ -831,10 +926,13 @@ def build_cluster_html(
         f' &middot; <a href="/episodes">episodes</a>'
     )
 
+    j = lambda o: json.dumps(o, separators=(",", ":"))
     return (
         _TEMPLATE
-        .replace("__CLUSTERS__",          json.dumps(clusters_js, separators=(",", ":")))
-        .replace("__TSNE__",               json.dumps(tsne or {}, separators=(",", ":")))
+        .replace("__EPS__",                j(eps))
+        .replace("__TXTS__",               j(txts))
+        .replace("__CLUSTERS__",           j(clusters_js))
+        .replace("__TSNE__",               j(tsne_js))
         .replace("__VIDEO_BASE__",         video_base)
         .replace("__FRAME_BASE__",         frame_base)
         .replace("__RUN_LABEL_ESCAPED__",  run_escaped)
@@ -859,16 +957,18 @@ if __name__ == "__main__":
         raw = json.load(open(args.tsne))
         spans = raw["spans"]
         tsne = {
-            "cid":   [s["cluster"] for s in spans],
-            "score": [s.get("score") or 0.0 for s in spans],
-            "start": [int(s.get("start", 0)) for s in spans],
-            "end":   [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
-            "ep":    [s.get("ep", s.get("episode", "")) for s in spans],
-            "txt":   [str(s.get("text", ""))[:60] for s in spans],
+            "cid":    [s["cluster"] for s in spans],
+            "score":  [s.get("score") or 0.0 for s in spans],
+            "start":  [int(s.get("start", 0)) for s in spans],
+            "end":    [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
+            "ep":     [s.get("ep", s.get("episode", "")) for s in spans],
+            "txt":    [str(s.get("text", ""))[:200] for s in spans],
+            "dims":   int(raw.get("dims", 3)),
+            "method": str(raw.get("method", "tsne")),
         }
         for mode in ("state", "action", "language"):
             if mode in raw:
-                tsne[mode] = {k: raw[mode][k] for k in ("x", "y", "z")}
+                tsne[mode] = {k: raw[mode][k] for k in raw[mode] if k in ("x", "y", "z")}
 
     html = build_cluster_html(
         data, tsne,
