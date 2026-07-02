@@ -5,6 +5,7 @@ from typing import Literal
 from egomimic.rldb.embodiment.embodiment import Embodiment
 from egomimic.rldb.zarr.action_chunk_transforms import (
     ActionChunkCoordinateFrameTransform,
+    BatchQuaternionPoseToXYZ6D,
     BatchQuaternionPoseToYPR,
     ConcatKeys,
     DeleteKeys,
@@ -12,9 +13,12 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     InterpolatePose,
     NumpyToTensor,
     PoseCoordinateFrameTransform,
+    QuaternionPoseToXYZ6D,
     QuaternionPoseToYPR,
     SplitKeys,
     Transform,
+    XYZ6D_to_XYZYPR,
+    XYZWXYZ_to_XYZ6D,
     XYZWXYZ_to_XYZYPR,
 )
 from egomimic.utils.egomimicUtils import (
@@ -26,18 +30,51 @@ from egomimic.utils.pose_utils import (
 
 
 class Eva(Embodiment):
+    # ABC-130k top camera (RealSense 640x480). Without this override Eva inherited
+    # Embodiment.VIZ_INTRINSICS_KEY="base" (Aria glasses, fx=266) which mis-scaled
+    # the eval overlay by ~1.6x. See INTRINSICS["eva"] in egomimicUtils.
+    VIZ_INTRINSICS_KEY = "eva"
+
     @staticmethod
     def get_transform_list(
         mode: Literal[
-            "cartesian", "cartesian_wristframe_ypr", "cartesian_wristframe_quat"
+            "cartesian",
+            "cartesian_6d",
+            "cartesian_wristframe_ypr",
+            "cartesian_wristframe_6d",
+            "cartesian_wristframe_quat",
         ],
+        extrinsics_key: str = "x5Dec13_2",
     ) -> list[Transform]:
+        # extrinsics_key selects the cam<-base transform baked into the cartesian
+        # (head/cam-frame) action targets. Default x5Dec13_2 (an EVA-robot hand-eye
+        # calib) matches the trained ckpts; override to e.g. "mecka" (identity) to
+        # express GT in the world frame for a viz/calibration experiment. NOTE: the
+        # wrist-frame modes are extrinsic-invariant (it cancels), so this only
+        # changes the proprio/obs frame there, not the action target.
         if mode == "cartesian":
-            return _build_eva_bimanual_transform_list(is_quat=True)
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, extrinsics_key=extrinsics_key
+            )
+        elif mode == "cartesian_6d":
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, rot_repr="6d", extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_ypr":
-            return _build_eva_bimanual_eef_frame_transform_list(is_quat=False)
+            return _build_eva_bimanual_eef_frame_transform_list(
+                is_quat=False, extrinsics_key=extrinsics_key
+            )
+        elif mode == "cartesian_wristframe_6d":
+            return _build_eva_bimanual_eef_frame_transform_list(
+                rot_repr="6d", extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_quat":
-            return _build_eva_bimanual_eef_frame_transform_list(is_quat=True)
+            return _build_eva_bimanual_eef_frame_transform_list(
+                is_quat=True, extrinsics_key=extrinsics_key
+            )
+        # Fail here, not later as a dataset with no transforms (KeyError on
+        # actions_cartesian deep in the loader).
+        raise ValueError(f"Unknown Eva transform mode: {mode!r}")
 
     @classmethod
     def _get_keymap(cls, keymap_mode: str):
@@ -132,12 +169,21 @@ def _build_eva_bimanual_revert_eef_frame_transform_list(
     left_cmd_camframe: str = "left.cmd_ee_pose_camframe",
     right_cmd_camframe: str = "right.cmd_ee_pose_camframe",
     is_quat: bool = True,
+    rot_repr: str = "ypr",
 ) -> list[Transform]:
-    """Revert wrist-frame EVA actions back to camera frame for visualization."""
-    if is_quat:
-        pose_shape = 7
+    """Revert wrist-frame EVA actions back to camera frame for visualization.
+
+    ``rot_repr="6d"`` reverts a model 6D prediction: the per-arm pose width is 9,
+    the coordinate transform runs in ``xyz6d`` mode (Gram-Schmidt happens there),
+    and the reverted cam-frame poses are finally converted to ypr so downstream
+    viz / deploy keep their ypr contract.
+    """
+    if rot_repr == "6d":
+        pose_shape = 9
+        revert_mode = "xyz6d"
     else:
-        pose_shape = 6
+        pose_shape = 7 if is_quat else 6
+        revert_mode = "xyzypr"
     transform_list = [
         # Extract obs camframe poses from the concatenated obs key
         SplitKeys(
@@ -164,16 +210,23 @@ def _build_eva_bimanual_revert_eef_frame_transform_list(
             target_world=left_obs_camframe,
             chunk_world=left_cmd_wristframe,
             transformed_key_name=left_cmd_camframe,
-            mode="xyzypr",
+            mode=revert_mode,
             inverse=False,
         ),
         ActionChunkCoordinateFrameTransform(
             target_world=right_obs_camframe,
             chunk_world=right_cmd_wristframe,
             transformed_key_name=right_cmd_camframe,
-            mode="xyzypr",
+            mode=revert_mode,
             inverse=False,
         ),
+    ]
+    if rot_repr == "6d":
+        # Collapse 6D columns back to ypr for viz / deploy after the revert.
+        transform_list.append(
+            XYZ6D_to_XYZYPR(keys=[left_cmd_camframe, right_cmd_camframe])
+        )
+    transform_list.append(
         ConcatKeys(
             key_list=[
                 left_cmd_camframe,
@@ -184,7 +237,7 @@ def _build_eva_bimanual_revert_eef_frame_transform_list(
             new_key_name=action_key,
             delete_old_keys=True,
         ),
-    ]
+    )
     return transform_list
 
 
@@ -212,9 +265,14 @@ def _build_eva_bimanual_eef_frame_transform_list(
     stride: int = 1,
     extrinsics_key: str = "x5Dec13_2",
     is_quat: bool = True,
+    rot_repr: str = "ypr",
 ) -> list[Transform]:
     """EVA bimanual transform pipeline with actions expressed relative to the
-    current EEF pose (wrist frame), analogous to keypoints relative to wrist pose."""
+    current EEF pose (wrist frame), analogous to keypoints relative to wrist pose.
+
+    The frame math always runs in quaternion; ``rot_repr`` controls the final
+    rotation encoding: ``"ypr"`` (when ``is_quat=False``), raw quaternion (when
+    ``is_quat=True``), or continuous ``"6d"`` columns."""
     extrinsics = EXTRINSICS[extrinsics_key]
     left_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["left"][None, :])[0]
     right_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["right"][None, :])[0]
@@ -290,7 +348,28 @@ def _build_eva_bimanual_eef_frame_transform_list(
         ),
     ]
 
-    if not is_quat:
+    if rot_repr == "6d":
+        transform_list.extend(
+            [
+                BatchQuaternionPoseToXYZ6D(
+                    pose_key=left_cmd_wristframe,
+                    output_key=left_cmd_wristframe,
+                ),
+                BatchQuaternionPoseToXYZ6D(
+                    pose_key=right_cmd_wristframe,
+                    output_key=right_cmd_wristframe,
+                ),
+                QuaternionPoseToXYZ6D(
+                    pose_key=left_obs_camframe,
+                    output_key=left_obs_camframe,
+                ),
+                QuaternionPoseToXYZ6D(
+                    pose_key=right_obs_camframe,
+                    output_key=right_obs_camframe,
+                ),
+            ]
+        )
+    elif not is_quat:
         transform_list.extend(
             [
                 BatchQuaternionPoseToYPR(
@@ -377,15 +456,23 @@ def _build_eva_bimanual_transform_list(
     stride: int = 1,
     extrinsics_key: str = "x5Dec13_2",
     is_quat: bool = True,
+    rot_repr: str = "ypr",
 ) -> list[Transform]:
-    """Canonical EVA bimanual transform pipeline used by tests and notebooks."""
+    """Canonical EVA bimanual transform pipeline used by tests and notebooks.
+
+    ``rot_repr="6d"`` keeps the frame math in quaternion (SLERP interpolation)
+    and emits continuous 6D rotation columns instead of ypr.
+    """
     extrinsics = EXTRINSICS[extrinsics_key]
     left_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["left"][None, :])[0]
     right_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["right"][None, :])[0]
     left_extra_batch_key = {"left_extrinsics_pose": left_extrinsics_pose}
     right_extra_batch_key = {"right_extrinsics_pose": right_extrinsics_pose}
 
-    mode = "xyzwxyz" if is_quat else "xyzypr"
+    # 6D conversion needs the quaternion intermediate so the columns come from a
+    # continuous rotation, not a wrapped Euler one.
+    use_quat = is_quat or rot_repr == "6d"
+    mode = "xyzwxyz" if use_quat else "xyzypr"
     transform_list = [
         ActionChunkCoordinateFrameTransform(
             target_world=left_target_world,
@@ -441,7 +528,18 @@ def _build_eva_bimanual_transform_list(
         ),
     ]
 
-    if is_quat:
+    if rot_repr == "6d":
+        transform_list.append(
+            XYZWXYZ_to_XYZ6D(
+                keys=[
+                    left_cmd_camframe,
+                    right_cmd_camframe,
+                    left_obs_pose,
+                    right_obs_pose,
+                ]
+            )
+        )
+    elif is_quat:
         transform_list.append(
             XYZWXYZ_to_XYZYPR(
                 keys=[

@@ -1,0 +1,45 @@
+# 6D-rotation variant of mecka_all_zarr: the transform_list emits the continuous
+# 6D rotation representation (18-dim bimanual cartesian) instead of Euler ypr.
+# Pair with model=pi0.5_bc_mecka (action_converters → HumanBimanualCartesian6D).
+# key_map mode stays "cartesian" (raw zarr keys are unchanged; only the rotation
+# encoding produced by the transform list differs). The ypr original
+# (mecka_all_zarr.yaml) is left untouched for HPT / DemInf, which expect 12-dim.
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: train
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: valid
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 30
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 32
+    num_workers: 30

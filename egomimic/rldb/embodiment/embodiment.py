@@ -176,6 +176,13 @@ class Embodiment(ABC):
         embodiment_id = batch["embodiment"][0].item()
         embodiment_name = get_embodiment(embodiment_id).lower()
 
+        # Capture annotations BEFORE any apply_transform: annotation tracks (e.g.
+        # sampled_prompt) are list-valued, and apply_transform only carries
+        # per-sample tensor keys forward, so they'd be dropped from the
+        # transformed batch -> KeyError. Frame-reverting viz configs (wristframe)
+        # set transform_list, so read annotations from the original batch here.
+        annotations = batch[annotation_key] if annotation_key is not None else None
+
         pred_actions = predictions[
             f"{embodiment_name}_{action_key}"
         ]  # TODO: make this work with groundtruth, clone batch and replace actions_keypoints with pred_actions
@@ -188,8 +195,6 @@ class Embodiment(ABC):
 
         images = batch[image_key]
         actions = batch[action_key]
-        if annotation_key is not None:
-            annotations = batch[annotation_key]
         ims_list = []
         images = _to_numpy(images)
         actions = _to_numpy(actions)
