@@ -489,6 +489,15 @@ class Mecka(Human):
             raise ValueError(
                 f"Unsupported mode '{mode}'. Expected one of: 'cartesian', 'keypoints'."
             )
+        # No-interp fingertips reads a full 100-frame horizon (no resampling), so the
+        # keypoint/wrist action chunks are read at kpts_horizon instead of 30.
+        if kpts_horizon != 30:
+            for _k in (
+                "left.action_keypoints", "right.action_keypoints",
+                "left.action_wrist_pose", "right.action_wrist_pose",
+            ):
+                if _k in key_map:
+                    key_map[_k] = {**key_map[_k], "horizon": kpts_horizon}
         if annotations:
             key_map["annotations"] = {
                 "key_type": "annotation_keys",

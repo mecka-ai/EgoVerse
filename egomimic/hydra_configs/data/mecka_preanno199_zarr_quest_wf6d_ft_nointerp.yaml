@@ -1,0 +1,284 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# QueST tokenizer (WRIST-FRAME 6D palm pose + 5 MANO fingertips per hand, 48-dim, NO resampling: 100 real frames) — 199 trusted-labeler pre-annotated episodes (Mongo-ingested, 68c…/68d… hashes).
+# Uses LocalEpisodeResolver (no SQL table); episodes live in mecka_data_v2 zarr volume.
+#
+# train     → all 199 episodes from preannotations_trusted_labelers_199.json
+# valid     → last 5 episodes (in-distribution reconstruction check)
+# train_viz → first 3 episodes (spot-check training reconstruction)
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      allowed_episode_ids:
+        - "68c3dbebe9e837b8eec3c2d6"
+        - "68c3e30b9c65dfc2d3048ba8"
+        - "68c4023b1e0d1d81b7edf6c9"
+        - "68c403c399bbf8dcf263713c"
+        - "68c49d2f7680df88da57b4ab"
+        - "68c4a62029d0f78e997a5bc5"
+        - "68c4c33375d9403cc4fdb813"
+        - "68c4c33475d9403cc4fdb81d"
+        - "68c5053142c89c4aa82ec285"
+        - "68c53f6659537e9ead0550f6"
+        - "68c585945dc427a9d85e5054"
+        - "68c5aa15bea0ae562b92a0e0"
+        - "68c5b8b6bea0ae562b92a11d"
+        - "68c5dbcc33e43850a914c474"
+        - "68c5dc87102551de19d83d18"
+        - "68c5dd69f9ce62a3f04c5e8c"
+        - "68c5de33bea0ae562b92a1bd"
+        - "68c5e84bcaa279a3f386bc28"
+        - "68c5f26259537e9ead05536f"
+        - "68c60257e9e837b8eec3c8c9"
+        - "68c616dd5dc427a9d85e5239"
+        - "68c63ddf10341f5ce7fed06b"
+        - "68c63eb4def4497ae3640a59"
+        - "68c64085ef6cc84c22b7e6e7"
+        - "68c64b63122941a869b9aa6f"
+        - "68c655c0ec331250d5e747e9"
+        - "68c69406a298d13f754d944c"
+        - "68c895224115b5b4b041a5a5"
+        - "68c982315392f21f38d22091"
+        - "68c991876f55ccdbb27de284"
+        - "68c998c2e2722ea2271163e5"
+        - "68c99f6b55831511cfe40398"
+        - "68c9a0c51dbbd4ceed9008ce"
+        - "68c9a2065103cc9262b492c9"
+        - "68c9a2d184ecc9125e1e0bd4"
+        - "68c9a5048c8887a68eddf0e7"
+        - "68c9a5ed2cab01ee359624ab"
+        - "68c9a6475f109bcce27c3f21"
+        - "68c9a671f7aeb085b60fcb95"
+        - "68c9a75462a648b8057c6743"
+        - "68c9a7ff8c8887a68eddf0f6"
+        - "68c9a927633c5706a58b0b77"
+        - "68c9b837cbfd55da83ea956e"
+        - "68c9b8433d07306db046d1d5"
+        - "68c9b871841616b2c4f83ef0"
+        - "68c9b8db7adfb407628afca3"
+        - "68c9b90d5bfe618385ef5822"
+        - "68c9bad0650e2b7e7f6fe45e"
+        - "68c9beb5a87e21e176a591da"
+        - "68c9beb97aa0d16e8dd1c037"
+        - "68c9c16ba1ea367a01cd62a2"
+        - "68c9c555e2722ea22711644e"
+        - "68d0b5b139f1cfca22c1115c"
+        - "68d0e2d3362d1163a3b9a812"
+        - "68d0e2d4362d1163a3b9a817"
+        - "68d176255dd0b4fb0e66fe11"
+        - "68d18270c478daa723d5c912"
+        - "68d1b68f362d1163a3b9aa16"
+        - "68d1baa11d29a1390d685fa6"
+        - "68d1d3a21d29a1390d685fe2"
+        - "68d20446d6026b3c26957f41"
+        - "68d21711e692e6458598d6fa"
+        - "68d24ff7d5da0393353cb06d"
+        - "68d265f1e692e6458598d78e"
+        - "68d27c6dec023a8391120a68"
+        - "68d282dd4f093d9ed301aa85"
+        - "68d28d0784aff09cac592cd9"
+        - "68d2b0d24f093d9ed301ab09"
+        - "68d2ca9484aff09cac592d59"
+        - "68d2ce3a3a35c217ca6c4b0b"
+        - "68d2cff3fdc3d72c21722df5"
+        - "68d2e0f440e4c013224af5ae"
+        - "68d2e4b4f1110f17cab93073"
+        - "68d2fd684107888f4548515b"
+        - "68d30047963606becec184b0"
+        - "68d3149284aff09cac592e39"
+        - "68d31ccf33e6ec1c3d42dd26"
+        - "68d34dfd6c95e0f292d7162f"
+        - "68d358cc0ddd54b74dec0d09"
+        - "68d365dad6026b3c2695826e"
+        - "68d371426a28a17b71a7fbe9"
+        - "68d37b34b460bbeb02f34631"
+        - "68d384506c95e0f292d7179b"
+        - "68d391f9d98254a0b8a5a8b5"
+        - "68d39aa99bbdd093fc50070b"
+        - "68d39b8bb5118d96d77fe047"
+        - "68d39daf181a3411ed145fe9"
+        - "68d39f4794642be1d88718a9"
+        - "68d39f4894642be1d88718ab"
+        - "68d3a09bade75412233d2f1a"
+        - "68d3a37940d6c4b427e29a15"
+        - "68d3a5d67b066cb2c7f29d6c"
+        - "68d3a7ffcea1f16ac771f48a"
+        - "68d3abd0e5761ef3261601da"
+        - "68d3b6f42ea7766c04293f97"
+        - "68d3bc9f17b2c483236ea060"
+        - "68d3be177b0a732458996224"
+        - "68d3d38af5cf426e3ca29288"
+        - "68d3d3a13f1af862216a1cc0"
+        - "68d3d3fae78c475fe9b3c05e"
+        - "68d3d436caff909a814b3439"
+        - "68d3d62b17b2c483236ea0eb"
+        - "68d3d74cbf26aa7727bf2c5c"
+        - "68d3d8a2e6f74fcaa2082322"
+        - "68d3d959e43a7c184ebcdb07"
+        - "68d3d9bbc03c89e6ffdb1b94"
+        - "68d3db2af8075f03011bcd90"
+        - "68d3dc1bc03c89e6ffdb1ba3"
+        - "68d3dd3f21a7fa3f254129d0"
+        - "68d3dd5537d09ad2edf86350"
+        - "68d3dd95b2791101a83bd634"
+        - "68d3ddca890039bfd5e5e418"
+        - "68d3ded8dee2dd8b46abcee1"
+        - "68d3df7a96772ec628720ec0"
+        - "68d3df836fbe40458fa41084"
+        - "68d3dfabf4abd6e6ceedfe19"
+        - "68d3dff9e5761ef3261602f6"
+        - "68d3e08faf5ed45de4512921"
+        - "68d3e196e01658bf77887247"
+        - "68d3e24fafda675cd7731720"
+        - "68d3e28a7cd24b318ca55a01"
+        - "68d3e2eaaa81462a8e1a09a7"
+        - "68d3e3313347ee746cc0dba2"
+        - "68d3e396e9a8cc50ad36f71b"
+        - "68d3e5547cd24b318ca55a15"
+        - "68d3e574330fbd900623902e"
+        - "68d3e59e91a44281fe3dfd1c"
+        - "68d3e5fd9fb5ff4324333459"
+        - "68d3e672347ceea1609f6f74"
+        - "68d3e6774b1c32266ea185fd"
+        - "68d3e700925361f5ea9d713d"
+        - "68d3e7e0ce136334df153789"
+        - "68d3e841b13874d8f711f53e"
+        - "68d3e8e9a2c9be23a2c7616a"
+        - "68d3e8eb2b641f84dc1d0639"
+        - "68d3e94feaaa6b198fd9d7c5"
+        - "68d3e9db5b6cfcbc9ef6c403"
+        - "68d3e9db5b6cfcbc9ef6c407"
+        - "68d3ead92b420f072efceed7"
+        - "68d3eb3aa0bae22e2ba1f544"
+        - "68d3eb4c593c576a5a68f356"
+        - "68d3eb7983e3803355f8176b"
+        - "68d3ebbcc478daa723d5cffa"
+        - "68d3ec58f8e579445c27a95b"
+        - "68d3ec9dbf26aa7727bf2cd6"
+        - "68d3ed291963191d9d22a7b8"
+        - "68d3edc112af763ea5dca391"
+        - "68d3edf7e956b9877079abcc"
+        - "68d3ee474d1da7e09284b306"
+        - "68d3ee75fdc3d72c217231f5"
+        - "68d3ef9c6df2d7f2057a2069"
+        - "68d3efb8c9877dc79633db38"
+        - "68d3efed28e87fa668047471"
+        - "68d3efed28e87fa668047473"
+        - "68d3efffa30578df032e8c7d"
+        - "68d3f216da0b8ca59e73a144"
+        - "68d3f2658191686d654b7c39"
+        - "68d3f373a611772dbbec050c"
+        - "68d3f3852b420f072efcef10"
+        - "68d3f3897f1737e8220536c5"
+        - "68d3f447b2791101a83bd6c0"
+        - "68d3f58a474b70ce54b863e7"
+        - "68d3f5c4ebeb92d19ee19324"
+        - "68d3f5ef0b15d43c1228ec9a"
+        - "68d3f64170ac33bcc29e1383"
+        - "68d3f785fdc3d72c2172322b"
+        - "68d3f78a6df2d7f2057a209d"
+        - "68d3f7a39ad4e83f3cd10e4b"
+        - "68d3f927e543371c966136d4"
+        - "68d3f9441e21f8c5c37fe23d"
+        - "68d3f9c83a35c217ca6c4eaa"
+        - "68d3f9d701e97f875b0a2d6f"
+        - "68d3fa55f5cf426e3ca2935a"
+        - "68d3fa8e6fbe40458fa4111a"
+        - "68d3fac1080f96540b692c26"
+        - "68d3faf97b0a732458996369"
+        - "68d3fb38bf26aa7727bf2d27"
+        - "68d3fb45afda675cd77317b5"
+        - "68d3fc48ea00ad7b77fa9b27"
+        - "68d3fc8f06df05f7fb14aabd"
+        - "68d3fc96f5cf426e3ca29367"
+        - "68d3fd7130210b5f98ff0514"
+        - "68d3fde096772ec628720f89"
+        - "68d3fe3bcfdb743f0cb0e35b"
+        - "68d3ff48462c3bd1f3389739"
+        - "68d3ff88bdac7d9d657e03fb"
+        - "68d3ff88bdac7d9d657e03fd"
+        - "68d3ffa76127398e6e20c911"
+        - "68d400b332ac0ec26bc55308"
+        - "68d400c1f846d0bc5e1c4256"
+        - "68d400f6faebe2a9a4905c94"
+        - "68d401769743ff69a2c94972"
+        - "68d403c8c32d0a30de745a98"
+        - "68d40487347ceea1609f7025"
+        - "68d4053a737c6330c3e7887b"
+        - "68d43583950312a1c06c9f83"
+        - "68d435bc58ae90e8b2082295"
+        - "68d435dc611c44ef88d9a37b"
+        - "68d43678330fbd9006239118"
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      allowed_episode_ids:
+        - "68d435bc58ae90e8b2082295"
+        - "68d435dc611c44ef88d9a37b"
+        - "68d43678330fbd9006239118"
+        - "68d43583950312a1c06c9f83"
+        - "68d4053a737c6330c3e7887b"
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+    mode: total
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      allowed_episode_ids:
+        - "68c3dbebe9e837b8eec3c2d6"
+        - "68c3e30b9c65dfc2d3048ba8"
+        - "68c4023b1e0d1d81b7edf6c9"
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_wristframe_6d_fingertips_nointerp
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+    prefetch_factor: 2
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 8
+    num_workers: 2
+    persistent_workers: false
+    prefetch_factor: 1
+    shuffle: false
