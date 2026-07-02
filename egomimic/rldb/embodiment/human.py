@@ -342,40 +342,27 @@ class Mecka(Human):
     def get_transform_list(
         cls,
         mode: Literal[
-            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
+            "cartesian",
             "cartesian_wristframe_6d",
+            "cartesian_wristframe_6d_fingertips_nointerp",
         ],
     ) -> list[Transform]:
         if mode == "cartesian":
             return _build_aria_cartesian_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
             )
-        elif mode == "cartesian_wristframe":
-            return _build_mecka_cartesian_wristframe_bimanual_transform_list(
-                stride=cls.ACTION_STRIDE,
-            )
-        elif mode == "cartesian_wristframe_nointerp":
-            # No interpolation: the keymap reads a full chunk_length (100) horizon of
-            # real frames, so the wrist-frame action chunk is used as read.
-            return _build_mecka_cartesian_wristframe_bimanual_transform_list(
-                interpolate=False,
-            )
         elif mode == "cartesian_wristframe_6d":
-            # Wrist-frame delta pose with continuous 6D rotation (pi-6d parity):
-            # single-anchor wrist frame + xyz + 6D columns → 9 per arm, 18 bimanual.
+            # The pi-6d 6D wrist-frame representation: each arm's ee-pose action chunk
+            # expressed relative to the current ee pose (single-anchor delta), rotation
+            # as continuous 6D columns → 9 per arm, 18 bimanual.
             return _build_mecka_cartesian_wristframe_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
                 rot_repr="6d",
             )
-        elif mode == "cartesian_wristframe_6d_fingertips":
-            # 6D wrist-frame palm pose (9) + 5 MANO fingertips in the wrist frame
-            # (15) per hand → 24 per hand, 48 bimanual.
-            return _build_mecka_wristframe_6d_fingertips_transform_list(
-                stride=cls.ACTION_STRIDE,
-            )
         elif mode == "cartesian_wristframe_6d_fingertips_nointerp":
-            # Same 48-dim palm+fingertips representation, but NO resampling: the keymap
-            # reads a full 100-frame horizon of real frames (no InterpolatePose slerp).
+            # 6D wrist-frame palm pose (9) + 5 MANO fingertips (indices 4/8/12/16/20) in
+            # the wrist frame (15) per hand → 24 per hand, 48 bimanual. No resampling:
+            # reads a full 100-frame horizon of real frames.
             return _build_mecka_wristframe_6d_fingertips_transform_list(
                 interpolate=False,
             )
@@ -384,32 +371,23 @@ class Mecka(Human):
     def get_keymap(
         cls,
         mode: Literal[
-            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
-            "cartesian_wristframe_6d", "cartesian_wristframe_6d_fingertips",
+            "cartesian", "cartesian_wristframe_6d",
             "cartesian_wristframe_6d_fingertips_nointerp", "keypoints"
         ],
         annotations: bool = False,
         norm_mode: bool = False,
     ):
-        # The 6D+fingertips modes need the keypoints raw keys (wrist pose + keypoints
-        # chunks), so route them to the keypoints keymap. The _nointerp variant reads a
-        # full 100-frame horizon of real frames (no resampling).
+        # The 6D+fingertips mode needs the keypoints raw keys (wrist pose + keypoints
+        # chunks) at a full 100-frame horizon (no resampling), so route it to the
+        # keypoints keymap with kpts_horizon=100.
         kpts_horizon = 30
-        if mode in (
-            "cartesian_wristframe_6d_fingertips",
-            "cartesian_wristframe_6d_fingertips_nointerp",
-        ):
-            if mode.endswith("_nointerp"):
-                kpts_horizon = 100
+        if mode == "cartesian_wristframe_6d_fingertips_nointerp":
+            kpts_horizon = 100
             mode = "keypoints"
-        # cartesian variants consume the same raw keys (action/obs ee poses + head
-        # pose); only the transform frame + horizon differ. The _nointerp variant
-        # reads a full 100-frame horizon (no InterpolatePose upsamples 30 -> 100).
-        if mode in (
-            "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
-            "cartesian_wristframe_6d",
-        ):
-            action_horizon = 100 if mode == "cartesian_wristframe_nointerp" else 30
+        # cartesian + cartesian_wristframe_6d consume the same raw keys (action/obs
+        # ee poses + head pose); only the transform frame differs.
+        if mode in ("cartesian", "cartesian_wristframe_6d"):
+            action_horizon = 30
             key_map = {
                 cls.VIZ_IMAGE_KEY: {
                     "key_type": "camera_keys",

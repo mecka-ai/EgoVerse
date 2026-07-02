@@ -1,9 +1,9 @@
 # QueST SkillVAE tokenizer for 6D wrist-frame palm pose + 5 MANO fingertips per hand.
 # action_dim=48: per hand [palm xyz+6D (9) | 5 fingertips xyz (15)] × 2 arms.
-# Pair with data=mecka_preanno199_zarr_quest_wf6d_ft (transform cartesian_wristframe_6d_fingertips).
+# Pair with data=mecka_preanno199_zarr_quest_wf6d_ft_nointerp (transform cartesian_wristframe_6d_fingertips_nointerp).
 #
 #   python egomimic/modal/trainModal.py \
-#       model=quest_tokenizer_ft data=mecka_preanno199_zarr_quest_wf6d_ft \
+#       model=quest_tokenizer_ft data=mecka_preanno199_zarr_quest_wf6d_ft_nointerp\
 #       visualization=fingertips_wrist_6d \
 #       evaluator=eval_quest_tokenizer_video "evaluator@train_viz_evaluator=train_viz_quest_tokenizer" \
 #       name=quest_tok_preanno199_ft description=preanno199_wf6d_fingertips \
