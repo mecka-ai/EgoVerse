@@ -756,6 +756,31 @@ class Reshape(Transform):
         return batch
 
 
+class SelectKeypoints(Transform):
+    """Select specific keypoint indices from a flattened ``(..., n_keypoints*item_dim)`` array.
+
+    Reshapes ``(..., n_keypoints, item_dim)`` and gathers ``indices`` along the
+    keypoint axis, returning ``(..., len(indices), item_dim)``. Used to pull the 5
+    MANO fingertips (indices 4/8/12/16/20) out of the 21-keypoint (63-dim) vector.
+    """
+
+    def __init__(self, input_key, output_key, indices, n_keypoints=21, item_dim=3):
+        self.input_key = input_key
+        self.output_key = output_key
+        self.indices = list(indices)
+        self.n_keypoints = int(n_keypoints)
+        self.item_dim = int(item_dim)
+
+    def transform(self, batch: dict) -> dict:
+        arr = np.asarray(batch[self.input_key])
+        lead = arr.shape[:-1]
+        arr = arr.reshape(*lead, self.n_keypoints, self.item_dim)
+        batch[self.output_key] = arr[..., self.indices, :]
+        return batch
+
+    transform_batch = transform
+
+
 # ---------------------------------------------------------------------------
 # Type Transforms
 # ---------------------------------------------------------------------------

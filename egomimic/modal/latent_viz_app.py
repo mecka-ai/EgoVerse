@@ -302,8 +302,8 @@ def _fetch_episode_metadata(hashes: list[str]) -> dict:
 @app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
     secrets=[modal.Secret.from_name("egoverse-sql")],
-    cpu=4.0,
-    memory=8192,
+    cpu=16.0,
+    memory=16384,
     min_containers=1,
     scaledown_window=600,
 )
@@ -563,9 +563,14 @@ def viewer():
         if not path.exists():
             return PlainTextResponse("not found", status_code=404)
 
+        # Input seeking (-ss before -i) is the fast keyframe-accurate path; downscale
+        # to ≤640px (preview popup is 400px, thumbs ~320px) so we don't decode/encode/
+        # ship a full-res frame; -nostdin/-loglevel trim per-process overhead.
         result = subprocess.run(
-            ["ffmpeg", "-ss", str(frame_num / 30.0), "-i", str(path),
-             "-vframes", "1", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            ["ffmpeg", "-nostdin", "-loglevel", "error",
+             "-ss", str(frame_num / 30.0), "-i", str(path),
+             "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
+             "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
             capture_output=True,
         )
         if result.returncode != 0 or not result.stdout:
