@@ -175,6 +175,46 @@ def _viz_traj(image, actions, intrinsics_key, **kwargs):
     return vis
 
 
+def _viz_fingertips(image, actions, intrinsics_key, **kwargs):
+    """Draw palm + 5 fingertip trajectories per hand, projected onto the image.
+
+    ``actions``: ``(T, 36)`` = per hand ``[palm_xyz(3), 5 fingertips xyz(15)]`` in
+    the camera (head) frame (produced by the revert transform). Each of the 6 points
+    per hand is drawn as an xyz trajectory in the given color palette (GT=Greens,
+    pred=Reds), so palm + finger motion over the chunk is visible.
+    """
+    color = kwargs.get("color", "Blues")
+    alpha = kwargs.get("alpha", 1.0)
+    if not ColorPalette.is_valid(color):
+        raise ValueError(f"Invalid color palette: {color}")
+
+    image = _prepare_viz_image(image)
+    intrinsics = INTRINSICS[intrinsics_key]
+    actions = np.asarray(actions)
+    if actions.ndim == 1:
+        actions = actions[None]
+
+    base = image.copy()
+    overlay = base.copy()
+    for hand_i, arm in enumerate(("left", "right")):
+        off = hand_i * 18
+        palm = actions[:, off : off + 3]                       # (T, 3)
+        tips = actions[:, off + 3 : off + 18].reshape(-1, 5, 3)  # (T, 5, 3)
+        for pts in (palm, *[tips[:, f, :] for f in range(5)]):
+            overlay = draw_actions(
+                overlay,
+                type="xyz",
+                color=color,
+                actions=pts,
+                extrinsics=None,
+                intrinsics=intrinsics,
+                arm=arm,
+            )
+    if alpha < 1.0:
+        return cv2.addWeighted(overlay, alpha, base, 1.0 - alpha, 0)
+    return overlay
+
+
 def _viz_axes(image, actions, intrinsics_key, axis_len_m=0.04, **kwargs):
     alpha = kwargs.get("alpha", 1.0)
     image = _prepare_viz_image(image)

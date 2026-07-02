@@ -21,6 +21,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
 )
 from egomimic.utils.viz_utils import (
     ColorPalette,
+    _viz_fingertips,
     _viz_keypoints,
 )
 
@@ -33,10 +34,17 @@ class Human(Embodiment):
         cls,
         image,
         viz_data,
-        mode=Literal["traj", "traj+rotation", "axes", "annotations", "keypoints"],
+        mode=Literal[
+            "traj", "traj+rotation", "axes", "annotations", "keypoints", "fingertips"
+        ],
         intrinsics_key=None,
         **kwargs,
     ):
+        if mode == "fingertips":
+            intrinsics_key = intrinsics_key or cls.VIZ_INTRINSICS_KEY
+            return _viz_fingertips(
+                image=image, actions=viz_data, intrinsics_key=intrinsics_key, **kwargs
+            )
         if mode == "keypoints":
             intrinsics_key = intrinsics_key or cls.VIZ_INTRINSICS_KEY
             color = kwargs.get("color", None)
@@ -358,17 +366,27 @@ class Mecka(Human):
                 stride=cls.ACTION_STRIDE,
                 rot_repr="6d",
             )
+        elif mode == "cartesian_wristframe_6d_fingertips":
+            # 6D wrist-frame palm pose (9) + 5 MANO fingertips in the wrist frame
+            # (15) per hand → 24 per hand, 48 bimanual.
+            return _build_mecka_wristframe_6d_fingertips_transform_list(
+                stride=cls.ACTION_STRIDE,
+            )
 
     @classmethod
     def get_keymap(
         cls,
         mode: Literal[
             "cartesian", "cartesian_wristframe", "cartesian_wristframe_nointerp",
-            "cartesian_wristframe_6d", "keypoints"
+            "cartesian_wristframe_6d", "cartesian_wristframe_6d_fingertips", "keypoints"
         ],
         annotations: bool = False,
         norm_mode: bool = False,
     ):
+        # The 6D+fingertips mode needs the keypoints raw keys (wrist pose + keypoints
+        # chunks), so route it to the keypoints keymap.
+        if mode == "cartesian_wristframe_6d_fingertips":
+            mode = "keypoints"
         # cartesian variants consume the same raw keys (action/obs ee poses + head
         # pose); only the transform frame + horizon differ. The _nointerp variant
         # reads a full 100-frame horizon (no InterpolatePose upsamples 30 -> 100).
@@ -1291,5 +1309,155 @@ def _build_mecka_cartesian_revert_wristframe_transform_list(
             new_key_name=action_key,
             delete_old_keys=True,
         ),
+    )
+    return transform_list
+
+
+# MANO fingertip keypoint indices (thumb, index, middle, ring, pinky tips). In the
+# 21-keypoint layout these are the first 5 (contiguous) -> the first 15 of 63 dims.
+_N_FINGERTIPS = 5
+_FINGERTIP_DIMS = _N_FINGERTIPS * 3  # 15
+
+
+def _build_mecka_wristframe_6d_fingertips_transform_list(
+    *,
+    target_world: str = "obs_head_pose",
+    target_world_ypr: str = "obs_head_pose_ypr",
+    target_world_is_quat: bool = True,
+    actions_key: str = "actions_cartesian",
+    obs_key: str = "observations.state.ee_pose",
+    chunk_length: int = 100,
+    horizon: int = 30,
+    stride: int = 1,
+    delete_target_world: bool = True,
+) -> list[Transform]:
+    """Wrist-frame 6D palm pose + 5 MANO fingertips per hand (single-anchor).
+
+    Per hand: palm (``obs_wrist_pose``) as a 6D wrist-frame delta relative to the
+    current wrist pose (9 dims) + the 5 fingertips (keypoints 0-4) expressed in that
+    same current-wrist frame (5*3 = 15 dims) = 24. Bimanual ``actions_cartesian`` is
+    ``(chunk_length, 48)``. Proprio ``observations.state.ee_pose`` holds each current
+    wrist pose in head frame as 6D (9/hand, 18 total) so the revert can re-anchor palm
+    + fingertips back to the camera frame for viz. Uses the keypoints keymap keys.
+    """
+    transform_list: list[Transform] = []
+    keys_to_delete: list[str] = []
+    action_parts: list[str] = []
+    obs_parts: list[str] = []
+
+    for side in ("left", "right"):
+        aw = f"{side}.action_wrist_pose"          # (H, 7) world wrist poses
+        akp = f"{side}.action_keypoints"          # (H, 63) world keypoints
+        ow = f"{side}.obs_wrist_pose"             # (7,) current world wrist pose
+        palm_wf = f"{side}.palm_wristframe"       # (H,7) -> (chunk,9)
+        tips = f"{side}.fingertips"               # (H,15) -> (H,5,3) -> (chunk,15)
+        tips_rest = f"{side}.kpts_rest"           # remaining 16 keypoints (dropped)
+        obs_wf_head = f"{side}.obs_wrist_headframe"  # (7,) -> (9,)
+
+        transform_list += [
+            # Palm: action wrist chunk relative to the CURRENT wrist pose (single-anchor
+            # delta). inverse=True -> obs_wrist^-1 @ action_wrist.
+            ActionChunkCoordinateFrameTransform(
+                target_world=ow, chunk_world=aw,
+                transformed_key_name=palm_wf, mode="xyzwxyz",
+            ),
+            # Fingertips: first 5 keypoints (15 dims) -> (H,5,3), expressed in the
+            # current wrist frame (xyz points, inverse=True).
+            SplitKeys(
+                input_key=akp,
+                output_key_list=[(tips, _FINGERTIP_DIMS), (tips_rest, 63 - _FINGERTIP_DIMS)],
+            ),
+            Reshape(input_key=tips, output_key=tips, shape=(horizon, _N_FINGERTIPS, 3)),
+            ActionChunkCoordinateFrameTransform(
+                target_world=ow, chunk_world=tips,
+                transformed_key_name=tips, mode="xyz",
+            ),
+            # Proprio: current wrist pose -> head frame (revert anchor).
+            PoseCoordinateFrameTransform(
+                target_world=target_world, pose_world=ow,
+                transformed_key_name=obs_wf_head, mode="xyzwxyz",
+            ),
+            # Interpolate H -> chunk_length (palm as quats, fingertips as xyz).
+            InterpolatePose(
+                new_chunk_length=chunk_length, action_key=palm_wf,
+                output_action_key=palm_wf, stride=stride, mode="xyzwxyz",
+            ),
+            InterpolatePose(
+                new_chunk_length=chunk_length, action_key=tips,
+                output_action_key=tips, stride=stride, mode="xyz",
+            ),
+            # Encode rotations as continuous 6D; flatten fingertips back to (chunk,15).
+            XYZWXYZ_to_XYZ6D(keys=[palm_wf, obs_wf_head]),
+            Reshape(input_key=tips, output_key=tips, shape=(chunk_length, _FINGERTIP_DIMS)),
+            # Per-hand action = palm(9) + fingertips(15) = 24.
+            ConcatKeys(
+                key_list=[palm_wf, tips], new_key_name=f"{side}.hand_action",
+                delete_old_keys=True,
+            ),
+        ]
+        action_parts.append(f"{side}.hand_action")
+        obs_parts.append(obs_wf_head)
+        keys_to_delete += [aw, akp, ow, tips_rest, f"{side}.obs_keypoints"]
+
+    if delete_target_world:
+        keys_to_delete.append(target_world)
+        if target_world_is_quat:
+            keys_to_delete.append(target_world_ypr)
+
+    transform_list += [
+        ConcatKeys(key_list=action_parts, new_key_name=actions_key, delete_old_keys=True),
+        ConcatKeys(key_list=obs_parts, new_key_name=obs_key, delete_old_keys=True),
+        DeleteKeys(keys_to_delete=keys_to_delete),
+    ]
+    return transform_list
+
+
+def _build_mecka_revert_wristframe_6d_fingertips_transform_list(
+    *,
+    action_key: str = "actions_cartesian",
+    obs_key: str = "observations.state.ee_pose",
+    chunk_length: int = 100,
+) -> list[Transform]:
+    """Revert 6D wrist-frame palm + fingertips to head-frame positions for viz.
+
+    Inverse of ``_build_mecka_wristframe_6d_fingertips_transform_list`` for viz.
+      action(48): per hand [palm 6D wrist(9) | fingertips wrist(15)].
+      obs(18):    per hand [wrist pose head 6D(9)] (the revert anchor).
+    Output action(36): per hand [palm xyz head(3) | 5 fingertips xyz head(15)] — the
+    camera-frame positions Mecka.viz(mode="fingertips") projects. Wired via the
+    visualization config's transform_list (applied to both GT and prediction).
+    """
+    transform_list: list[Transform] = [
+        SplitKeys(input_key=obs_key,
+                  output_key_list=[("left.owh", 9), ("right.owh", 9)]),
+        SplitKeys(input_key=action_key,
+                  output_key_list=[("left.hand", 24), ("right.hand", 24)]),
+    ]
+    viz_parts: list[str] = []
+    for side in ("left", "right"):
+        owh, hand = f"{side}.owh", f"{side}.hand"
+        palm, tips = f"{side}.palm6d", f"{side}.tips"
+        palm_head, palm_xyz, palm_rot = f"{side}.palm_head", f"{side}.palm_xyz", f"{side}.palm_rot"
+        transform_list += [
+            SplitKeys(input_key=hand, output_key_list=[(palm, 9), (tips, 15)]),
+            # palm 6D wrist -> head (re-anchor), keep only xyz for the point viz.
+            ActionChunkCoordinateFrameTransform(
+                target_world=owh, chunk_world=palm,
+                transformed_key_name=palm_head, mode="xyz6d", inverse=False,
+            ),
+            SplitKeys(input_key=palm_head, output_key_list=[(palm_xyz, 3), (palm_rot, 6)]),
+            # fingertips wrist -> head.
+            Reshape(input_key=tips, output_key=tips, shape=(chunk_length, _N_FINGERTIPS, 3)),
+            ActionChunkCoordinateFrameTransform(
+                target_world=owh, chunk_world=tips,
+                transformed_key_name=tips, mode="xyz", inverse=False,
+            ),
+            Reshape(input_key=tips, output_key=tips, shape=(chunk_length, _FINGERTIP_DIMS)),
+            ConcatKeys(key_list=[palm_xyz, tips], new_key_name=f"{side}.viz",
+                       delete_old_keys=True),
+        ]
+        viz_parts.append(f"{side}.viz")
+    transform_list.append(
+        ConcatKeys(key_list=viz_parts, new_key_name=action_key, delete_old_keys=True)
     )
     return transform_list
