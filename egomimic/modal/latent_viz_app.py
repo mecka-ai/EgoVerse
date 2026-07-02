@@ -26,6 +26,14 @@ DEFAULT_RUN = "deminf_tsne/14task_dim64_k10_20_viz3d_2026-06-09_19-49-48"
 OUTPUTS_MOUNT = "/mnt/outputs"
 PREVIEW_MOUNT = "/mnt/previews"
 
+# Pre-rendered frames live at PREVIEW_MOUNT/frames/{hash}/{idx:06d}.jpg, extracted
+# every FRAME_STRIDE frames (matches the t-SNE every_n sampling). File index j
+# (1-based) ↔ original mp4 frame (j-1)*FRAME_STRIDE, so a requested frame f maps
+# to file round(f/FRAME_STRIDE)+1. The /frame endpoint serves these as static
+# files (~50ms) and only falls back to on-demand ffmpeg when one is missing.
+FRAME_STRIDE = 10
+FRAME_MAX_W = 640
+
 _HERE = Path(__file__).resolve().parent
 _BUILDER         = _HERE.parent / "scripts" / "build_latent_viz.py"
 _SPAN_BUILDER    = _HERE.parent / "scripts" / "build_span_viz.py"
@@ -300,6 +308,66 @@ def _fetch_episode_metadata(hashes: list[str]) -> dict:
 
 
 @app.function(
+    image=image,
+    volumes={PREVIEW_MOUNT: previews_volume},
+    cpu=4.0,
+    timeout=1800,
+)
+def _render_frames_for(episode_hash: str) -> str:
+    """Extract every FRAME_STRIDE-th frame of one episode's MP4 to downscaled JPEGs
+    at PREVIEW_MOUNT/frames/{hash}/%06d.jpg (one ffmpeg pass, full decode)."""
+    import subprocess
+
+    safe = Path(episode_hash).name
+    mp4 = Path(PREVIEW_MOUNT) / f"{safe}.mp4"
+    if not mp4.exists():
+        return f"skip {safe}: no mp4"
+    outdir = Path(PREVIEW_MOUNT) / "frames" / safe
+    if outdir.is_dir() and any(outdir.glob("*.jpg")):
+        return f"skip {safe}: already rendered"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(mp4),
+         "-vf", f"select=not(mod(n\\,{FRAME_STRIDE})),scale='min({FRAME_MAX_W},iw)':-2",
+         "-vsync", "0", "-q:v", "5", str(outdir / "%06d.jpg")],
+        capture_output=True,
+    )
+    n = len(list(outdir.glob("*.jpg")))
+    if r.returncode != 0 or n == 0:
+        return f"FAIL {safe}: rc={r.returncode} {r.stderr.decode()[:120]}"
+    previews_volume.commit()
+    return f"{safe}: {n} frames"
+
+
+@app.function(
+    volumes={PREVIEW_MOUNT: previews_volume},
+    timeout=7200,
+)
+def render_all_frames(only: list[str] | None = None):
+    """Pre-render frame JPEGs for every episode MP4 (or just ``only`` hashes).
+    Fan out one container per episode via .map(). Run with:
+      MODAL_ENVIRONMENT=robotics modal run egomimic/modal/latent_viz_app.py::render_all_frames
+    """
+    previews_volume.reload()
+    eps = only or sorted(p.stem for p in Path(PREVIEW_MOUNT).glob("*.mp4"))
+    print(f"[frames] rendering {len(eps)} episodes (stride={FRAME_STRIDE})")
+    done = failed = skipped = 0
+    for msg in _render_frames_for.map(eps, order_outputs=False):
+        if msg.startswith("FAIL"):
+            failed += 1
+            print(msg)
+        elif "already" in msg or "no mp4" in msg:
+            skipped += 1
+        else:
+            done += 1
+        if (done + failed + skipped) % 50 == 0:
+            print(f"[frames] {done} done · {skipped} skipped · {failed} failed")
+    print(f"[frames] COMPLETE: {done} rendered · {skipped} skipped · {failed} failed")
+    return {"rendered": done, "skipped": skipped, "failed": failed}
+
+
+@app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
     secrets=[modal.Secret.from_name("egoverse-sql")],
     cpu=16.0,
@@ -553,6 +621,19 @@ def viewer():
         from fastapi.responses import Response
 
         safe = Path(episode_hash).name
+
+        # Fast path: pre-rendered static JPEG (see FRAME_STRIDE docstring).
+        idx = round(frame_num / FRAME_STRIDE) + 1
+        jpg = Path(PREVIEW_MOUNT) / "frames" / safe / f"{idx:06d}.jpg"
+        if not jpg.exists():
+            _reload_volumes()
+        if jpg.exists():
+            return FileResponse(
+                str(jpg), media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
+        # Fallback: on-demand ffmpeg extraction (runs not yet pre-rendered).
         cache_key = f"{safe}_{frame_num}"
         if cache_key in frame_cache:
             return Response(frame_cache[cache_key], media_type="image/jpeg")
@@ -577,6 +658,9 @@ def viewer():
             return PlainTextResponse("frame extraction failed", status_code=500)
 
         frame_cache[cache_key] = result.stdout
-        return Response(result.stdout, media_type="image/jpeg")
+        return Response(
+            result.stdout, media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     return web

@@ -653,14 +653,22 @@ function renderGrid(){
     return true;
   });
 
+  // Cap DOM cards — runs can have tens of thousands of spans; rendering every
+  // card freezes the browser. Show the top MAX_CARDS (by current sort) and note
+  // how many are hidden so it's never a silent truncation.
+  const MAX_CARDS=400;
+  const shown=filtered.slice(0,MAX_CARDS);
+  const capNote=filtered.length>MAX_CARDS
+    ? ` &middot; <span style="color:#e0c14f">showing first ${MAX_CARDS}</span> (narrow with a cluster/filter)` : '';
+
   const lbl=curCluster?`${curCluster}: ${CLUSTERS[curCluster].label}`:'all clusters';
   document.getElementById('gridhead').innerHTML=
     `<b>${esc(lbl)}</b> &mdash; ${filtered.length}/${n} spans &middot; `+
-    `mean ${mean.toFixed(3)} &middot; [${mn.toFixed(3)}, ${mx.toFixed(3)}] `+
+    `mean ${mean.toFixed(3)} &middot; [${mn.toFixed(3)}, ${mx.toFixed(3)}]${capNote} `+
     histoSVG(allScores);
 
   let idc=0;
-  const cards=filtered.map(s=>{
+  const cards=shown.map(s=>{
     const ri=rank[s.id]??0;
     const pct=mx>mn?(s.score-mn)/(mx-mn):0.5;
     const isTop=ri<nTop;
