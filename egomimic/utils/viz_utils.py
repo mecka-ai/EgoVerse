@@ -194,13 +194,20 @@ def _viz_fingertips(image, actions, intrinsics_key, **kwargs):
     if actions.ndim == 1:
         actions = actions[None]
 
+    palm_dot_size = kwargs.get("palm_dot_size", 5)      # normal
+    fingertip_dot_size = kwargs.get("fingertip_dot_size", 2)  # smaller
+
     base = image.copy()
     overlay = base.copy()
     for hand_i, arm in enumerate(("left", "right")):
         off = hand_i * 18
         palm = actions[:, off : off + 3]                       # (T, 3)
         tips = actions[:, off + 3 : off + 18].reshape(-1, 5, 3)  # (T, 5, 3)
-        for pts in (palm, *[tips[:, f, :] for f in range(5)]):
+        # palm at normal dot size; fingertips smaller.
+        for pts, dot_size in (
+            (palm, palm_dot_size),
+            *[(tips[:, f, :], fingertip_dot_size) for f in range(5)],
+        ):
             overlay = draw_actions(
                 overlay,
                 type="xyz",
@@ -209,6 +216,7 @@ def _viz_fingertips(image, actions, intrinsics_key, **kwargs):
                 extrinsics=None,
                 intrinsics=intrinsics,
                 arm=arm,
+                dot_size=dot_size,
             )
     if alpha < 1.0:
         return cv2.addWeighted(overlay, alpha, base, 1.0 - alpha, 0)

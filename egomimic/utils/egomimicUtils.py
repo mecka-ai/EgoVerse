@@ -556,7 +556,8 @@ def draw_rotation_text(
 
 
 def draw_actions(
-    im, type, color, actions, extrinsics, intrinsics, arm="both", kinematics_solver=None
+    im, type, color, actions, extrinsics, intrinsics, arm="both", kinematics_solver=None,
+    dot_size=5,
 ):
     """
     args:
@@ -602,7 +603,7 @@ def draw_actions(
         actions_drawable = actions
 
     actions_drawable = cam_frame_to_cam_pixels(actions_drawable, intrinsics)
-    im = draw_dot_on_frame(im, actions_drawable, show=False, palette=color)
+    im = draw_dot_on_frame(im, actions_drawable, show=False, palette=color, dot_size=dot_size)
 
     return im
 
