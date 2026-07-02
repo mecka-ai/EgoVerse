@@ -686,6 +686,57 @@ class PolicyRollout(Rollout):
                     revert_batch["actions_cartesian"], dtype=np.float32
                 )
             self.debug_actions = self.actions.copy()
+
+            # --- per-inference debug: policy actions in WRIST frame (raw pred,
+            # pre-revert) and CAMERA frame (post-revert). The full action's wrist
+            # rotation is decoded to ZYX ypr degrees for readability. Prints on
+            # every policy step (once per inference / chunk).
+            if self.cartesian:
+                from egomimic.utils.pose_utils import _xyz6d_to_matrix
+
+                def _fmt(a):
+                    return np.array2string(
+                        np.asarray(a, dtype=float), precision=4, suppress_small=True
+                    )
+
+                def _wf_ypr(block):
+                    # per-arm wrist-frame slice -> ZYX ypr (deg). 6D block is
+                    # [xyz c1 c2 (g)] (rotation from the two 6D columns); ypr block
+                    # is [xyz ypr (g)] (ypr already, radians).
+                    block = np.asarray(block, dtype=float)
+                    if self.use_6d:
+                        Rm = _xyz6d_to_matrix(block[:9][None])[0, :3, :3]
+                        return _ypr_deg(Rm)
+                    return np.round(np.rad2deg(block[3:6]), 1)
+
+                _wf = np.atleast_2d(_wf_preds)           # wrist-frame chunk (pre-revert)
+                _cf = np.atleast_2d(self.debug_actions)  # camera-frame chunk (post-revert)
+                _both = self.arm == "both"
+                _wfw = 10 if self.use_6d else 7          # per-arm wrist-frame width
+
+                # WRISTFRAME (always available). Per-arm blocks: L first, R second.
+                _wfL = _wf[0, 0:_wfw]
+                print(f"[dbg step {i}] WRISTFRAME pred (pre-revert) shape={_wf.shape}")
+                line = f"    L: pos={_fmt(_wfL[:3])} ypr(deg)={_fmt(_wf_ypr(_wfL))}"
+                if _both:
+                    _wfR = _wf[0, _wfw:2 * _wfw]
+                    line += f"    R: pos={_fmt(_wfR[:3])} ypr(deg)={_fmt(_wf_ypr(_wfR))}"
+                print(line)
+                print(f"    row0 action={_fmt(_wf[0])}")
+
+                # CAMFRAME only exists after the both-arm revert (14-dim ypr:
+                # per-arm [xyz ypr grip]); single-arm skips the revert.
+                if _both:
+                    _cfL, _cfR = _cf[0, 0:7], _cf[0, 7:14]
+                    print(f"[dbg step {i}] CAMFRAME (post-revert) shape={_cf.shape}")
+                    print(
+                        f"    L: pos={_fmt(_cfL[:3])} "
+                        f"ypr(deg)={_fmt(np.round(np.rad2deg(_cfL[3:6]), 1))}"
+                        f"    R: pos={_fmt(_cfR[:3])} "
+                        f"ypr(deg)={_fmt(np.round(np.rad2deg(_cfR[3:6]), 1))}"
+                    )
+                    print(f"    row0 action={_fmt(_cf[0])}")
+
             if not self._printed_diag:
                 self._printed_diag = True
                 self._diagnose_inputs(obs, transform_list_batch, processed_batch, preds)

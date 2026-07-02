@@ -225,7 +225,13 @@ def _has_stuck_frames(obs_list, cam_name, threshold=STUCK_FRAME_THRESHOLD) -> bo
 
 def save_demo(demo_data, demo_dir: Path, episode_id, camera_res, robot_interface,
               strict_cameras: bool = False) -> bool:
-    """Write one episode to ``demo_<id>.hdf5`` in EgoVerse layout.
+    """Write one episode to ``<epoch_ms>.hdf5`` in EgoVerse layout.
+
+    The filename stem is the save-time epoch-ms timestamp because the zarr
+    converter derives both the episode hash and the legacy-gripper-fix gate
+    from it (eva_utils.resolve_timestamp_ms); it is also stored as the
+    ``timestamp_ms`` attr so tooling never has to parse the filename. The
+    ``episode_id`` is only the human-facing counter for console messages.
 
     demo_data keys (lists, one entry per step):
         obs                  -> {cam_name: BGR frame}
@@ -253,8 +259,9 @@ def save_demo(demo_data, demo_dir: Path, episode_id, camera_res, robot_interface
             return False
         print(f"[save] WARNING: {msg} Saving anyway.")
 
-    filename = demo_dir / f"demo_{episode_id}.hdf5"
-    print(f"[save] Writing {n_steps} steps to {filename}")
+    timestamp_ms = int(time.time() * 1000)
+    filename = demo_dir / f"{timestamp_ms}.hdf5"
+    print(f"[save] Writing episode {episode_id} ({n_steps} steps) to {filename}")
 
     robot_joints = np.asarray(demo_data["robot_joint_actions"])  # (T, 14)
     cmd_joints = np.asarray(demo_data["cmd_joint_actions"])      # (T, 14)
@@ -266,6 +273,7 @@ def save_demo(demo_data, demo_dir: Path, episode_id, camera_res, robot_interface
     # so the default 2MB would thrash on every frame write.
     with h5py.File(str(filename), "w", rdcc_nbytes=1024**2 * 32) as root:
         root.attrs["sim"] = False
+        root.attrs["timestamp_ms"] = timestamp_ms
         obs = root.create_group("observations")
         images = obs.create_group("images")
         for cam_name, (H, W) in camera_res.items():
@@ -323,7 +331,7 @@ def collect_yam_demo(
     demo_dir=DEFAULT_DEMO_DIR,
     episode_id_start=0,
     episode_length=None,
-    bilateral_kp=0.15,
+    bilateral_kp=0.05,
     gripper=GripperType.LINEAR_4310,
     strict_cameras=False,
     debug_buttons=False,
@@ -600,7 +608,7 @@ def main():
         help="If set, auto-save and increment after this many recorded steps.",
     )
     parser.add_argument(
-        "--bilateral-kp", type=float, default=0.15,
+        "--bilateral-kp", type=float, default=0.05,
         help="Leader force-feedback gain (fraction of the leader's control kp).",
     )
     args = parser.parse_args()

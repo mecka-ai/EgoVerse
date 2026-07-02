@@ -203,9 +203,10 @@ def main():
                     help="row-align the two eyes using the calibrated cam0<->cam1 extrinsic")
     ap.add_argument("--side-by-side", action="store_true",
                     help="show the two eyes as separate panes (cam0 | cam1) instead of one fused image")
-    ap.add_argument("--fuse-mode", choices=["fill", "blend"], default="fill",
-                    help="how to combine the eyes into one image: 'fill' (cam0 base, cam1 fills its "
-                         "out-of-FoV border — no parallax ghosting; default) or 'blend' (average the overlap)")
+    ap.add_argument("--fuse-mode", choices=["cam0", "fill", "blend"], default="cam0",
+                    help="how to combine the eyes into one image: 'cam0' (cam0 only — single optical "
+                         "center, no ghosting; default), 'fill' (cam0 base, cam1 fills its out-of-FoV "
+                         "border) or 'blend' (average the overlap)")
     # ROI crop (px trimmed per edge of the fused image) to isolate the table+arms.
     # Default None => load from rig-config, else 0 (no crop).
     ap.add_argument("--crop-left", type=int, default=None, help="px to trim from the LEFT edge")

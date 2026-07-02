@@ -280,21 +280,22 @@ EXTRINSICS = {
         #   left  rot rows [0.10781224,-0.86856751,0.48370136] ...
         #   right rot rows [0.074985,-0.89368126,0.44239243] ...
         "left": np.array(
-            [
-                [-0.04478335, -0.87071272, 0.48974872, 0.11429783],
-                [-0.99742794, 0.06643469, 0.02690639, -0.34963458],
-                [-0.05596404, -0.48728409, -0.87144836, 1.01078516],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
-        ),
+    [
+        [ 0.0437291,  -0.85821391,  0.5114261,   0.08690521],
+        [-0.99754573, -0.00948836,  0.06937217, -0.25327518],
+        [-0.05468356, -0.5132045,  -0.85652253,  0.83357606],
+        [ 0.0,         0.0,         0.0,          1.0       ],
+    ]
+),
         "right": np.array(
-            [
-                [-0.06345426, -0.89561090, 0.44028931, 0.12621833],
-                [-0.99794232, 0.06101066, -0.01971857, 0.64589818],
-                [-0.00920218, -0.44063456, -0.89763941, 1.43613881],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
-        ),
+    [
+        [ 0.04251619, -0.84174054,  0.53820557,  0.04959916],
+        [-0.98836195,  0.04331659,  0.14582295,  0.27905066],
+        [-0.14605832, -0.53814174, -0.83010266,  0.87148985],
+        [ 0.0,         0.0,         0.0,          1.0       ],
+    ]
+)
+,
     },
     "x5Dec13_2": {
         "left": np.array(
@@ -379,7 +380,7 @@ EXTRINSICS = {
     },
 }
 
-# YAM front camera = Atlas (ATLASHX2952) FORWARD STEREO (cam0 left + cam1 right),
+# YAM front camera = Atlas (ATLASHX328) FORWARD STEREO (cam0 left + cam1 right),
 # double-sphere RECTIFIED to a pinhole, RE-AIMED (pitch/yaw/roll), FUSED into one
 # image, then ROI-CROPPED — exactly the front_img_1 that AtlasStereoCamera produces
 # for rollout + data collection. Native fx,fy with the principal point at the
@@ -387,20 +388,30 @@ EXTRINSICS = {
 # cy = 600 - crop_top). 3x4 (K|0) to match every other INTRINSICS entry. Valid at
 # the cropped output resolution.
 #
-# These values track egomimic/robot/YAM/calibration/rig_aim.json (serial 2952,
-# crop left/right/top/bottom = 250/250/320/0 -> 1420x880). REGENERATE after any
-# rig_aim.json change with:
-#     python -c "import sys; sys.path.insert(0,'egomimic/robot/YAM'); \
-#                from yam_cameras import StereoFrontProcessor; \
-#                print(StereoFrontProcessor(2952).intrinsics)"
-# (StereoFrontProcessor.intrinsics is the single source of truth.)
-YAM_INTRINSICS = np.array(
-    [
-        [482.0812950643657, 0.0, 710.0, 0.0],
-        [0.0, 482.0473315598244, 280.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-    ]
-)
+# DERIVED (not hand-copied) from the same source of truth the camera pipeline uses:
+# yam_cameras.stereo_front_output_intrinsics() reads the Atlas calibration DB for
+# the deployed serial (yam_cameras.ATLAS_SERIAL) + the crop in rig_aim.json, so
+# these track the real camera and any rig_aim change automatically. The literal
+# fallback (Atlas serial 328, crop 250/250/320/0) is used only in checkouts that
+# lack the calibration DB (e.g. training-only machines).
+try:
+    import importlib.util as _ilu
+
+    _yc_path = os.path.join(
+        os.path.dirname(__file__), "..", "robot", "YAM", "yam_cameras.py"
+    )
+    _spec = _ilu.spec_from_file_location("yam_cameras", _yc_path)
+    _yc = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_yc)
+    YAM_INTRINSICS = _yc.stereo_front_output_intrinsics()
+except Exception:  # calibration DB / yam_cameras unavailable -> last-known-good (328)
+    YAM_INTRINSICS = np.array(
+        [
+            [476.8638244793585, 0.0, 710.0, 0.0],
+            [0.0, 476.6994709394347, 280.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
 
 INTRINSICS = {
     "base": ARIA_INTRINSICS,

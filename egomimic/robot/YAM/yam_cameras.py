@@ -52,8 +52,11 @@ except ImportError:
 # =====================================================================
 # Atlas front camera (front_img_1): down-looking cam3, rectified + cropped.
 # =====================================================================
-ATLAS_SERIAL = 2952            # ATLASHX2952 (calibration_db primary key)
-ATLAS_DEVICE_ID = "ATLASHX2952"
+ATLAS_SERIAL = 328             # ATLASHX328 (calibration_db primary key) — the
+                               # deployed rig. MUST match the physical camera, or
+                               # the DS->pinhole undistort maps AND the derived
+                               # intrinsics come from the wrong device's calibration.
+ATLAS_DEVICE_ID = "ATLASHX328"
 FRONT_CAM_INDEX = 3            # cam3 = Bottom SLAM = down-looking (the "third camera")
 CROP_FRACTION = 0.75           # center-crop the rectified image to 75% of each dim
 
@@ -254,11 +257,15 @@ def stereo_rectify_rotations(serial=ATLAS_SERIAL, db_path=_CALIB_DB):
     return R_half, R_rel.T @ R_half
 
 
-def fuse_eyes(left, right, mask0, mask1, mode="fill"):
+def fuse_eyes(left, right, mask0, mask1, mode="cam0"):
     """Combine the two rectified eyes (same virtual camera) into ONE image.
 
-    'fill': cam0 base, cam1 fills only cam0's out-of-FoV border -> no parallax
-    ghosting. 'blend': average where both eyes are valid (classic fused look)."""
+    'cam0': cam0 ONLY (right/masks ignored) -> single optical center, so the
+    front K (which uses cam0) is exactly consistent and there is no parallax
+    ghosting anywhere. 'fill': cam0 base, cam1 fills only cam0's out-of-FoV
+    border. 'blend': average where both eyes are valid (classic fused look)."""
+    if mode == "cam0":
+        return left.copy()
     if mode == "fill":
         out = left.copy()
         holes = mask1 & ~mask0
@@ -283,6 +290,27 @@ def edge_crop(img, left=0, right=0, top=0, bottom=0):
     return img[y0:y1, x0:x1]
 
 
+def stereo_front_output_intrinsics(serial=ATLAS_SERIAL,
+                                   rig_config_path=DEFAULT_RIG_CONFIG):
+    """Pinhole K (3x4) of the fused front image (``front_img_1``), derived from
+    cam0's double-sphere focal length + the ROI crop in ``rig_aim.json`` — the
+    SAME formula ``StereoFrontProcessor`` uses, but WITHOUT building the remap
+    tables (no cv2). A pure re-aim rotation about the optical center leaves
+    fx/fy/cx/cy unchanged, so only the crop shifts the (centered) principal point.
+
+    This is the single source of truth for ``YAM_INTRINSICS`` — derive, don't copy,
+    so the intrinsics track the deployed serial and any crop change automatically.
+    """
+    cam0 = load_ds_intrinsics(serial, 0)
+    cfg = load_rig_aim(serial, rig_config_path)
+    w, h = cam0["width"], cam0["height"]
+    cx = w / 2.0 - int(cfg["crop_left"])
+    cy = h / 2.0 - int(cfg["crop_top"])
+    return np.array([[cam0["fx"], 0.0, cx, 0.0],
+                     [0.0, cam0["fy"], cy, 0.0],
+                     [0.0, 0.0, 1.0, 0.0]], dtype=np.float64)
+
+
 class StereoFrontProcessor:
     """Rectify + re-aim + fuse + crop the Atlas forward stereo pair into ONE
     pinhole front image (``front_img_1``).
@@ -296,7 +324,7 @@ class StereoFrontProcessor:
     def __init__(self, serial=ATLAS_SERIAL, rig_config_path=DEFAULT_RIG_CONFIG,
                  pitch_deg=None, yaw_deg=None, roll_deg=None,
                  crop_left=None, crop_right=None, crop_top=None, crop_bottom=None,
-                 fuse_mode="fill", stereo_rectify=False):
+                 fuse_mode="cam0", stereo_rectify=False):
         if cv2 is None:
             raise ImportError("opencv (cv2) is required for stereo rectification")
         cfg = load_rig_aim(serial, rig_config_path)
@@ -556,7 +584,7 @@ class AtlasStereoCamera(threading.Thread):
 
     def __init__(self, serial=ATLAS_SERIAL, crop_frac=STEREO_CROP_FRACTION,
                  fps=30, device=None, raw=False, rig_config_path=DEFAULT_RIG_CONFIG,
-                 fuse_mode="fill", stereo_rectify=False):
+                 fuse_mode="cam0", stereo_rectify=False):
         super().__init__(daemon=True)
         if cv2 is None:
             raise ImportError("opencv (cv2) is required for the Atlas stereo camera")

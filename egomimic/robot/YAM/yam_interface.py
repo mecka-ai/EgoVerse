@@ -49,6 +49,55 @@ except Exception:  # pragma: no cover - base import is optional for YAM
 # Site (frame) used for FK/IK in the YAM MuJoCo model.
 _GRASP_SITE = "grasp_site"
 
+
+def _patch_kinematics_xml(xml_path, arm="right"):
+    """Correct the combined MuJoCo XML for the YAM rig; returns a new file path.
+
+    Fixes live in tracked EgoVerse code because external/i2rt is
+    gitignored/vendored (an edit there would not persist):
+
+    1. (both arms) joint6 axis NEGATED: i2rt's config/no_gripper.yml sets
+       last_joint_mount.yam.axis = "0 0 1", sign-flipped vs yam.urdf and the
+       physical joint-6 encoder. Uncorrected, mink FK/IK diverge from the real arm
+       by a config-dependent ~10deg (breaks camframe obs + hand-eye calibration).
+       Verified: after the flip, mink FK == URDF eef_link FK (rot corr 1.000) and
+       matches the AprilTag ground truth.
+
+    2. (LEFT arm only) grasp_site rotated 180 deg about its z (tool) axis.
+       EE frame convention (per-arm base, at q=0):
+         right (stock, the default): x DOWN, y LEFT,  z = tool forward
+         left  (z-rolled 180 deg):   x UP,   y RIGHT, z = tool forward
+       Both are proper right-handed frames; patching the SITE keeps mink FK and
+       IK consistent (get_pose <-> set_pose round-trips). The hand-eye extrinsic
+       is unaffected (a constant gripper relabel cancels in AX=XB), but eepose /
+       observations recorded under a different site convention are
+       frame-incompatible.
+
+    Remove shim if i2rt fixes these upstream.
+    """
+    import xml.etree.ElementTree as ET
+    from scipy.spatial.transform import Rotation as _Rot
+
+    tree = ET.parse(xml_path)
+    j6 = tree.getroot().find(".//joint[@name='joint6']")
+    if j6 is not None:
+        ax = [float(x) for x in j6.get("axis", "0 0 1").split()]
+        j6.set("axis", " ".join(f"{-a:g}" for a in ax))
+
+    if arm == "left":
+        site = tree.getroot().find(".//site[@name='grasp_site']")
+        if site is not None:
+            w, x, y, z = [float(v) for v in site.get("quat", "1 0 0 0").split()]
+            r_old = _Rot.from_quat([x, y, z, w])                 # scipy xyzw
+            r_new = r_old * _Rot.from_euler("z", 180, degrees=True)  # about site z (tool)
+            qx, qy, qz, qw = r_new.as_quat()
+            site.set("quat", f"{qw:g} {qx:g} {qy:g} {qz:g}")
+
+    suffix = f"_fix_{arm}.xml"
+    out_path = (xml_path[:-4] + suffix) if xml_path.endswith(".xml") else xml_path + suffix
+    tree.write(out_path)
+    return out_path
+
 # Default CAN channel per arm. Override via the `channels` ctor arg.
 _DEFAULT_CHANNELS = {"left": "can0", "right": "can1"}
 
@@ -128,7 +177,7 @@ class YAMInterface(Robot_Interface):
         # Note: with NO_GRIPPER the grasp_site sits at the wrist flange, so
         # get_pose() reports the flange frame (add a fixed gripper offset
         # downstream if you need the fingertip grasp point).
-        kin_model_path = combine_arm_and_gripper_xml(self.arm_type, GripperType.NO_GRIPPER)
+        base_xml = combine_arm_and_gripper_xml(self.arm_type, GripperType.NO_GRIPPER)
 
         for arm in self.arms:
             if arm not in self.channels:
@@ -141,30 +190,12 @@ class YAMInterface(Robot_Interface):
                 gripper_limits_override=self._gripper_limits_override,
             )
 
-            # === TEMP: soften the follower PD for safe rollout bring-up ========
-            # Lower the ARM-joint kp/kd (NOT the gripper, kept full so grasps
-            # still hold) so an off prediction nudges instead of slamming. This
-            # is a temporary bring-up aid — set YAM_PD_SCALE=1.0 to restore the
-            # SDK defaults, or delete this block. Applied live via update_kp_kd
-            # (control loop reads self._kp/_kd each tick).
-            _pd_scale = float(os.environ.get("YAM_PD_SCALE", "0.5"))
-            if _pd_scale != 1.0:
-                ctrl = self.controller[arm]
-                new_kp = np.asarray(ctrl._kp, dtype=float).copy()
-                new_kd = np.asarray(ctrl._kd, dtype=float).copy()
-                new_kp[:6] *= _pd_scale  # arm joints only; leave gripper [6] as-is
-                new_kd[:6] *= _pd_scale
-                ctrl.update_kp_kd(new_kp, new_kd)
-                print(
-                    f"[YAM][TEMP] {arm}: scaled arm PD by {_pd_scale} -> "
-                    f"kp[:6]={np.round(new_kp[:6], 2)} kd[:6]={np.round(new_kd[:6], 2)} "
-                    f"(YAM_PD_SCALE=1.0 to disable)"
-                )
-            # === END TEMP =====================================================
-
             # Each arm gets its own solver: mink.Configuration holds internal
-            # state, so sharing one across arms would race.
-            self.kinematics[arm] = Kinematics(kin_model_path, _GRASP_SITE)
+            # state, so sharing one across arms would race. The model is patched
+            # PER ARM (joint-6 fix for both; left additionally gets the 180deg
+            # grasp_site z-roll -> x-up/y-right vs right's stock x-down/y-left).
+            self.kinematics[arm] = Kinematics(
+                _patch_kinematics_xml(base_xml, arm), _GRASP_SITE)
 
     def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None,
                               front_raw=False):
@@ -253,10 +284,14 @@ class YAMInterface(Robot_Interface):
         self.set_joints(joints, arm)
         return joints
 
+    # Home joint config (deg): all-zeros configuration, gripper open.
+    _HOME_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
     def set_home(self):
-        """Move every arm to the zero configuration with the gripper open."""
+        """Move every arm to the home config (EE on the base y=0 plane), gripper open."""
         for arm in self.arms:
             home = np.zeros(7, dtype=np.float64)
+            home[: self.N_ARM_JOINTS] = np.deg2rad(self._HOME_DEG)
             home[6] = 1.0  # gripper open
             # Smooth interpolated move when available; else a single command.
             mover = getattr(self.controller[arm], "move_joints", None)
@@ -265,6 +300,14 @@ class YAMInterface(Robot_Interface):
             else:
                 self.set_joints(home, arm)
                 time.sleep(1.0)
+        # DEBUG: EE pose of each wrist at home (FK of the current joints).
+        for arm in self.arms:
+            xyz, rot = self.get_pose(arm, se3=False)
+            ypr = rot.as_euler("ZYX", degrees=True)
+            print(
+                f"[YAM home] {arm} eepose: xyz(m)={np.round(xyz, 4)}  "
+                f"ypr(deg)={np.round(ypr, 1)}"
+            )
 
     # ------------------------------------------------------------------
     # Observations
@@ -315,7 +358,17 @@ class YAMInterface(Robot_Interface):
         return joints[:7]
 
     def get_pose(self, arm, se3=False):
-        """Forward kinematics for one arm.
+        """Forward kinematics for one arm (patched mink grasp_site frame).
+
+        Frame convention (see _patch_kinematics_xml), per-arm base at q=0:
+          right (stock, default): x DOWN, y LEFT,  z = tool forward
+          left  (z-rolled 180):   x UP,   y RIGHT, z = tool forward
+        The underlying mink model carries the tracked-in-repo joint-6 axis fix
+        (vendored no_gripper.yml disagrees with yam.urdf + the physical encoder;
+        unpatched FK is ~10deg off, config-dependent). With the joint fix,
+        mink FK == URDF eef_link FK (rot corr 1.000) and matches the AprilTag
+        ground truth. FK here and solve_ik share this model, so they stay
+        consistent. (yam_fk.py is the independent URDF FK used to validate.)
 
         Args:
             arm (str): "left" or "right".
