@@ -163,6 +163,9 @@ class Aria(Human):
             return _build_human_keypoints_eef_frame_transform_list(
                 stride=cls.ACTION_STRIDE, is_quat=True
             )
+        # Fail here, not later as a dataset with no transforms (KeyError on
+        # actions_cartesian deep in the loader).
+        raise ValueError(f"Unknown Aria transform mode: {mode!r}")
 
     @classmethod
     def _get_keymap(
@@ -265,6 +268,9 @@ class Scale(Human):
                 stride=cls.ACTION_STRIDE,
                 rot_repr="6d",
             )
+        # Fail here, not later as a dataset with no transforms (KeyError on
+        # actions_cartesian deep in the loader).
+        raise ValueError(f"Unknown Scale transform mode: {mode!r}")
 
     @classmethod
     def _get_keymap(

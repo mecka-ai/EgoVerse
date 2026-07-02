@@ -72,6 +72,9 @@ class Eva(Embodiment):
             return _build_eva_bimanual_eef_frame_transform_list(
                 is_quat=True, extrinsics_key=extrinsics_key
             )
+        # Fail here, not later as a dataset with no transforms (KeyError on
+        # actions_cartesian deep in the loader).
+        raise ValueError(f"Unknown Eva transform mode: {mode!r}")
 
     @classmethod
     def _get_keymap(cls, keymap_mode: str):

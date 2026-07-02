@@ -258,12 +258,7 @@ class EpisodeResolver:
         self.norm_stats = norm_stats
         self.pause_removal_epsilon = pause_removal_epsilon
 
-    def _load_zarr_datasets(
-        self,
-        search_path: Path,
-        valid_folder_names: set[str],
-        meta_lookup: dict | None = None,
-    ):
+    def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
         """
         Loads multiple Zarr datasets from the specified folder path, filtering only those whose hashes
         are present in the valid_folder_names set.
@@ -271,10 +266,6 @@ class EpisodeResolver:
         Args:
             search_path (Path): The root directory to search for Zarr datasets.
             valid_folder_names (set[str]): A set of valid folder names (episode hashes without ".zarr") to filter datasets.
-            meta_lookup (dict | None): optional {hash: {"num_frames": int, "embodiment": str}}.
-                When an episode is present, its dataset is built via the DEFERRED fast-path
-                (len known up front, zarr opened lazily on first __getitem__) instead of the
-                eager open — avoids the per-worker open storm. Missing/None -> eager.
         Returns:
             dict[str, ZarrDataset]: a dictionary mapping string keys to constructed zarr datasets from valid filters.
         """
@@ -301,16 +292,12 @@ class EpisodeResolver:
                 skipped.append(p.name)
                 continue
             try:
-                meta = meta_lookup.get(name) if meta_lookup else None
                 ds_obj = dataset_class(
                     p,
                     key_map=self.key_map,
                     transform_list=self.transform_list,
                     norm_stats=self.norm_stats,
                     pause_removal_epsilon=self.pause_removal_epsilon,
-                    # Deferred fast-path when the manifest has this episode; else eager.
-                    _total_frames=meta["num_frames"] if meta else None,
-                    _embodiment=meta["embodiment"] if meta else None,
                 )
                 datasets[name] = ds_obj
             except Exception as e:
@@ -715,7 +702,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
         pause_removal_epsilon: float | None = None,
-        metadata_manifest: str | None = None,
     ):
         super().__init__(
             folder_path,
@@ -728,18 +714,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         self.allowed_episode_ids = (
             set(allowed_episode_ids) if allowed_episode_ids else None
         )
-        # Optional {hash: {num_frames, embodiment}} manifest (build_meta_manifest.py).
-        # When set, datasets use the DEFERRED fast-path: len known from the manifest,
-        # zarr opened lazily on first __getitem__ -> no eager per-worker open storm.
-        self._meta_lookup = None
-        if metadata_manifest:
-            with open(metadata_manifest) as f:
-                self._meta_lookup = json.load(f)
-            logger.info(
-                "metadata_manifest: %d entries from %s (deferred zarr open)",
-                len(self._meta_lookup),
-                metadata_manifest,
-            )
 
     @staticmethod
     def _local_filters_match(
@@ -824,19 +798,12 @@ class LocalEpisodeResolver(EpisodeResolver):
                 ):
                     if candidate.is_dir():
                         try:
-                            m = (
-                                self._meta_lookup.get(episode_hash)
-                                if self._meta_lookup
-                                else None
-                            )
                             datasets[episode_hash] = dataset_class(
                                 candidate,
                                 key_map=self.key_map,
                                 transform_list=self.transform_list,
                                 norm_stats=self.norm_stats,
                                 pause_removal_epsilon=self.pause_removal_epsilon,
-                                _total_frames=m["num_frames"] if m else None,
-                                _embodiment=m["embodiment"] if m else None,
                             )
                         except Exception as e:
                             logger.error(
@@ -866,9 +833,7 @@ class LocalEpisodeResolver(EpisodeResolver):
                 "filters matched no episodes in the local directory."
             )
         datasets = self._load_zarr_datasets(
-            search_path=self.folder_path,
-            valid_folder_names=valid_folder_names,
-            meta_lookup=self._meta_lookup,
+            search_path=self.folder_path, valid_folder_names=valid_folder_names
         )
         self._run_pause_precompute(datasets)
         return datasets
