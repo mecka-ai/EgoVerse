@@ -50,24 +50,29 @@ except Exception:  # pragma: no cover - base import is optional for YAM
 _GRASP_SITE = "grasp_site"
 
 
-def _patch_kinematics_xml(xml_path, arm="right"):
+def _patch_kinematics_xml(xml_path, arm="right", convention="default"):
     """Correct the combined MuJoCo XML for the YAM rig; returns a new file path.
 
     Fixes live in tracked EgoVerse code because external/i2rt is
     gitignored/vendored (an edit there would not persist):
 
-    1. (both arms) joint6 axis NEGATED: i2rt's config/no_gripper.yml sets
+    1. (always) joint6 axis NEGATED: i2rt's config/no_gripper.yml sets
        last_joint_mount.yam.axis = "0 0 1", sign-flipped vs yam.urdf and the
        physical joint-6 encoder. Uncorrected, mink FK/IK diverge from the real arm
        by a config-dependent ~10deg (breaks camframe obs + hand-eye calibration).
        Verified: after the flip, mink FK == URDF eef_link FK (rot corr 1.000) and
        matches the AprilTag ground truth.
 
-    2. (LEFT arm only) grasp_site rotated 180 deg about its z (tool) axis.
-       EE frame convention (per-arm base, at q=0):
-         right (stock, the default): x DOWN, y LEFT,  z = tool forward
-         left  (z-rolled 180 deg):   x UP,   y RIGHT, z = tool forward
-       Both are proper right-handed frames; patching the SITE keeps mink FK and
+    2. grasp_site orientation, selected by ``convention`` (per-arm base, at q=0):
+
+       "default" (both arms identical; the OpenCV/camera axis convention):
+         both: x RIGHT, y DOWN, z = tool FORWARD   (stock post-rotated Rz(-90))
+
+       "libero" (both arms identical, matches LIBERO/robosuite and EVA's
+       eef_link: identity with the arm base at q=0, tool axis = x):
+         both: x = tool FORWARD, y LEFT, z UP    (stock post-rotated Ry(-90))
+
+       All are proper right-handed frames; patching the SITE keeps mink FK and
        IK consistent (get_pose <-> set_pose round-trips). The hand-eye extrinsic
        is unaffected (a constant gripper relabel cancels in AX=XB), but eepose /
        observations recorded under a different site convention are
@@ -78,22 +83,29 @@ def _patch_kinematics_xml(xml_path, arm="right"):
     import xml.etree.ElementTree as ET
     from scipy.spatial.transform import Rotation as _Rot
 
+    if convention not in ("default", "libero"):
+        raise ValueError(f"unknown EE frame convention '{convention}'")
+
     tree = ET.parse(xml_path)
     j6 = tree.getroot().find(".//joint[@name='joint6']")
     if j6 is not None:
         ax = [float(x) for x in j6.get("axis", "0 0 1").split()]
         j6.set("axis", " ".join(f"{-a:g}" for a in ax))
 
-    if arm == "left":
+    if convention == "libero":
+        site_rot = _Rot.from_euler("y", -90, degrees=True)   # both arms: x=tool fwd, y left, z up
+    else:  # "default"
+        site_rot = _Rot.from_euler("z", -90, degrees=True)   # both arms: x right, y down, z=tool fwd
+
+    if site_rot is not None:
         site = tree.getroot().find(".//site[@name='grasp_site']")
         if site is not None:
             w, x, y, z = [float(v) for v in site.get("quat", "1 0 0 0").split()]
-            r_old = _Rot.from_quat([x, y, z, w])                 # scipy xyzw
-            r_new = r_old * _Rot.from_euler("z", 180, degrees=True)  # about site z (tool)
+            r_new = _Rot.from_quat([x, y, z, w]) * site_rot   # post-multiply (body side)
             qx, qy, qz, qw = r_new.as_quat()
             site.set("quat", f"{qw:g} {qx:g} {qy:g} {qz:g}")
 
-    suffix = f"_fix_{arm}.xml"
+    suffix = f"_fix_{arm}_{convention}.xml"
     out_path = (xml_path[:-4] + suffix) if xml_path.endswith(".xml") else xml_path + suffix
     tree.write(out_path)
     return out_path
@@ -120,10 +132,16 @@ class YAMInterface(Robot_Interface):
         camera_names=None,
         cameras_cfg=None,
         front_raw=False,
+        ee_frame_convention="default",
     ):
         """
         Args:
             arms (list[str]): subset of ["left", "right"].
+            ee_frame_convention (str): grasp_site frame for FK/IK, same for both
+                arms — "default" (x right, y down, z = tool forward; the
+                OpenCV/camera axis convention) or "libero" (x = tool forward,
+                y left, z up — matches LIBERO/robosuite + EVA eef_link).
+                See _patch_kinematics_xml.
             channels (dict[str, str] | None): CAN channel per arm, e.g.
                 {"left": "can0", "right": "can1"}. Defaults to _DEFAULT_CHANNELS.
             gripper_type (GripperType): YAM gripper variant.
@@ -152,6 +170,7 @@ class YAMInterface(Robot_Interface):
         self.arm_type = arm_type
         self._zero_gravity_mode = zero_gravity_mode
         self._gripper_limits_override = gripper_limits_override
+        self.ee_frame_convention = ee_frame_convention
 
         # Controllers: one YAM robot + kinematics solver per arm.
         self.controller = {}
@@ -195,7 +214,8 @@ class YAMInterface(Robot_Interface):
             # PER ARM (joint-6 fix for both; left additionally gets the 180deg
             # grasp_site z-roll -> x-up/y-right vs right's stock x-down/y-left).
             self.kinematics[arm] = Kinematics(
-                _patch_kinematics_xml(base_xml, arm), _GRASP_SITE)
+                _patch_kinematics_xml(base_xml, arm, self.ee_frame_convention),
+                _GRASP_SITE)
 
     def _create_cam_recorders(self, cameras_cfg=None, wrist_serial_to_name=None,
                               front_raw=False):
@@ -285,7 +305,7 @@ class YAMInterface(Robot_Interface):
         return joints
 
     # Home joint config (deg): all-zeros configuration, gripper open.
-    _HOME_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    _HOME_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     def set_home(self):
         """Move every arm to the home config (EE on the base y=0 plane), gripper open."""
@@ -360,9 +380,10 @@ class YAMInterface(Robot_Interface):
     def get_pose(self, arm, se3=False):
         """Forward kinematics for one arm (patched mink grasp_site frame).
 
-        Frame convention (see _patch_kinematics_xml), per-arm base at q=0:
-          right (stock, default): x DOWN, y LEFT,  z = tool forward
-          left  (z-rolled 180):   x UP,   y RIGHT, z = tool forward
+        Frame convention (see _patch_kinematics_xml), per-arm base at q=0,
+        identical for both arms; selected by ee_frame_convention:
+          "default": x RIGHT, y DOWN, z = tool forward   (OpenCV axis convention)
+          "libero":  x = tool forward, y LEFT, z UP      (LIBERO/EVA eef_link)
         The underlying mink model carries the tracked-in-repo joint-6 axis fix
         (vendored no_gripper.yml disagrees with yam.urdf + the physical encoder;
         unpatched FK is ~10deg off, config-dependent). With the joint fix,

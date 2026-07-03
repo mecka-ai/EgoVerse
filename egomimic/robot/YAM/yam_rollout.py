@@ -272,7 +272,8 @@ TEMP_DIR = "/home/robot/temp_dir"
 
 
 def _build_robot_interface(
-    arms_list, robot="eva", offline_debug=False, offline_episode_path=None, yam_channels=None
+    arms_list, robot="eva", offline_debug=False, offline_episode_path=None,
+    yam_channels=None, yam_ee_convention="default",
 ):
     if robot == "yam":
         if offline_debug:
@@ -284,7 +285,8 @@ def _build_robot_interface(
         # YAMInterface always opens its cameras, so get_obs() includes
         # front_img_1 / left_wrist_img / right_wrist_img — the keys the obs
         # pipeline consumes (and it raises if no cameras are available).
-        return YAMInterface(arms=arms_list, channels=yam_channels)
+        return YAMInterface(arms=arms_list, channels=yam_channels,
+                            ee_frame_convention=yam_ee_convention)
 
     if offline_debug:
         from robot_interface import OfflineARXInterface
@@ -1016,7 +1018,42 @@ def render_pred_overlay(actions, front_img):
     return Yam.viz_transformed_batch(viz_batch, mode="traj+rotation")
 
 
-def preview_and_confirm(actions, front_img, step_i, annotation=None):
+def _compose_with_wrist_cams(overlay, obs, arms):
+    """Stack the front-cam action overlay with the raw wrist-cam frames so the
+    preview window shows ``[left wrist | front (+overlay) | right wrist]``.
+
+    Wrist frames (obs["left_wrist_img"] / ["right_wrist_img"], BGR HWC) are
+    resized to the overlay height and hstacked; a missing cam (single-arm run)
+    is skipped. Returns the composite BGR image, or the bare overlay if there
+    are no wrist cams to add.
+    """
+    h = overlay.shape[0]
+
+    def _panel(key, label):
+        img = obs.get(key)
+        if img is None:
+            return None
+        p = _front_img_to_uint8_hwc(img)
+        scale = h / p.shape[0]
+        p = cv2.resize(p, (max(1, int(round(p.shape[1] * scale))), h))
+        cv2.putText(p, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+        cv2.putText(p, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        return p
+
+    panels = []
+    if arms in ("left", "both"):
+        lp = _panel("left_wrist_img", "left wrist")
+        if lp is not None:
+            panels.append(lp)
+    panels.append(overlay)
+    if arms in ("right", "both"):
+        rp = _panel("right_wrist_img", "right wrist")
+        if rp is not None:
+            panels.append(rp)
+    return np.hstack(panels) if len(panels) > 1 else overlay
+
+
+def preview_and_confirm(actions, obs, step_i, annotation=None, arms="both"):
     """Show the predicted-action overlay and BLOCK until the operator decides.
 
     The arm is NOT commanded until this returns. Keys (focus the preview window):
@@ -1025,7 +1062,8 @@ def preview_and_confirm(actions, front_img, step_i, annotation=None):
         q / ESC           -> quit the rollout
     Returns 'execute', 'skip', or 'quit'.
     """
-    overlay = render_pred_overlay(actions, front_img)
+    overlay = render_pred_overlay(actions, obs["front_img_1"])
+    overlay = _compose_with_wrist_cams(overlay, obs, arms)
     banner = f"step {step_i}" + (f"  |  prompt: {annotation}" if annotation else "")
     hint = "ENTER/space = EXECUTE    s = skip    q = quit"
     h = overlay.shape[0]
@@ -1045,11 +1083,12 @@ def preview_and_confirm(actions, front_img, step_i, annotation=None):
             return "quit"
 
 
-def preview_live_update(actions, front_img, step_i, annotation=None):
+def preview_live_update(actions, obs, step_i, annotation=None, arms="both"):
     """Non-blocking live overlay: refresh the window with the latest predicted
     chunk and return immediately (the rollout keeps executing). Returns True if
     the operator pressed q/ESC in the window (quit), else False."""
-    overlay = render_pred_overlay(actions, front_img)
+    overlay = render_pred_overlay(actions, obs["front_img_1"])
+    overlay = _compose_with_wrist_cams(overlay, obs, arms)
     banner = f"step {step_i} (LIVE)" + (f"  |  {annotation}" if annotation else "")
     cv2.putText(overlay, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
     cv2.putText(overlay, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
@@ -1093,6 +1132,7 @@ def main(
     robot="yam",
     extrinsics_key=None,
     yam_channels=None,
+    yam_ee_convention="default",
     preview=False,
     preview_live=False,
     no_execute=False,
@@ -1123,6 +1163,7 @@ def main(
         offline_debug=offline_debug,
         offline_episode_path=offline_episode_path,
         yam_channels=yam_channels,
+        yam_ee_convention=yam_ee_convention,
     )
 
     if policy_path is not None:
@@ -1177,6 +1218,7 @@ def main(
         termios.tcsetattr(kp.fd, termios.TCSADRAIN, kp.old)
         print("\n--- INTERVENTION (rollout paused) ---")
         print("  c            : continue rollout")
+        print("  h            : send arms to home (does not clear policy state)")
         print("  a <path>     : load new annotation file")
         print("  r            : restart rollout")
         print("  q            : quit")
@@ -1195,6 +1237,10 @@ def main(
             elif cmd == "q":
                 tty.setcbreak(kp.fd)
                 return "quit"
+            elif cmd == "h":
+                print("Sending arms to home...")
+                ri.set_home()
+                print("Arms at home. Still paused — c to continue, r to restart, q to quit.")
             elif cmd == "r":
                 tty.setcbreak(kp.fd)
                 return "restart"
@@ -1208,7 +1254,7 @@ def main(
                     continue
                 policy.load_annotation(ann_path)
             else:
-                print(f"Unknown command: '{cmd}'. Use c / a <path> / r / q.")
+                print(f"Unknown command: '{cmd}'. Use c / h / a <path> / r / q.")
 
     try:
         with _KeyPoll() as kp:
@@ -1286,9 +1332,10 @@ def main(
                         ):
                             decision = preview_and_confirm(
                                 policy.debug_actions,
-                                obs["front_img_1"],
+                                obs,
                                 step_i,
                                 annotation=getattr(policy, "annotation", None),
+                                arms=arms,
                             )
                             if decision == "quit":
                                 print("Quit requested from preview.")
@@ -1304,9 +1351,10 @@ def main(
                             if step_i % query_frequency == 0:
                                 if preview_live_update(
                                     policy.debug_actions,
-                                    obs["front_img_1"],
+                                    obs,
                                     step_i,
                                     annotation=getattr(policy, "annotation", None),
+                                    arms=arms,
                                 ):
                                     print("Quit requested from live preview.")
                                     return
@@ -1454,6 +1502,15 @@ def build_arg_parser(description="Rollout robot model."):
         default="can_follower_r",
         help="CAN channel for the right YAM follower arm (--robot yam).",
     )
+    parser.add_argument(
+        "--ee-convention",
+        type=str,
+        default="default",
+        choices=["default", "libero"],
+        help="YAM grasp_site frame convention (--robot yam). MUST match the "
+        "convention the training demos were collected with. 'libero' = both arms "
+        "x fwd / y left / z up (LIBERO/EVA-congruent); see yam_interface.",
+    )
     return parser
 
 
@@ -1475,6 +1532,7 @@ def run_from_args(args):
         robot=args.robot,
         extrinsics_key=args.extrinsics_key,
         yam_channels={"left": args.yam_left_can, "right": args.yam_right_can},
+        yam_ee_convention=args.ee_convention,
         preview=args.preview,
         preview_live=args.preview_live,
         no_execute=args.no_execute,
