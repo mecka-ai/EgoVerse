@@ -951,6 +951,33 @@ class PolicyRollout(Rollout):
         self.policy.eval()
 
 
+# Training front-image geometry: the zarr conversion (eva_to_zarr
+# resize_video_thwc) stores front_img_1 STRETCH-resized from the stereo
+# pipeline's native re-aimed crop (~1420x880) to 640x480, so the policy,
+# eval viz, and INTRINSICS["yam"] all live at 640x480. The live
+# AtlasStereoCamera emits the NATIVE crop instead.
+_FRONT_TRAINING_WH = (640, 480)
+
+
+def _match_training_front_resolution(obs):
+    """Stretch-resize ``obs["front_img_1"]`` in place to the training resolution.
+
+    Without this the policy sees a differently-scaled, un-stretched scene at
+    rollout than it trained on (a real train/deploy distribution shift), and
+    the debug/preview overlays project with a K that does not match the image.
+    Applied once at obs ingestion so the model input, ``debug_policy`` /
+    ``preview_and_confirm`` overlays, and ``INTRINSICS["yam"]`` stay mutually
+    consistent. No-op for frames already at 640x480 (e.g. the wrist cams or a
+    future collection stack that resizes on-camera).
+    """
+    f = obs.get("front_img_1")
+    if f is not None and f.shape[:2] != (_FRONT_TRAINING_WH[1], _FRONT_TRAINING_WH[0]):
+        obs["front_img_1"] = cv2.resize(
+            f, _FRONT_TRAINING_WH, interpolation=cv2.INTER_AREA
+        )
+    return obs
+
+
 def debug_policy(
     actions, front_img, step_i
 ):
@@ -1248,6 +1275,7 @@ def main(
                         actions = None
                         if rollout_type == "policy":
                             obs = ri.get_obs()
+                            _match_training_front_resolution(obs)
                             actions = policy.rollout_step(step_i, obs)
                         elif rollout_type == "replay":
                             actions = policy.rollout_step(step_i)
