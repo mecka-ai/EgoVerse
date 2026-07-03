@@ -16,6 +16,7 @@
 # Usage:
 #   ./run_yam_pick_hat_wrist.sh                # full run, 8 GPUs, tmux
 #   SMOKE=1 ./run_yam_pick_hat_wrist.sh        # inline pipeline smoke (trainer=debug, 1 GPU)
+#   SMOKE=1 SMOKE_GPUS=4 ./run_yam_pick_hat_wrist.sh  # smoke with DDP across 4 GPUs
 #   GPUS=4 LR=1e-4 ./run_yam_pick_hat_wrist.sh # tweak resources
 #   CKPT_PATH=/abs/last.ckpt ./run_yam_pick_hat_wrist.sh   # resume an interrupted run
 set -euo pipefail
@@ -44,12 +45,12 @@ LR="${LR:-5e-5}"
 NORM_PATH="${NORM_PATH:-}"
 NORM_SAMPLE_FRAC="${NORM_SAMPLE_FRAC:-1.0}"
 GPUS="${GPUS:-8}"
-# Step-based cadence. ~13k train frames -> a few hundred steps/epoch, so val
-# every 500 steps and viz every 4th val. VIZ/CKPT must be multiples of
-# VAL_INTERVAL for the step-modulo gates to line up with validation passes.
-VAL_INTERVAL="${VAL_INTERVAL:-500}"
-VIZ_EVERY="${VIZ_EVERY:-2000}"
-CKPT_EVERY="${CKPT_EVERY:-1000}"
+# Step-based cadence: val every 1000 steps, ckpt every 2000, viz every 5000
+# (every 5th val). VIZ must be a multiple of VAL_INTERVAL for the step-modulo
+# gate to line up with a validation pass.
+VAL_INTERVAL="${VAL_INTERVAL:-1000}"
+VIZ_EVERY="${VIZ_EVERY:-5000}"
+CKPT_EVERY="${CKPT_EVERY:-2000}"
 CKPT_PATH="${CKPT_PATH:-}"
 MAX_STEPS="${MAX_STEPS:-}"
 SAVE_TOP_K="${SAVE_TOP_K:-3}"
@@ -84,6 +85,7 @@ if [[ -n "$SMOKE" ]]; then
   _common_env
   export HF_TOKEN="$(grep -oP 'HF_TOKEN=\K.*' "$KEYFILE" || true)"
   export WANDB_MODE=disabled
+  SMOKE_GPUS="${SMOKE_GPUS:-1}"
   [[ -f "$WEIGHT_PATH/model.safetensors" ]] || {
     echo "ERROR: base weights not found: $WEIGHT_PATH/model.safetensors" >&2; exit 1; }
 
@@ -94,7 +96,7 @@ if [[ -n "$SMOKE" ]]; then
     "visualization=$VIZ"
     "model.robomimic_model.config.pytorch_weight_path=$WEIGHT_PATH"
     trainer=debug
-    launch_params.gpus_per_node=1
+    "launch_params.gpus_per_node=$SMOKE_GPUS"
     # Fire viz every step so the wrist->cam revert path is exercised in the smoke.
     evaluator.viz_every_n_steps=1
     train_viz_evaluator.viz_every_n_steps=1
