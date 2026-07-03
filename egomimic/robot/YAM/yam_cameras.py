@@ -727,7 +727,7 @@ class AtlasStereoCamera(threading.Thread):
 # =====================================================================
 DEFAULT_CAMERA_NAMES = {
     "353322270967": "right_wrist_img",
-    "323622270294": "left_wrist_img",
+    "353322271563": "left_wrist_img",
 }
 
 # Per-camera RealSense resolution overrides, keyed by friendly name ->

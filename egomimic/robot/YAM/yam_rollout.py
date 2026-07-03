@@ -59,19 +59,16 @@ from scipy.spatial.transform import Rotation as R
 from egomimic.models.denoising_policy import DenoisingPolicy
 from egomimic.pl_utils.pl_model import ModelWrapper
 from egomimic.pl_utils.pl_data_utils import build_tokenized_collate
-from egomimic.rldb.embodiment.embodiment import get_embodiment, get_embodiment_id
+from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.embodiment.eva import (
     Eva,
     _build_eva_bimanual_revert_eef_frame_transform_list,
 )
 from egomimic.rldb.embodiment.yam import Yam
-from egomimic.robot.eva.eva_kinematics import EvaMinkKinematicsSolver
 from egomimic.utils.egomimicUtils import (
     CameraTransforms,
     cam_frame_to_base_frame,
-    draw_actions,
     interpolate_arr,
-    interpolate_arr_euler,
 )
 from egomimic.utils.pose_utils import xyzw_to_wxyz
 
@@ -81,21 +78,6 @@ from egomimic.utils.pose_utils import xyzw_to_wxyz
 import select
 import termios
 import tty
-
-
-def visualize_actions(ims, actions, extrinsics, intrinsics, arm="both"):
-    if actions.shape[-1] == 7 or actions.shape[-1] == 14:
-        ac_type = "joints"
-    elif actions.shape[-1] == 3 or actions.shape[-1] == 6:
-        ac_type = "xyz"
-    else:
-        raise ValueError(f"Unknown action type with shape {actions.shape}")
-
-    ims = draw_actions(
-        ims, ac_type, "Purples", actions, extrinsics, intrinsics, arm=arm
-    )
-
-    return ims
 
 
 R_t_e = np.array(
@@ -134,36 +116,6 @@ def ee_pose_to_rot_ee_frame(pose):
     return ee_pose_to_rot_ee_frame_batch(pose[None, ...])[0]
 
 
-# --- one-shot orientation diagnostic (localize a wrist flip) -----------------
-def _geodesic_deg(Ra, Rb):
-    """Angle (deg) between two rotation matrices."""
-    c = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
-    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
-
-
-def _bimanual_rot_mats(vec, use_6d):
-    """(left_R, right_R) 3x3 from a bimanual pose row.
-
-    use_6d  -> per-arm [xyz(3) c1(3) c2(3) (grip)], rot cols at [0:9]/[10:19].
-    not 6d  -> per-arm ypr [xyz(3) ypr(3) (grip)], ypr at [3:6]/[10:13] (ZYX).
-    """
-    vec = np.asarray(vec, dtype=float)
-    if vec.ndim > 1:
-        vec = vec[0]  # first chunk row
-    if use_6d:
-        from egomimic.utils.pose_utils import _xyz6d_to_matrix
-        L = _xyz6d_to_matrix(vec[0:9][None])[0, :3, :3]
-        Rr = _xyz6d_to_matrix(vec[10:19][None])[0, :3, :3]
-    else:
-        L = R.from_euler("ZYX", vec[3:6]).as_matrix()
-        Rr = R.from_euler("ZYX", vec[10:13]).as_matrix()
-    return L, Rr
-
-
-def _ypr_deg(Rm):
-    return np.round(R.from_matrix(Rm).as_euler("ZYX", degrees=True), 1)
-
-
 def _slerp_resample_cartesian(chunk, target_len):
     """Resample a cartesian action chunk to target_len, interpolating rotation
     with SLERP (quaternion geodesic) instead of linear Euler.
@@ -197,87 +149,16 @@ def rot_ee_frame_to_ee_pose(pose_rot):
     return rot_ee_frame_to_ee_pose_batch(pose_rot[None, ...])[0]
 
 
-def viz_rot_ee_pose(image, eepose, action_image_path, rot_image_path):
-    """
-    Save both cartesian-action and orientation-axis visualizations for an EVA
-    action chunk using the same conventions as the debug path.
-    """
-    arr = np.asarray(eepose, dtype=np.float32)
-    if arr.ndim == 1:
-        arr = arr[None, ...]
-    if arr.ndim != 2 or arr.shape[1] not in (12, 14):
-        raise ValueError(f"Expected eepose shape (T, 12|14), got {arr.shape}")
-
-    os.makedirs(os.path.dirname(action_image_path) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(rot_image_path) or ".", exist_ok=True)
-
-    img = np.asarray(image)
-    if img.ndim == 3 and img.shape[0] in (1, 3):
-        img = np.transpose(img, (1, 2, 0))
-    if img.ndim != 3 or img.shape[-1] != 3:
-        raise ValueError(
-            f"Expected image shape (H, W, 3) or (3, H, W), got {img.shape}"
-        )
-    if img.dtype != np.uint8:
-        if img.max() <= 1.0:
-            img = (img * 255.0).clip(0, 255).astype(np.uint8)
-        else:
-            img = img.clip(0, 255).astype(np.uint8)
-
-    if arr.shape[1] == 14:
-        left_xyz = arr[:, :3]
-        right_xyz = arr[:, 7:10]
-    else:
-        left_xyz = arr[:, :3]
-        right_xyz = arr[:, 6:9]
-    action_xyz = np.hstack([left_xyz, right_xyz]).astype(np.float32, copy=False)
-
-    camera_transforms = CameraTransforms(
-        intrinsics_key="base", extrinsics_key="x5Dec13_2"
-    )
-    im_action = visualize_actions(
-        img.copy(),
-        action_xyz,
-        camera_transforms.extrinsics,
-        camera_transforms.intrinsics,
-        arm="both",
-    )
-    cv2.imwrite(action_image_path, im_action)
-
-    eva_viz_batch = {
-        "observations.images.front_img_1": torch.from_numpy(img[None, ...]),
-        "actions_cartesian": torch.from_numpy(arr[None, ...]),
-    }
-    im_rot = Eva.viz_transformed_batch(eva_viz_batch, mode="palm_axes")
-    cv2.imwrite(rot_image_path, im_rot)
-    return im_action, im_rot
-
-
-GRIPPER_WIDTH = 0.09
 # Control parameters
 DEFAULT_FREQUENCY = 30  # Hz
 QUERY_FREQUENCY = 30
 DEFAULT_RESAMPLE_LENGTH = 45
 
-RIGHT_CAM_SERIAL = ""
-LEFT_CAM_SERIAL = ""
-
-EMBODIMENT_MAP = {
-    "both": 8,
-    "left": 7,
-    "right": 6,
-}
-
-TEMP_DIR = "/home/robot/temp_dir"
-
 
 def _build_robot_interface(
-    arms_list, robot="eva", offline_debug=False, offline_episode_path=None,
-    yam_channels=None, yam_ee_convention="default",
+    arms_list, robot="eva", yam_channels=None, yam_ee_convention="default",
 ):
     if robot == "yam":
-        if offline_debug:
-            raise ValueError("--offline-debug is not supported for --robot yam")
         # YAMInterface is a sibling module (this file lives in egomimic/robot/YAM/);
         # YAM/ is already on sys.path (see the path setup at the top of this file).
         from yam_interface import YAMInterface
@@ -288,25 +169,9 @@ def _build_robot_interface(
         return YAMInterface(arms=arms_list, channels=yam_channels,
                             ee_frame_convention=yam_ee_convention)
 
-    if offline_debug:
-        from robot_interface import OfflineARXInterface
-
-        return OfflineARXInterface(arms=arms_list, dataset_path=offline_episode_path)
-
     from robot_interface import ARXInterface
 
     return ARXInterface(arms=arms_list)
-
-
-def _get_model_xml_path():
-    candidates = [
-        "/home/robot/robot_ws/egomimic/resources/model_x5.xml",
-        os.path.join(_EGOMIMIC_DIR, "resources", "model_x5.xml"),
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return candidates[-1]
 
 
 class _KeyPoll:
@@ -369,7 +234,6 @@ class PolicyRollout(Rollout):
         cartesian,
         extrinsics_key,
         resampled_action_len=None,
-        debug=False,
         annotation_path=None,
         annotation_text=None,
         robot="eva",
@@ -418,10 +282,10 @@ class PolicyRollout(Rollout):
         self.policy_device = self.device
         print(f"[rollout] Loading policy from {self.policy_path}")
         self.policy = self._load_policy()
+        # Camera-frame copy of the latest predicted chunk (post-revert, pre
+        # cam->base) — the frame the preview overlay projects in.
         self.debug_actions = None
-        self._printed_diag = False  # one-shot input-alignment dump (see _diagnose_inputs)
         self.resampled_action_len = resampled_action_len
-        self.debug = debug
 
         # Decouple the MODEL embodiment from the HARDWARE robot. The checkpoint's
         # norm stats, action converter, and forward_eval output key are all keyed to
@@ -591,71 +455,13 @@ class PolicyRollout(Rollout):
 
         # chunk: (T, D) -> (1, T, D) and back
         if self.cartesian:
-            # SLERP rotation interp (default) is correct through gimbal lock
-            # (pitch~=90); linear-Euler interp sweeps the wrist there -> flip.
-            # Set YAM_EULER_INTERP=1 to fall back to the old linear-Euler path
-            # (for A/B-ing the wrist-flip fix).
-            if os.environ.get("YAM_EULER_INTERP", "0") == "1":
-                if self.arm == "both":
-                    left = interpolate_arr_euler(chunk[:, :7][None, ...], target_len)[0]
-                    right = interpolate_arr_euler(chunk[:, 7:14][None, ...], target_len)[0]
-                    out = np.hstack([left, right])
-                else:
-                    out = interpolate_arr_euler(chunk[None, ...], target_len)[0]
-            else:
-                out = _slerp_resample_cartesian(chunk, target_len)
+            # SLERP rotation interp is correct through gimbal lock (pitch~=90),
+            # where linear-Euler interp sweeps the wrist the wrong way -> flip.
+            out = _slerp_resample_cartesian(chunk, target_len)
         else:
             out = interpolate_arr(chunk[None, ...], target_len)[0]
 
         return out.astype(np.float32, copy=False)
-
-    def _diagnose_inputs(self, obs, fed_batch, processed_batch, preds):
-        """One-shot dump of what actually reaches pi0.5, to localize 'noise'
-        predictions: key-mapping / image / state / prompt misalignment, and the
-        scale of the (unnormalized) action output."""
-        m = self.policy.model
-        eid = self.embodiment_id
-        pb = processed_batch.get(eid, {})
-        print("\n========== [diag] pi0.5 input alignment ==========")
-        print(f"[diag] embodiment   : {self.embodiment_name} (id={eid})")
-        print(f"[diag] camera_keys  : {m.camera_keys.get(eid)}")
-        print(f"[diag] proprio_keys : {m.proprio_keys.get(eid)}")
-        print(f"[diag] lang_keys    : {m.lang_keys.get(eid)}")
-        print(f"[diag] ac_key       : {m.ac_keys.get(eid)}")
-        print(f"[diag] pi_cam_keys  : {getattr(m, 'pi_cam_keys', None)}")
-        print(f"[diag] fed keys     : {sorted(fed_batch.keys())}")
-        print(f"[diag] survived keys: {sorted(pb.keys())}")
-
-        # Cameras: did they survive the keymap, and is the content real (not black)?
-        for k in getattr(m, "pi_cam_keys", []) or []:
-            if k in pb and hasattr(pb[k], "shape"):
-                t = pb[k].float()
-                print(f"[diag] cam '{k}': shape={tuple(t.shape)} "
-                      f"min={t.min():.3f} max={t.max():.3f} mean={t.mean():.3f}")
-            else:
-                print(f"[diag] cam '{k}': MISSING from processed_batch (will be duplicated+masked)")
-        f = obs.get("front_img_1")
-        if f is not None:
-            f = np.asarray(f)
-            print(f"[diag] raw front_img_1: shape={f.shape} dtype={f.dtype} "
-                  f"min={f.min()} max={f.max()} mean={f.mean():.2f}  (~0 everywhere => black cam)")
-
-        # Proprio/state: present and right width?
-        for k in (m.proprio_keys.get(eid) or []):
-            present = k in pb and hasattr(pb[k], "shape")
-            print(f"[diag] proprio '{k}': present={present} "
-                  f"shape={tuple(pb[k].shape) if present else None}")
-
-        # Language conditioning
-        tok = pb.get("tokenized_prompt")
-        has_tok = tok is not None and hasattr(tok, "numel") and tok.numel() > 0
-        print(f"[diag] tokenized_prompt nonempty: {has_tok}  annotation='{self.annotation}'")
-
-        # Output scale: pure noise tends to be ~constant std with no structure.
-        p = preds.detach().float().cpu()
-        print(f"[diag] preds(unnorm) shape={tuple(p.shape)} min={p.min():.4f} "
-              f"max={p.max():.4f} mean={p.mean():.4f} std={p.std():.4f}")
-        print("==================================================\n")
 
     def rollout_step(self, i, obs):
         if i % self.query_frequency == 0:
@@ -682,7 +488,6 @@ class PolicyRollout(Rollout):
                 f"{embodiment_name}_actions_cartesian"
             ]
             self.actions = preds.detach().cpu().numpy().squeeze()
-            _wf_preds = self.actions.copy()  # wrist-frame prediction (pre-revert)
             # Predictions are eef/wrist-relative (6D (T,20) if self.use_6d, else
             # ypr (T,14)). Revert them to CAMERA frame by composing with the
             # current EE pose so the overlay (camera-frame pinhole projection) and
@@ -702,59 +507,6 @@ class PolicyRollout(Rollout):
                 )
             self.debug_actions = self.actions.copy()
 
-            # --- per-inference debug: policy actions in WRIST frame (raw pred,
-            # pre-revert) and CAMERA frame (post-revert). The full action's wrist
-            # rotation is decoded to ZYX ypr degrees for readability. Prints on
-            # every policy step (once per inference / chunk).
-            if self.cartesian:
-                from egomimic.utils.pose_utils import _xyz6d_to_matrix
-
-                def _fmt(a):
-                    return np.array2string(
-                        np.asarray(a, dtype=float), precision=4, suppress_small=True
-                    )
-
-                def _wf_ypr(block):
-                    # per-arm wrist-frame slice -> ZYX ypr (deg). 6D block is
-                    # [xyz c1 c2 (g)] (rotation from the two 6D columns); ypr block
-                    # is [xyz ypr (g)] (ypr already, radians).
-                    block = np.asarray(block, dtype=float)
-                    if self.use_6d:
-                        Rm = _xyz6d_to_matrix(block[:9][None])[0, :3, :3]
-                        return _ypr_deg(Rm)
-                    return np.round(np.rad2deg(block[3:6]), 1)
-
-                _wf = np.atleast_2d(_wf_preds)           # wrist-frame chunk (pre-revert)
-                _cf = np.atleast_2d(self.debug_actions)  # camera-frame chunk (post-revert)
-                _both = self.arm == "both"
-                _wfw = 10 if self.use_6d else 7          # per-arm wrist-frame width
-
-                # WRISTFRAME (always available). Per-arm blocks: L first, R second.
-                _wfL = _wf[0, 0:_wfw]
-                print(f"[dbg step {i}] WRISTFRAME pred (pre-revert) shape={_wf.shape}")
-                line = f"    L: pos={_fmt(_wfL[:3])} ypr(deg)={_fmt(_wf_ypr(_wfL))}"
-                if _both:
-                    _wfR = _wf[0, _wfw:2 * _wfw]
-                    line += f"    R: pos={_fmt(_wfR[:3])} ypr(deg)={_fmt(_wf_ypr(_wfR))}"
-                print(line)
-                print(f"    row0 action={_fmt(_wf[0])}")
-
-                # CAMFRAME only exists after the both-arm revert (14-dim ypr:
-                # per-arm [xyz ypr grip]); single-arm skips the revert.
-                if _both:
-                    _cfL, _cfR = _cf[0, 0:7], _cf[0, 7:14]
-                    print(f"[dbg step {i}] CAMFRAME (post-revert) shape={_cf.shape}")
-                    print(
-                        f"    L: pos={_fmt(_cfL[:3])} "
-                        f"ypr(deg)={_fmt(np.round(np.rad2deg(_cfL[3:6]), 1))}"
-                        f"    R: pos={_fmt(_cfR[:3])} "
-                        f"ypr(deg)={_fmt(np.round(np.rad2deg(_cfR[3:6]), 1))}"
-                    )
-                    print(f"    row0 action={_fmt(_cf[0])}")
-
-            if not self._printed_diag:
-                self._printed_diag = True
-                self._diagnose_inputs(obs, transform_list_batch, processed_batch, preds)
             if self.cartesian:
                 if self.arm == "both":
                     left_actions = self.actions[:, :7]
@@ -792,72 +544,12 @@ class PolicyRollout(Rollout):
                     else:
                         self.actions = transformed_6dof
 
-            # --- one-shot orientation diagnostic: localize a wrist flip -------
-            # Prints orientation at each stage for the FIRST chunk row, with the
-            # two key angles: |wristframe pred from identity| (~180 => the model
-            # itself predicts a flip => obs/proprio wrong or OOD) and |reverted vs
-            # obs| (~180 => the revert/frame composition flips it; ~0 => the flip
-            # is downstream in cam->base / rot_ee_frame / IK).
-            if (
-                self.cartesian
-                and self.arm == "both"
-                and not getattr(self, "_printed_orient_diag", False)
-            ):
-                self._printed_orient_diag = True
-                try:
-                    oL, oR = _bimanual_rot_mats(obs_state_camframe, self.use_6d)
-                    wL, wR = _bimanual_rot_mats(_wf_preds, self.use_6d)
-                    rL, rR = _bimanual_rot_mats(self.debug_actions, False)
-                    bL, bR = _bimanual_rot_mats(self.actions, False)
-                    # Robot's ACTUAL current EE orientation (base frame, ZYX).
-                    # eepose = [L xyz ypr g | R xyz ypr g] -> ypr at [3:6]/[10:13].
-                    raw = np.asarray(obs["ee_poses"], dtype=float)
-                    cL = R.from_euler("ZYX", raw[3:6]).as_matrix()
-                    cR = R.from_euler("ZYX", raw[10:13]).as_matrix()
-                    I3 = np.eye(3)
-                    print(f"\n===== [orient-diag] step {i} (first chunk row) =====")
-                    for nm, o, w, r, b, c in (
-                        ("LEFT", oL, wL, rL, bL, cL),
-                        ("RIGHT", oR, wR, rR, bR, cR),
-                    ):
-                        print(f"  {nm}:")
-                        print(f"    obs camframe ypr(deg)      = {_ypr_deg(o)}")
-                        print(f"    wristframe PRED ypr(deg)   = {_ypr_deg(w)}"
-                              f"   |angle from identity| = {_geodesic_deg(I3, w):6.1f} deg"
-                              f"   (small=stay-put, ~180=model flips)")
-                        print(f"    reverted camframe ypr(deg) = {_ypr_deg(r)}"
-                              f"   |angle vs obs|        = {_geodesic_deg(o, r):6.1f} deg"
-                              f"   (~0=revert ok, ~180=revert/frame flip)")
-                        print(f"    base ee-pose ypr(deg)      = {_ypr_deg(b)}")
-                        print(f"    RAW current ee ypr(deg)    = {_ypr_deg(c)}"
-                              f"   |base vs raw current| = {_geodesic_deg(b, c):6.1f} deg"
-                              f"   (~0=stay-put closes, large=decode broken)")
-                    # Full commanded-chunk trajectory: does the base ee-pose
-                    # SWING/flip across the chunk rows (model traj / 6D->ypr
-                    # collapse), or stay put (=> flip is in IK / execution)?
-                    acts = np.asarray(self.actions, dtype=float)
-                    if acts.ndim == 2 and acts.shape[1] >= 13:
-                        for nm, off in (("LEFT", 0), ("RIGHT", 7)):
-                            rr = R.from_euler("ZYX", acts[:, off + 3 : off + 6]).as_matrix()
-                            devs = np.array(
-                                [_geodesic_deg(rr[0], rr[k]) for k in range(len(rr))]
-                            )
-                            k = int(np.argmax(devs))
-                            print(f"  {nm} chunk traj: max |row{k} vs row0| = {devs[k]:6.1f} deg"
-                                  f"  over {len(rr)} rows"
-                                  f"  (large => commanded trajectory itself swings/flips;"
-                                  f" small => flip is in IK/execution)")
-                    print("======================================================\n")
-                except Exception as _e:
-                    print(f"[orient-diag] failed: {_e!r}")
-
             if self.resampled_action_len is not None:
                 self.actions = self._downsample_chunk(
                     self.actions, self.resampled_action_len
                 )
-            # print(f"actions: {self.actions[6:7]}, debug_actions: {self.debug_actions[6:7]}")
 
-            print(f"Inference time: {(time.time() - start_infer_t)}s")
+            print(f"Inference time: {time.time() - start_infer_t:.2f}s")
 
         act_i = i % self.query_frequency
         return self.actions[act_i]
@@ -976,11 +668,11 @@ def _match_training_front_resolution(obs):
 
     Without this the policy sees a differently-scaled, un-stretched scene at
     rollout than it trained on (a real train/deploy distribution shift), and
-    the debug/preview overlays project with a K that does not match the image.
-    Applied once at obs ingestion so the model input, ``debug_policy`` /
-    ``preview_and_confirm`` overlays, and ``INTRINSICS["yam"]`` stay mutually
-    consistent. No-op for frames already at 640x480 (e.g. the wrist cams or a
-    future collection stack that resizes on-camera).
+    the preview overlays project with a K that does not match the image.
+    Applied once at obs ingestion so the model input, the preview overlays, and
+    ``INTRINSICS["yam"]`` stay mutually consistent. No-op for frames already at
+    640x480 (e.g. the wrist cams or a future collection stack that resizes
+    on-camera).
     """
     f = obs.get("front_img_1")
     if f is not None and f.shape[:2] != (_FRONT_TRAINING_WH[1], _FRONT_TRAINING_WH[0]):
@@ -988,36 +680,6 @@ def _match_training_front_resolution(obs):
             f, _FRONT_TRAINING_WH, interpolation=cv2.INTER_AREA
         )
     return obs
-
-
-def debug_policy(
-    actions, front_img, step_i
-):
-    os.makedirs("debug", exist_ok=True)
-
-    if isinstance(front_img, torch.Tensor):
-        if front_img.dim() == 4:
-            front_img = front_img[0].permute(1, 2, 0).cpu().numpy()
-        elif front_img.dim() == 3:
-            if front_img.shape[0] == 3:
-                front_img = front_img.permute(1, 2, 0).cpu().numpy()
-            else:
-                front_img = front_img.cpu().numpy()
-    elif front_img.ndim == 3 and front_img.shape[0] == 3:
-        front_img = front_img.transpose(1, 2, 0)
-    front_img = front_img.astype(np.uint8)
-
-    actions = actions.squeeze()
-    eva_viz_batch = {
-        "observations.images.front_img_1": torch.from_numpy(front_img[None, ...]),
-        "actions_cartesian": torch.from_numpy(
-            actions.astype(np.float32, copy=False)[None, ...]
-        ),
-    }
-    im_viz = Yam.viz_transformed_batch(eva_viz_batch, mode="traj+rotation")
-
-    cv2.imwrite(f"debug/debug_{step_i}.png", im_viz)
-    breakpoint()
 
 
 PREVIEW_WINDOW = "pi predicted actions"
@@ -1042,7 +704,7 @@ def render_pred_overlay(actions, front_img):
 
     ``actions`` must be the policy output in the CAMERA frame (i.e.
     ``policy.debug_actions``, captured before the cam->base transform). Returns a
-    BGR uint8 image via the same overlay pipeline as the offline eval / --debug.
+    BGR uint8 image via the same overlay pipeline as the offline eval.
     """
     front_hwc = _front_img_to_uint8_hwc(front_img)
     actions = np.asarray(actions).squeeze()
@@ -1160,10 +822,7 @@ def main(
     query_frequency=None,
     policy_path=None,
     dataset_path=None,
-    debug=False,
     resampled_action_len=None,
-    offline_debug=False,
-    offline_episode_path=None,
     annotation_path=None,
     annotation_text=None,
     robot="yam",
@@ -1187,18 +846,9 @@ def main(
     else:
         arms_list = ["left"]
 
-    if offline_episode_path is not None and not offline_debug:
-        raise ValueError("--offline-episode-path requires --offline-debug.")
-    if policy_path is not None and offline_debug and offline_episode_path is None:
-        raise ValueError(
-            "--policy-path requires --offline-episode-path in --offline-debug mode."
-        )
-
     ri = _build_robot_interface(
         arms_list=arms_list,
         robot=robot,
-        offline_debug=offline_debug,
-        offline_episode_path=offline_episode_path,
         yam_channels=yam_channels,
         yam_ee_convention=yam_ee_convention,
     )
@@ -1212,7 +862,6 @@ def main(
             cartesian=cartesian,
             extrinsics_key=extrinsics_key,
             resampled_action_len=resampled_action_len,
-            debug=debug,
             annotation_path=annotation_path,
             annotation_text=annotation_text,
             robot=robot,
@@ -1222,23 +871,14 @@ def main(
         policy = ReplayRollout(dataset_path=dataset_path, cartesian=cartesian)
     else:
         raise ValueError(
-            "Must provide either --policy-path or --dataset-path (and optionally --repo-id)."
+            "Must provide either --policy-path or --dataset-path."
         )
 
-    print(f"Cartesian value {cartesian}")
     if no_execute:
         print(
             "[rollout] --no-execute: DRY RUN. Predicting + visualizing only; the arm "
             "will NOT be commanded by the policy (the initial set_home still runs)."
         )
-
-    # EVA-only helpers (unused on the YAM path, and EvaMinkKinematicsSolver
-    # would try to load the EVA x5 MJCF which isn't relevant for YAM).
-    if robot == "eva":
-        camera_transforms = CameraTransforms(
-            intrinsics_key="base", extrinsics_key=extrinsics_key
-        )
-        kinematics_solver = EvaMinkKinematicsSolver(model_path=_get_model_xml_path())
 
     def _enter_intervention(kp, policy, rollout_type):
         """Pause rollout and wait for user command.
@@ -1335,8 +975,6 @@ def main(
                             actions = policy.rollout_step(step_i, obs)
                         elif rollout_type == "replay":
                             actions = policy.rollout_step(step_i)
-                        elif rollout_type == "replay_lerobot":
-                            actions = policy.rollout_step(step_i)
                         else:
                             raise ValueError(f"Invalid rollout type: {rollout_type}")
 
@@ -1349,15 +987,6 @@ def main(
                             if result == "restart":
                                 reset_rollout(ri, policy)
                             break
-
-                        if debug and rollout_type == "policy" and step_i % query_frequency == 0:
-                            debug_actions = policy.debug_actions
-                            front_img = obs["front_img_1"]
-                            debug_policy(
-                                debug_actions,
-                                front_img,
-                                step_i,
-                            )
 
                         # Preview-and-confirm gate: once per predicted chunk, show
                         # the overlay and block until the operator approves. The
@@ -1456,16 +1085,6 @@ def build_arg_parser(description="Rollout robot model."):
     parser.add_argument("--policy-path", type=str, help="policy checkpoint path")
     parser.add_argument("--dataset-path", type=str, help="dataset path for replay")
     parser.add_argument(
-        "--offline-debug",
-        action="store_true",
-        help="use the offline dummy robot interface for rollout debugging",
-    )
-    parser.add_argument(
-        "--offline-episode-path",
-        type=str,
-        help="local EVA Zarr episode path used as observation source in offline debug mode",
-    )
-    parser.add_argument(
         "--cartesian",
         action="store_true",
         help="control in cartesian space instead of joint space",
@@ -1474,12 +1093,7 @@ def build_arg_parser(description="Rollout robot model."):
         "--resampled-action-len",
         type=int,
         default=DEFAULT_RESAMPLE_LENGTH,
-        help="Resample each predicted action chunk to this length (e.g., 100 -> 45). Euler if --cartesian.",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="enable debug visualization of actions on images",
+        help="Resample each predicted action chunk to this length (e.g., 100 -> 45).",
     )
     parser.add_argument(
         "--annotation-path",
@@ -1553,7 +1167,6 @@ def build_arg_parser(description="Rollout robot model."):
 
 
 def run_from_args(args):
-    print(f"Resampling actions to {args.resampled_action_len}")
     return main(
         arms=args.arms,
         frequency=args.frequency,
@@ -1561,10 +1174,7 @@ def run_from_args(args):
         policy_path=args.policy_path,
         dataset_path=args.dataset_path,
         cartesian=args.cartesian,
-        debug=args.debug,
         resampled_action_len=args.resampled_action_len,
-        offline_debug=args.offline_debug,
-        offline_episode_path=args.offline_episode_path,
         annotation_path=args.annotation_path,
         annotation_text=args.annotation,
         robot=args.robot,

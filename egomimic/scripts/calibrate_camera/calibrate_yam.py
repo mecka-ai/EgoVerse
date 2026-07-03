@@ -129,6 +129,10 @@ def parse_args():
     p.add_argument("--method", default="PARK",
                    choices=["PARK", "TSAI", "HORAUD", "ANDREFF", "DANIILIDIS"],
                    help="cv2.calibrateHandEye solver")
+    p.add_argument("--ee-convention", default="default", choices=["default", "libero"],
+                   help="grasp_site frame convention; MUST match the YAMInterface "
+                        "ee_frame_convention used at collection/rollout (see "
+                        "yam_interface._patch_kinematics_xml)")
     p.add_argument("--store-npy", action="store_true",
                    help="also save the 4x4 T as <h5_dir>/extrinsics_yam_<arm>.npy")
     p.add_argument("--debug", action="store_true")
@@ -264,6 +268,7 @@ def main():
             _patch_kinematics_xml(
                 combine_arm_and_gripper_xml(ArmType.YAM, GripperType.NO_GRIPPER),
                 args.arm,
+                args.ee_convention,
             ),
             "grasp_site",
         )

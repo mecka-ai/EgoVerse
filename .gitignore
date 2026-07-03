@@ -55,3 +55,7 @@ failures.jsonl
 scratch/
 aws
 external/i2rt
+bottle_handover
+calibration_left
+calibration_right
+test-viz-ig

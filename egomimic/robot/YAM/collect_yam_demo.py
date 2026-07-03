@@ -12,6 +12,8 @@ Workflow (per the teaching-handle sync button):
     * Press the sync button(s) again           -> disengage + save the episode
       (auto-increments the episode id). An empty or discarded episode is dropped.
     * If ``--episode-length`` is set, recording auto-stops/saves at that many steps.
+    * After each episode ends, followers AND leaders auto-home so every episode
+      starts from the same canonical pose (disable with ``--no-auto-home``).
 
 Keyboard (type the letter + Enter in the launching terminal):
     d  discard the in-progress episode (won't be saved on disengage)
@@ -23,8 +25,8 @@ Example (bimanual, teaching-handle leaders + linear_4310 followers):
         --left-leader-can can_leader_l   --right-leader-can can_leader_r \
         --left-follower-can can_follower_l --right-follower-can can_follower_r \
         --camera-name 420222073106=front_img_1 \
-        --camera-name 353322270967=left_wrist_img \
-        --camera-name 323622270294=right_wrist_img \
+        --camera-name 353322271563=left_wrist_img \
+        --camera-name 353322270967=right_wrist_img \
         --demo-dir ./demos --episode-length 600
 """
 
@@ -336,6 +338,8 @@ def collect_yam_demo(
     strict_cameras=False,
     debug_buttons=False,
     front_raw=False,
+    ee_convention="default",
+    auto_home=True,
 ):
     demo_dir = Path(demo_dir)
     demo_dir.mkdir(parents=True, exist_ok=True)
@@ -354,6 +358,7 @@ def collect_yam_demo(
         zero_gravity_mode=False,  # hold commanded poses during teleop
         camera_names=serial_to_name,  # interface opens & owns the cameras
         front_raw=front_raw,  # raw un-rectified front fisheye (for calibration)
+        ee_frame_convention=ee_convention,  # recorded eepose frame — keep in sync
     )
 
     # --- Leaders (teaching handles) -----------------------------------------
@@ -386,6 +391,14 @@ def collect_yam_demo(
         kbd.quit = True
 
     signal.signal(signal.SIGINT, _on_sigint)
+
+    def _home_all(reason=""):
+        """Send followers home and drive leaders to zero (then passive again)."""
+        print(f"[home] {reason}Homing followers AND leaders — LET GO of the handles ...")
+        robot_interface.set_home()
+        for a in arms:
+            leaders[a].go_home(kp=leader_kp[a], kd=leader_kd[a])
+        print("[home] Done; leaders are passive (back-drivable) again.")
 
     print(
         "\n[ready] Press the teaching-handle sync button(s) to engage teleop & "
@@ -440,11 +453,7 @@ def collect_yam_demo(
             if kbd.home.is_set():
                 kbd.home.clear()
                 if not synchronized:
-                    print("[home] Homing followers AND leaders — LET GO of the handles ...")
-                    robot_interface.set_home()
-                    for a in arms:
-                        leaders[a].go_home(kp=leader_kp[a], kd=leader_kd[a])
-                    print("[home] Done; leaders are passive (back-drivable) again.")
+                    _home_all()
                 else:
                     print("[home] Ignored: disengage teleop first.")
 
@@ -457,6 +466,7 @@ def collect_yam_demo(
 
             # --- Sync button edge: toggle engagement --------------------------
             if buttons_pressed:
+                episode_ended = False
                 if not synchronized:
                     # Engage: bilateral PD on leaders, slow-move followers to leaders.
                     print("[teleop] Engaging ...")
@@ -476,6 +486,7 @@ def collect_yam_demo(
                     for a in arms:
                         leaders[a].update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
                     synchronized = False
+                    episode_ended = True
                     if not discard_episode:
                         if save_demo(demo_data, demo_dir, episode_id, camera_res,
                                      robot_interface, strict_cameras=strict_cameras):
@@ -487,6 +498,11 @@ def collect_yam_demo(
                     leaders[a].get_info()[1][0] > SYNC_BUTTON_THRESHOLD for a in arms
                 ):
                     time.sleep(0.01)
+
+                # Auto-home AFTER the debounce so the leaders aren't driven while
+                # the operator is still pressing the (handle-mounted) sync button.
+                if episode_ended and auto_home:
+                    _home_all("episode ended; ")
 
             # --- Synchronized: follower tracks leader, record ----------------
             if synchronized:
@@ -521,6 +537,8 @@ def collect_yam_demo(
                                      robot_interface, strict_cameras=strict_cameras):
                             episode_id += 1
                     reset_data(demo_data)
+                    if auto_home:
+                        _home_all("episode ended; ")
 
             # Maintain loop rate.
             elapsed = time.time() - loop_start
@@ -611,6 +629,17 @@ def main():
         "--bilateral-kp", type=float, default=0.05,
         help="Leader force-feedback gain (fraction of the leader's control kp).",
     )
+    parser.add_argument(
+        "--ee-convention", default="default", choices=["default", "libero"],
+        help="grasp_site frame baked into the recorded eepose. 'libero' = both "
+        "arms x fwd / y left / z up (LIBERO/EVA-congruent). Keep rollout + "
+        "calibration on the SAME convention (see yam_interface).",
+    )
+    parser.add_argument(
+        "--no-auto-home", dest="auto_home", action="store_false",
+        help="Don't auto-home the followers + leaders after each episode ends "
+        "(default: home after every episode so each starts from the same pose).",
+    )
     args = parser.parse_args()
 
     if args.arms == "both":
@@ -638,6 +667,8 @@ def main():
         strict_cameras=args.strict_cameras,
         debug_buttons=args.debug_buttons,
         front_raw=args.raw_front,
+        ee_convention=args.ee_convention,
+        auto_home=args.auto_home,
     )
 
 
