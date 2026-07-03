@@ -22,12 +22,12 @@ class TrainVizEvalVideo(EvalVideo):
         self,
         base: EvalVideo,
         limit_val_batches: int = 400,
-        viz_every_n_epochs: int = 1,
+        viz_every_n_steps: int = 1,
     ):
         self.base = base
         super().__init__(
             limit_val_batches=limit_val_batches,
-            viz_every_n_epochs=viz_every_n_epochs,
+            viz_every_n_steps=viz_every_n_steps,
         )
 
     @property

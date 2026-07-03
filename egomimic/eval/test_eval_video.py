@@ -2,7 +2,16 @@
 
 These exercise the metrics/viz split without a GPU or a real Trainer: a
 ``SimpleNamespace`` stands in for ``self.trainer`` so we can drive
-``current_epoch``/``is_global_zero`` directly.
+``global_step``/``is_global_zero`` directly.
+
+Gating is **step based** (``trainer.global_step``) to match the step-based
+training regime (``val_check_interval`` measured in steps). Cheap metrics log
+on every validation pass; the expensive viz/video rendering fires only when
+``global_step`` is a multiple of ``viz_every_n_steps``. Unlike the epoch-based
+gate, there is no off-by-one alignment subtlety: at validation time
+``global_step`` is exactly the step count Lightning triggered on, so a video
+renders whenever ``viz_every_n_steps`` is an integer multiple of
+``val_check_interval``.
 """
 
 import os
@@ -34,60 +43,73 @@ class _StubEvalVideo(EvalVideo):
         return metrics, images_dict
 
 
-def _fake_trainer(current_epoch=0, is_global_zero=True):
+def _fake_trainer(global_step=0, is_global_zero=True):
     lm = SimpleNamespace(device="cpu", log_dict=lambda *a, **k: None)
     return SimpleNamespace(
-        current_epoch=current_epoch,
+        global_step=global_step,
         is_global_zero=is_global_zero,
         lightning_module=lm,
     )
 
 
-def _rendered_epochs(viz_every_n, check_val, max_epochs):
-    """Epochs at which a video is actually written: Lightning runs validation
-    (``(e + 1) % check_val == 0``) AND ``_should_viz()`` fires."""
-    ev = _StubEvalVideo("/tmp", viz_every_n_epochs=viz_every_n)
+def _rendered_steps(viz_every_n, val_check_interval, max_steps):
+    """Steps at which a video is actually written: Lightning runs validation
+    (``step % val_check_interval == 0``) AND ``_should_viz()`` fires."""
+    ev = _StubEvalVideo("/tmp", viz_every_n_steps=viz_every_n)
     out = []
-    for e in range(max_epochs):
-        if (e + 1) % check_val != 0:
-            continue  # Lightning does not run validation this epoch
-        ev.trainer = _fake_trainer(current_epoch=e)
+    for s in range(1, max_steps + 1):
+        if s % val_check_interval != 0:
+            continue  # Lightning does not run validation this step
+        ev.trainer = _fake_trainer(global_step=s)
         if ev._should_viz():
-            out.append(e)
+            out.append(s)
     return out
 
 
 # --- viz / validation alignment ------------------------------------------------
 
 
+def test_should_viz_step_modulo():
+    # _should_viz fires exactly on multiples of viz_every_n_steps.
+    ev = _StubEvalVideo("/tmp", viz_every_n_steps=10000)
+    ev.trainer = _fake_trainer(global_step=10000)
+    assert ev._should_viz()
+    ev.trainer = _fake_trainer(global_step=20000)
+    assert ev._should_viz()
+    ev.trainer = _fake_trainer(global_step=12000)
+    assert not ev._should_viz()
+
+
 def test_viz_aligns_with_validation_trigger():
-    # The canonical production case (viz_every_n=200, check_val=20) that
-    # previously rendered ZERO videos: viz must land on validation-trigger
-    # epochs (e where (e+1)%20==0), i.e. 199 and 399, not 200/400.
-    assert _rendered_epochs(200, 20, 400) == [199, 399]
+    # The canonical production case (eval_pi.yaml): val_check_interval=2000,
+    # viz_every_n_steps=10000 -> metrics every 2000 steps, a video every 5th
+    # validation, i.e. at 10000 and 20000.
+    assert _rendered_steps(10000, 2000, 20000) == [10000, 20000]
 
 
-def test_viz_every_epoch_when_check_val_1():
-    # Matches the L40S smoke test: videos at epoch_0 and epoch_1.
-    assert _rendered_epochs(1, 1, 4) == [0, 1, 2, 3]
+def test_viz_every_validation_when_equal():
+    # viz_every_n_steps == val_check_interval -> a video on every validation.
+    assert _rendered_steps(2000, 2000, 8000) == [2000, 4000, 6000, 8000]
 
 
 def test_viz_multiple_of_check_val():
-    assert _rendered_epochs(2, 1, 4) == [1, 3]
-    assert _rendered_epochs(40, 20, 200) == [39, 79, 119, 159, 199]
+    assert _rendered_steps(4000, 2000, 12000) == [4000, 8000, 12000]
+
+
+def test_viz_fires_at_step_zero_standalone_eval():
+    # Standalone eval runs with global_step == 0; 0 % N == 0 so viz fires.
+    ev = _StubEvalVideo("/tmp", viz_every_n_steps=10000)
+    ev.trainer = _fake_trainer(global_step=0)
+    assert ev._should_viz()
 
 
 def test_viz_disabled_for_nonpositive():
-    assert _rendered_epochs(0, 1, 4) == []
-
-
-def test_old_buggy_gate_rendered_nothing():
-    # Documents the regression this fix closes: the pre-fix gate
-    # ``current_epoch % N == 0`` never coincides with the validation-trigger
-    # epochs when gcd(N, check_val) > 1, so no video was ever written.
-    val_epochs = [e for e in range(400) if (e + 1) % 20 == 0]
-    buggy = [e for e in val_epochs if e % 200 == 0]
-    assert buggy == []
+    # A non-positive cadence disables viz entirely, on every step.
+    for viz_every_n in (0, -1):
+        ev = _StubEvalVideo("/tmp", viz_every_n_steps=viz_every_n)
+        for s in (0, 2000, 10000):
+            ev.trainer = _fake_trainer(global_step=s)
+            assert not ev._should_viz()
 
 
 # --- DDP rank gating -----------------------------------------------------------
@@ -96,8 +118,8 @@ def test_old_buggy_gate_rendered_nothing():
 def test_only_rank0_buffers_frames(tmp_path):
     # Non-zero DDP rank: metrics are still computed (so sync_dist log_dict does
     # not deadlock), but no frames are buffered and no videos dir is created.
-    ev = _StubEvalVideo(str(tmp_path / "nonzero"), viz_every_n_epochs=1)
-    ev.trainer = _fake_trainer(current_epoch=0, is_global_zero=False)
+    ev = _StubEvalVideo(str(tmp_path / "nonzero"), viz_every_n_steps=1)
+    ev.trainer = _fake_trainer(global_step=0, is_global_zero=False)
     ev.on_validation_start()
     ev.on_validation_step({}, 0)
     assert ev.compute_calls == [False]
@@ -106,10 +128,10 @@ def test_only_rank0_buffers_frames(tmp_path):
 
 
 def test_rank0_buffers_frames_and_creates_dir(tmp_path):
-    ev = _StubEvalVideo(str(tmp_path / "rank0"), viz_every_n_epochs=1)
-    ev.trainer = _fake_trainer(current_epoch=0, is_global_zero=True)
+    ev = _StubEvalVideo(str(tmp_path / "rank0"), viz_every_n_steps=1)
+    ev.trainer = _fake_trainer(global_step=0, is_global_zero=True)
     ev.on_validation_start()
     ev.on_validation_step({}, 0)
     assert ev.compute_calls == [True]
     assert len(ev.val_image_buffer["mecka_bimanual"]) == 4
-    assert os.path.isdir(os.path.join(ev.video_dir(), "epoch_0"))
+    assert os.path.isdir(os.path.join(ev.video_dir(), "step_0"))

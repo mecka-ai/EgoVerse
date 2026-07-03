@@ -7,3 +7,6 @@ dataloader_stall:
   _target_: egomimic.utils.timing_callback.DataLoaderStallLogger
   stall_threshold_s: 0.5
   log_ready_after_stall: true
+  # Log windowed throughput/frames_per_sec every N batches so fps stays frequent
+  # even with long epochs (limit_train_batches=null). 0 disables intra-epoch logging.
+  fps_log_every_n_batches: 50

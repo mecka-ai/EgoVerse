@@ -1,7 +1,6 @@
 _target_: egomimic.eval.train_viz_eval_video.TrainVizEvalVideo
-# Gate train_viz video rendering to every N epochs (set on the wrapper, whose
-# on_validation_* hooks run for the train_viz dataloader). train_viz/ metrics
-# still log every validation pass.
-viz_every_n_epochs: 100
+# Gating lives on the wrapper (its on_validation_* hooks fire), not the base.
+# Render/write train-viz videos every 10000 steps; metrics every val pass.
+viz_every_n_steps: 10000
 base:
   _target_: egomimic.eval.eval_pi.PIEvalVideo
