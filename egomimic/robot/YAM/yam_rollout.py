@@ -487,25 +487,38 @@ class PolicyRollout(Rollout):
             else:
                 with open(annotation_path, "r") as f:
                     self.annotation = f.read().strip()
-                self.collate_fn = build_tokenized_collate(
-                    max_length=128,
-                    model_name="google/paligemma-3b-mix-224",
-                    sampling_mode="first",
-                    annotation_key="annotations",
-                    default_prompt=self.annotation,
-                )
+                self.collate_fn = self._make_collate(self.annotation)
         # Inline prompt (e.g. --annotation "Fold the shirt") takes effect only if
         # no annotation file was successfully loaded above.
         if self.annotation is None and annotation_text:
             self.annotation = annotation_text.strip()
-            self.collate_fn = build_tokenized_collate(
-                max_length=128,
-                model_name="google/paligemma-3b-mix-224",
-                sampling_mode="first",
-                annotation_key="annotations",
-                default_prompt=self.annotation,
-            )
+            self.collate_fn = self._make_collate(self.annotation)
             print(f"[rollout] Using inline annotation prompt: '{self.annotation}'")
+
+    def _make_collate(self, default_prompt):
+        """Tokenizing collate with the SAME prompt format the checkpoint trained on.
+
+        The pi0.5 training configs (e.g. data=yam_pick_hat_wrist_pi) set
+        ``proprio: true`` + ``embodiment_label: true``, so every training prompt
+        is ``"Task: <text>, Embodiment: <name>, State: <256-bin proprio>;\\nAction: "``.
+        Rollout previously built the collate WITHOUT those flags, so the model
+        was conditioned on a bare prompt it never saw in training — no Task
+        anchor, no Embodiment block, and no discretized State splice (a proprio
+        pathway the model learned to read). NOTE: proprio_keys must be passed
+        explicitly here (this branch's collate has no default), and the batch's
+        "embodiment" key must be the integer id for the Embodiment splice.
+        """
+        return build_tokenized_collate(
+            max_length=128,
+            model_name="google/paligemma-3b-mix-224",
+            sampling_mode="first",
+            annotation_key="annotations",
+            default_prompt=default_prompt,
+            proprio_keys=["observations.state.ee_pose"],
+            state_num_bins=256,
+            proprio=True,
+            embodiment_label=True,
+        )
 
     LOCAL_WEIGHT_PATH = os.path.join(
         _EGOMIMIC_DIR, "algo", "pi_checkpoints", "pi05_base_pytorch"
@@ -913,8 +926,11 @@ class PolicyRollout(Rollout):
             left_cmd_ee_pose = torch.from_numpy(left_xyzwxyz).view(1, 7).repeat(45, 1)
             data["left.cmd_ee_pose"] = left_cmd_ee_pose
 
-        data["embodiment"] = self.embodiment_name
-        data["metadata.robot_name"] = self.embodiment_name
+        # Integer ids, matching training's ZarrDataset (which stores
+        # get_embodiment_id(...) for both keys). The collate's Embodiment splice
+        # does int(sample["embodiment"]) — a string here would crash it.
+        data["embodiment"] = self.embodiment_id
+        data["metadata.robot_name"] = self.embodiment_id
         
         if self.annotation is not None:
             data["annotations"] = [self.annotation]
@@ -937,13 +953,7 @@ class PolicyRollout(Rollout):
         with open(annotation_path, "r") as f:
             self.annotation = f.read().strip()
         if self.collate_fn is default_collate:
-            self.collate_fn = build_tokenized_collate(
-                max_length=128,
-                model_name="google/paligemma-3b-mix-224",
-                sampling_mode="first",
-                annotation_key="annotations",
-                default_prompt=self.annotation,
-            )
+            self.collate_fn = self._make_collate(self.annotation)
         print(f"[rollout] Loaded new annotation from {annotation_path}: '{self.annotation}'")
         return True
 
