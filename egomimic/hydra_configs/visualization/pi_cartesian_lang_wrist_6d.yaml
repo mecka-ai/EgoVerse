@@ -1,0 +1,32 @@
+# pi0.5 wrist-frame viz for 6D action chunks (cartesian_wristframe_6d).
+#
+# Like pi_cartesian_lang_wrist, but tells the wrist->cam revert that the action
+# is 6D (rot_repr: 6d -> per-arm pose width 9, revert mode xyz6d). The default
+# wrist viz inherits is_quat:false (ypr, width 6/7), which would mis-split a 6D
+# (width-9) action chunk. obs_key: ee_pose matches the proprio key name after the
+# PI batch processing rename (process_batch_for_training).
+defaults:
+  - cartesian_wrist
+  - _self_
+
+eva_bimanual:
+  image_key: base_0_rgb
+  annotation_key: sampled_prompt
+  transform_list:
+    obs_key: ee_pose
+    rot_repr: 6d
+
+# YAM shares Eva's zarr schema and wrist->cam revert; only the viz projection
+# differs (Yam.VIZ_INTRINSICS_KEY = "yam"). Full entry (cartesian_wrist has no
+# yam block to inherit from).
+yam_bimanual:
+  _target_: egomimic.rldb.embodiment.yam.Yam.viz_gt_preds
+  _partial_: true
+  image_key: base_0_rgb
+  annotation_key: sampled_prompt
+  action_key: actions_cartesian
+  mode: traj
+  transform_list:
+    _target_: egomimic.rldb.embodiment.eva._build_eva_bimanual_revert_eef_frame_transform_list
+    obs_key: ee_pose
+    rot_repr: 6d

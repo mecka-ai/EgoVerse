@@ -1,0 +1,115 @@
+# YAM_PICK_HAT_WRIST_PI — pi0.5 finetune on the local yam_pick_hat set, WRISTFRAME 6D.
+#
+# Single-embodiment (yam_bimanual) pi0.5 finetune from the stock base release
+# (pi05_base_pytorch) on the 42-episode yam_pick_hat collection
+# (/workspace/yam_pick_hat, ~9.2 min @30fps: "pick up the black hat using the
+# left arm and drop it into a brown box").
+#
+#   action: cartesian_wristframe_6d -> 20-dim [L: xyz(3) 6d(6) grip(1) | R: same],
+#           expressed relative to the current EEF pose. The cam<-base extrinsic
+#           cancels out of the wrist-frame action target, so training needs no
+#           camera calibration; EXTRINSICS["yam"] (via the Yam class) only sets
+#           the cam-frame the proprio/obs live in and the eval-viz revert frame.
+#   pair with: model=pi0.5_bc_yam (RobotBimanualCartesian6D, 20-dim repack)
+#              visualization=pi_cartesian_lang_wrist_6d (wrist->cam revert, has
+#              a yam_bimanual entry)
+#   norm stats: compute FRESH at startup (wrist-frame distribution; the set is
+#              tiny so this takes seconds — leave precomputed_norm_path=null).
+#
+# Episodes are fixed-length recording buffers (300-600 rows) zero-padded past
+# the `total_frames` attr; ZarrDataset lengths come from `total_frames` and
+# chunk reads clamp to it, so the padding is never consumed.
+#
+# Launch (single node, from repo root; see PR notes for the full command):
+#   python egomimic/trainHydra.py --config-name=train_zarr_cartesian_pi \
+#     data=yam_pick_hat_wrist_pi model=pi0.5_bc_yam \
+#     visualization=pi_cartesian_lang_wrist_6d \
+#     model.robomimic_model.config.pytorch_weight_path=<repo>/egomimic/algo/pi_checkpoints/pi05_base_pytorch
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# --- pi0.5 tokenizer / prompt wiring (mirrors the eva wrist finetunes) ---
+use_tokenizer: true
+model_name: "google/paligemma-3b-mix-224"
+sampling_mode: random
+annotation_key: annotations
+default_prompt: ""
+embodiment_label: true
+# proprio true: keeps observations.state.ee_pose (cam-frame 6D) in the batch,
+# which the wrist eval-viz revert needs to define the frame.
+proprio: true
+state_num_bins: 256
+control_mode: null
+
+train_datasets:
+  yam_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/yam_pick_hat
+      key_map:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_transform_list
+        mode: cartesian_wristframe_6d
+    mode: train
+
+valid_datasets:
+  yam_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/yam_pick_hat
+      key_map:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_transform_list
+        mode: cartesian_wristframe_6d
+    mode: valid
+
+# Small viz set for evaluator@train_viz_evaluator=train_viz_pi.
+train_viz_datasets:
+  yam_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /workspace/yam_pick_hat
+      key_map:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_keymap
+        keymap_mode: cartesian
+        annotation_key: annotations
+      transform_list:
+        _target_: egomimic.rldb.embodiment.yam.Yam.get_transform_list
+        mode: cartesian_wristframe_6d
+      debug: 6
+    mode: total
+
+# 42 episodes / ~16.5k frames total: keep loaders small.
+train_dataloader_params:
+  yam_bimanual:
+    batch_size: 32
+    num_workers: 8
+    persistent_workers: true
+    prefetch_factor: 4
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  yam_bimanual:
+    batch_size: 32
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false
+
+train_viz_dataloader_params:
+  yam_bimanual:
+    batch_size: 6
+    num_workers: 2
+    persistent_workers: false
+    shuffle: false
