@@ -404,24 +404,35 @@ try:
     _spec.loader.exec_module(_yc)
     YAM_INTRINSICS = _yc.stereo_front_output_intrinsics()
 except Exception:  # calibration DB / yam_cameras unavailable -> last-known-good (328)
+    # cx = 960 - crop_left(450); cy = 600 - crop_top(320); rig_aim crop 450/250/320/0.
     YAM_INTRINSICS = np.array(
         [
-            [476.8638244793585, 0.0, 710.0, 0.0],
+            [476.8638244793585, 0.0, 510.0, 0.0],
             [0.0, 476.6994709394347, 280.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
         ]
     )
 
 # The zarr episodes store front_img_1 STRETCH-RESIZED from the stereo pipeline's
-# native re-aimed crop (1420x880 at serial 328 / crop 250/250/320/0) down to
-# 640x480 at collection time, so the native-resolution K above must be rescaled
-# per-axis to be valid on the stored images. Verified on yam_pick_hat: with the
-# scaled K the GT overlay lands on both grippers; the native K is ~2x off (and a
-# crop-to-4:3-then-resize hypothesis mis-registers the right arm). Update
-# _YAM_NATIVE_WH if the rig_aim crop changes, _YAM_STORED_WH if the collection
-# resize changes.
-_YAM_NATIVE_WH = (1420, 880)
+# native re-aimed crop down to 640x480 at collection time, so the
+# native-resolution K above must be rescaled per-axis to be valid on the stored
+# images. The native size is DERIVED from the same source as the K itself
+# (cam0 dims - rig_aim crop) so it tracks crop changes automatically; a stale
+# hardcode bit twice already: (1420, 880) + cx=710 encoded the pre-change
+# crop_left=250 rig, and on crop_left=450 data the fx/cx errors CANCEL on the
+# right arm but ADD on the left arm (dcx=+52px, dfx=-35), which masqueraded as
+# a left-arm-only calibration problem in the eval viz. Fallback matches the
+# fallback K above (crop 450/250/320/0 -> 1220x880).
 _YAM_STORED_WH = (640, 480)
+try:
+    _cam0 = _yc.load_ds_intrinsics(cam_index=0)  # cam0 = stereo left eye (1920x1200)
+    _cfg = _yc.load_rig_aim()
+    _YAM_NATIVE_WH = (
+        int(_cam0["width"]) - int(_cfg["crop_left"]) - int(_cfg["crop_right"]),
+        int(_cam0["height"]) - int(_cfg["crop_top"]) - int(_cfg["crop_bottom"]),
+    )
+except Exception:
+    _YAM_NATIVE_WH = (1220, 880)
 YAM_INTRINSICS = YAM_INTRINSICS.copy()
 YAM_INTRINSICS[0, :] *= _YAM_STORED_WH[0] / _YAM_NATIVE_WH[0]
 YAM_INTRINSICS[1, :] *= _YAM_STORED_WH[1] / _YAM_NATIVE_WH[1]
