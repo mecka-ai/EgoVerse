@@ -20,9 +20,35 @@ DATASET_KEY_MAPPINGS = {
 ACTION_KEYS = {"cmd_eepose", "obs_eepose", "cmd_joints", "obs_joints"}
 
 
+def resolve_timestamp_ms(episode_path) -> int:
+    """Epoch-ms timestamp of an episode: the integer filename stem (EVA
+    convention), else the ``timestamp_ms`` hdf5 attr (YAM collector).
+
+    Raises instead of guessing: a fabricated small integer would both mis-hash
+    the episode and (if it parses to a pre-cutoff date) silently trigger the
+    legacy EVA gripper renormalization below.
+    """
+    stem = Path(episode_path).stem
+    try:
+        return int(stem)
+    except ValueError:
+        pass
+    with h5py.File(episode_path, "r") as f:
+        ts = f.attrs.get("timestamp_ms")
+    if ts is not None:
+        return int(ts)
+    raise ValueError(
+        f"Cannot determine the epoch-ms timestamp for '{episode_path}': the "
+        f"filename stem '{stem}' is not an integer and the file has no "
+        f"'timestamp_ms' attr. Re-collect with the current collect_yam_demo.py "
+        f"(which stamps both), or add the attr / rename to the TRUE epoch-ms of "
+        f"the recording — do NOT invent a number."
+    )
+
+
 class EvaHD5Extractor:
     @staticmethod
-    def process_episode(episode_path, arm):
+    def process_episode(episode_path, arm, robot="eva"):
         """
         Extracts all feature keys from a given episode and returns as a dictionary
         Parameters
@@ -31,6 +57,10 @@ class EvaHD5Extractor:
             Path to the HDF5 file containing the episode data.
         arm : str
             String for which arm to add data for
+        robot : str
+            Which robot recorded the episode ("eva" or "yam"). Selects the
+            metadata.embodiment id and gates the legacy EVA-only gripper
+            renormalization.
         Returns
         -------
         episode_feats : dict
@@ -47,8 +77,8 @@ class EvaHD5Extractor:
         """
         episode_feats = dict()
 
+        timestamp_ms = resolve_timestamp_ms(episode_path)
         with h5py.File(episode_path, "r") as episode:
-            episode_name = Path(episode_path).stem
             for camera in EvaHD5Extractor.get_cameras(episode):
                 images = (
                     torch.from_numpy(episode["observations"]["images"][camera][:])
@@ -69,7 +99,6 @@ class EvaHD5Extractor:
                 mapped_key = DATASET_KEY_MAPPINGS.get(state, state)
                 episode_feats[f"cmd_{mapped_key}"] = episode["actions"][state][:]
 
-            timestamp_ms = int(episode_name)
             episode_dt = datetime.datetime.fromtimestamp(
                 timestamp_ms / 1000.0, tz=datetime.timezone.utc
             )
@@ -78,18 +107,20 @@ class EvaHD5Extractor:
                     episode_feats[key] = EvaHD5Extractor.clean_zero_data(
                         episode_feats[key]
                     )
-                    if episode_dt < GRIPPER_NORMALIZE_CUTOFF:
+                    # Legacy fix for early EVA recordings whose grippers were
+                    # not yet [0,1]-normalized. EVA-only: YAM grippers have
+                    # always been absolute [0,1], and a per-episode min-max
+                    # would silently rescale them inconsistently.
+                    if robot == "eva" and episode_dt < GRIPPER_NORMALIZE_CUTOFF:
                         episode_feats[key] = EvaHD5Extractor.normalize_grippers(
                             episode_feats[key]
                         )
 
             num_timesteps = episode_feats["obs_eepose"].shape[0]
-            if arm == "right":
-                value = EMBODIMENT.EVA_RIGHT_ARM.value
-            elif arm == "left":
-                value = EMBODIMENT.EVA_LEFT_ARM.value
-            else:
-                value = EMBODIMENT.EVA_BIMANUAL.value
+            arm_suffix = {"right": "RIGHT_ARM", "left": "LEFT_ARM"}.get(
+                arm, "BIMANUAL"
+            )
+            value = EMBODIMENT[f"{robot.upper()}_{arm_suffix}"].value
 
             episode_feats["metadata.embodiment"] = np.full(
                 (num_timesteps, 1), value, dtype=np.int32

@@ -14,7 +14,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from egomimic.rldb.zarr.zarr_writer import ZarrWriter
-from egomimic.scripts.eva_process.eva_utils import EvaHD5Extractor
+from egomimic.scripts.eva_process.eva_utils import (
+    EvaHD5Extractor,
+    resolve_timestamp_ms,
+)
 from egomimic.utils.aws.aws_sql import timestamp_ms_to_episode_hash
 from egomimic.utils.egomimicUtils import str2bool
 from egomimic.utils.pose_utils import xyzw_to_wxyz
@@ -50,13 +53,16 @@ def rot_orientation(quat: np.ndarray) -> np.ndarray:
     return R.from_matrix(rotation).as_quat()
 
 
-def _arm_to_embodiment(arm: str) -> str:
-    """Map arm string to embodiment identifier."""
-    return {
-        "left": "eva_left_arm",
-        "right": "eva_right_arm",
-        "both": "eva_bimanual",
-    }.get(arm, "eva_bimanual")
+def _arm_to_embodiment(arm: str, robot: str = "eva") -> str:
+    """Map arm + robot to the zarr embodiment identifier (e.g. 'yam_bimanual').
+
+    The name must be a member of rldb.embodiment.EMBODIMENT (lowercased): the
+    dataset layer maps it back to the enum id for norm-stats lookup, outlier
+    rejection, and embodiment-based filtering, so tagging YAM episodes as eva_*
+    silently disables all three.
+    """
+    suffix = {"left": "left_arm", "right": "right_arm"}.get(arm, "bimanual")
+    return f"{robot}_{suffix}"
 
 
 def _separate_numeric_and_image(episode_feats: dict):
@@ -164,6 +170,7 @@ def convert_episode(
     task_description: str = "",
     save_mp4: bool = False,
     chunk_timesteps: int = 100,
+    robot: str = "eva",
 ) -> tuple[Path, Path]:
     """Process one HDF5 file and write a .zarr episode.
 
@@ -173,6 +180,7 @@ def convert_episode(
     episode_feats = EvaHD5Extractor.process_episode(
         episode_path=raw_path,
         arm=arm,
+        robot=robot,
     )
 
     front_key = "images.front_img_1"
@@ -183,7 +191,7 @@ def convert_episode(
     numeric_data, image_data = _separate_numeric_and_image(episode_feats)
     numeric_data = _split_per_arm(numeric_data, arm)
 
-    embodiment = _arm_to_embodiment(arm)
+    embodiment = _arm_to_embodiment(arm, robot)
 
     zarr_path = ZarrWriter.create_and_write(
         episode_path=output_dir / f"{dataset_name}.zarr",
@@ -226,7 +234,11 @@ def main(args) -> None:
     """
 
     try:
-        episode_hash = timestamp_ms_to_episode_hash(Path(args.raw_path).stem)
+        # Resolve the timestamp from the stem OR the hdf5 attr (YAM collector),
+        # so the hash and the stem-parsing in process_episode stay consistent.
+        episode_hash = timestamp_ms_to_episode_hash(
+            resolve_timestamp_ms(args.raw_path)
+        )
         zarr_path, mp4_path = convert_episode(
             raw_path=Path(args.raw_path),
             output_dir=Path(args.output_dir),
@@ -237,6 +249,7 @@ def main(args) -> None:
             task_description=args.task_description,
             save_mp4=args.save_mp4,
             chunk_timesteps=args.chunk_timesteps,
+            robot=getattr(args, "robot", "eva"),
         )
         return zarr_path, mp4_path
     except Exception:
@@ -260,6 +273,11 @@ def argument_parse():
     )
     parser.add_argument(
         "--arm", type=str, choices=["left", "right", "both"], default="both"
+    )
+    parser.add_argument(
+        "--robot", type=str, choices=["eva", "yam"], default="eva",
+        help="Robot that recorded the episodes; sets the zarr embodiment tag "
+             "(e.g. yam_bimanual) and gates the legacy EVA gripper fix.",
     )
     parser.add_argument("--save-mp4", type=str2bool, default=False)
     parser.add_argument(

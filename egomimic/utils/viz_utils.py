@@ -175,7 +175,14 @@ def _viz_traj(image, actions, intrinsics_key, **kwargs):
     return vis
 
 
-def _viz_axes(image, actions, intrinsics_key, axis_len_m=0.04, **kwargs):
+def _viz_axes(image, actions, intrinsics_key, axis_len_m=0.04, axes_stride=None, **kwargs):
+    """Draw the EE orientation as +x/+y/+z arrows (red/green/blue).
+
+    axes_stride: if None, draw axes only at the first pose (the chunk start).
+    If an int, draw axes at every ``axes_stride``-th pose along the chunk so the
+    orientation trajectory (ypr over the chunk) is visible. Arrows point in the
+    POSITIVE direction of each EE axis, projected into the image.
+    """
     alpha = kwargs.get("alpha", 1.0)
     image = _prepare_viz_image(image)
     intrinsics = INTRINSICS[intrinsics_key]
@@ -211,14 +218,8 @@ def _viz_axes(image, actions, intrinsics_key, axis_len_m=0.04, **kwargs):
             )
         return frame
 
-    def _draw_rotation_at_anchor(
-        frame, xyz_seq, ypr_seq, label, anchor_color, **kwargs
-    ):
-        if len(xyz_seq) == 0 or len(ypr_seq) == 0:
-            return frame
-
-        palm_xyz = xyz_seq[0]
-        palm_ypr = ypr_seq[0]
+    def _draw_axes_at_pose(frame, palm_xyz, palm_ypr, label, anchor_color):
+        """Draw +x/+y/+z arrows for ONE EE pose (xyz + ZYX euler, camera frame)."""
         rot = R.from_euler("ZYX", palm_ypr, degrees=False).as_matrix()
 
         axis_points_cam = np.vstack(
@@ -240,28 +241,37 @@ def _viz_axes(image, actions, intrinsics_key, axis_len_m=0.04, **kwargs):
         if not (0 <= x0 < w and 0 <= y0 < h):
             return frame
 
-        cv2.circle(frame, (x0, y0), 4, anchor_color, -1)
+        cv2.circle(frame, (x0, y0), 3, anchor_color, -1)
+        # +x red, +y green, +z blue — arrowheads mark the POSITIVE direction.
         axis_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
         for i, color in enumerate(axis_colors, start=1):
             x1, y1 = pts[i]
             if 0 <= x1 < w and 0 <= y1 < h:
-                cv2.line(frame, (x0, y0), (x1, y1), color, 2)
-                cv2.circle(frame, (x1, y1), 2, color, -1)
+                cv2.arrowedLine(
+                    frame, (x0, y0), (x1, y1), color, 2,
+                    line_type=cv2.LINE_AA, tipLength=0.3,
+                )
 
-        cv2.putText(
-            frame,
-            label,
-            (x0 + 6, max(12, y0 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            anchor_color,
-            1,
-            cv2.LINE_AA,
-        )
+        if label:
+            cv2.putText(
+                frame, label, (x0 + 6, max(12, y0 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, anchor_color, 1, cv2.LINE_AA,
+            )
         return frame
 
-    vis = _draw_rotation_at_anchor(vis, left_xyz, left_ypr, "L rot", (255, 180, 80))
-    vis = _draw_rotation_at_anchor(vis, right_xyz, right_ypr, "R rot", (80, 180, 255))
+    def _draw_axes_along(frame, xyz_seq, ypr_seq, label, anchor_color):
+        n = min(len(xyz_seq), len(ypr_seq))
+        if n == 0:
+            return frame
+        idxs = [0] if not axes_stride else list(range(0, n, max(1, int(axes_stride))))
+        for k in idxs:
+            frame = _draw_axes_at_pose(
+                frame, xyz_seq[k], ypr_seq[k], label if k == 0 else "", anchor_color
+            )
+        return frame
+
+    vis = _draw_axes_along(vis, left_xyz, left_ypr, "L rot", (255, 180, 80))
+    vis = _draw_axes_along(vis, right_xyz, right_ypr, "R rot", (80, 180, 255))
     vis = _draw_axis_color_legend(vis)
     if alpha < 1.0:
         vis = cv2.addWeighted(vis, alpha, base, 1.0 - alpha, 0)

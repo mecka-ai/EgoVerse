@@ -1,0 +1,27 @@
+defaults:
+  - pi0.5_base
+  - _self_
+
+# YAM bimanual robot. 20-dim continuous-6D cartesian+gripper action space
+# ([L: xyz c1 c2 g | R: xyz c1 c2 g]); only the camera extrinsics differ (yam).
+# Pair with data=yam_all_zarr_6d (transform_list mode cartesian_wristframe_6d),
+# whose pipeline emits the 6D columns BEFORE normalization, so per-dim norm acts
+# on the bounded 6D columns, not wrapped Euler angles. RobotBimanualCartesian6D's
+# to32/from32 are then a pure repack (no trig), unlike the legacy
+# RobotBimanualCartesianEuler whose to32 ran ypr->6D AFTER normalize (the bug).
+robomimic_model:
+  camera_transforms:
+    _target_: egomimic.utils.egomimicUtils.CameraTransforms
+    intrinsics_key: "base"
+    extrinsics_key: "yam"
+  ac_keys:
+    yam_bimanual: "actions_cartesian"
+  domains: ["yam_bimanual"]
+
+  action_converters:
+    rules:
+      YAM_BIMANUAL:
+        _target_: egomimic.utils.action_utils.RobotBimanualCartesian6D
+    # optional fallback if no match is found
+    fallback:
+      _target_: egomimic.utils.action_utils.BaseActionConverter

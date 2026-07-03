@@ -53,3 +53,5 @@ hydra_configs/data/extra/**
 settings.json
 failures.jsonl
 scratch/
+aws
+external/i2rt

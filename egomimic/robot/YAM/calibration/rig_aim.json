@@ -1,0 +1,20 @@
+{
+  "2952": {
+    "crop_bottom": 0,
+    "crop_left": 250,
+    "crop_right": 250,
+    "crop_top": 320,
+    "pitch_deg": -0.25,
+    "roll_deg": 0.0,
+    "yaw_deg": 17.75
+  },
+  "328": {
+    "crop_bottom": 0,
+    "crop_left": 450,
+    "crop_right": 250,
+    "crop_top": 320,
+    "pitch_deg": 0.0,
+    "roll_deg": -0.5,
+    "yaw_deg": 10.5
+  }
+}

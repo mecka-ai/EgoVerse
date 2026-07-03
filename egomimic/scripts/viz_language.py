@@ -20,6 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 from egomimic.rldb.embodiment.embodiment import Embodiment
 from egomimic.rldb.embodiment.eva import Eva
 from egomimic.rldb.embodiment.human import Aria, Mecka, Scale
+from egomimic.rldb.embodiment.yam import Yam
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.viz_utils import _prepare_viz_image
 
@@ -38,6 +39,9 @@ _EMBODIMENT_CLASSES: dict[str, type[Embodiment]] = {
     "mecka_bimanual": Mecka,
     "mecka_right_arm": Mecka,
     "mecka_left_arm": Mecka,
+    "yam_bimanual": Yam,
+    "yam_right_arm": Yam,
+    "yam_left_arm": Yam,
 }
 
 

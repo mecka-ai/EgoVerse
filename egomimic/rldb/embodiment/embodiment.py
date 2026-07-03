@@ -32,6 +32,9 @@ class EMBODIMENT(Enum):
     SCALE_BIMANUAL = 12
     SCALE_RIGHT_ARM = 13
     SCALE_LEFT_ARM = 14
+    YAM_RIGHT_ARM = 15
+    YAM_LEFT_ARM = 16
+    YAM_BIMANUAL = 17
 
 
 EMBODIMENT_ID_TO_KEY = {member.value: member.name for member in EMBODIMENT}
@@ -61,7 +64,7 @@ class Embodiment(ABC):
     def viz_transformed_batch(
         cls,
         batch,
-        mode=Literal["traj", "traj+rotation", "axes", "annotations"],
+        mode=Literal["traj", "traj+rotation", "traj+axes", "axes", "annotations"],
         viz_batch_key="actions_cartesian",
         image_key=None,
         transform_list=None,
@@ -95,7 +98,7 @@ class Embodiment(ABC):
         cls,
         image,
         viz_data,
-        mode=Literal["traj", "traj+rotation", "axes", "annotations"],
+        mode=Literal["traj", "traj+rotation", "traj+axes", "axes", "annotations"],
         intrinsics_key=None,
         **kwargs,
     ):
@@ -122,6 +125,19 @@ class Embodiment(ABC):
         if mode == "axes":
             return _viz_axes(
                 image=image,
+                actions=viz_data,
+                intrinsics_key=intrinsics_key,
+                **kwargs,
+            )
+        if mode == "traj+axes":
+            vis = _viz_traj(
+                image=image,
+                actions=viz_data,
+                intrinsics_key=intrinsics_key,
+                **kwargs,
+            )
+            return _viz_axes(
+                image=vis,
                 actions=viz_data,
                 intrinsics_key=intrinsics_key,
                 **kwargs,
