@@ -15,3 +15,18 @@ eva_bimanual:
   transform_list:
     obs_key: ee_pose
     rot_repr: 6d
+
+# YAM shares Eva's zarr schema and wrist->cam revert; only the viz projection
+# differs (Yam.VIZ_INTRINSICS_KEY = "yam"). Full entry (cartesian_wrist has no
+# yam block to inherit from).
+yam_bimanual:
+  _target_: egomimic.rldb.embodiment.yam.Yam.viz_gt_preds
+  _partial_: true
+  image_key: base_0_rgb
+  annotation_key: sampled_prompt
+  action_key: actions_cartesian
+  mode: traj
+  transform_list:
+    _target_: egomimic.rldb.embodiment.eva._build_eva_bimanual_revert_eef_frame_transform_list
+    obs_key: ee_pose
+    rot_repr: 6d
