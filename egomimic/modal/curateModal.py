@@ -216,7 +216,8 @@ def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dic
 
 def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
     """Project high-dim embeddings to ``dims``-D (2 or 3). method: 'tsne'|'umap'|'pca'.
-    tsne/umap PCA→50 first when wider; umap-learn is pip-installed on demand."""
+    tsne/umap PCA→50 first when wider; umap-learn/openTSNE pip-installed on demand.
+    t-SNE uses openTSNE (FFT interpolation, ~10-30x faster than sklearn) when available."""
     import numpy as _np
     from sklearn.decomposition import PCA
     X = _np.asarray(X, dtype=_np.float32)
@@ -233,9 +234,21 @@ def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
             _sp2.run([_s2.executable, "-m", "pip", "install", "-q", "umap-learn"], check=True)
             import umap
         return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
-    from sklearn.manifold import TSNE
+    # t-SNE: prefer openTSNE (FFT interpolation, ~10-30x faster than sklearn for large N).
     perplexity = min(50, max(5, len(X) // 100))
-    return TSNE(n_components=dims, init="pca", perplexity=perplexity, random_state=seed).fit_transform(X)
+    try:
+        import openTSNE as _ot
+    except ImportError:
+        import subprocess as _sp3, sys as _s3
+        print("[project3d] installing openTSNE…")
+        _sp3.run([_s3.executable, "-m", "pip", "install", "-q", "openTSNE"], check=True)
+        import openTSNE as _ot
+    print(f"[project3d] openTSNE {_ot.__version__}: {len(X)} pts → {dims}D, perplexity={perplexity}")
+    tsne = _ot.TSNE(
+        n_components=dims, perplexity=perplexity, n_jobs=-1,
+        initialization="pca", random_state=seed, verbose=True,
+    )
+    return _np.asarray(tsne.fit(X), dtype=_np.float32)
 
 
 def _build_quest_token_tsne(
