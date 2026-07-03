@@ -413,6 +413,20 @@ except Exception:  # calibration DB / yam_cameras unavailable -> last-known-good
         ]
     )
 
+# The zarr episodes store front_img_1 STRETCH-RESIZED from the stereo pipeline's
+# native re-aimed crop (1420x880 at serial 328 / crop 250/250/320/0) down to
+# 640x480 at collection time, so the native-resolution K above must be rescaled
+# per-axis to be valid on the stored images. Verified on yam_pick_hat: with the
+# scaled K the GT overlay lands on both grippers; the native K is ~2x off (and a
+# crop-to-4:3-then-resize hypothesis mis-registers the right arm). Update
+# _YAM_NATIVE_WH if the rig_aim crop changes, _YAM_STORED_WH if the collection
+# resize changes.
+_YAM_NATIVE_WH = (1420, 880)
+_YAM_STORED_WH = (640, 480)
+YAM_INTRINSICS = YAM_INTRINSICS.copy()
+YAM_INTRINSICS[0, :] *= _YAM_STORED_WH[0] / _YAM_NATIVE_WH[0]
+YAM_INTRINSICS[1, :] *= _YAM_STORED_WH[1] / _YAM_NATIVE_WH[1]
+
 INTRINSICS = {
     "base": ARIA_INTRINSICS,
     "base_half": ARIA_INTRINSICS_HALF,
