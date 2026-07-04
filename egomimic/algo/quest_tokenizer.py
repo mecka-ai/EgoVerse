@@ -31,6 +31,9 @@ class QuestTokenizerTrainer(Algo):
         ac_keys: Dict[str, str],
         skill_vae,
         viz_func: Optional[dict] = None,
+        loss_block_weights: Optional[List[dict]] = None,
+        vision_encoder: Optional[nn.Module] = None,
+        image_key: str = "front_img_1",
         **kwargs,
     ):
         self.nets = nn.ModuleDict()
@@ -39,6 +42,11 @@ class QuestTokenizerTrainer(Algo):
         self.domains = list(domains)
         self.ac_keys = dict(ac_keys)
         self.skill_vae = skill_vae
+        # Per-block reconstruction weighting: list of {name, start, end, weight}.
+        # Loss = sum_b weight_b * mean(MSE over dims [start:end]) / sum_b weight_b,
+        # so each block contributes by weight, not by dim count / raw scale.
+        self.loss_blocks = [dict(b) for b in loss_block_weights] if loss_block_weights else None
+        self.image_key = image_key
 
         device_arg = kwargs.get("device")
         if device_arg is not None:
@@ -66,9 +74,43 @@ class QuestTokenizerTrainer(Algo):
                 )
 
         self.nets["tokenizer"] = skill_vae
+        if vision_encoder is not None:
+            # obs_emb conditioning: trainable image encoder whose token both the
+            # SkillVAE encoder and decoder attend to.
+            self.nets["vision"] = vision_encoder
         self.nets = self.nets.float().to(self.device)
 
         self.training_step_count = 0
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _obs_emb(self, _batch):
+        """Vision conditioning token (B, 1, emb_dim), or None when not configured."""
+        if "vision" not in self.nets:
+            return None
+        if self.image_key not in _batch:
+            raise KeyError(
+                f"vision_encoder is configured but image key {self.image_key!r} is "
+                f"missing from the batch; available keys: {list(_batch.keys())}"
+            )
+        return self.nets["vision"](_batch[self.image_key])
+
+    def _recon_loss(self, recon, actions):
+        """(loss, per_block) — per-block weighted mean MSE, or plain MSE if unset."""
+        if not self.loss_blocks:
+            return F.mse_loss(recon, actions), {}
+        per_block = {}
+        total = 0.0
+        weight_sum = 0.0
+        for blk in self.loss_blocks:
+            s, e, w = int(blk["start"]), int(blk["end"]), float(blk["weight"])
+            blk_loss = F.mse_loss(recon[..., s:e], actions[..., s:e])
+            per_block[blk["name"]] = blk_loss
+            total = total + w * blk_loss
+            weight_sum += w
+        return total / max(weight_sum, 1e-8), per_block
 
     @override
     def process_batch_for_training(self, batch):
@@ -118,11 +160,16 @@ class QuestTokenizerTrainer(Algo):
             embodiment_name = get_embodiment(embodiment_id).lower()
             ac_key = self.ac_keys_by_id[embodiment_id]
             actions = _batch[ac_key]
-            recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](actions)
-            recon_loss = F.mse_loss(recon, actions)
+            obs_emb = self._obs_emb(_batch)
+            recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](
+                actions, obs_emb=obs_emb
+            )
+            recon_loss, per_block = self._recon_loss(recon, actions)
             predictions[f"{embodiment_name}_recon_loss"] = recon_loss
             predictions[f"{embodiment_name}_commit_loss"] = commit_loss.mean()
             predictions[f"{embodiment_name}_perplexity"] = pp
+            for blk_name, blk_loss in per_block.items():
+                predictions[f"{embodiment_name}_block_{blk_name}_loss"] = blk_loss
         return predictions
 
     @override
@@ -133,7 +180,10 @@ class QuestTokenizerTrainer(Algo):
                 embodiment_name = get_embodiment(embodiment_id).lower()
                 ac_key = self.ac_keys_by_id[embodiment_id]
                 actions = _batch[ac_key]
-                recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](actions)
+                obs_emb = self._obs_emb(_batch)
+                recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](
+                    actions, obs_emb=obs_emb
+                )
                 recons_dict[f"{embodiment_name}_{ac_key}"] = recon
         return recons_dict
 
@@ -144,7 +194,10 @@ class QuestTokenizerTrainer(Algo):
             ac_key = self.ac_keys_by_id[embodiment_id]
             actions = _batch[ac_key]
             with torch.inference_mode():
-                recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](actions)
+                obs_emb = self._obs_emb(_batch)
+                recon, pp, pp_sample, commit_loss, codes = self.nets["tokenizer"](
+                    actions, obs_emb=obs_emb
+                )
                 mse = F.mse_loss(recon, actions)
             metrics[f"{embodiment_name}_reconst_mse"] = mse
             metrics[f"{embodiment_name}_perplexity"] = pp.mean()
@@ -165,6 +218,11 @@ class QuestTokenizerTrainer(Algo):
             loss_dict[f"{embodiment_name}_recon_loss"] = recon_loss
             loss_dict[f"{embodiment_name}_commit_loss"] = commit_loss
             loss_dict[f"{embodiment_name}_loss"] = combined
+            # Surface per-block losses (palm vs fingertips) for logging.
+            prefix = f"{embodiment_name}_block_"
+            for k, v in predictions.items():
+                if k.startswith(prefix):
+                    loss_dict[k] = v
             total = total + combined
         loss_dict["action_loss"] = total / max(len(self.domains), 1)
         return loss_dict

@@ -635,9 +635,19 @@ def viewer():
             "end":   [int(s.get("end",   s.get("start", 0) + 1)) for s in spans],
             "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
             "txt":   [str(s.get("text", ""))[:200]        for s in spans],
+            # ids carry span identity (and, for token-level plots, a '#t{k}' token
+            # counter) — the builder derives span/token color modes from them
+            "id":    [str(s.get("id", ""))                for s in spans],
         }
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))
+        result["ntok"] = int(data.get("ntok", 25))       # QueST tokens per chunk
+        if data.get("metrics"):
+            result["metrics"] = data["metrics"]
+        if data.get("level"):
+            result["level"] = str(data["level"])
+        if any("n_chunks" in s for s in spans):
+            result["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]

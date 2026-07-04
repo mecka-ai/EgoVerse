@@ -312,7 +312,10 @@ function wrapText(s,w){
   return out.join('<br>');
 }
 
-/* ── color tables + shared hover customdata (built once) ── */
+/* ── color tables + shared hover customdata (built once) ──
+   Modes: cluster/episode/score/time always; 'span' when point ids carry span
+   identity; 'token' (position within QueST chunk, light→dark) for token-level
+   plots — flipping to color-by-token makes positional leakage visible at a glance. */
 function buildColorTables(){
   if(!HAS_TSNE) return;
   const N=TSNE.cid.length;
@@ -321,18 +324,32 @@ function buildColorTables(){
   const mn=finite.length?Math.min(...finite):0, mx=finite.length?Math.max(...finite):1;
   const s0=Math.min(...starts), s1=Math.max(...starts)||1;
   const wrapped=TXTS.map(t=>wrapText(t,44));   // wrap each unique text once
+  const hasTok=!!TSNE.tok, hasSid=!!TSNE.sid, ntok=TSNE.ntok||25;
   const ct={cluster:new Array(N), episode:new Array(N), score:new Array(N), time:new Array(N)};
+  if(hasSid) ct.span=new Array(N);
+  if(hasTok) ct.token=new Array(N);
   CUSTOM=new Array(N);
   for(let k=0;k<N;k++){
     ct.cluster[k]=goldenColor(TSNE.cid[k]);
     ct.episode[k]=goldenColor(TSNE.ei[k]);
     ct.score[k]=rgb(redGreen(mx>mn?(scores[k]-mn)/(mx-mn):0.5));
     ct.time[k]=rgb(lerp3([170,215,255],[10,40,90],(starts[k]-s0)/Math.max(1,s1-s0)));
+    if(hasSid) ct.span[k]=goldenColor(TSNE.sid[k]);
+    if(hasTok) ct.token[k]=rgb(lerp3([120,200,255],[230,90,40],(TSNE.tok[k]<0?0:TSNE.tok[k])/Math.max(1,ntok-1)));
+    // extra hover facts: token position (token-level) / chunk count (span-level)
+    const extra = hasTok && TSNE.tok[k]>=0 ? `tok ${TSNE.tok[k]}/${ntok}`
+                : TSNE.nch ? `${TSNE.nch[k]} chunk${TSNE.nch[k]===1?'':'s'}` : '';
     CUSTOM[k]=[k, TSNE.cid[k], TSNE.start[k],
                isFinite(scores[k])?scores[k].toFixed(3):'?',
-               wrapped[TSNE.ti[k]]||'', epOf(TSNE.ei[k]).slice(0,14)];
+               wrapped[TSNE.ti[k]]||'', epOf(TSNE.ei[k]).slice(0,14), extra];
   }
   COLOR_TABLES=ct;
+  // surface the extra color modes in the Color dropdown only when data supports them
+  const cm=document.getElementById('colorMode');
+  if(hasSid && ![...cm.options].some(o=>o.value==='span'))
+    cm.add(new Option('span','span'));
+  if(hasTok && ![...cm.options].some(o=>o.value==='token'))
+    cm.add(new Option('token index','token'));
 }
 
 /* ── ui state ── */
@@ -362,7 +379,9 @@ function applyStyle(){
     const passSel = sel.size===0 || sel.has(selEp ? TSNE.ei[k] : TSNE.cid[k]);
     const passHl  = !u.hlOn || (TSNE.start[k]<=u.hlF+u.hlW && TSNE.end[k]>=u.hlF-u.hlW);
     if(passSel && passHl){ aC.push(base[k]); aS.push(u.hlOn?u.size*2.2:u.size); aCust.push(CUSTOM[k]); aIdx.push(k); }
-    else cIdx.push(k);
+    // Non-selected points vanish entirely (semi-transparent 3-D markers depth-sort
+    // badly and wash out white); only frame-highlight misses stay as dim context.
+    else if(passSel) cIdx.push(k);
   }
   activeMods.forEach(mod=>{
     const t=TSNE[mod];
@@ -414,7 +433,7 @@ function ensurePanels(mods){
     '<div class="panel-row">'+rm.map(mod=>`
       <div class="panel-wrap">
         <div class="panel-title">${MOD_LABELS[mod]||mod}
-          <span class="pt-badge">${TOTAL_SPANS} spans</span></div>
+          <span class="pt-badge">${(HAS_TSNE?TSNE.cid.length:TOTAL_SPANS).toLocaleString()} pts</span></div>
         <div id="panel_${mod}" class="panel"></div>
       </div>`).join('')+'</div>'
   ).join('');
@@ -440,7 +459,8 @@ function renderTsne(preserveToggles){
     const t=TSNE[mod];
     const el=document.getElementById('panel_'+mod);
     if(!t||!el) continue;
-    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>';
+    const extraH=(TSNE.tok||TSNE.nch)?' &middot; %{customdata[6]}':'';
+    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}'+extraH+'<br>%{customdata[4]}<extra></extra>';
     const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large point clouds
     // trace 0 = ACTIVE (hoverable + clickable); trace 1 = CONTEXT (dim, hover skipped);
     // trace 2 = SELECTION diamond. applyStyle() partitions points between 0 and 1.
@@ -484,8 +504,14 @@ function renderTsne(preserveToggles){
 
   const hidden=hiddenMods.size?` &middot; <span style="color:#f87">${hiddenMods.size} hidden</span>`:'';
   const projName=(TSNE.method||'tsne').toUpperCase();
+  const lvl=TSNE.level?`${TSNE.level}-level`:(TSNE.tok?'token-level':'');
+  const m=TSNE.metrics||{}, mp=[];
+  if(m.nmi_language_kmeans!=null) mp.push(`NMI ${m.nmi_language_kmeans}`);
+  if(m.knn_language_acc!=null) mp.push(`kNN ${m.knn_language_acc}`);
+  if(m.same_span_locality_lift!=null) mp.push(`lift ${m.same_span_locality_lift}`);
+  const mNote=mp.length?` &middot; <span style="color:#7fd4ff" title="alignment: NMI(language, KMeans-on-embedding) &middot; language kNN accuracy &middot; same-span locality lift">${mp.join(' ')}</span>`:'';
   document.getElementById('tstats').innerHTML=
-    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${hidden}`;
+    `${TSNE.cid.length.toLocaleString()} pts${lvl?' ('+lvl+')':''} &middot; ${avail.length} modes &middot; ${projName}${mNote}${hidden}`;
   const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+(IS2D?' 2-D':' 3-D');
   buildLegend();
   applyStyle();
@@ -915,6 +941,27 @@ def build_cluster_html(
             "dims":   tsne.get("dims", 3),
             "method": tsne.get("method", "tsne"),
         }
+        # Span identity + token index, derived from point ids. Token-level plots use
+        # ids of the form '<span_id>#t<k>' where k is a flat token counter — the
+        # position within its chunk is k % ntok. Span-level plots have bare span ids.
+        ids = tsne.get("id")
+        if ids:
+            sid_idx: dict = {}
+            sids, toks = [], []
+            for pid in ids:
+                base, _, tsuf = pid.partition("#t")
+                sids.append(sid_idx.setdefault(base, len(sid_idx)))
+                toks.append(int(tsuf) % int(tsne.get("ntok", 25)) if tsuf.isdigit() else -1)
+            tsne_js["sid"] = sids
+            if any(t >= 0 for t in toks):
+                tsne_js["tok"] = toks
+                tsne_js["ntok"] = int(tsne.get("ntok", 25))
+        if tsne.get("nch"):
+            tsne_js["nch"] = tsne["nch"]
+        if tsne.get("metrics"):
+            tsne_js["metrics"] = tsne["metrics"]
+        if tsne.get("level"):
+            tsne_js["level"] = tsne["level"]
         for mode in ("state", "action", "language"):
             if mode in tsne:
                 tsne_js[mode] = tsne[mode]
@@ -963,9 +1010,17 @@ if __name__ == "__main__":
             "end":    [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
             "ep":     [s.get("ep", s.get("episode", "")) for s in spans],
             "txt":    [str(s.get("text", ""))[:200] for s in spans],
+            "id":     [str(s.get("id", "")) for s in spans],
             "dims":   int(raw.get("dims", 3)),
             "method": str(raw.get("method", "tsne")),
+            "ntok":   int(raw.get("ntok", 25)),
         }
+        if raw.get("metrics"):
+            tsne["metrics"] = raw["metrics"]
+        if raw.get("level"):
+            tsne["level"] = str(raw["level"])
+        if any("n_chunks" in s for s in spans):
+            tsne["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
         for mode in ("state", "action", "language"):
             if mode in raw:
                 tsne[mode] = {k: raw[mode][k] for k in raw[mode] if k in ("x", "y", "z")}
