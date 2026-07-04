@@ -16,6 +16,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     PoseCoordinateFrameTransform,
     QuaternionPoseToYPR,
     Reshape,
+    SanitizeQuatPoseChunk,
     SelectKeypoints,
     SplitKeys,
     Transform,
@@ -1522,6 +1523,9 @@ def _build_mecka_wf6d_fingertips_stepwise_transform_list(
         obs_wf_head = f"{side}.obs_wrist_headframe"  # (7,) -> (9,)
 
         transform_list += [
+            # Tracking-dropout rows (zero-quat) crash from_quat; forward-fill them
+            # (delta across a dropout = identity) and re-anchor ow to row 0.
+            SanitizeQuatPoseChunk(chunk_key=aw, anchor_key=ow),
             # Palm: consecutive frame-to-frame deltas (A_0 = identity).
             ConsecutiveDeltaChunk(chunk_key=aw, output_key=palm_sw),
             # Fingertips: MANO tips in the wrist frame of the SAME timestep.

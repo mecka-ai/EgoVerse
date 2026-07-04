@@ -789,6 +789,56 @@ def _se3_inverse_batch(mats: np.ndarray) -> np.ndarray:
     return out
 
 
+class SanitizeQuatPoseChunk(Transform):
+    """Forward/backward-fill invalid rows (zero-norm or non-finite quats) in an
+    xyzwxyz pose chunk.
+
+    Mecka episodes contain tracking-dropout rows where obs_wrist_pose is all
+    zeros; ``scipy.Rotation.from_quat`` raises on them ("Found zero norm
+    quaternions"). Filling an invalid row with the previous valid pose makes the
+    consecutive delta across it the identity (= no motion), which is the sane
+    reading of "tracking lost, hold last pose". Leading invalid rows are
+    backward-filled from the first valid row. Raises if the whole chunk is
+    invalid (the dataset's retry-with-random-index fallback handles that).
+
+    ``anchor_key``: optional single-pose key to overwrite with sanitized row 0,
+    preserving the obs == chunk[0] anchor invariant.
+    """
+
+    def __init__(self, chunk_key: str, anchor_key: str | None = None, eps: float = 1e-6):
+        self.chunk_key = chunk_key
+        self.anchor_key = anchor_key
+        self.eps = float(eps)
+
+    def transform(self, batch: dict) -> dict:
+        chunk = np.asarray(batch[self.chunk_key]).copy()  # (T, 7)
+        if chunk.ndim != 2 or chunk.shape[-1] != 7:
+            raise ValueError(
+                f"SanitizeQuatPoseChunk expects (T, 7) xyzwxyz, got {chunk.shape} "
+                f"for key '{self.chunk_key}'"
+            )
+        quat = chunk[:, 3:7]
+        valid = np.isfinite(chunk).all(axis=-1) & (
+            np.linalg.norm(quat, axis=-1) > self.eps
+        )
+        if not valid.all():
+            if not valid.any():
+                raise ValueError(
+                    f"SanitizeQuatPoseChunk: no valid pose rows in chunk "
+                    f"'{self.chunk_key}' (all zero/non-finite)"
+                )
+            # forward-fill: index of the most recent valid row at each t
+            idx = np.where(valid, np.arange(len(valid)), -1)
+            idx = np.maximum.accumulate(idx)
+            first_valid = int(np.argmax(valid))
+            idx[idx < 0] = first_valid  # leading invalids -> backward-fill
+            chunk = chunk[idx]
+        batch[self.chunk_key] = chunk
+        if self.anchor_key is not None:
+            batch[self.anchor_key] = chunk[0].copy()
+        return batch
+
+
 class ConsecutiveDeltaChunk(Transform):
     """Pose chunk → step-wise (frame-to-frame) deltas: A_t = P_{t-1}^{-1} ∘ P_t.
 
