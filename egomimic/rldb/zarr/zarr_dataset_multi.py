@@ -337,12 +337,14 @@ class EpisodeResolver:
         transform_list: list | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        snap_horizon_to_end: bool = False,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
         self.transform_list = transform_list
         self.norm_stats = norm_stats
         self.pause_removal_epsilon = pause_removal_epsilon
+        self.snap_horizon_to_end = bool(snap_horizon_to_end)
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
         """
@@ -384,6 +386,7 @@ class EpisodeResolver:
                     transform_list=self.transform_list,
                     norm_stats=self.norm_stats,
                     pause_removal_epsilon=self.pause_removal_epsilon,
+                    snap_horizon_to_end=self.snap_horizon_to_end,
                 )
                 datasets[name] = ds_obj
             except Exception as e:
@@ -788,6 +791,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
         pause_removal_epsilon: float | None = None,
+        snap_horizon_to_end: bool = False,
     ):
         super().__init__(
             folder_path,
@@ -795,6 +799,7 @@ class LocalEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            snap_horizon_to_end=snap_horizon_to_end,
         )
         self.debug = debug
         self.allowed_episode_ids = (
@@ -893,6 +898,7 @@ class LocalEpisodeResolver(EpisodeResolver):
                                 transform_list=self.transform_list,
                                 norm_stats=self.norm_stats,
                                 pause_removal_epsilon=self.pause_removal_epsilon,
+                                snap_horizon_to_end=self.snap_horizon_to_end,
                             )
                         except Exception as e:
                             logger.error(
@@ -1647,6 +1653,7 @@ class ZarrDataset(torch.utils.data.Dataset):
         transform_list: list | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        snap_horizon_to_end: bool = False,
         _total_frames: int | None = None,
         _embodiment: str | None = None,
         precomputed_metadata: dict | None = None,
@@ -1700,6 +1707,13 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.transform = transform_list
         self.norm_stats = norm_stats or {}
         self.pause_removal_epsilon = pause_removal_epsilon
+        # snap_horizon_to_end: never pad chunks near the episode end — clamp the
+        # anchor so the largest horizoned window fits entirely in real frames
+        # (frames in the last max_horizon-1 snap back to the last full chunk).
+        self.snap_horizon_to_end = bool(snap_horizon_to_end)
+        self._max_horizon = max(
+            (v.get("horizon") or 0 for v in (key_map or {}).values()), default=0
+        )
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
@@ -2392,6 +2406,14 @@ class ZarrDataset(torch.utils.data.Dataset):
         ZarrDataset handles jpeg decoding and transform function errors, and triggers resample on dataset level.
         """
         self._ensure_episode_reader()
+        if self.snap_horizon_to_end and self._max_horizon:
+            # Snap the anchor back so the largest window fits in real frames — the
+            # whole sample (obs anchor, image, action chunks) shifts consistently,
+            # and _pad_sequences never has anything to pad.
+            if self.keep_indices is not None:
+                idx = min(idx, max(0, len(self.keep_indices) - self._max_horizon))
+            else:
+                idx = min(idx, max(0, self.total_frames - self._max_horizon))
         if self.keep_indices is not None:
             real_idx = int(self.keep_indices[idx])
         else:
