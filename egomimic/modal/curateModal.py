@@ -171,137 +171,187 @@ def _read_span_action_trajectories(cfg, span_meta: list[dict], tag: str) -> list
     return trajectories
 
 
-def _read_episode_action_chunks(cfg, episode_hashes: list[str], tag: str) -> dict:
-    """Read per-episode action CHUNKS ``(T, horizon, action_dim)`` from zarr.
-
-    Unlike ``_read_span_action_trajectories`` (which reduces to the executed per-frame
-    action), this keeps the full 3-D chunks — one ``horizon``-frame action chunk per frame,
-    the exact input the QueST tokenizer was trained on. pause removal forced OFF.
-    Returns ``{episode_hash: (T, horizon, action_dim) float32}``.
-    """
-    import hydra as _hydra
-    import numpy as _np
-    from concurrent.futures import ThreadPoolExecutor
-    from omegaconf import OmegaConf as _OC
-
-    ds_cfg = next(iter(cfg.data.train_datasets.values()))
-    resolver_cfg = _OC.create(_OC.to_container(ds_cfg.resolver, resolve=True))
-    resolver_cfg["pause_removal_epsilon"] = None
-    resolver = _hydra.utils.instantiate(resolver_cfg)
-    resolved = resolver.resolve()
-    episodes = dict(resolved.datasets) if hasattr(resolved, "datasets") else dict(resolved)
-    unique_eps = sorted(set(episode_hashes))
-    print(f"{tag} QueST chunk read: resolver has {len(episodes)} eps; reading {len(unique_eps)}")
-
-    def _read_one(ep: str):
-        actions, _, _ = episodes[ep]._collect_curation_batched(
-            action_key="actions_cartesian",
-            image_key="observations.images.front_img_1",
-            image_decode_workers=0,
-            load_images=False,
-        )
-        a = _np.asarray(actions, dtype=_np.float32)  # (T, horizon, action_dim)
-        return ep, a
-
-    cache: dict = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for ep, a in pool.map(_read_one, [e for e in unique_eps if e in episodes]):
-            cache[ep] = a
-    print(f"{tag} QueST chunk read: cached {len(cache)} episodes")
-    return cache
-
-
-def _project3d(X, method: str = "tsne", seed: int = 0, dims: int = 3):
-    """Project high-dim embeddings to ``dims``-D (2 or 3). method: 'tsne'|'umap'|'pca'.
-    tsne/umap PCA→50 first when wider; umap-learn is pip-installed on demand."""
-    import numpy as _np
-    from sklearn.decomposition import PCA
-    X = _np.asarray(X, dtype=_np.float32)
-    if method == "pca":
-        return PCA(n_components=dims, random_state=seed).fit_transform(X)
-    if X.shape[1] > 50:
-        X = PCA(n_components=50, random_state=seed).fit_transform(X)
-    if method == "umap":
-        try:
-            import umap
-        except ImportError:
-            import subprocess as _sp2, sys as _s2
-            print("[project3d] installing umap-learn…")
-            _sp2.run([_s2.executable, "-m", "pip", "install", "-q", "umap-learn"], check=True)
-            import umap
-        return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1, random_state=seed).fit_transform(X)
-    from sklearn.manifold import TSNE
-    return TSNE(n_components=dims, init="pca", perplexity=30, random_state=seed).fit_transform(X)
-
-
 def _build_quest_token_tsne(
     cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
-    output_dir, task_name, tag, device, seed, cap: int = 60000,
+    output_dir, task_name, tag, device, seed,
 ):
-    """QueST token-level t-SNE: tile each span into non-overlapping horizon-length action
-    chunks, QueST-encode each into tokens, plot one point per token colored by the span's
-    language cluster. Writes tsne3d/spans_tsne3d.json (action mode) for the cluster viewer.
+    """Token/chunk/span-level QueST projection for the cluster viewer.
+
+    Modular pipeline (egomimic.curation.token_viz): snap-to-full-chunk span tiling
+    deduped by (episode, frame) → process-pool cached chunk read → QueST encode
+    (+ FSQ codes) → granularity pooling + preproc → balanced subsample → projection.
+    Chunk / token / projection tiers are content-key cached under token_viz.cache_dir,
+    so re-projections (new method/dims/granularity) skip the zarr read and re-encode.
+    Writes tsne3d/spans_tsne3d.json (explicit per-point tok_idx / chunk_frame /
+    chunk_idx / sid fields) and metrics.json.
     """
     import numpy as _np
+    from omegaconf import OmegaConf as _OCq
+
+    from egomimic.curation import token_viz as tv
+    from egomimic.curation.config import select_token_viz_settings
     from egomimic.curation.embedders import QuestTokenEmbedder
 
-    from omegaconf import OmegaConf as _OCq
+    tvs = select_token_viz_settings(cfg)
     H = int(_OCq.select(cfg, "model.action_embedder.quest_horizon", default=100))  # block size fed to QueST
-    ep_chunks = _read_episode_action_chunks(cfg, [m["episode"] for m in span_meta], tag)
-
-    chunk_list, owner = [], []
-    for i, m in enumerate(span_meta):
-        arr = ep_chunks.get(m["episode"])
-        if arr is None or len(arr) == 0:
-            continue
-        executed = arr[:, 0, :] if arr.ndim == 3 else arr      # executed per-frame trajectory (T, D)
-        T = executed.shape[0]
-        for idx in range(int(m["start"]), min(int(m["end"]), T), H):  # non-overlapping H-frame windows
-            w = executed[idx : idx + H]
-            if len(w) < H:                                     # pad short/last window to H (repeat last frame)
-                w = _np.concatenate([w, _np.repeat(w[-1:], H - len(w), axis=0)], axis=0)
-            chunk_list.append(w); owner.append(i)
-    if not chunk_list:
-        print(f"{tag} QueST: no chunks found — skipping"); return
-    chunks = _np.stack(chunk_list).astype(_np.float32)         # (Nc, H, D)
-    print(f"{tag} QueST: horizon={H}, {len(chunks)} chunks from {len(span_meta)} spans")
-
-    qt = QuestTokenEmbedder(ae.checkpoint_path, device=device); qt.fit()
-    tok = qt.embed_chunks(chunks)                              # (Nc, ntok, Denc)
-    ntok = tok.shape[1]
-    X = tok.reshape(-1, tok.shape[2]).astype(_np.float32)      # (Nc*ntok, Denc)
-    owner_tok = _np.repeat(_np.asarray(owner), ntok)
-    M = len(X)
-    print(f"{tag} QueST: {len(chunks)} chunks × {ntok} tok = {M} tokens from {len(span_meta)} spans")
-
-    rng = _np.random.default_rng(seed)
-    sel = _np.sort(rng.choice(M, cap, replace=False)) if M > cap else _np.arange(M)
-
     method = str(_OCq.select(cfg, "model.projection", default="tsne")).lower()
     dims = int(_OCq.select(cfg, "model.projection_dims", default=3))
-    print(f"{tag} QueST: projecting {len(sel)} tokens with {method} ({dims}D)")
-    emb = _project3d(X[sel], method, seed, dims=dims)
-    coords = {"x": emb[:, 0].astype(float).tolist(), "y": emb[:, 1].astype(float).tolist(),
-              "span_idx": list(range(len(emb)))}
-    if dims >= 3:
-        coords["z"] = emb[:, 2].astype(float).tolist()
+    cache_dir = tvs.cache_dir if tvs.cache else ""
 
-    def _o(k):  # owner span meta for token index k
-        return span_meta[owner_tok[k]], span_ids[owner_tok[k]]
+    # 1+2. Chunk plan + read (snap-to-full-chunk, dedupe, per-episode cache, process pool).
+    ds_cfg = next(iter(cfg.data.train_datasets.values()))
+    resolver_cfg = _OCq.to_container(ds_cfg.resolver, resolve=True)
+    resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match the latent store)
+    chunks, chunk_ep, chunk_frame, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
+        resolver_cfg, CFG.remote_repo_dir, span_meta, H, cache_dir, tag,
+    )
+    Nc = len(chunks)
+
+    # 3. QueST encode + FSQ codes (cached on chunk identity + checkpoint + horizon).
+    ep_order = sorted(set(chunk_ep))
+    ep_idx_of = {e: i for i, e in enumerate(ep_order)}
+    chunk_ep_idx = _np.asarray([ep_idx_of[e] for e in chunk_ep], dtype=_np.int32)
+    tok_key = tv.cache_key({
+        "data": read_info["data_tag"], "eps": ep_order,
+        "chunks": tv.array_key(chunk_ep_idx, chunk_frame),
+        "ckpt": str(ae.checkpoint_path), "horizon": H,
+    })
+    cached = tv.cache_load_npz(cache_dir, "tokens", tok_key)
+    if cached is not None:
+        emb = cached["emb"].astype(_np.float32)
+        codes = cached["codes"] if "codes" in cached else None
+        codebook_size = int(cached["codebook_size"]) if "codebook_size" in cached else None
+        print(f"{tag} QueST: token cache HIT ({tok_key}) → {emb.shape}")
+    else:
+        qt = QuestTokenEmbedder(ae.checkpoint_path, device=device)
+        qt.fit()
+        emb, codes, codebook_size = qt.embed_chunks_with_codes(chunks)
+        if cache_dir:
+            extra = {} if codes is None else {"codes": codes, "codebook_size": codebook_size}
+            p = tv.cache_save_npz(cache_dir, "tokens", tok_key, emb=emb, **extra)
+            print(f"{tag} QueST: token cache write → {p}")
+    ntok = emb.shape[1]
+    print(f"{tag} QueST: horizon={H}, {Nc} chunks × {ntok} tok from {len(span_chunks)} spans "
+          f"(granularity={tvs.granularity})")
+
+    # 4. Granularity pooling (the one pooling path) + point metadata.
+    chunk_emb = tv.pool_chunks(emb)                              # (Nc, D)
+    span_emb, span_order = tv.pool_spans(chunk_emb, span_chunks)  # (Ns, D)
+    if tvs.granularity == "token":
+        X = emb.reshape(-1, emb.shape[2]).astype(_np.float32)
+        pt_chunk = _np.repeat(_np.arange(Nc, dtype=_np.int32), ntok)
+        pt_tok = _np.tile(_np.arange(ntok, dtype=_np.int32), Nc)
+        pt_span = chunk_owner[pt_chunk]
+    elif tvs.granularity == "chunk":
+        X = chunk_emb
+        pt_chunk = _np.arange(Nc, dtype=_np.int32)
+        pt_tok = _np.full(Nc, -1, dtype=_np.int32)
+        pt_span = chunk_owner
+    elif tvs.granularity == "span":
+        X = span_emb
+        pt_chunk = _np.full(len(span_order), -1, dtype=_np.int32)
+        pt_tok = _np.full(len(span_order), -1, dtype=_np.int32)
+        pt_span = span_order
+    else:
+        raise ValueError(f"unknown token_viz.granularity: {tvs.granularity!r}")
+
+    X = tv.preprocess(
+        X, center_by_position=tvs.center_by_position,
+        pos_ids=(pt_tok if tvs.granularity == "token" else None),
+        l2norm=tvs.l2norm, whiten=tvs.whiten, pca_dim=tvs.pca_dim, seed=seed,
+    )
+
+    # 5. Balanced subsample (per-span / per-cluster fair shares) + cached projection.
+    span_cid = _np.asarray([int(span_cluster.get(span_ids[i], -1)) for i in range(len(span_meta))])
+    if tvs.balance == "cluster":
+        groups = span_cid[pt_span]
+    elif tvs.balance == "none":
+        groups = _np.zeros(len(X), dtype=_np.int32)
+    else:
+        groups = pt_span
+    sel = tv.balanced_subsample(groups, tvs.cap, seed)
+    if len(sel) < len(X):
+        print(f"{tag} QueST: subsampled {len(X)} → {len(sel)} points "
+              f"(cap={tvs.cap}, balance={tvs.balance})")
+
+    proj_key = tv.cache_key({
+        "tokens": tok_key, "granularity": tvs.granularity, "method": method, "dims": dims,
+        "seed": seed, "cap": tvs.cap, "balance": tvs.balance,
+        "preproc": {"center_by_position": tvs.center_by_position, "l2norm": tvs.l2norm,
+                    "whiten": tvs.whiten, "pca_dim": tvs.pca_dim},
+    })
+    cached = tv.cache_load_npz(cache_dir, "proj", proj_key)
+    if cached is not None and len(cached["coords"]) == len(sel):
+        proj = cached["coords"].astype(_np.float32)
+        print(f"{tag} QueST: projection cache HIT ({proj_key})")
+    else:
+        print(f"{tag} QueST: projecting {len(sel)} {tvs.granularity} points with {method} ({dims}D)")
+        proj = tv.project_points(X[sel], method=method, dims=dims, seed=seed)
+        if cache_dir:
+            tv.cache_save_npz(cache_dir, "proj", proj_key, coords=proj, sel=sel)
+
+    # 6. Alignment metrics (metrics.json) — language/locality/codebook numbers per run.
+    if tvs.metrics:
+        from egomimic.curation.token_metrics import compute_alignment_metrics
+        tok_flat = emb.reshape(-1, emb.shape[2])
+        tok_span_all = chunk_owner[_np.repeat(_np.arange(Nc), ntok)]
+        metrics = compute_alignment_metrics(
+            span_emb=span_emb, span_lang=span_cid[span_order],
+            chunk_emb=chunk_emb, chunk_lang=span_cid[chunk_owner],
+            token_emb=tok_flat, token_lang=span_cid[tok_span_all], token_span=tok_span_all,
+            coords=proj, coords_tok_idx=pt_tok[sel],
+            codes=codes, codebook_size=codebook_size, seed=seed,
+        )
+        metrics.update({
+            "granularity": tvs.granularity, "method": method, "dims": dims,
+            "n_chunks": int(Nc), "n_tokens_per_chunk": int(ntok),
+            "n_spans_mapped": len(span_chunks),
+            "chunks_snapped_spans": read_info["snapped"],
+            "spans_previously_dropped": read_info["dropped_old"],
+            "chunk_refs_deduped": read_info["deduped"],
+            "episodes_failed": [e for e, _ in read_info["failed"]],
+        })
+        mpath = Path(output_dir) / "metrics.json"
+        mpath.parent.mkdir(parents=True, exist_ok=True)
+        with open(mpath, "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"{tag} QueST: metrics → {mpath}: "
+              f"lang_nmi={metrics['language_nmi']}, knn={metrics['lang_knn_acc']}, "
+              f"locality={metrics['same_span_locality']}, fsq={metrics['fsq']}, "
+              f"tokidx_map_nmi={metrics['tokidx_map_nmi']}")
+
+    # 7. Viewer JSON with explicit per-point fields.
+    coords = {"x": proj[:, 0].astype(float).tolist(), "y": proj[:, 1].astype(float).tolist(),
+              "span_idx": list(range(len(proj)))}
+    if dims >= 3:
+        coords["z"] = proj[:, 2].astype(float).tolist()
     spans_list, cids = [], []
-    for j, k in enumerate(sel):
-        m, sid = _o(k); cid = int(span_cluster.get(sid, -1)); cids.append(cid)
-        spans_list.append({"id": f"{sid}#t{int(k)}", "ep": m["episode"], "start": int(m["start"]),
-                           "end": int(m["end"]), "text": m["text"], "score": None, "cluster": cid})
+    for k in sel:
+        si = int(pt_span[k])
+        m, sid = span_meta[si], span_ids[si]
+        ci, tj = int(pt_chunk[k]), int(pt_tok[k])
+        cid = int(span_cid[si])
+        cids.append(cid)
+        # start/end: the chunk window for token/chunk points (frame-precise hover +
+        # time coloring), the span itself for span points.
+        s0, e0 = ((int(chunk_frame[ci]), int(chunk_frame[ci]) + H) if ci >= 0
+                  else (int(m["start"]), int(m["end"])))
+        spans_list.append({
+            "id": f"{sid}#c{ci}t{tj}" if ci >= 0 else sid,
+            "sid": sid, "ep": m["episode"], "start": s0, "end": e0, "text": m["text"],
+            "score": None, "cluster": cid, "tok_idx": tj, "chunk_idx": ci,
+            "chunk_frame": (int(chunk_frame[ci]) if ci >= 0 else -1),
+        })
     cids = _np.asarray(cids)
     clusters_meta = {str(c): {"label": cluster_labels.get(str(c), ""), "n_spans": int((cids == c).sum())}
                      for c in sorted(set(cids.tolist()))}
     out = {"n_clusters": len(clusters_meta), "clusters": clusters_meta, "spans": spans_list,
-           "action": coords, "method": method, "dims": dims}
+           "action": coords, "method": method, "dims": dims, "granularity": tvs.granularity}
     tsne_dir = Path(output_dir) / "tsne3d"; tsne_dir.mkdir(parents=True, exist_ok=True)
     with open(tsne_dir / "spans_tsne3d.json", "w") as f:
         json.dump(out, f)
-    print(f"{tag} QueST: wrote token t-SNE → {tsne_dir/'spans_tsne3d.json'} ({len(sel)} tokens plotted)")
+    print(f"{tag} QueST: wrote {tvs.granularity}-level {method} → {tsne_dir/'spans_tsne3d.json'} "
+          f"({len(sel)} points plotted)")
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +813,25 @@ def _score_task(
 
     tag = f"[{task_name}][score]"
     t_start = _time.perf_counter()
+
+    # Run provenance: resolved config + git commit + inputs + seed, next to scores/ —
+    # a run must be reproducible from its output dir alone.
+    import datetime as _dt
+    from omegaconf import OmegaConf as _OCprov
+    prov = _OCprov.create({
+        "provenance": {
+            "run_name": run_name, "task": task_name,
+            "git_remote": git_remote, "git_commit": git_commit,
+            "hydra_args": list(hydra_args),
+            "latents_source": latents_source or None, "output_dir": output_dir,
+            "seed": select_seed(cfg),
+            "written_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        },
+        "config": _OCprov.to_container(cfg, resolve=True),
+    })
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    (Path(output_dir) / "run_config.yaml").write_text(_OCprov.to_yaml(prov))
+    print(f"{tag} provenance → {Path(output_dir) / 'run_config.yaml'}")
 
     # QueST token embedder needs the external/quest submodule (SkillVAE); the score
     # worker boots without submodules, so init it on demand here.

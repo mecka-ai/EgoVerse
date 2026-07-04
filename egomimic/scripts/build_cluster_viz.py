@@ -143,6 +143,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
       <select id="colorMode" onchange="applyStyle()">
         <option value="cluster">cluster</option>
         <option value="episode">episode</option>
+        <option value="span">span</option>
+        <option value="tokpos">token position</option>
         <option value="score">MI score</option>
         <option value="time">time (light&rarr;dark)</option>
       </select></span>
@@ -217,6 +219,8 @@ const RUN_KEY    = "clusterviz:" + "__RUN_LABEL_ESCAPED__";   // localStorage ke
 
 const HAS_TSNE = TSNE && TSNE.cid && TSNE.cid.length;
 const IS2D = (TSNE && TSNE.dims || 3) === 2;   // 2-D vs 3-D scatter
+const HAS_TOK = HAS_TSNE && TSNE.tok && TSNE.tok.some(v=>v>=0);   // token-granularity run
+const HAS_SID = HAS_TSNE && TSNE.sid && TSNE.sid.some(s=>s);      // per-point span identity
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
   parseInt(a.replace('cluster_','')) - parseInt(b.replace('cluster_',''))
 );
@@ -278,6 +282,12 @@ const EP_LIST = (()=>{const cnt={}; ALL_CID.forEach(cid=>CLUSTERS[cid].spans.for
 const EP_IDX = Object.fromEntries(EP_LIST.map(e=>[e.ep,e.idx]));
 function epColor(ep){const i=EP_IDX[ep]??0; return rgb(hsv2rgb((i*137.508)%360/360,0.85,0.9));}
 
+/* ── per-point span identity (token/chunk runs: many points share one span) ── */
+const SID_IDX = (()=>{ if(!HAS_SID) return {}; const m={}; let n=0;
+  for(const s of TSNE.sid) if(s && !(s in m)) m[s]=n++;
+  return m; })();
+function sidColor(sid){const i=SID_IDX[sid]??0; return rgb(hsv2rgb((i*137.508)%360/360,0.8,0.92));}
+
 /* ── color tables (built once) ── */
 function buildColorTables(){
   if(!HAS_TSNE) return;
@@ -287,11 +297,16 @@ function buildColorTables(){
   const mn=finite.length?Math.min(...finite):0, mx=finite.length?Math.max(...finite):1;
   const s0=Math.min(...starts), s1=Math.max(...starts)||1;
   const ct={cluster:new Array(N), episode:new Array(N), score:new Array(N), time:new Array(N)};
+  const maxTok = HAS_TOK ? TSNE.tok.reduce((a,b)=>Math.max(a,b),1) : 1;   // reduce: 60k-arg spread overflows
+  if(HAS_TOK) ct.tokpos=new Array(N);
+  if(HAS_SID) ct.span=new Array(N);
   for(let k=0;k<N;k++){
     ct.cluster[k]=cidColor(TSNE.cid[k]);
     ct.episode[k]=epColor(TSNE.ep[k]);
     ct.score[k]=rgb(redGreen(mx>mn?(scores[k]-mn)/(mx-mn):0.5));
     ct.time[k]=rgb(lerp3([170,215,255],[10,40,90],(starts[k]-s0)/Math.max(1,s1-s0)));
+    if(HAS_TOK) ct.tokpos[k]=TSNE.tok[k]>=0?rgb(lerp3([250,220,80],[90,30,160],TSNE.tok[k]/maxTok)):'#888';
+    if(HAS_SID) ct.span[k]=sidColor(TSNE.sid[k]);
   }
   COLOR_TABLES=ct;
 }
@@ -397,9 +412,11 @@ function renderTsne(preserveToggles){
     const N=t.x.length;
     const custom=new Array(N);
     for(let k=0;k<N;k++){
-      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14)];
+      custom[k]=[k, TSNE.cid[k], TSNE.start[k], isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?', TSNE.txt[k]||'', (TSNE.ep[k]||'').slice(0,14), HAS_TOK?TSNE.tok[k]:-1];
     }
-    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}<br>%{customdata[4]}<extra></extra>';
+    const hov='cluster %{customdata[1]} &middot; ep %{customdata[5]}&hellip; &middot; f%{customdata[2]} &middot; %{customdata[3]}'
+              +(HAS_TOK?' &middot; tok %{customdata[6]}':'')
+              +'<br>%{customdata[4]}<extra></extra>';
     const tType = IS2D ? 'scattergl' : 'scatter3d';   // WebGL for large 2-D point clouds
     const main = {type:tType,mode:'markers',x:t.x,y:t.y,customdata:custom,
                   marker:{size:u.size,color:base,line:{width:0}},hovertemplate:hov};
@@ -436,8 +453,9 @@ function renderTsne(preserveToggles){
 
   const hidden=hiddenMods.size?` &middot; <span style="color:#f87">${hiddenMods.size} hidden</span>`:'';
   const projName=(TSNE.method||'tsne').toUpperCase();
+  const gran=TSNE.granularity?` &middot; ${TSNE.granularity}-level`:'';
   document.getElementById('tstats').innerHTML=
-    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${hidden}`;
+    `${TOTAL_SPANS.toLocaleString()} spans &middot; ${avail.length} modes &middot; ${projName}${gran}${hidden}`;
   const tabEl=document.getElementById('tab-tsne'); if(tabEl) tabEl.textContent=projName+(IS2D?' 2-D':' 3-D');
   buildLegend();
   applyStyle();
@@ -774,7 +792,12 @@ window.addEventListener('resize',()=>{
 
 /* ── init ── */
 buildCSel();
+// color modes only meaningful for runs that carry the data
+if(!HAS_TOK){ const o=document.querySelector('#colorMode option[value="tokpos"]'); if(o) o.remove(); }
+if(!HAS_SID){ const o=document.querySelector('#colorMode option[value="span"]'); if(o) o.remove(); }
 loadState();            // restore persisted selection + color/select modes (per run)
+{ const cm=document.getElementById('colorMode');   // persisted mode may not exist for this run
+  if(cm && ![...cm.options].some(o=>o.value===cm.value)) cm.value='cluster'; }
 updateClusterDisplay();
 buildColorTables();
 renderTsne(false);      // renders panels synchronously (or shows no-data note)

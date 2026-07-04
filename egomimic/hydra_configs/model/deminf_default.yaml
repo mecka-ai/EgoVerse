@@ -7,6 +7,28 @@ device: cuda
 projection: tsne
 projection_dims: 3
 
+# Token-level span viz (action_embedder.type=quest_tokens) — egomimic/curation/token_viz.py.
+# granularity: projection point granularity. span (default) for language-alignment work;
+#              token for debugging the tokenizer itself; chunk in between.
+# balance:     subsample allocation for cap — span | cluster | none (uniform lets
+#              chunk-rich spans dominate the map).
+# preproc:     embedding stages before projection (these change what the map shows more
+#              than the projection method does).
+# cache:       content-keyed chunk/token/projection caches on the volume — a projection
+#              tweak (2D→3D, tsne→umap, new granularity) skips the zarr read + re-encode.
+token_viz:
+  granularity: span   # token | chunk | span
+  cap: 60000
+  balance: span       # span | cluster | none
+  preproc:
+    center_by_position: false  # token granularity: subtract per-token-position mean
+    l2norm: false
+    whiten: false
+    pca_dim: 50       # pre-projection PCA; 0 = off
+  cache: true
+  cache_dir: /root/EgoVerse/logs/deminf_cache
+  metrics: true       # write metrics.json (language NMI, kNN acc, locality lift, FSQ usage)
+
 keys:
   action: actions_cartesian
   image: observations.images.front_img_1

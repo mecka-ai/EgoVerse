@@ -82,6 +82,31 @@ class ActionEmbedderSettings:
 
 
 @dataclass(frozen=True)
+class TokenVizSettings:
+    """Token-level span viz settings (``model.token_viz``; action_embedder.type=quest_tokens).
+
+    granularity: projection point granularity — ``token`` (one point per QueST token,
+                 for debugging the tokenizer) | ``chunk`` | ``span`` (default; one point
+                 per annotation span, for language-alignment work).
+    balance:     subsample allocation for the ``cap`` — ``span`` | ``cluster`` | ``none``
+                 (uniform sampling lets chunk-rich spans dominate the map).
+    preproc:     center_by_position / l2norm / whiten / pca_dim stages before projection.
+    cache:       reuse chunk / token / projection caches under ``cache_dir``.
+    """
+
+    granularity: str = "span"
+    cap: int = 60000
+    balance: str = "span"
+    center_by_position: bool = False
+    l2norm: bool = False
+    whiten: bool = False
+    pca_dim: int = 50
+    cache: bool = True
+    cache_dir: str = "/root/EgoVerse/logs/deminf_cache"
+    metrics: bool = True
+
+
+@dataclass(frozen=True)
 class TsneVizConfig:
     """t-SNE export settings (``model.tsne``)."""
 
@@ -283,6 +308,27 @@ def select_action_embedder_settings(cfg: Any) -> ActionEmbedderSettings:
         reuse_latents_npz=(
             str(block.get("reuse_latents_npz")) if block.get("reuse_latents_npz") else None
         ),
+    )
+
+
+def select_token_viz_settings(cfg: Any) -> TokenVizSettings:
+    """Read ``model.token_viz`` settings; defaults if absent."""
+    block = OmegaConf.select(cfg, "model.token_viz", default=None)
+    d = TokenVizSettings()
+    if block is None:
+        return d
+    pre = block.get("preproc", None) or {}
+    return TokenVizSettings(
+        granularity=str(block.get("granularity", d.granularity)).lower().strip(),
+        cap=int(block.get("cap", d.cap)),
+        balance=str(block.get("balance", d.balance)).lower().strip(),
+        center_by_position=bool(pre.get("center_by_position", d.center_by_position)),
+        l2norm=bool(pre.get("l2norm", d.l2norm)),
+        whiten=bool(pre.get("whiten", d.whiten)),
+        pca_dim=int(pre.get("pca_dim", d.pca_dim)),
+        cache=bool(block.get("cache", d.cache)),
+        cache_dir=str(block.get("cache_dir", d.cache_dir)),
+        metrics=bool(block.get("metrics", d.metrics)),
     )
 
 

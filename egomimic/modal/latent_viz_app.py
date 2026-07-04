@@ -455,6 +455,10 @@ def viewer():
         }
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))
+        result["granularity"] = str(data.get("granularity", ""))
+        # explicit per-point token/span fields (token/chunk-granularity runs)
+        result["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
+        result["sid"] = [str(s.get("sid", "")) for s in spans]
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]

@@ -1206,22 +1206,34 @@ class QuestTokenEmbedder:
         return np.repeat(projected, H, axis=0)[:N]
 
     def embed_chunks(self, chunks: np.ndarray) -> np.ndarray:
-        """Encode action chunks into per-token embeddings.
+        """Encode action chunks into per-token embeddings ``(N, num_tokens, encoder_dim)``."""
+        return self.embed_chunks_with_codes(chunks)[0]
+
+    def embed_chunks_with_codes(
+        self, chunks: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray | None, int | None]:
+        """Encode action chunks into per-token embeddings plus quantizer codes.
 
         Args:
             chunks: ``(N, T_chunk, action_dim)`` float array (T_chunk = training horizon).
 
         Returns:
-            ``(N, num_tokens, encoder_dim)`` float32 array.
+            ``(emb, codes, codebook_size)`` — ``emb`` is ``(N, num_tokens, encoder_dim)``
+            float32 pre-quantization embeddings; ``codes`` is ``(N, num_tokens)`` int64
+            FSQ/VQ codebook indices from ``SkillVAE.quantize`` (None when the tokenizer
+            has no quantizer).
         """
         if not self._fitted:
             raise RuntimeError("Call fit() before embed_chunks()")
         chunks = np.asarray(chunks, dtype=np.float32)
         if len(chunks) == 0:
-            return np.empty((0, self.num_tokens or 0, self.encoder_dim or 0), dtype=np.float32)
+            return (np.empty((0, self.num_tokens or 0, self.encoder_dim or 0), dtype=np.float32),
+                    None, None)
         vae = self._model.nets["tokenizer"]
         ds = self._model.data_schematic
+        has_vq = hasattr(vae, "quantize") and hasattr(vae, "vq")
         outputs: list[np.ndarray] = []
+        codes_out: list[np.ndarray] = []
         t0 = time.perf_counter()
         with torch.no_grad():
             for start in range(0, len(chunks), self.batch_size):
@@ -1229,13 +1241,19 @@ class QuestTokenEmbedder:
                 normed = ds.normalize_data({self._ac_key: b}, self._eid)[self._ac_key]
                 z = vae.encode(normed.to(self.device))  # (B, num_tokens, encoder_dim)
                 outputs.append(np.asarray(z.detach().cpu().numpy(), dtype=np.float32))
+                if has_vq:
+                    _, indices, *_ = vae.quantize(z)  # (B, num_tokens) codebook indices
+                    codes_out.append(np.asarray(indices.detach().cpu().numpy(), dtype=np.int64))
         out = np.concatenate(outputs, axis=0)
+        codes = np.concatenate(codes_out, axis=0) if codes_out else None
+        codebook_size = int(vae.vq.codebook_size) if has_vq else None
         self.num_tokens, self.encoder_dim = int(out.shape[1]), int(out.shape[2])
         logger.info(
-            "[actions] QuestTokenEmbedder: %d chunks → %s (%d tok/chunk) in %.2fs",
-            len(chunks), out.shape, self.num_tokens, time.perf_counter() - t0,
+            "[actions] QuestTokenEmbedder: %d chunks → %s (%d tok/chunk, codes=%s) in %.2fs",
+            len(chunks), out.shape, self.num_tokens,
+            "none" if codes is None else f"codebook {codebook_size}", time.perf_counter() - t0,
         )
-        return out
+        return out, codes, codebook_size
 
 
 class ActionEmbedder:
