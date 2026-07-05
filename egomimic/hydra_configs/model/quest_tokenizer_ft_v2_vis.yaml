@@ -1,0 +1,58 @@
+# quest_tokenizer_ft_v2 + VISION CONDITIONING (change 6).
+# SkillVAE.encode/decode natively accept obs_emb (previously unused): a trainable
+# ResNet18 encodes the ego image (front_img_1) into one (B, 1, 384) token that both
+# encoder and decoder attend to. Tasks that differ by object rather than hand
+# kinematics become separable — action-only tokenization has a hard ceiling there.
+# All v2 changes included (block weights, step-wise data, no pos-emb, downsample 8).
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+
+robomimic_model:
+  _target_: egomimic.algo.quest_tokenizer.QuestTokenizerTrainer
+  data_schematic: _${data.dataset.data_schematic}
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  image_key: "front_img_1"
+  vision_encoder:
+    _target_: egomimic.algo.skill_vae_mecka.ImageObsEncoder
+    emb_dim: 384            # must match skill_vae encoder_dim
+    pretrained: true
+    image_size: 224
+
+  # 48-dim layout: [L palm 6D (0:9) | L tips (9:24) | R palm 6D (24:33) | R tips (33:48)]
+  loss_block_weights:
+    - {name: palm_left, start: 0, end: 9, weight: 1.0}
+    - {name: tips_left, start: 9, end: 24, weight: 2.0}
+    - {name: palm_right, start: 24, end: 33, weight: 1.0}
+    - {name: tips_right, start: 33, end: 48, weight: 2.0}
+
+  skill_vae:
+    _target_: egomimic.algo.skill_vae_mecka.SkillVAEMecka
+    action_dim: 48
+    use_positional_emb: false
+    encoder_dim: 384
+    decoder_dim: 384
+    skill_block_size: 100
+    downsample_factor: 8    # 100 frames -> 13 latent tokens
+    attn_pdrop: 0.1
+    use_causal_encoder: true
+    use_causal_decoder: true
+    encoder_heads: 6
+    encoder_layers: 4
+    decoder_heads: 6
+    decoder_layers: 6
+    vq_type: "fsq"
+    fsq_level: [8, 5, 5, 5]
+    codebook_dim: 512
+    codebook_size: 1024
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+
+scheduler: null

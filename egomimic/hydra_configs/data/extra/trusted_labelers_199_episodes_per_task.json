@@ -1,0 +1,1389 @@
+{
+  "summary": {
+    "requested": 199,
+    "found": 199,
+    "missing": [],
+    "num_task_id": 102,
+    "num_canonical_tasks": 87
+  },
+  "by_task_id": {
+    "stocking_shelves": [
+      "68c5f26259537e9ead05536f",
+      "68c60257e9e837b8eec3c8c9",
+      "68c64085ef6cc84c22b7e6e7",
+      "68c655c0ec331250d5e747e9",
+      "68c991876f55ccdbb27de284",
+      "68c998c2e2722ea2271163e5",
+      "68c9a5048c8887a68eddf0e7",
+      "68c9a5ed2cab01ee359624ab",
+      "68c9a671f7aeb085b60fcb95",
+      "68c9a927633c5706a58b0b77",
+      "68c9b871841616b2c4f83ef0",
+      "68c9bad0650e2b7e7f6fe45e",
+      "68d0e2d3362d1163a3b9a812",
+      "68d0e2d4362d1163a3b9a817",
+      "68d24ff7d5da0393353cb06d",
+      "68d282dd4f093d9ed301aa85",
+      "68d39aa99bbdd093fc50070b",
+      "68d3ddca890039bfd5e5e418",
+      "68d3e2eaaa81462a8e1a09a7",
+      "68d3e574330fbd900623902e",
+      "68d3e59e91a44281fe3dfd1c",
+      "68d3e5fd9fb5ff4324333459",
+      "68d3eb7983e3803355f8176b",
+      "68d3ebbcc478daa723d5cffa",
+      "68d3ec58f8e579445c27a95b",
+      "68d3edf7e956b9877079abcc",
+      "68d3efb8c9877dc79633db38",
+      "68d3f5c4ebeb92d19ee19324",
+      "68d3fb38bf26aa7727bf2d27",
+      "68d3fc96f5cf426e3ca29367",
+      "68d3fd7130210b5f98ff0514",
+      "68d3ff88bdac7d9d657e03fb",
+      "68d3ffa76127398e6e20c911",
+      "68d435bc58ae90e8b2082295"
+    ],
+    "cleaning_shoes": [
+      "68d1d3a21d29a1390d685fe2",
+      "68d21711e692e6458598d6fa",
+      "68d28d0784aff09cac592cd9",
+      "68d391f9d98254a0b8a5a8b5",
+      "68d3a7ffcea1f16ac771f48a",
+      "68d3abd0e5761ef3261601da",
+      "68d3d436caff909a814b3439",
+      "68d3dd5537d09ad2edf86350",
+      "68d3e672347ceea1609f6f74",
+      "68d3eb4c593c576a5a68f356",
+      "68d3f7a39ad4e83f3cd10e4b",
+      "68d3fe3bcfdb743f0cb0e35b",
+      "68d401769743ff69a2c94972"
+    ],
+    "arranging_flowers": [
+      "68c9b90d5bfe618385ef5822",
+      "68d2ca9484aff09cac592d59",
+      "68d39b8bb5118d96d77fe047",
+      "68d3e6774b1c32266ea185fd",
+      "68d3e8eb2b641f84dc1d0639",
+      "68d3ed291963191d9d22a7b8",
+      "68d3ef9c6df2d7f2057a2069"
+    ],
+    "folding_clothes": [
+      "68c4c33375d9403cc4fdb813",
+      "68c4c33475d9403cc4fdb81d",
+      "68c5aa15bea0ae562b92a0e0",
+      "68d1b68f362d1163a3b9aa16",
+      "68d3f447b2791101a83bd6c0"
+    ],
+    "ironing": [
+      "68c5dbcc33e43850a914c474",
+      "68c895224115b5b4b041a5a5",
+      "68d3e841b13874d8f711f53e",
+      "68d3f2658191686d654b7c39",
+      "68d3fde096772ec628720f89"
+    ],
+    "sanding_wood": [
+      "68d27c6dec023a8391120a68",
+      "68d2e0f440e4c013224af5ae",
+      "68d2fd684107888f4548515b",
+      "68d3df7a96772ec628720ec0",
+      "68d3f216da0b8ca59e73a144"
+    ],
+    "sewing": [
+      "68c5053142c89c4aa82ec285",
+      "68c5dc87102551de19d83d18",
+      "68d2b0d24f093d9ed301ab09",
+      "68d3a5d67b066cb2c7f29d6c",
+      "68d3fa8e6fbe40458fa4111a"
+    ],
+    "shopping": [
+      "68c5de33bea0ae562b92a1bd",
+      "68c9a2065103cc9262b492c9",
+      "68d3ee474d1da7e09284b306",
+      "68d3f64170ac33bcc29e1383",
+      "68d3f9c83a35c217ca6c4eaa"
+    ],
+    "organizing_displays": [
+      "68c9a0c51dbbd4ceed9008ce",
+      "68d3f3852b420f072efcef10",
+      "68d3fb45afda675cd77317b5",
+      "68d43678330fbd9006239118"
+    ],
+    "organizing_merchandise": [
+      "68d176255dd0b4fb0e66fe11",
+      "68d3a09bade75412233d2f1a",
+      "68d3ee75fdc3d72c217231f5"
+    ],
+    "organizing_shelves": [
+      "68d3e8e9a2c9be23a2c7616a",
+      "68d3edc112af763ea5dca391",
+      "68d3ff88bdac7d9d657e03fd"
+    ],
+    "repairing_phones": [
+      "68c9a6475f109bcce27c3f21",
+      "68d3d9bbc03c89e6ffdb1b94",
+      "68d3dc1bc03c89e6ffdb1ba3"
+    ],
+    "stocking_displays": [
+      "68c9b8433d07306db046d1d5",
+      "68c9beb97aa0d16e8dd1c037",
+      "68d3efffa30578df032e8c7d"
+    ],
+    "woodworking": [
+      "68d2e4b4f1110f17cab93073",
+      "68d34dfd6c95e0f292d7162f",
+      "68d3efed28e87fa668047473"
+    ],
+    "cleaning_tools": [
+      "68c49d2f7680df88da57b4ab",
+      "68c64b63122941a869b9aa6f"
+    ],
+    "cleaning_vehicles": [
+      "68c9b8db7adfb407628afca3",
+      "68c9beb5a87e21e176a591da"
+    ],
+    "cooking": [
+      "68d3faf97b0a732458996369",
+      "68d3ff48462c3bd1f3389739"
+    ],
+    "jewelry_making": [
+      "68c403c399bbf8dcf263713c",
+      "68d3e700925361f5ea9d713d"
+    ],
+    "organizing_inventory": [
+      "68c53f6659537e9ead0550f6",
+      "68d3be177b0a732458996224"
+    ],
+    "packaging_items": [
+      "68d3149284aff09cac592e39",
+      "68d3e5547cd24b318ca55a15"
+    ],
+    "painting_nails": [
+      "68c3dbebe9e837b8eec3c2d6",
+      "68c4a62029d0f78e997a5bc5"
+    ],
+    "repairing_laptops": [
+      "68c9a7ff8c8887a68eddf0f6",
+      "68d3dd95b2791101a83bd634"
+    ],
+    "repairing_phone": [
+      "68d2ce3a3a35c217ca6c4b0b",
+      "68d3e3313347ee746cc0dba2"
+    ],
+    "sorting_buttons": [
+      "68c69406a298d13f754d944c",
+      "68d3d62b17b2c483236ea0eb"
+    ],
+    "stocking_refrigerators": [
+      "68c5b8b6bea0ae562b92a11d",
+      "68d3fc48ea00ad7b77fa9b27"
+    ],
+    "wrapping_flowers": [
+      "68d1baa11d29a1390d685fa6",
+      "68d3df836fbe40458fa41084"
+    ],
+    "wrapping_gifts": [
+      "68d20446d6026b3c26957f41",
+      "68d3e196e01658bf77887247"
+    ],
+    "arranging_appliances": [
+      "68d39f4894642be1d88718ab"
+    ],
+    "arranging_products": [
+      "68d3dd3f21a7fa3f254129d0"
+    ],
+    "arranging_wood_pieces": [
+      "68d3efed28e87fa668047471"
+    ],
+    "assembling_frames": [
+      "68d3e94feaaa6b198fd9d7c5"
+    ],
+    "assembling_keyboards": [
+      "68d400c1f846d0bc5e1c4256"
+    ],
+    "baking": [
+      "68d435dc611c44ef88d9a37b"
+    ],
+    "boxing_items": [
+      "68d3e08faf5ed45de4512921"
+    ],
+    "cleaning_bicycles": [
+      "68d3f9441e21f8c5c37fe23d"
+    ],
+    "cleaning_equipment": [
+      "68d3e28a7cd24b318ca55a01"
+    ],
+    "cleaning_furniture": [
+      "68c9c555e2722ea22711644e"
+    ],
+    "creating_nail_art": [
+      "68c4023b1e0d1d81b7edf6c9"
+    ],
+    "cutting_grass": [
+      "68d3f9d701e97f875b0a2d6f"
+    ],
+    "cutting_paper": [
+      "68d31ccf33e6ec1c3d42dd26"
+    ],
+    "decorating_cakes": [
+      "68d3a37940d6c4b427e29a15"
+    ],
+    "disassembling_computer": [
+      "68d3d38af5cf426e3ca29288"
+    ],
+    "disassembling_keyboards": [
+      "68d3f785fdc3d72c2172322b"
+    ],
+    "dishwashing": [
+      "68d3ded8dee2dd8b46abcee1"
+    ],
+    "examining_kettles": [
+      "68c9c16ba1ea367a01cd62a2"
+    ],
+    "flattening_cardboard_boxes": [
+      "68d3e9db5b6cfcbc9ef6c407"
+    ],
+    "folding_fabrics": [
+      "68c5e84bcaa279a3f386bc28"
+    ],
+    "framing_pictures": [
+      "68d3eb3aa0bae22e2ba1f544"
+    ],
+    "gardening": [
+      "68d3d959e43a7c184ebcdb07"
+    ],
+    "installing_batteries": [
+      "68d358cc0ddd54b74dec0d09"
+    ],
+    "labeling_products": [
+      "68d3d74cbf26aa7727bf2c5c"
+    ],
+    "lacing_shoes": [
+      "68d30047963606becec184b0"
+    ],
+    "managing_inventory": [
+      "68d400f6faebe2a9a4905c94"
+    ],
+    "measuring_zippers": [
+      "68d3d8a2e6f74fcaa2082322"
+    ],
+    "mixing_polish": [
+      "68c3e30b9c65dfc2d3048ba8"
+    ],
+    "opening_and_closing_boxes": [
+      "68d3e7e0ce136334df153789"
+    ],
+    "organizing_boxes": [
+      "68d3e9db5b6cfcbc9ef6c403"
+    ],
+    "organizing_cables": [
+      "68c9a75462a648b8057c6743"
+    ],
+    "organizing_clothes": [
+      "68d0b5b139f1cfca22c1115c"
+    ],
+    "organizing_counters": [
+      "68d3dfabf4abd6e6ceedfe19"
+    ],
+    "organizing_pastries": [
+      "68c63eb4def4497ae3640a59"
+    ],
+    "organizing_stock": [
+      "68c99f6b55831511cfe40398"
+    ],
+    "packaging": [
+      "68d40487347ceea1609f7025"
+    ],
+    "packaging_electronics": [
+      "68d371426a28a17b71a7fbe9"
+    ],
+    "packaging_food": [
+      "68d3f373a611772dbbec050c"
+    ],
+    "packaging_parts": [
+      "68d2cff3fdc3d72c21722df5"
+    ],
+    "packaging_pastries": [
+      "68c63ddf10341f5ce7fed06b"
+    ],
+    "packaging_products": [
+      "68d3ec9dbf26aa7727bf2cd6"
+    ],
+    "packing_orders": [
+      "68d3f58a474b70ce54b863e7"
+    ],
+    "peeling_seeds": [
+      "68c5dd69f9ce62a3f04c5e8c"
+    ],
+    "picking_items": [
+      "68d3f78a6df2d7f2057a209d"
+    ],
+    "polishing_glassware": [
+      "68d3bc9f17b2c483236ea060"
+    ],
+    "portioning_dough": [
+      "68d3fac1080f96540b692c26"
+    ],
+    "potting_plant": [
+      "68d3f3897f1737e8220536c5"
+    ],
+    "preparing_an_item": [
+      "68d3f5ef0b15d43c1228ec9a"
+    ],
+    "preparing_beverages": [
+      "68c9b837cbfd55da83ea956e"
+    ],
+    "preparing_clothes": [
+      "68c585945dc427a9d85e5054"
+    ],
+    "preparing_fabric": [
+      "68d3ead92b420f072efceed7"
+    ],
+    "preparing_food": [
+      "68d3e24fafda675cd7731720"
+    ],
+    "preparing_solution": [
+      "68d3e396e9a8cc50ad36f71b"
+    ],
+    "removing_keycaps": [
+      "68d3f927e543371c966136d4"
+    ],
+    "repairing_electronics": [
+      "68d43583950312a1c06c9f83"
+    ],
+    "repairing_guitars": [
+      "68d400b332ac0ec26bc55308"
+    ],
+    "repairing_keyboards": [
+      "68d18270c478daa723d5c912"
+    ],
+    "repairing_lightbulbs": [
+      "68d3d3a13f1af862216a1cc0"
+    ],
+    "repairing_shoes": [
+      "68d3fc8f06df05f7fb14aabd"
+    ],
+    "repairing_smartphones": [
+      "68d3db2af8075f03011bcd90"
+    ],
+    "repairing_speakers": [
+      "68d365dad6026b3c2695826e"
+    ],
+    "repairing_watches": [
+      "68d265f1e692e6458598d78e"
+    ],
+    "restocking_refrigerators": [
+      "68c9a2d184ecc9125e1e0bd4"
+    ],
+    "sanding_metal_sheets": [
+      "68d37b34b460bbeb02f34631"
+    ],
+    "sawing_wood": [
+      "68d384506c95e0f292d7179b"
+    ],
+    "sorting_hardware": [
+      "68d3b6f42ea7766c04293f97"
+    ],
+    "sorting_merchandise": [
+      "68c616dd5dc427a9d85e5239"
+    ],
+    "spraying_plants": [
+      "68d3dff9e5761ef3261602f6"
+    ],
+    "stamping_paper": [
+      "68d403c8c32d0a30de745a98"
+    ],
+    "stocking_appliances": [
+      "68d39f4794642be1d88718a9"
+    ],
+    "stocking_phone_cases": [
+      "68c982315392f21f38d22091"
+    ],
+    "unpacking": [
+      "68d39daf181a3411ed145fe9"
+    ],
+    "unstocking_displays": [
+      "68d3fa55f5cf426e3ca2935a"
+    ],
+    "washing_sink": [
+      "68d4053a737c6330c3e7887b"
+    ],
+    "wrapping": [
+      "68d3d3fae78c475fe9b3c05e"
+    ]
+  },
+  "by_canonical_task": {
+    "<none>": [
+      "68c3e30b9c65dfc2d3048ba8",
+      "68c4023b1e0d1d81b7edf6c9",
+      "68c4a62029d0f78e997a5bc5",
+      "68c4c33375d9403cc4fdb813",
+      "68c4c33475d9403cc4fdb81d",
+      "68c585945dc427a9d85e5054",
+      "68c5aa15bea0ae562b92a0e0",
+      "68c5dc87102551de19d83d18",
+      "68c5de33bea0ae562b92a1bd",
+      "68c5e84bcaa279a3f386bc28",
+      "68c5f26259537e9ead05536f",
+      "68c60257e9e837b8eec3c8c9",
+      "68c63ddf10341f5ce7fed06b",
+      "68c895224115b5b4b041a5a5",
+      "68c982315392f21f38d22091",
+      "68c991876f55ccdbb27de284",
+      "68c9a2065103cc9262b492c9",
+      "68c9a2d184ecc9125e1e0bd4",
+      "68c9a5048c8887a68eddf0e7",
+      "68c9a6475f109bcce27c3f21",
+      "68c9a7ff8c8887a68eddf0f6",
+      "68c9b837cbfd55da83ea956e",
+      "68c9b8433d07306db046d1d5",
+      "68c9b8db7adfb407628afca3",
+      "68c9beb5a87e21e176a591da",
+      "68c9c16ba1ea367a01cd62a2",
+      "68d0b5b139f1cfca22c1115c",
+      "68d0e2d3362d1163a3b9a812",
+      "68d18270c478daa723d5c912",
+      "68d1b68f362d1163a3b9aa16",
+      "68d24ff7d5da0393353cb06d",
+      "68d2ce3a3a35c217ca6c4b0b",
+      "68d2cff3fdc3d72c21722df5",
+      "68d2e0f440e4c013224af5ae",
+      "68d34dfd6c95e0f292d7162f",
+      "68d358cc0ddd54b74dec0d09",
+      "68d365dad6026b3c2695826e",
+      "68d371426a28a17b71a7fbe9",
+      "68d39f4794642be1d88718a9",
+      "68d39f4894642be1d88718ab",
+      "68d3be177b0a732458996224",
+      "68d3d38af5cf426e3ca29288",
+      "68d3d3a13f1af862216a1cc0",
+      "68d3d3fae78c475fe9b3c05e",
+      "68d3d74cbf26aa7727bf2c5c",
+      "68d3d8a2e6f74fcaa2082322",
+      "68d3d9bbc03c89e6ffdb1b94",
+      "68d3db2af8075f03011bcd90",
+      "68d3dc1bc03c89e6ffdb1ba3",
+      "68d3dd3f21a7fa3f254129d0",
+      "68d3dd5537d09ad2edf86350",
+      "68d3dd95b2791101a83bd634",
+      "68d3ddca890039bfd5e5e418",
+      "68d3ded8dee2dd8b46abcee1",
+      "68d3df7a96772ec628720ec0",
+      "68d3dff9e5761ef3261602f6",
+      "68d3e196e01658bf77887247",
+      "68d3e3313347ee746cc0dba2",
+      "68d3e396e9a8cc50ad36f71b",
+      "68d3e5fd9fb5ff4324333459",
+      "68d3e700925361f5ea9d713d",
+      "68d3e94feaaa6b198fd9d7c5",
+      "68d3eb3aa0bae22e2ba1f544",
+      "68d3ebbcc478daa723d5cffa",
+      "68d3ec58f8e579445c27a95b",
+      "68d3edc112af763ea5dca391",
+      "68d3efed28e87fa668047471",
+      "68d3efed28e87fa668047473",
+      "68d3f2658191686d654b7c39",
+      "68d3f447b2791101a83bd6c0",
+      "68d3f5ef0b15d43c1228ec9a",
+      "68d3f785fdc3d72c2172322b",
+      "68d3f7a39ad4e83f3cd10e4b",
+      "68d3f9441e21f8c5c37fe23d",
+      "68d3fa8e6fbe40458fa4111a",
+      "68d3faf97b0a732458996369",
+      "68d3fc8f06df05f7fb14aabd",
+      "68d3fde096772ec628720f89",
+      "68d3ff48462c3bd1f3389739",
+      "68d3ff88bdac7d9d657e03fb",
+      "68d400b332ac0ec26bc55308",
+      "68d400c1f846d0bc5e1c4256",
+      "68d400f6faebe2a9a4905c94",
+      "68d401769743ff69a2c94972",
+      "68d403c8c32d0a30de745a98",
+      "68d40487347ceea1609f7025",
+      "68d4053a737c6330c3e7887b",
+      "68d43583950312a1c06c9f83",
+      "68d435bc58ae90e8b2082295"
+    ],
+    "tc_208": [
+      "68c655c0ec331250d5e747e9",
+      "68c9a5ed2cab01ee359624ab",
+      "68c9a671f7aeb085b60fcb95",
+      "68d3e574330fbd900623902e",
+      "68d3f58a474b70ce54b863e7",
+      "68d3fc96f5cf426e3ca29367",
+      "68d3fd7130210b5f98ff0514",
+      "68d3ff88bdac7d9d657e03fd",
+      "68d3ffa76127398e6e20c911"
+    ],
+    "tc_72": [
+      "68d21711e692e6458598d6fa",
+      "68d28d0784aff09cac592cd9",
+      "68d3abd0e5761ef3261601da",
+      "68d3fe3bcfdb743f0cb0e35b"
+    ],
+    "tc_156": [
+      "68d27c6dec023a8391120a68",
+      "68d2e4b4f1110f17cab93073",
+      "68d2fd684107888f4548515b"
+    ],
+    "tc_831": [
+      "68c9a0c51dbbd4ceed9008ce",
+      "68d0e2d4362d1163a3b9a817",
+      "68d3e59e91a44281fe3dfd1c"
+    ],
+    "tc_11748": [
+      "68c9bad0650e2b7e7f6fe45e",
+      "68d3ee474d1da7e09284b306"
+    ],
+    "tc_2205": [
+      "68c616dd5dc427a9d85e5239",
+      "68c99f6b55831511cfe40398"
+    ],
+    "tc_265": [
+      "68d176255dd0b4fb0e66fe11",
+      "68d3e8e9a2c9be23a2c7616a"
+    ],
+    "tc_4328": [
+      "68c9b90d5bfe618385ef5822",
+      "68d39b8bb5118d96d77fe047"
+    ],
+    "tc_4972": [
+      "68d3e6774b1c32266ea185fd",
+      "68d3ef9c6df2d7f2057a2069"
+    ],
+    "tc_720": [
+      "68d39daf181a3411ed145fe9",
+      "68d3e9db5b6cfcbc9ef6c407"
+    ],
+    "tc_841": [
+      "68d20446d6026b3c26957f41",
+      "68d3ec9dbf26aa7727bf2cd6"
+    ],
+    "tc_8541": [
+      "68c9beb97aa0d16e8dd1c037",
+      "68d3eb7983e3803355f8176b"
+    ],
+    "tc_1018": [
+      "68d37b34b460bbeb02f34631"
+    ],
+    "tc_10256": [
+      "68d3f64170ac33bcc29e1383"
+    ],
+    "tc_10390": [
+      "68d3a5d67b066cb2c7f29d6c"
+    ],
+    "tc_11459": [
+      "68d3d62b17b2c483236ea0eb"
+    ],
+    "tc_1199": [
+      "68d3e9db5b6cfcbc9ef6c403"
+    ],
+    "tc_1203": [
+      "68d3df836fbe40458fa41084"
+    ],
+    "tc_123": [
+      "68d3e2eaaa81462a8e1a09a7"
+    ],
+    "tc_12417": [
+      "68d3e672347ceea1609f6f74"
+    ],
+    "tc_13": [
+      "68d3e841b13874d8f711f53e"
+    ],
+    "tc_1324": [
+      "68c5dd69f9ce62a3f04c5e8c"
+    ],
+    "tc_13303": [
+      "68d43678330fbd9006239118"
+    ],
+    "tc_13457": [
+      "68d1baa11d29a1390d685fa6"
+    ],
+    "tc_139": [
+      "68d3fb38bf26aa7727bf2d27"
+    ],
+    "tc_14": [
+      "68d3e8eb2b641f84dc1d0639"
+    ],
+    "tc_1411": [
+      "68d3a7ffcea1f16ac771f48a"
+    ],
+    "tc_145": [
+      "68d3f373a611772dbbec050c"
+    ],
+    "tc_1457": [
+      "68d2b0d24f093d9ed301ab09"
+    ],
+    "tc_14970": [
+      "68d391f9d98254a0b8a5a8b5"
+    ],
+    "tc_1503": [
+      "68c9b871841616b2c4f83ef0"
+    ],
+    "tc_1554": [
+      "68d3e7e0ce136334df153789"
+    ],
+    "tc_1621": [
+      "68d384506c95e0f292d7179b"
+    ],
+    "tc_1673": [
+      "68c63eb4def4497ae3640a59"
+    ],
+    "tc_1714": [
+      "68d282dd4f093d9ed301aa85"
+    ],
+    "tc_1854": [
+      "68d3a37940d6c4b427e29a15"
+    ],
+    "tc_1959": [
+      "68c5b8b6bea0ae562b92a11d"
+    ],
+    "tc_2": [
+      "68c5053142c89c4aa82ec285"
+    ],
+    "tc_206": [
+      "68d31ccf33e6ec1c3d42dd26"
+    ],
+    "tc_2246": [
+      "68d2ca9484aff09cac592d59"
+    ],
+    "tc_2364": [
+      "68d3fc48ea00ad7b77fa9b27"
+    ],
+    "tc_24": [
+      "68d3e24fafda675cd7731720"
+    ],
+    "tc_2405": [
+      "68c69406a298d13f754d944c"
+    ],
+    "tc_27": [
+      "68d3f3897f1737e8220536c5"
+    ],
+    "tc_2875": [
+      "68d3d436caff909a814b3439"
+    ],
+    "tc_2929": [
+      "68d3f5c4ebeb92d19ee19324"
+    ],
+    "tc_3014": [
+      "68d3efffa30578df032e8c7d"
+    ],
+    "tc_3103": [
+      "68d3dfabf4abd6e6ceedfe19"
+    ],
+    "tc_3175": [
+      "68c5dbcc33e43850a914c474"
+    ],
+    "tc_3191": [
+      "68d3e28a7cd24b318ca55a01"
+    ],
+    "tc_3337": [
+      "68c9a927633c5706a58b0b77"
+    ],
+    "tc_337": [
+      "68d435dc611c44ef88d9a37b"
+    ],
+    "tc_341": [
+      "68d3ee75fdc3d72c217231f5"
+    ],
+    "tc_358": [
+      "68d30047963606becec184b0"
+    ],
+    "tc_363": [
+      "68d1d3a21d29a1390d685fe2"
+    ],
+    "tc_370": [
+      "68c64b63122941a869b9aa6f"
+    ],
+    "tc_375": [
+      "68d3bc9f17b2c483236ea060"
+    ],
+    "tc_4015": [
+      "68d3149284aff09cac592e39"
+    ],
+    "tc_4065": [
+      "68d3eb4c593c576a5a68f356"
+    ],
+    "tc_4152": [
+      "68d3fb45afda675cd77317b5"
+    ],
+    "tc_4201": [
+      "68d3fa55f5cf426e3ca2935a"
+    ],
+    "tc_4206": [
+      "68d3ed291963191d9d22a7b8"
+    ],
+    "tc_43": [
+      "68c9c555e2722ea22711644e"
+    ],
+    "tc_4450": [
+      "68d3efb8c9877dc79633db38"
+    ],
+    "tc_509": [
+      "68d3f3852b420f072efcef10"
+    ],
+    "tc_5147": [
+      "68c64085ef6cc84c22b7e6e7"
+    ],
+    "tc_524": [
+      "68d3b6f42ea7766c04293f97"
+    ],
+    "tc_528": [
+      "68d265f1e692e6458598d78e"
+    ],
+    "tc_546": [
+      "68d3e5547cd24b318ca55a15"
+    ],
+    "tc_5513": [
+      "68d3f78a6df2d7f2057a209d"
+    ],
+    "tc_5917": [
+      "68d3ead92b420f072efceed7"
+    ],
+    "tc_6038": [
+      "68c3dbebe9e837b8eec3c2d6"
+    ],
+    "tc_623": [
+      "68d3d959e43a7c184ebcdb07"
+    ],
+    "tc_6615": [
+      "68d39aa99bbdd093fc50070b"
+    ],
+    "tc_70": [
+      "68d3f927e543371c966136d4"
+    ],
+    "tc_7167": [
+      "68d3f216da0b8ca59e73a144"
+    ],
+    "tc_727": [
+      "68d3f9d701e97f875b0a2d6f"
+    ],
+    "tc_8": [
+      "68d3fac1080f96540b692c26"
+    ],
+    "tc_8019": [
+      "68d3f9c83a35c217ca6c4eaa"
+    ],
+    "tc_8123": [
+      "68c9a75462a648b8057c6743"
+    ],
+    "tc_8143": [
+      "68d3e08faf5ed45de4512921"
+    ],
+    "tc_820": [
+      "68c53f6659537e9ead0550f6"
+    ],
+    "tc_9283": [
+      "68c49d2f7680df88da57b4ab"
+    ],
+    "tc_9401": [
+      "68c403c399bbf8dcf263713c"
+    ],
+    "tc_9460": [
+      "68d3edf7e956b9877079abcc"
+    ],
+    "tc_98": [
+      "68c998c2e2722ea2271163e5"
+    ],
+    "tc_985": [
+      "68d3a09bade75412233d2f1a"
+    ]
+  },
+  "canonical_id_labels": {
+    "tc_6038": "Applying polish and decorations to artificial nails and curing them under a UV lamp.",
+    "tc_9401": "Cut material and attach a loop to an object.",
+    "tc_9283": "Cleaning parts with a brush",
+    "tc_2": "Sewing fabric pieces using a sewing machine",
+    "tc_820": "Picking up and stacking blocks",
+    "tc_1959": "Transferring items from one container to another",
+    "tc_3175": "Iron and fold laundry on an ironing board",
+    "tc_1324": "Peel fruit with a knife into container",
+    "tc_2205": "Stack small boxes.",
+    "tc_1673": "Rolling out dough and shaping pastries with a mold.",
+    "tc_5147": "Organizing and placing retail items on a display.",
+    "tc_370": "Wiping utensils with a cloth and placing them in a drawer",
+    "tc_208": "Transferring snacks between a box and a store shelf.",
+    "tc_2405": "Sorting and packaging buttons into containers or bags.",
+    "tc_98": "Stocking canned goods from a box onto shelves.",
+    "tc_831": "Cleaning and stocking phone cases on a display rack",
+    "tc_8123": "Cleaning product packaging with a cloth",
+    "tc_3337": "Organizing and stocking sachets of consumer products on shelves",
+    "tc_1503": "Organize packaged parts (hardware, auto) by placing them on a shelf/rack.",
+    "tc_4328": "Trimming and arranging flowers for a bouquet using shears",
+    "tc_11748": "Transferring sachets between shelves and baskets.",
+    "tc_8541": "Stock retail display stand with product",
+    "tc_43": "Wiping a wooden table with a cloth",
+    "tc_265": "Wiping items and a shelf with a cloth",
+    "tc_13457": "Wrap flowers with paper and secure them.",
+    "tc_363": "Scrubbing and cleaning a shoe with a brush and soap",
+    "tc_841": "Wrap a box with paper and tape.",
+    "tc_72": "Cleaning a sneaker with a brush and cleaning solution",
+    "tc_528": "Repairing a watch's internal components using precision tools.",
+    "tc_156": "Sanding wood by hand using sandpaper.",
+    "tc_1714": "Organizing and hanging packaged merchandise on a display rack",
+    "tc_1457": "Sewing fabric with a sewing machine.",
+    "tc_2246": "Arranging flowers and wrapping them in paper to create a bouquet",
+    "tc_358": "Lace and tie shoelaces on a shoe.",
+    "tc_4015": "Wrapping objects with bubble wrap and tape.",
+    "tc_206": "Cutting paper stacks with a guillotine paper cutter",
+    "tc_1018": "Polish metal sheet with polisher",
+    "tc_1621": "Cutting wood with a hand saw",
+    "tc_14970": "Clean slides with brush and cloth",
+    "tc_6615": "Stack metal objects",
+    "tc_720": "Flatten and stack cardboard boxes.",
+    "tc_985": "Organizing phone accessories from a display rack.",
+    "tc_1854": "Frosting a cake on a turntable with a spatula.",
+    "tc_10390": "Folding garments and attaching labels using a tagging gun.",
+    "tc_1411": "Cleaning a shoe with a cloth and a brush",
+    "tc_524": "Sorting and inspecting wire harnesses",
+    "tc_375": "Washing and drying dishes using a sponge and cloth",
+    "tc_2875": "Clean shoe sole with brush",
+    "tc_11459": "Sorting buttons into piles or a tray.",
+    "tc_623": "Scooping soil from a container into smaller containers.",
+    "tc_1203": "Wrap flowers with paper to create a bouquet.",
+    "tc_3103": "Clearing and cleaning a kitchen counter and dishes",
+    "tc_8143": "Transferring snack packages from a shelf into a box",
+    "tc_24": "Peeling garlic cloves by hand",
+    "tc_3191": "Clean and organize a work surface",
+    "tc_123": "Scanning barcodes on items using a handheld scanner.",
+    "tc_546": "Package small items into bags and seal them using a heat sealer or tape.",
+    "tc_12417": "Scrubbing a shoe with a brush and cleaning liquid",
+    "tc_4972": "Arranging flowers into a bouquet",
+    "tc_1554": "Assembling bolts with washers and nuts",
+    "tc_13": "Ironing clothing on an ironing board",
+    "tc_14": "Wrapping a flower bouquet with decorative paper and tape",
+    "tc_1199": "Assembling and disassembling cardboard boxes",
+    "tc_5917": "Cut fabric with a template and scissors",
+    "tc_4065": "Cleaning the sole of a shoe with a brush and soap",
+    "tc_4206": "Preparing and arranging flowers by cutting stems",
+    "tc_9460": "Organize glue bottles on shelf",
+    "tc_341": "Placing pet leashes onto display hooks",
+    "tc_4450": "Pack snack bags into cardboard box for shipping",
+    "tc_3014": "Organizing phone cases and headphone boxes on a display",
+    "tc_7167": "Sanding wooden slats with sandpaper",
+    "tc_145": "Wrap cake slices in plastic with tape",
+    "tc_509": "Inspecting and packaging screen protectors",
+    "tc_27": "Filling small plastic pots with soil using a hand trowel",
+    "tc_2929": "Stocking instant noodles from a box onto shelves",
+    "tc_10256": "Transferring electronic components into containers for packaging",
+    "tc_5513": "Clean and organize snack packages on a shelf.",
+    "tc_70": "Removing keycaps from a keyboard with a keycap puller.",
+    "tc_8019": "Organize and stock candy products on a display counter",
+    "tc_727": "Removing weeds with a sickle.",
+    "tc_4201": "Stocking phone cases or pouches on a display rack",
+    "tc_8": "Weighing dough and rolling it into balls",
+    "tc_139": "Organizing books on shelves.",
+    "tc_4152": "Fold and stack cardboard boxes.",
+    "tc_2364": "Moving paint cans to a shelf.",
+    "tc_337": "Shaping dough into pastries",
+    "tc_13303": "Move boxed items between a shelf and a table"
+  },
+  "by_label": {
+    "stocking_shelves": [
+      "68c5f26259537e9ead05536f",
+      "68c9a5048c8887a68eddf0e7",
+      "68c9a5ed2cab01ee359624ab",
+      "68d3e5fd9fb5ff4324333459",
+      "68d3ebbcc478daa723d5cffa",
+      "68d3fc96f5cf426e3ca29367",
+      "68d3ffa76127398e6e20c911"
+    ],
+    "sanding_wood": [
+      "68d27c6dec023a8391120a68",
+      "68d2e0f440e4c013224af5ae",
+      "68d2e4b4f1110f17cab93073",
+      "68d2fd684107888f4548515b",
+      "68d3df7a96772ec628720ec0",
+      "68d3f216da0b8ca59e73a144"
+    ],
+    "cleaning_shoe": [
+      "68d3d436caff909a814b3439",
+      "68d3e672347ceea1609f6f74",
+      "68d3eb4c593c576a5a68f356",
+      "68d3f7a39ad4e83f3cd10e4b",
+      "68d401769743ff69a2c94972"
+    ],
+    "folding_clothes": [
+      "68c4c33375d9403cc4fdb813",
+      "68c4c33475d9403cc4fdb81d",
+      "68c5aa15bea0ae562b92a0e0",
+      "68d1b68f362d1163a3b9aa16",
+      "68d3f447b2791101a83bd6c0"
+    ],
+    "restocking_shelves": [
+      "68d39aa99bbdd093fc50070b",
+      "68d3e574330fbd900623902e",
+      "68d3f3852b420f072efcef10",
+      "68d3f5c4ebeb92d19ee19324",
+      "68d3fd7130210b5f98ff0514"
+    ],
+    "cleaning_and_organizing_phone_cases": [
+      "68d0e2d3362d1163a3b9a812",
+      "68d0e2d4362d1163a3b9a817",
+      "68d3e59e91a44281fe3dfd1c"
+    ],
+    "ironing_clothes": [
+      "68c895224115b5b4b041a5a5",
+      "68d3e841b13874d8f711f53e",
+      "68d3fde096772ec628720f89"
+    ],
+    "sewing_fabric": [
+      "68c5053142c89c4aa82ec285",
+      "68d2b0d24f093d9ed301ab09",
+      "68d3fa8e6fbe40458fa4111a"
+    ],
+    "arranging_flowers": [
+      "68c9b90d5bfe618385ef5822",
+      "68d2ca9484aff09cac592d59"
+    ],
+    "flattening_and_stacking_cardboard_boxes": [
+      "68d3e9db5b6cfcbc9ef6c403",
+      "68d3e9db5b6cfcbc9ef6c407"
+    ],
+    "organizing_kettles": [
+      "68d39f4794642be1d88718a9",
+      "68d39f4894642be1d88718ab"
+    ],
+    "organizing_phone_cases": [
+      "68c9a0c51dbbd4ceed9008ce",
+      "68d3fa55f5cf426e3ca2935a"
+    ],
+    "organizing_products": [
+      "68d3fb45afda675cd77317b5",
+      "68d43678330fbd9006239118"
+    ],
+    "packaging_swiss_rolls": [
+      "68c63ddf10341f5ce7fed06b",
+      "68d3f373a611772dbbec050c"
+    ],
+    "packing_groceries": [
+      "68c991876f55ccdbb27de284",
+      "68c998c2e2722ea2271163e5"
+    ],
+    "placing_items_on_shelf": [
+      "68d3ff88bdac7d9d657e03fb",
+      "68d3ff88bdac7d9d657e03fd"
+    ],
+    "preparing_flowers": [
+      "68d3e6774b1c32266ea185fd",
+      "68d3ed291963191d9d22a7b8"
+    ],
+    "restocking_items": [
+      "68c5de33bea0ae562b92a1bd",
+      "68c64085ef6cc84c22b7e6e7"
+    ],
+    "restocking_shelf": [
+      "68d3dd3f21a7fa3f254129d0",
+      "68d3dfabf4abd6e6ceedfe19"
+    ],
+    "scanning_and_stocking_items": [
+      "68d24ff7d5da0393353cb06d",
+      "68d3e2eaaa81462a8e1a09a7"
+    ],
+    "sorting_buttons": [
+      "68c69406a298d13f754d944c",
+      "68d3d62b17b2c483236ea0eb"
+    ],
+    "wrapping_bouquet": [
+      "68d3df836fbe40458fa41084",
+      "68d3e8eb2b641f84dc1d0639"
+    ],
+    "wrapping_box": [
+      "68d20446d6026b3c26957f41",
+      "68d3e196e01658bf77887247"
+    ],
+    "wrapping_item": [
+      "68d3d3fae78c475fe9b3c05e",
+      "68d40487347ceea1609f7025"
+    ],
+    "adding_seasoning_to_pot": [
+      "68d3faf97b0a732458996369"
+    ],
+    "applying_cleaner_and_brushing": [
+      "68d3a7ffcea1f16ac771f48a"
+    ],
+    "applying_nail_polish": [
+      "68c4a62029d0f78e997a5bc5"
+    ],
+    "applying_price_tags": [
+      "68d3d74cbf26aa7727bf2c5c"
+    ],
+    "arranging_baked_goods": [
+      "68c63eb4def4497ae3640a59"
+    ],
+    "arranging_boxes": [
+      "68c53f6659537e9ead0550f6"
+    ],
+    "arranging_flowers_in_vase": [
+      "68d39b8bb5118d96d77fe047"
+    ],
+    "arranging_kettles": [
+      "68c9c16ba1ea367a01cd62a2"
+    ],
+    "arranging_products": [
+      "68c616dd5dc427a9d85e5239"
+    ],
+    "arranging_small_boxes": [
+      "68c99f6b55831511cfe40398"
+    ],
+    "arranging_wood_pieces": [
+      "68d3efed28e87fa668047471"
+    ],
+    "assembling_keyboard": [
+      "68d400c1f846d0bc5e1c4256"
+    ],
+    "assembling_wooden_box": [
+      "68d34dfd6c95e0f292d7162f"
+    ],
+    "attaching_clasp": [
+      "68c403c399bbf8dcf263713c"
+    ],
+    "bottling_liquid": [
+      "68d3e396e9a8cc50ad36f71b"
+    ],
+    "brushing_shoe": [
+      "68d1d3a21d29a1390d685fe2"
+    ],
+    "cleaning_and_organizing_items": [
+      "68d3be177b0a732458996224"
+    ],
+    "cleaning_and_organizing_products": [
+      "68d3eb7983e3803355f8176b"
+    ],
+    "cleaning_and_organizing_tools": [
+      "68c64b63122941a869b9aa6f"
+    ],
+    "cleaning_and_stacking_boxes": [
+      "68d3e8e9a2c9be23a2c7616a"
+    ],
+    "cleaning_chair": [
+      "68c9c555e2722ea22711644e"
+    ],
+    "cleaning_clipper_guards": [
+      "68c49d2f7680df88da57b4ab"
+    ],
+    "cleaning_framed_picture": [
+      "68d3eb3aa0bae22e2ba1f544"
+    ],
+    "cleaning_glass": [
+      "68d3bc9f17b2c483236ea060"
+    ],
+    "cleaning_gym_equipment": [
+      "68d3e28a7cd24b318ca55a01"
+    ],
+    "cleaning_items": [
+      "68c9a75462a648b8057c6743"
+    ],
+    "cleaning_phone_internals": [
+      "68d3dc1bc03c89e6ffdb1ba3"
+    ],
+    "cleaning_products": [
+      "68d176255dd0b4fb0e66fe11"
+    ],
+    "cleaning_shoe_sole": [
+      "68d28d0784aff09cac592cd9"
+    ],
+    "cleaning_shoes": [
+      "68d3abd0e5761ef3261601da"
+    ],
+    "cleaning_sink_and_dish_rack": [
+      "68d4053a737c6330c3e7887b"
+    ],
+    "cleaning_wood": [
+      "68d3efed28e87fa668047473"
+    ],
+    "connecting_sata_cables": [
+      "68d3d38af5cf426e3ca29288"
+    ],
+    "curing_nail_in_uv_lamp": [
+      "68c3e30b9c65dfc2d3048ba8"
+    ],
+    "cutting_fabric": [
+      "68d3ead92b420f072efceed7"
+    ],
+    "cutting_grass": [
+      "68d3f9d701e97f875b0a2d6f"
+    ],
+    "cutting_paper": [
+      "68d31ccf33e6ec1c3d42dd26"
+    ],
+    "disassembling_case": [
+      "68c9a7ff8c8887a68eddf0f6"
+    ],
+    "disassembling_keyboard": [
+      "68d3f927e543371c966136d4"
+    ],
+    "disassembling_laptop": [
+      "68d3dd95b2791101a83bd634"
+    ],
+    "disassembling_phone": [
+      "68c9a6475f109bcce27c3f21"
+    ],
+    "dusting_shelves": [
+      "68d3f9441e21f8c5c37fe23d"
+    ],
+    "filing_fake_nail": [
+      "68c4023b1e0d1d81b7edf6c9"
+    ],
+    "filing_frets": [
+      "68d400b332ac0ec26bc55308"
+    ],
+    "folding_and_unfolding_cardboard_boxes": [
+      "68d3e7e0ce136334df153789"
+    ],
+    "folding_shirt": [
+      "68c585945dc427a9d85e5054"
+    ],
+    "inspecting_fabric": [
+      "68c5e84bcaa279a3f386bc28"
+    ],
+    "installing_switches": [
+      "68d18270c478daa723d5c912"
+    ],
+    "ironing_and_folding_laundry": [
+      "68c5dbcc33e43850a914c474"
+    ],
+    "ironing_pants": [
+      "68d3f2658191686d654b7c39"
+    ],
+    "lacing_shoe": [
+      "68d30047963606becec184b0"
+    ],
+    "making_beaded_bracelet": [
+      "68d3e700925361f5ea9d713d"
+    ],
+    "making_tart_shells": [
+      "68d435dc611c44ef88d9a37b"
+    ],
+    "organizing_glue_bottles": [
+      "68d3edf7e956b9877079abcc"
+    ],
+    "organizing_items": [
+      "68d3a09bade75412233d2f1a"
+    ],
+    "organizing_pet_leashes": [
+      "68d3ee75fdc3d72c217231f5"
+    ],
+    "organizing_phone_cases_on_display": [
+      "68d3efffa30578df032e8c7d"
+    ],
+    "organizing_products_on_tray": [
+      "68c9bad0650e2b7e7f6fe45e"
+    ],
+    "organizing_rolled_paper": [
+      "68c60257e9e837b8eec3c8c9"
+    ],
+    "organizing_sachets_in_basket": [
+      "68c9a927633c5706a58b0b77"
+    ],
+    "organizing_stock": [
+      "68d282dd4f093d9ed301aa85"
+    ],
+    "packaging_items": [
+      "68d2cff3fdc3d72c21722df5"
+    ],
+    "packing_items": [
+      "68d371426a28a17b71a7fbe9"
+    ],
+    "packing_items_in_bags": [
+      "68d3e5547cd24b318ca55a15"
+    ],
+    "packing_phone_cases": [
+      "68c982315392f21f38d22091"
+    ],
+    "packing_snacks_into_box": [
+      "68d3efb8c9877dc79633db38"
+    ],
+    "packing_wafers_into_box": [
+      "68d435bc58ae90e8b2082295"
+    ],
+    "peeling_and_cutting_garlic": [
+      "68d3e24fafda675cd7731720"
+    ],
+    "peeling_lotus_seeds": [
+      "68c5dd69f9ce62a3f04c5e8c"
+    ],
+    "picking_groceries": [
+      "68c9a2065103cc9262b492c9"
+    ],
+    "picking_items_from_shelf": [
+      "68d3e08faf5ed45de4512921"
+    ],
+    "picking_products_from_shelf": [
+      "68d3f58a474b70ce54b863e7"
+    ],
+    "picking_snacks_from_shelf": [
+      "68d3f64170ac33bcc29e1383"
+    ],
+    "placing_cake_toppers": [
+      "68d3a37940d6c4b427e29a15"
+    ],
+    "placing_keycaps": [
+      "68d3f785fdc3d72c2172322b"
+    ],
+    "planting_flower": [
+      "68d3d959e43a7c184ebcdb07"
+    ],
+    "potting_plant": [
+      "68d3f3897f1737e8220536c5"
+    ],
+    "preparing_fabric": [
+      "68d3a5d67b066cb2c7f29d6c"
+    ],
+    "preparing_kumquats": [
+      "68c9b837cbfd55da83ea956e"
+    ],
+    "preparing_nails": [
+      "68c3dbebe9e837b8eec3c2d6"
+    ],
+    "preparing_sandal_sole": [
+      "68d3fc8f06df05f7fb14aabd"
+    ],
+    "preparing_shirt": [
+      "68d0b5b139f1cfca22c1115c"
+    ],
+    "processing_inventory": [
+      "68d3f5ef0b15d43c1228ec9a"
+    ],
+    "prying_battery": [
+      "68d3d9bbc03c89e6ffdb1b94"
+    ],
+    "removing_items": [
+      "68d3edc112af763ea5dca391"
+    ],
+    "removing_phone_components": [
+      "68d3e3313347ee746cc0dba2"
+    ],
+    "repairing_electronics": [
+      "68d3d3a13f1af862216a1cc0"
+    ],
+    "repairing_watch_mechanism": [
+      "68d265f1e692e6458598d78e"
+    ],
+    "replacing_battery": [
+      "68d358cc0ddd54b74dec0d09"
+    ],
+    "restocking_display": [
+      "68c9beb97aa0d16e8dd1c037"
+    ],
+    "restocking_fridge": [
+      "68c5b8b6bea0ae562b92a11d"
+    ],
+    "restocking_hair_vitamins": [
+      "68d3fb38bf26aa7727bf2d27"
+    ],
+    "restocking_snacks": [
+      "68c655c0ec331250d5e747e9"
+    ],
+    "rinsing_motorcycle": [
+      "68c9beb5a87e21e176a591da"
+    ],
+    "sanding_metal_sheet": [
+      "68d37b34b460bbeb02f34631"
+    ],
+    "sawing_wood": [
+      "68d384506c95e0f292d7179b"
+    ],
+    "scanning_and_stocking_cans": [
+      "68d3ddca890039bfd5e5e418"
+    ],
+    "screwing_components": [
+      "68d2ce3a3a35c217ca6c4b0b"
+    ],
+    "scrubbing_shoe": [
+      "68d3dd5537d09ad2edf86350"
+    ],
+    "scrubbing_shoe_upper": [
+      "68d21711e692e6458598d6fa"
+    ],
+    "securing_frame_backing": [
+      "68d3e94feaaa6b198fd9d7c5"
+    ],
+    "selecting_flowers": [
+      "68d3ef9c6df2d7f2057a2069"
+    ],
+    "selecting_products": [
+      "68d3ee474d1da7e09284b306"
+    ],
+    "sewing": [
+      "68c5dc87102551de19d83d18"
+    ],
+    "shopping_for_groceries": [
+      "68d3f78a6df2d7f2057a209d"
+    ],
+    "shopping_for_snacks": [
+      "68d3f9c83a35c217ca6c4eaa"
+    ],
+    "showing_product": [
+      "68c9b871841616b2c4f83ef0"
+    ],
+    "sorting_wire_nuts": [
+      "68d3b6f42ea7766c04293f97"
+    ],
+    "sorting_zippers": [
+      "68d3d8a2e6f74fcaa2082322"
+    ],
+    "spraying_plants": [
+      "68d3dff9e5761ef3261602f6"
+    ],
+    "stamping_paper": [
+      "68d403c8c32d0a30de745a98"
+    ],
+    "stirring_pot": [
+      "68d3ff48462c3bd1f3389739"
+    ],
+    "stocking_canned_drinks": [
+      "68d3fc48ea00ad7b77fa9b27"
+    ],
+    "stocking_drinks": [
+      "68d3ec58f8e579445c27a95b"
+    ],
+    "stocking_phone_cases": [
+      "68c9b8433d07306db046d1d5"
+    ],
+    "stocking_refrigerator": [
+      "68c9a2d184ecc9125e1e0bd4"
+    ],
+    "stocking_snacks": [
+      "68c9a671f7aeb085b60fcb95"
+    ],
+    "testing_laptop_power_on": [
+      "68d43583950312a1c06c9f83"
+    ],
+    "unpacking_and_flattening_boxes": [
+      "68d39daf181a3411ed145fe9"
+    ],
+    "unscrewing_phone_components": [
+      "68d3db2af8075f03011bcd90"
+    ],
+    "unscrewing_speaker_panel": [
+      "68d365dad6026b3c2695826e"
+    ],
+    "washing_dishes": [
+      "68d3ded8dee2dd8b46abcee1"
+    ],
+    "weighing_dough": [
+      "68d3fac1080f96540b692c26"
+    ],
+    "wet_brushing_shoe_sole": [
+      "68d3fe3bcfdb743f0cb0e35b"
+    ],
+    "wiping_back_of_scooter": [
+      "68c9b8db7adfb407628afca3"
+    ],
+    "wiping_shoe": [
+      "68d391f9d98254a0b8a5a8b5"
+    ],
+    "wrapping_flowers": [
+      "68d1baa11d29a1390d685fa6"
+    ],
+    "wrapping_gift": [
+      "68d3ec9dbf26aa7727bf2cd6"
+    ],
+    "wrapping_item_with_bubble_wrap": [
+      "68d3149284aff09cac592e39"
+    ],
+    "writing_on_notebook": [
+      "68d400f6faebe2a9a4905c94"
+    ]
+  }
+}

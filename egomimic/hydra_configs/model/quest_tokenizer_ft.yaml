@@ -1,0 +1,56 @@
+# QueST SkillVAE tokenizer for 6D wrist-frame palm pose + 5 MANO fingertips per hand.
+# action_dim=48: per hand [palm xyz+6D (9) | 5 fingertips xyz (15)] × 2 arms.
+# Pair with data=mecka_preanno199_zarr_quest_wf6d_ft_nointerp (transform cartesian_wristframe_6d_fingertips_nointerp).
+#
+#   python egomimic/modal/trainModal.py \
+#       model=quest_tokenizer_ft data=mecka_preanno199_zarr_quest_wf6d_ft_nointerp\
+#       visualization=fingertips_wrist_6d \
+#       evaluator=eval_quest_tokenizer_video "evaluator@train_viz_evaluator=train_viz_quest_tokenizer" \
+#       name=quest_tok_preanno199_ft description=preanno199_wf6d_fingertips \
+#       trainer=ddp_modal trainer.check_val_every_n_epoch=30 trainer.limit_train_batches=100 \
+#       trainer.limit_val_batches=100 callbacks.model_checkpoint.every_n_epochs=30 \
+#       +modal_gpu=A100 +modal_cpu=12 +modal_memory_gb=80 +modal_volume=mecka_data_v2 \
+#       init_submodules=quest reject_outliers=false launch_params.gpus_per_node=1
+#
+# Online norm stats (no precomputed_norm_path): this representation has its own
+# distribution; 6D + xyz channels are continuous so per-dim stats are valid.
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+
+robomimic_model:
+  _target_: egomimic.algo.quest_tokenizer.QuestTokenizerTrainer
+  data_schematic: _${data.dataset.data_schematic}
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  skill_vae:
+    _target_: quest.algos.quest_modules.skill_vae.SkillVAE
+    action_dim: 48          # per hand: palm(9) + 5 fingertips(15) = 24; ×2 arms
+    # Beefed up vs the 18-dim configs (encoder/decoder 256->384, layers 2/4->4/6,
+    # heads 4->6): 48-dim palm+fingertips is a higher-dim, richer target than the
+    # 12/18-dim ee-pose actions, so give the tokenizer more capacity.
+    encoder_dim: 384
+    decoder_dim: 384
+    skill_block_size: 100
+    downsample_factor: 4    # 100/4 = 25 latent tokens
+    attn_pdrop: 0.1
+    use_causal_encoder: true
+    use_causal_decoder: true
+    encoder_heads: 6        # 384/6 = 64 head dim
+    encoder_layers: 4
+    decoder_heads: 6
+    decoder_layers: 6
+    vq_type: "fsq"
+    fsq_level: [8, 5, 5, 5]  # codebook 1000 (latent, independent of action_dim)
+    codebook_dim: 512
+    codebook_size: 1024
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+
+scheduler: null

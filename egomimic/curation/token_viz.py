@@ -367,7 +367,8 @@ def project_points(X: np.ndarray, method: str = "tsne", dims: int = 3,
     """Project embeddings to ``dims``-D (2 or 3). method: 'tsne' | 'umap' | 'pca'.
 
     No hidden preprocessing — dimensionality reduction before tsne/umap is the
-    ``preprocess`` pca_dim stage. umap-learn is pip-installed on demand."""
+    ``preprocess`` pca_dim stage. t-SNE uses openTSNE (FFT interpolation, ~10-30x
+    faster than sklearn for large N); openTSNE/umap-learn pip-install on demand."""
     from sklearn.decomposition import PCA
     X = np.asarray(X, dtype=np.float32)
     if method == "pca":
@@ -382,6 +383,14 @@ def project_points(X: np.ndarray, method: str = "tsne", dims: int = 3,
             import umap
         return umap.UMAP(n_components=dims, n_neighbors=15, min_dist=0.1,
                          random_state=seed).fit_transform(X)
-    from sklearn.manifold import TSNE
-    return TSNE(n_components=dims, init="pca", perplexity=30,
-                random_state=seed).fit_transform(X)
+    perplexity = min(50, max(5, len(X) // 100))
+    try:
+        import openTSNE
+    except ImportError:
+        import subprocess, sys
+        print("[project] installing openTSNE…")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "openTSNE"], check=True)
+        import openTSNE
+    tsne = openTSNE.TSNE(n_components=dims, perplexity=perplexity, n_jobs=-1,
+                         initialization="pca", random_state=seed)
+    return np.asarray(tsne.fit(X), dtype=np.float32)

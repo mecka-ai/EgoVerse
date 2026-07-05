@@ -1,0 +1,33 @@
+# Visualization for 6D wrist-frame palm + 5 fingertips actions (mecka). The revert
+# transform re-anchors the palm (6D wrist delta) and fingertips (wrist-frame xyz)
+# back to the camera/head frame, producing per-hand [palm_xyz, 5 fingertips xyz];
+# Mecka.viz(mode="fingertips") draws palm + fingertip trajectories (GT green / pred
+# red). Pair with data=mecka_preanno199_zarr_quest_wf6d_ft.
+eva_bimanual:
+  _target_: egomimic.rldb.embodiment.eva.Eva.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+aria_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Aria.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+mecka_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Mecka.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: fingertips
+  transform_list:
+    _target_: egomimic.rldb.embodiment.human._build_mecka_revert_wristframe_6d_fingertips_transform_list
+    # process_batch_for_training maps observations.state.ee_pose -> keyname "ee_pose"
+    obs_key: "ee_pose"
+scale_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Scale.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj

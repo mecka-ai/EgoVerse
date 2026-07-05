@@ -26,6 +26,14 @@ DEFAULT_RUN = "deminf_tsne/14task_dim64_k10_20_viz3d_2026-06-09_19-49-48"
 OUTPUTS_MOUNT = "/mnt/outputs"
 PREVIEW_MOUNT = "/mnt/previews"
 
+# Pre-rendered frames live at PREVIEW_MOUNT/frames/{hash}/{idx:06d}.jpg, extracted
+# every FRAME_STRIDE frames (matches the t-SNE every_n sampling). File index j
+# (1-based) ↔ original mp4 frame (j-1)*FRAME_STRIDE, so a requested frame f maps
+# to file round(f/FRAME_STRIDE)+1. The /frame endpoint serves these as static
+# files (~50ms) and only falls back to on-demand ffmpeg when one is missing.
+FRAME_STRIDE = 10
+FRAME_MAX_W = 640
+
 _HERE = Path(__file__).resolve().parent
 _BUILDER         = _HERE.parent / "scripts" / "build_latent_viz.py"
 _SPAN_BUILDER    = _HERE.parent / "scripts" / "build_span_viz.py"
@@ -300,19 +308,168 @@ def _fetch_episode_metadata(hashes: list[str]) -> dict:
 
 
 @app.function(
+    image=image,
+    volumes={PREVIEW_MOUNT: previews_volume},
+    cpu=4.0,
+    timeout=1800,
+)
+def _render_frames_for(episode_hash: str) -> str:
+    """Extract every FRAME_STRIDE-th frame of one episode's MP4 to downscaled JPEGs
+    at PREVIEW_MOUNT/frames/{hash}/%06d.jpg (one ffmpeg pass, full decode)."""
+    import subprocess
+
+    safe = Path(episode_hash).name
+    mp4 = Path(PREVIEW_MOUNT) / f"{safe}.mp4"
+    if not mp4.exists():
+        return f"skip {safe}: no mp4"
+    outdir = Path(PREVIEW_MOUNT) / "frames" / safe
+    if outdir.is_dir() and any(outdir.glob("*.jpg")):
+        return f"skip {safe}: already rendered"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(mp4),
+         "-vf", f"select=not(mod(n\\,{FRAME_STRIDE})),scale='min({FRAME_MAX_W},iw)':-2",
+         "-vsync", "0", "-q:v", "5", str(outdir / "%06d.jpg")],
+        capture_output=True,
+    )
+    n = len(list(outdir.glob("*.jpg")))
+    if r.returncode != 0 or n == 0:
+        return f"FAIL {safe}: rc={r.returncode} {r.stderr.decode()[:120]}"
+    previews_volume.commit()
+    return f"{safe}: {n} frames"
+
+
+@app.function(
+    volumes={PREVIEW_MOUNT: previews_volume},
+    timeout=7200,
+)
+def render_all_frames(only: list[str] | None = None):
+    """Pre-render frame JPEGs for every episode MP4 (or just ``only`` hashes).
+    Fan out one container per episode via .map(). Run with:
+      MODAL_ENVIRONMENT=robotics modal run egomimic/modal/latent_viz_app.py::render_all_frames
+    """
+    previews_volume.reload()
+    eps = only or sorted(p.stem for p in Path(PREVIEW_MOUNT).glob("*.mp4"))
+    print(f"[frames] rendering {len(eps)} episodes (stride={FRAME_STRIDE})")
+    done = failed = skipped = 0
+    for msg in _render_frames_for.map(eps, order_outputs=False):
+        if msg.startswith("FAIL"):
+            failed += 1
+            print(msg)
+        elif "already" in msg or "no mp4" in msg:
+            skipped += 1
+        else:
+            done += 1
+        if (done + failed + skipped) % 50 == 0:
+            print(f"[frames] {done} done · {skipped} skipped · {failed} failed")
+    print(f"[frames] COMPLETE: {done} rendered · {skipped} skipped · {failed} failed")
+    return {"rendered": done, "skipped": skipped, "failed": failed}
+
+
+# Image for the language-tSNE regen job: Qwen3 text embedder (same model the
+# curation used) + sklearn. Kept separate from the viewer image so the ASGI app
+# stays lean (no torch/transformers).
+_lang_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch", "transformers", "scikit-learn", "numpy", "hf_transfer")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+)
+
+
+@app.function(
+    image=_lang_image,
+    gpu="A10G",
+    volumes={OUTPUTS_MOUNT: outputs_volume},
+    timeout=1800,
+)
+def regen_language_tsne(run: str, dims: int | None = None) -> dict:
+    """Compute a language t-SNE for a cluster run and merge it into
+    tsne3d/spans_tsne3d.json (adds the ``language`` block the viewer panel needs).
+
+    The run's spans only carry action embeddings; the language space is
+    reconstructed from each span's annotation text with the same Qwen3 embedder
+    the curation used. Only the unique texts are embedded (usually a few thousand)
+    then t-SNE'd and broadcast back to every span, so identical annotations share
+    a language coordinate. Run with:
+      MODAL_ENVIRONMENT=robotics modal run egomimic/modal/latent_viz_app.py::regen_language_tsne --run <run>
+    """
+    import json
+    import numpy as np
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE as SkTSNE
+
+    run = run.strip().strip("/")
+    outputs_volume.reload()
+    tsne_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
+    if not tsne_path.is_file():
+        raise FileNotFoundError(f"tsne3d/spans_tsne3d.json not found under {run!r}")
+    data = json.load(open(tsne_path))
+    spans = data["spans"]
+    dims = int(dims or data.get("dims", 3))
+
+    texts = [str(s.get("text", "")) for s in spans]
+    uniq = sorted(set(texts))
+    uidx = {t: i for i, t in enumerate(uniq)}
+    print(f"[lang] {run}: {len(spans)} spans, {len(uniq)} unique texts, dims={dims}")
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", padding_side="left")
+    model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", dtype=torch.float16).to("cuda").eval()
+
+    def _pool(h, mask):
+        left = bool((mask[:, -1].sum() == mask.shape[0]).item())
+        if left:
+            return h[:, -1]
+        sl = mask.sum(dim=1) - 1
+        return h[torch.arange(h.size(0), device=h.device), sl]
+
+    embs = []
+    with torch.no_grad():
+        for st in range(0, len(uniq), 64):
+            batch = uniq[st : st + 64]
+            t = tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to("cuda")
+            h = model(**t).last_hidden_state
+            p = torch.nn.functional.normalize(_pool(h, t["attention_mask"]).float(), p=2, dim=1)
+            embs.append(p.cpu().numpy().astype(np.float32))
+    U = np.concatenate(embs, axis=0)
+    print(f"[lang] embedded {U.shape}")
+
+    X = PCA(n_components=50, random_state=42).fit_transform(U) if U.shape[1] > 50 else U
+    perp = max(5.0, min(30.0, (len(U) - 1) / 3.0))
+    coords = SkTSNE(n_components=dims, perplexity=perp, init="pca", random_state=42).fit_transform(X)
+
+    # broadcast unique-text coords back to every span
+    def _col(axis):
+        return [round(float(coords[uidx[texts[k]], axis]), 3) for k in range(len(spans))]
+
+    lang = {"x": _col(0), "y": _col(1)}
+    if dims == 3:
+        lang["z"] = _col(2)
+    data["language"] = lang
+    with open(tsne_path, "w") as f:
+        json.dump(data, f)
+    outputs_volume.commit()
+    print(f"[lang] wrote language block ({len(spans)} pts, dims={dims}) → {tsne_path}")
+    return {"run": run, "spans": len(spans), "unique_texts": len(uniq), "dims": dims}
+
+
+@app.function(
     volumes={OUTPUTS_MOUNT: outputs_volume, PREVIEW_MOUNT: previews_volume},
     secrets=[modal.Secret.from_name("egoverse-sql")],
-    cpu=4.0,
-    memory=8192,
-    min_containers=1,
-    scaledown_window=600,
+    cpu=16.0,
+    memory=32768,
+    min_containers=2,
+    scaledown_window=1200,
 )
-@modal.concurrent(max_inputs=50)
+@modal.concurrent(max_inputs=100)
 @modal.asgi_app()
 def viewer():
     import sys
 
-    from fastapi import FastAPI, HTTPException, Query
+    from fastapi import FastAPI, HTTPException, Query, Request
+    from fastapi.middleware.gzip import GZipMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
     sys.path.insert(0, "/root")
@@ -321,6 +478,32 @@ def viewer():
     from build_cluster_viz import build_cluster_html
 
     web = FastAPI(title="Meckaverse")
+
+    class SelectiveGZipMiddleware(GZipMiddleware):
+        """Gzip everything EXCEPT media paths. Compressing /video responses breaks
+        the browser's byte-range seek model (ranges address compressed bytes) and
+        media stacks fire a hard <video> error on Content-Encoding'd MP4; /frame
+        JPEGs are already compressed. HTML/JSON still gzips ~5x."""
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and scope.get("path", "").startswith(("/video/", "/frame/")):
+                await self.app(scope, receive, send)
+                return
+            await super().__call__(scope, receive, send)
+
+    # The viewer HTML embeds megabytes of JSON that compresses ~5x — gzip is the
+    # single biggest page-load win.
+    web.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
+
+    @web.middleware("http")
+    async def _no_stale_html(request: Request, call_next):
+        # HTML is rebuilt server-side when run outputs change; force browsers to
+        # revalidate so a stale viewer page can never linger after a redeploy.
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     # run path → (mtime stamp, HTML); rebuilt when the run's outputs change.
     html_cache:         dict[str, tuple[float, str]] = {}
     span_html_cache:    dict[str, tuple[float, str]] = {}
@@ -451,14 +634,23 @@ def viewer():
             "start": [int(s.get("start", 0))              for s in spans],
             "end":   [int(s.get("end",   s.get("start", 0) + 1)) for s in spans],
             "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
-            "txt":   [str(s.get("text", ""))[:60]         for s in spans],
+            "txt":   [str(s.get("text", ""))[:200]        for s in spans],
+            # ids carry span identity (and, for token-level plots, a '#t{k}' token
+            # counter) — the builder derives span/token color modes from them
+            "id":    [str(s.get("id", ""))                for s in spans],
         }
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))
-        result["granularity"] = str(data.get("granularity", ""))
         # explicit per-point token/span fields (token/chunk-granularity runs)
         result["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
         result["sid"] = [str(s.get("sid", "")) for s in spans]
+        result["ntok"] = int(data.get("ntok", 25))       # QueST tokens per chunk
+        if data.get("metrics"):
+            result["metrics"] = data["metrics"]
+        if data.get("level"):
+            result["level"] = str(data["level"])
+        if any("n_chunks" in s for s in spans):
+            result["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]
@@ -557,6 +749,19 @@ def viewer():
         from fastapi.responses import Response
 
         safe = Path(episode_hash).name
+
+        # Fast path: pre-rendered static JPEG (see FRAME_STRIDE docstring).
+        idx = round(frame_num / FRAME_STRIDE) + 1
+        jpg = Path(PREVIEW_MOUNT) / "frames" / safe / f"{idx:06d}.jpg"
+        if not jpg.exists():
+            _reload_volumes()
+        if jpg.exists():
+            return FileResponse(
+                str(jpg), media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+
+        # Fallback: on-demand ffmpeg extraction (runs not yet pre-rendered).
         cache_key = f"{safe}_{frame_num}"
         if cache_key in frame_cache:
             return Response(frame_cache[cache_key], media_type="image/jpeg")
@@ -567,15 +772,23 @@ def viewer():
         if not path.exists():
             return PlainTextResponse("not found", status_code=404)
 
+        # Input seeking (-ss before -i) is the fast keyframe-accurate path; downscale
+        # to ≤640px (preview popup is 400px, thumbs ~320px) so we don't decode/encode/
+        # ship a full-res frame; -nostdin/-loglevel trim per-process overhead.
         result = subprocess.run(
-            ["ffmpeg", "-ss", str(frame_num / 30.0), "-i", str(path),
-             "-vframes", "1", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            ["ffmpeg", "-nostdin", "-loglevel", "error",
+             "-ss", str(frame_num / 30.0), "-i", str(path),
+             "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
+             "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
             capture_output=True,
         )
         if result.returncode != 0 or not result.stdout:
             return PlainTextResponse("frame extraction failed", status_code=500)
 
         frame_cache[cache_key] = result.stdout
-        return Response(result.stdout, media_type="image/jpeg")
+        return Response(
+            result.stdout, media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     return web

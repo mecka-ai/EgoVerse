@@ -1,0 +1,57 @@
+# QueST tokenizer v2 for step-wise 6D palm + per-timestep MANO fingertips (48-dim).
+# Changes vs quest_tokenizer_ft (all four latent-quality fixes):
+#   1. Per-block reconstruction weights: fingertips weighted 2x vs palm (per-block
+#      mean MSE, so centimeter-scale grasp geometry can't be drowned by palm deltas).
+#   2. Representation is step-wise (data=..._ft_sw): palm = frame-to-frame velocity
+#      deltas, fingertips per-timestep wrist frame — no cumulative-displacement axis.
+#   3. No encoder positional embedding (SkillVAEMecka use_positional_emb=false): the
+#      causal conv stack provides implicit position; decoder keeps its own fixed
+#      positional queries. Removes "I am token k" from the FSQ codes.
+#   4. Coarser tokens: downsample_factor 4 -> 8 (100 frames -> 13 tokens, ~0.27s
+#      primitives instead of ~0.13s).
+# Pair with data=mecka_preanno199_zarr_quest_wf6d_ft_sw + visualization=fingertips_wrist_6d_sw.
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+
+robomimic_model:
+  _target_: egomimic.algo.quest_tokenizer.QuestTokenizerTrainer
+  data_schematic: _${data.dataset.data_schematic}
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  # 48-dim layout: [L palm 6D (0:9) | L tips (9:24) | R palm 6D (24:33) | R tips (33:48)]
+  loss_block_weights:
+    - {name: palm_left, start: 0, end: 9, weight: 1.0}
+    - {name: tips_left, start: 9, end: 24, weight: 2.0}
+    - {name: palm_right, start: 24, end: 33, weight: 1.0}
+    - {name: tips_right, start: 33, end: 48, weight: 2.0}
+
+  skill_vae:
+    _target_: egomimic.algo.skill_vae_mecka.SkillVAEMecka
+    action_dim: 48          # per hand: palm(9) + 5 fingertips(15) = 24; ×2 arms
+    use_positional_emb: false
+    encoder_dim: 384
+    decoder_dim: 384
+    skill_block_size: 100
+    downsample_factor: 8    # 100 frames -> 13 latent tokens (~0.27s primitives)
+    attn_pdrop: 0.1
+    use_causal_encoder: true
+    use_causal_decoder: true
+    encoder_heads: 6        # 384/6 = 64 head dim
+    encoder_layers: 4
+    decoder_heads: 6
+    decoder_layers: 6
+    vq_type: "fsq"
+    fsq_level: [8, 5, 5, 5]  # codebook 1000
+    codebook_dim: 512
+    codebook_size: 1024
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+
+scheduler: null

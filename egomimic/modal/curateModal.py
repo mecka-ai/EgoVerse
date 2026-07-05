@@ -290,7 +290,8 @@ def _build_quest_token_tsne(
         if cache_dir:
             tv.cache_save_npz(cache_dir, "proj", proj_key, coords=proj, sel=sel)
 
-    # 6. Alignment metrics (metrics.json) — language/locality/codebook numbers per run.
+    # 6. Alignment metrics (metrics.json, and embedded in the viewer JSON as chips).
+    metrics = None
     if tvs.metrics:
         from egomimic.curation.token_metrics import compute_alignment_metrics
         tok_flat = emb.reshape(-1, emb.shape[2])
@@ -336,17 +337,23 @@ def _build_quest_token_tsne(
         # time coloring), the span itself for span points.
         s0, e0 = ((int(chunk_frame[ci]), int(chunk_frame[ci]) + H) if ci >= 0
                   else (int(m["start"]), int(m["end"])))
-        spans_list.append({
+        rec = {
             "id": f"{sid}#c{ci}t{tj}" if ci >= 0 else sid,
             "sid": sid, "ep": m["episode"], "start": s0, "end": e0, "text": m["text"],
             "score": None, "cluster": cid, "tok_idx": tj, "chunk_idx": ci,
             "chunk_frame": (int(chunk_frame[ci]) if ci >= 0 else -1),
-        })
+        }
+        if tvs.granularity == "span":
+            rec["n_chunks"] = len(span_chunks.get(si, []))
+        spans_list.append(rec)
     cids = _np.asarray(cids)
     clusters_meta = {str(c): {"label": cluster_labels.get(str(c), ""), "n_spans": int((cids == c).sum())}
                      for c in sorted(set(cids.tolist()))}
     out = {"n_clusters": len(clusters_meta), "clusters": clusters_meta, "spans": spans_list,
-           "action": coords, "method": method, "dims": dims, "granularity": tvs.granularity}
+           "action": coords, "method": method, "dims": dims,
+           "level": tvs.granularity, "ntok": int(ntok)}
+    if metrics is not None:
+        out["metrics"] = metrics
     tsne_dir = Path(output_dir) / "tsne3d"; tsne_dir.mkdir(parents=True, exist_ok=True)
     with open(tsne_dir / "spans_tsne3d.json", "w") as f:
         json.dump(out, f)

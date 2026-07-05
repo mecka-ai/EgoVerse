@@ -28,9 +28,11 @@ from egomimic.utils.pose_utils import (
     _interpolate_quat_wxyz_batch,
     _interpolate_xyz,
     _matrix_to_xyz,
+    _matrix_to_xyz6d,
     _matrix_to_xyzwxyz,
     _matrix_to_xyzypr,
     _xyz_to_matrix,
+    _xyz6d_to_matrix,
     _xyzwxyz_to_matrix,
     _xyzypr_to_matrix,
     wxyz_to_xyzw,
@@ -179,7 +181,7 @@ class ActionChunkCoordinateFrameTransform(Transform):
         chunk_world: str,
         transformed_key_name: str,
         extra_batch_key: dict = None,
-        mode: Literal["xyz", "xyzwxyz", "xyzypr"] = "xyzwxyz",
+        mode: Literal["xyz", "xyzwxyz", "xyzypr", "xyz6d"] = "xyzwxyz",
         inverse: bool = True,
     ):
         """
@@ -226,14 +228,24 @@ class ActionChunkCoordinateFrameTransform(Transform):
             to_matrix_fn = _xyzwxyz_to_matrix
         elif self.mode == "xyzypr":
             to_matrix_fn = _xyzypr_to_matrix
+        elif self.mode == "xyz6d":
+            # Gram-Schmidt re-orthonormalization happens here when reverting a
+            # (possibly non-orthonormal) model 6D prediction back to a frame.
+            to_matrix_fn = _xyz6d_to_matrix
         elif self.mode == "xyz":
             to_matrix_fn = _xyz_to_matrix
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
-        target_world_to_matrix_fn = (
-            _xyzwxyz_to_matrix if target_world.shape[-1] == 7 else _xyzypr_to_matrix
-        )
+        # Dispatch the target-world parser by its width: 7 -> xyz+quat(wxyz),
+        # 9 -> xyz+6D columns, else xyz+ypr.
+        target_width = target_world.shape[-1]
+        if target_width == 7:
+            target_world_to_matrix_fn = _xyzwxyz_to_matrix
+        elif target_width == 9:
+            target_world_to_matrix_fn = _xyz6d_to_matrix
+        else:
+            target_world_to_matrix_fn = _xyzypr_to_matrix
         # Convert to SE3 for transformation
         target_se3 = SE3.from_matrix(
             target_world_to_matrix_fn(target_world[None, :])[0]
@@ -253,6 +265,8 @@ class ActionChunkCoordinateFrameTransform(Transform):
             chunk_in_target_frame = _matrix_to_xyzwxyz(chunk_mats)
         elif self.mode == "xyzypr":
             chunk_in_target_frame = _matrix_to_xyzypr(chunk_mats)
+        elif self.mode == "xyz6d":
+            chunk_in_target_frame = _matrix_to_xyz6d(chunk_mats)
         elif self.mode == "xyz":
             chunk_in_target_frame = _matrix_to_xyz(chunk_mats)
         else:
@@ -517,6 +531,93 @@ class XYZWXYZ_to_XYZYPR(Transform):
         return batch
 
 
+class XYZWXYZ_to_XYZ6D(Transform):
+    """Convert listed keys from xyz+quat(wxyz) to xyz+6D-columns in-place.
+
+    The 6D representation (Zhou et al. / 6DRepNet) is the first two columns of
+    the rotation matrix and is continuous everywhere (no ±pi wraparound), which
+    is what makes per-dimension normalization meaningful. Ported from pi-6d.
+    """
+
+    def __init__(self, keys: list[str]):
+        self.keys = list(keys)
+
+    def transform(self, batch: dict) -> dict:
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 1 and value.shape[0] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value[None, :]))[0]
+            elif value.ndim == 2 and value.shape[1] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value))
+            else:
+                raise ValueError(
+                    f"XYZWXYZ_to_XYZ6D expects key '{key}' to have shape (7,) "
+                    f"or (T, 7), got {value.shape}"
+                )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: (B, 7) obs → (B, 9), (B, H, 7) chunks → (B, H, 9)."""
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 2 and value.shape[-1] == 7:
+                batch[key] = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value))  # (B, 9)
+            elif value.ndim == 3 and value.shape[-1] == 7:
+                B, H = value.shape[:2]
+                flat = _matrix_to_xyz6d(_xyzwxyz_to_matrix(value.reshape(B * H, 7)))
+                batch[key] = flat.reshape(B, H, 9)
+            else:
+                raise ValueError(
+                    f"XYZWXYZ_to_XYZ6D.transform_batch: key '{key}' shape {value.shape} "
+                    f"— expected (B, 7) or (B, H, 7)"
+                )
+        return batch
+
+
+class XYZ6D_to_XYZYPR(Transform):
+    """Convert listed keys from xyz+6D-columns to xyz+ypr in-place.
+
+    Runs Gram-Schmidt (via ``_xyz6d_to_matrix``) to re-orthonormalize the two
+    columns, then reads Euler angles off the matrix. Used at the tail of the
+    revert pipeline so viz keeps seeing ypr while the model predicts 6D. Ported
+    from pi-6d.
+    """
+
+    def __init__(self, keys: list[str]):
+        self.keys = list(keys)
+
+    def transform(self, batch: dict) -> dict:
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 1 and value.shape[0] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value[None, :]))[0]
+            elif value.ndim == 2 and value.shape[1] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value))
+            else:
+                raise ValueError(
+                    f"XYZ6D_to_XYZYPR expects key '{key}' to have shape (9,) "
+                    f"or (T, 9), got {value.shape}"
+                )
+        return batch
+
+    def transform_batch(self, batch: dict) -> dict:
+        """Vectorized: (B, 9) obs → (B, 6), (B, H, 9) chunks → (B, H, 6)."""
+        for key in self.keys:
+            value = np.asarray(batch[key])
+            if value.ndim == 2 and value.shape[-1] == 9:
+                batch[key] = _matrix_to_xyzypr(_xyz6d_to_matrix(value))  # (B, 6)
+            elif value.ndim == 3 and value.shape[-1] == 9:
+                B, H = value.shape[:2]
+                flat = _matrix_to_xyzypr(_xyz6d_to_matrix(value.reshape(B * H, 9)))
+                batch[key] = flat.reshape(B, H, 6)
+            else:
+                raise ValueError(
+                    f"XYZ6D_to_XYZYPR.transform_batch: key '{key}' shape {value.shape} "
+                    f"— expected (B, 9) or (B, H, 9)"
+                )
+        return batch
+
+
 class CartesianWithGripperCoordinateTransform(Transform):
     def __init__(
         self,
@@ -653,6 +754,219 @@ class Reshape(Transform):
     def transform(self, batch: dict) -> dict:
         batch[self.output_key] = batch[self.input_key].reshape(*self.shape)
         return batch
+
+
+def _pose_to_matrix_by_width(poses: np.ndarray) -> np.ndarray:
+    """Dispatch pose→matrix by last-dim width: 7→xyzwxyz, 9→xyz6d, 6→xyzypr."""
+    width = poses.shape[-1]
+    if width == 7:
+        return _xyzwxyz_to_matrix(poses)
+    if width == 9:
+        return _xyz6d_to_matrix(poses)
+    if width == 6:
+        return _xyzypr_to_matrix(poses)
+    raise ValueError(f"Unsupported pose width {width} (expected 6, 7, or 9)")
+
+
+def _matrix_to_pose_by_width(mats: np.ndarray, width: int) -> np.ndarray:
+    if width == 7:
+        return _matrix_to_xyzwxyz(mats)
+    if width == 9:
+        return _matrix_to_xyz6d(mats)
+    if width == 6:
+        return _matrix_to_xyzypr(mats)
+    raise ValueError(f"Unsupported pose width {width} (expected 6, 7, or 9)")
+
+
+def _se3_inverse_batch(mats: np.ndarray) -> np.ndarray:
+    """Vectorized SE3 inverse: [[R,t],[0,1]]^-1 = [[R^T, -R^T t],[0,1]] for (T,4,4)."""
+    R = mats[:, :3, :3]
+    t = mats[:, :3, 3]
+    Rt = np.transpose(R, (0, 2, 1))
+    out = np.broadcast_to(np.eye(4, dtype=mats.dtype), mats.shape).copy()
+    out[:, :3, :3] = Rt
+    out[:, :3, 3] = -np.einsum("tij,tj->ti", Rt, t)
+    return out
+
+
+class SanitizeQuatPoseChunk(Transform):
+    """Forward/backward-fill invalid rows (zero-norm or non-finite quats) in an
+    xyzwxyz pose chunk.
+
+    Mecka episodes contain tracking-dropout rows where obs_wrist_pose is all
+    zeros; ``scipy.Rotation.from_quat`` raises on them ("Found zero norm
+    quaternions"). Filling an invalid row with the previous valid pose makes the
+    consecutive delta across it the identity (= no motion), which is the sane
+    reading of "tracking lost, hold last pose". Leading invalid rows are
+    backward-filled from the first valid row. Raises if the whole chunk is
+    invalid (the dataset's retry-with-random-index fallback handles that).
+
+    ``anchor_key``: optional single-pose key to overwrite with sanitized row 0,
+    preserving the obs == chunk[0] anchor invariant.
+    """
+
+    def __init__(self, chunk_key: str, anchor_key: str | None = None, eps: float = 1e-6):
+        self.chunk_key = chunk_key
+        self.anchor_key = anchor_key
+        self.eps = float(eps)
+
+    def transform(self, batch: dict) -> dict:
+        chunk = np.asarray(batch[self.chunk_key]).copy()  # (T, 7)
+        if chunk.ndim != 2 or chunk.shape[-1] != 7:
+            raise ValueError(
+                f"SanitizeQuatPoseChunk expects (T, 7) xyzwxyz, got {chunk.shape} "
+                f"for key '{self.chunk_key}'"
+            )
+        quat = chunk[:, 3:7]
+        valid = np.isfinite(chunk).all(axis=-1) & (
+            np.linalg.norm(quat, axis=-1) > self.eps
+        )
+        if not valid.all():
+            if not valid.any():
+                raise ValueError(
+                    f"SanitizeQuatPoseChunk: no valid pose rows in chunk "
+                    f"'{self.chunk_key}' (all zero/non-finite)"
+                )
+            # forward-fill: index of the most recent valid row at each t
+            idx = np.where(valid, np.arange(len(valid)), -1)
+            idx = np.maximum.accumulate(idx)
+            first_valid = int(np.argmax(valid))
+            idx[idx < 0] = first_valid  # leading invalids -> backward-fill
+            chunk = chunk[idx]
+        batch[self.chunk_key] = chunk
+        if self.anchor_key is not None:
+            batch[self.anchor_key] = chunk[0].copy()
+        return batch
+
+
+class ConsecutiveDeltaChunk(Transform):
+    """Pose chunk → step-wise (frame-to-frame) deltas: A_t = P_{t-1}^{-1} ∘ P_t.
+
+    A_0 = identity. Output has the same representation/width as the input chunk.
+    Unlike the single-anchor wrist-frame transform (all steps relative to P_0),
+    this yields per-step velocities — the cumulative "distance since anchor"
+    signal is removed at the representation level.
+    """
+
+    def __init__(self, chunk_key: str, output_key: str):
+        self.chunk_key = chunk_key
+        self.output_key = output_key
+
+    def transform(self, batch: dict) -> dict:
+        chunk = np.asarray(batch[self.chunk_key])
+        if chunk.ndim != 2:
+            raise ValueError(
+                f"ConsecutiveDeltaChunk expects (T, D), got {chunk.shape} for key "
+                f"'{self.chunk_key}'"
+            )
+        width = chunk.shape[-1]
+        mats = _pose_to_matrix_by_width(chunk)              # (T, 4, 4)
+        deltas = _se3_inverse_batch(mats[:-1]) @ mats[1:]   # (T-1, 4, 4)
+        eye = np.broadcast_to(np.eye(4, dtype=mats.dtype), (1, 4, 4))
+        out = np.concatenate([eye, deltas], axis=0)         # (T, 4, 4), A_0 = I
+        batch[self.output_key] = _matrix_to_pose_by_width(out, width)
+        return batch
+
+
+class PerTimestepCoordinateFrameTransform(Transform):
+    """Express chunk_t in target_t's frame, per timestep.
+
+    ``target_chunk``: (T, 6|7|9) pose per timestep. ``chunk``: (T, K, 3) points
+    (mode="xyz"). inverse=True → target_t^{-1} ∘ chunk_t (world → target frame);
+    inverse=False → target_t ∘ chunk_t (target frame → world/parent).
+    Unlike ActionChunkCoordinateFrameTransform (one target for the whole chunk),
+    the target here varies per timestep — e.g. fingertips in the wrist frame of
+    the SAME timestep (pure articulation, no cumulative palm motion).
+    """
+
+    def __init__(
+        self,
+        target_chunk: str,
+        chunk: str,
+        transformed_key_name: str,
+        mode: Literal["xyz"] = "xyz",
+        inverse: bool = True,
+    ):
+        if mode != "xyz":
+            raise ValueError("PerTimestepCoordinateFrameTransform supports mode='xyz' only")
+        self.target_chunk = target_chunk
+        self.chunk = chunk
+        self.transformed_key_name = transformed_key_name
+        self.inverse = inverse
+
+    def transform(self, batch: dict) -> dict:
+        target = np.asarray(batch[self.target_chunk])   # (T, 6|7|9)
+        points = np.asarray(batch[self.chunk])          # (T, K, 3)
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError(
+                f"PerTimestepCoordinateFrameTransform expects (T, K, 3) points, got "
+                f"{points.shape} for key '{self.chunk}'"
+            )
+        if target.shape[0] != points.shape[0]:
+            raise ValueError(
+                f"target/chunk timestep mismatch: {target.shape[0]} vs {points.shape[0]}"
+            )
+        mats = _pose_to_matrix_by_width(target)          # (T, 4, 4)
+        if self.inverse:
+            mats = _se3_inverse_batch(mats)
+        R = mats[:, :3, :3]
+        t = mats[:, :3, 3]
+        out = np.einsum("tij,tkj->tki", R, points) + t[:, None, :]
+        batch[self.transformed_key_name] = out
+        return batch
+
+
+class CumulativeComposeChunk(Transform):
+    """Chain-compose step-wise deltas back to absolute poses (revert for viz).
+
+    ``P_t = anchor ∘ A_0 ∘ A_1 ∘ … ∘ A_t`` (A_0 is identity in the encoding, so
+    P_0 = anchor). Inverse of ConsecutiveDeltaChunk given the anchor pose.
+    Output uses the anchor's representation width.
+    """
+
+    def __init__(self, anchor_key: str, delta_key: str, output_key: str):
+        self.anchor_key = anchor_key
+        self.delta_key = delta_key
+        self.output_key = output_key
+
+    def transform(self, batch: dict) -> dict:
+        anchor = np.asarray(batch[self.anchor_key])   # (6|7|9,)
+        deltas = np.asarray(batch[self.delta_key])    # (T, 6|7|9)
+        width = anchor.shape[-1]
+        anchor_mat = _pose_to_matrix_by_width(anchor[None])[0]   # (4, 4)
+        delta_mats = _pose_to_matrix_by_width(deltas)            # (T, 4, 4)
+        out = np.empty_like(delta_mats)
+        running = anchor_mat
+        for i in range(delta_mats.shape[0]):
+            running = running @ delta_mats[i]
+            out[i] = running
+        batch[self.output_key] = _matrix_to_pose_by_width(out, width)
+        return batch
+
+
+class SelectKeypoints(Transform):
+    """Select specific keypoint indices from a flattened ``(..., n_keypoints*item_dim)`` array.
+
+    Reshapes ``(..., n_keypoints, item_dim)`` and gathers ``indices`` along the
+    keypoint axis, returning ``(..., len(indices), item_dim)``. Used to pull the 5
+    MANO fingertips (indices 4/8/12/16/20) out of the 21-keypoint (63-dim) vector.
+    """
+
+    def __init__(self, input_key, output_key, indices, n_keypoints=21, item_dim=3):
+        self.input_key = input_key
+        self.output_key = output_key
+        self.indices = list(indices)
+        self.n_keypoints = int(n_keypoints)
+        self.item_dim = int(item_dim)
+
+    def transform(self, batch: dict) -> dict:
+        arr = np.asarray(batch[self.input_key])
+        lead = arr.shape[:-1]
+        arr = arr.reshape(*lead, self.n_keypoints, self.item_dim)
+        batch[self.output_key] = arr[..., self.indices, :]
+        return batch
+
+    transform_batch = transform
 
 
 # ---------------------------------------------------------------------------
