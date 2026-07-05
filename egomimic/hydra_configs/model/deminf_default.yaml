@@ -16,6 +16,13 @@ projection_dims: 3
 #              than the projection method does).
 # cache:       content-keyed chunk/token/projection caches on the volume — a projection
 #              tweak (2D→3D, tsne→umap, new granularity) skips the zarr read + re-encode.
+# Optional span filter for clustered scoring/viz: path to an episode-set JSON —
+# either {"sets": [{"name": ..., "episodes": [{"episode_id": ...}, ...]}, ...]} (e.g.
+# data/extra/preanno199_aligned_verb_hand_sets.json) or a plain list of episode ids.
+# Only spans from these episodes are clustered/scored/plotted. null = all spans.
+span_filter:
+  episodes_json: null
+
 token_viz:
   granularity: span   # token | chunk | span
   cap: 60000

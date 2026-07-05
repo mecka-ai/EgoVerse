@@ -1,0 +1,117 @@
+{
+  "description": "Two curated preanno199 episode sets, each with a strong, distinct verb+handedness concentration across annotation spans (manually frequency-checked).",
+  "sets": [
+    {
+      "name": "bimanual_pick_and_place_core",
+      "verb_handedness_concentration": "pick up + both hands / place + both hands",
+      "pattern": "pick up <object> with both hands -> place <object> on <shelf/stack/container> with both hands",
+      "coverage": "~90% of verb segments are the two target combos; pick/place counts ~1:1",
+      "episodes": [
+        {
+          "episode_id": "68d3edc112af763ea5dca391",
+          "task": "organizing_shelves/removing_items",
+          "spans": 6,
+          "pick_up_both": 6,
+          "place_both": 6,
+          "other_segments": 0
+        },
+        {
+          "episode_id": "68c9b871841616b2c4f83ef0",
+          "task": "stocking_shelves (box stacking)",
+          "spans": 18,
+          "pick_up_both": 16,
+          "place_both": 17,
+          "other_segments": 1
+        },
+        {
+          "episode_id": "68c9a671f7aeb085b60fcb95",
+          "task": "stocking_snacks",
+          "spans": 28,
+          "pick_up_both": 15,
+          "place_both": 16,
+          "other_segments": 1
+        },
+        {
+          "episode_id": "68d3f78a6df2d7f2057a209d",
+          "task": "picking_items (groceries)",
+          "spans": 33,
+          "pick_up_both": 16,
+          "place_both": 17,
+          "other_segments": 1
+        },
+        {
+          "episode_id": "68c9c16ba1ea367a01cd62a2",
+          "task": "arranging_kettles",
+          "spans": 10,
+          "pick_up_both": 7,
+          "place_both": 7,
+          "other_segments": 3
+        },
+        {
+          "episode_id": "68d3ff88bdac7d9d657e03fd",
+          "task": "placing_items_on_shelf",
+          "spans": 15,
+          "pick_up_both": 10,
+          "place_both": 10,
+          "other_segments": 7
+        }
+      ]
+    },
+    {
+      "name": "asymmetric_hold_left_scrub_right",
+      "verb_handedness_concentration": "hold + left hand / scrub + right hand",
+      "pattern": "hold <shoe> with left hand + scrub <shoe> with brush in right hand (residual: dip brush in solution with right hand)",
+      "coverage": "~64% of verb segments are the two target combos (72% including dip+right); strongly lateralized left-stabilize / right-act",
+      "episodes": [
+        {
+          "episode_id": "68d1d3a21d29a1390d685fe2",
+          "task": "cleaning_shoes",
+          "spans": 16,
+          "hold_left": 15,
+          "scrub_right": 12,
+          "other_segments": 5
+        },
+        {
+          "episode_id": "68d3f7a39ad4e83f3cd10e4b",
+          "task": "cleaning_shoes",
+          "spans": 18,
+          "hold_left": 15,
+          "scrub_right": 12,
+          "other_segments": 10
+        },
+        {
+          "episode_id": "68d3e672347ceea1609f6f74",
+          "task": "cleaning_shoes",
+          "spans": 12,
+          "hold_left": 9,
+          "scrub_right": 11,
+          "other_segments": 4
+        },
+        {
+          "episode_id": "68d3a7ffcea1f16ac771f48a",
+          "task": "cleaning_shoes",
+          "spans": 25,
+          "hold_left": 13,
+          "scrub_right": 12,
+          "other_segments": 21
+        },
+        {
+          "episode_id": "68d3eb4c593c576a5a68f356",
+          "task": "cleaning_shoes",
+          "spans": 23,
+          "hold_left": 17,
+          "scrub_right": 11,
+          "other_segments": 16
+        },
+        {
+          "episode_id": "68d21711e692e6458598d6fa",
+          "task": "cleaning_shoes",
+          "spans": 25,
+          "hold_left": 24,
+          "scrub_right": 12,
+          "other_segments": 15
+        }
+      ]
+    }
+  ]
+}

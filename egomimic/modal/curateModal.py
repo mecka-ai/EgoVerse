@@ -547,6 +547,30 @@ def _score_task_clustered(
              "end": int(sp["end"]), "text": sp["text"]}
         )
 
+    # Optional episode-set span filter (model.span_filter.episodes_json): restrict
+    # clustering/scoring/viz to spans from the listed episodes.
+    from omegaconf import OmegaConf as _OCf
+    filt_json = _OCf.select(cfg, "model.span_filter.episodes_json", default=None)
+    if filt_json:
+        doc = json.loads(Path(str(filt_json)).read_text())
+        if isinstance(doc, dict) and "sets" in doc:
+            ep_set = {e["episode_id"]: s["name"] for s in doc["sets"] for e in s["episodes"]}
+        else:
+            ep_set = {str(e): "set" for e in doc}
+        keep = [i for i, m in enumerate(span_meta) if m["episode"] in ep_set]
+        per_set: dict[str, int] = {}
+        for i in keep:
+            per_set[ep_set[span_meta[i]["episode"]]] = per_set.get(ep_set[span_meta[i]["episode"]], 0) + 1
+        span_state = [span_state[i] for i in keep]
+        span_action = [span_action[i] for i in keep]
+        span_ids = [span_ids[i] for i in keep]
+        span_texts = [span_texts[i] for i in keep]
+        span_meta = [span_meta[i] for i in keep]
+        print(f"{tag} span filter {filt_json}: kept {len(keep)} spans from "
+              f"{len({m['episode'] for m in span_meta})} episodes {per_set}")
+        if not keep:
+            raise ValueError(f"span filter {filt_json} matched no spans in the store")
+
     print(
         f"{tag} clustered: {len(span_ids)} annotation spans "
         f"from {len(manifest['episodes'])} episodes (store: {src_dir})"
