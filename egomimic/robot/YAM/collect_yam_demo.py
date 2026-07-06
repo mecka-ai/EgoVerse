@@ -16,7 +16,8 @@ Workflow (per the teaching-handle sync button):
       starts from the same canonical pose (disable with ``--no-auto-home``).
 
 Keyboard (type the letter + Enter in the launching terminal):
-    d  discard the in-progress episode (won't be saved on disengage)
+    d  discard the in-progress episode: immediately stop teleop, return home
+       (unless --no-auto-home), and don't save
     h  send followers home (only while disengaged)
     q  quit
 
@@ -457,12 +458,26 @@ def collect_yam_demo(
                 else:
                     print("[home] Ignored: disengage teleop first.")
 
-            # Discard request.
+            # Discard request: stop teleop immediately and return home (mirroring
+            # the episode-end path, but without saving), instead of only dropping
+            # the buffer and continuing to record until the next disengage.
             if kbd.discard.is_set():
                 kbd.discard.clear()
                 discard_episode = True
+                was_synced = synchronized
+                if synchronized:
+                    # Relax leaders (back-drivable) — same as a disengage.
+                    print("[teleop] Disengaging (discard) ...")
+                    for a in arms:
+                        leaders[a].update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
+                    synchronized = False
                 reset_data(demo_data)
-                print("[episode] Marked for discard; buffer cleared.")
+                print("[episode] Discarded; buffer cleared.")
+                # Return followers + leaders home, gated on --auto-home like the
+                # episode-end auto-home. Keyboard-triggered, so no sync-button
+                # debounce is needed (the handle button isn't being held).
+                if was_synced and auto_home:
+                    _home_all("episode discarded; ")
 
             # --- Sync button edge: toggle engagement --------------------------
             if buttons_pressed:

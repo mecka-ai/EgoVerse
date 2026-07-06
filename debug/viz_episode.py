@@ -51,6 +51,13 @@ from egomimic.rldb.embodiment.yam import Yam
 _RAW_STEREO_W = 3840
 _RAW_STEREO_HALF = 1920
 
+# INTRINSICS['yam'] lives in the 640x480 training space: the rollout stretch-
+# resizes front_img_1 to this before projecting (commits a2af51b/ea896fa). The
+# stored/rectified front is the processor-native 1220x880, so we must resize to
+# match K here or every projected point lands ~0.53x too small (compressed into
+# the top-left corner, off the arms).
+_K_WH = (640, 480)
+
 # eepose = 14-dim per-arm [xyz(3), ZYX euler(3), gripper(1)]; left[0:7] right[7:14].
 _ARM = {"left": 0, "right": 7}
 
@@ -234,6 +241,10 @@ def main():
             frame_bgr = np.ascontiguousarray(imgs[t][..., ::-1])   # RGB->BGR for cv2
             if rectify is not None:
                 frame_bgr = rectify(frame_bgr)
+            # Match the front image to the space INTRINSICS['yam'] is defined in
+            # (640x480), exactly as the rollout does, so the overlay lines up.
+            if frame_bgr.shape[1::-1] != _K_WH:
+                frame_bgr = cv2.resize(frame_bgr, _K_WH, interpolation=cv2.INTER_AREA)
             # Drawn arrows: PLAIN camera frame (tag-validated convention).
             viz12 = build_viz_data(ee, t, a.horizon, a.arm, a.extrinsics_key)
             overlay = Yam.viz(image=frame_bgr, viz_data=viz12,
