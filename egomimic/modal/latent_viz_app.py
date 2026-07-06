@@ -642,12 +642,30 @@ def viewer():
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))
         result["ntok"] = int(data.get("ntok", 25))       # QueST tokens per chunk
-        if data.get("metrics"):
-            result["metrics"] = data["metrics"]
+        # token-viz pipeline fields: explicit per-point token position / span identity
+        # and a run granularity tag (token | chunk | span)
+        if data.get("granularity"):
+            result["level"] = str(data["granularity"])
         if data.get("level"):
             result["level"] = str(data["level"])
+        if any("tok_idx" in s for s in spans):
+            result["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
+        if any(s.get("sid") for s in spans):
+            result["sid"] = [str(s.get("sid", "")) for s in spans]
         if any("n_chunks" in s for s in spans):
             result["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
+        metrics = data.get("metrics")
+        if not metrics:  # token-viz pipeline writes a metrics.json sidecar instead
+            for cand in (tsne_path.parent / "metrics.json",
+                         Path(OUTPUTS_MOUNT) / run / "metrics.json"):
+                if cand.is_file():
+                    try:
+                        metrics = json.load(open(cand))
+                    except Exception:
+                        metrics = None
+                    break
+        if metrics:
+            result["metrics"] = metrics
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]
