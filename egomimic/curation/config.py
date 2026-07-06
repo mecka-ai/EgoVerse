@@ -95,6 +95,9 @@ class TokenVizSettings:
     """
 
     granularity: str = "span"
+    # Temporal normalization: resample each span's action sequence to ONE quest_horizon-
+    # length chunk (no chunk sharing between spans, no out-of-span frames).
+    span_resample: bool = False
     cap: int = 60000
     balance: str = "span"
     center_by_position: bool = False
@@ -320,6 +323,7 @@ def select_token_viz_settings(cfg: Any) -> TokenVizSettings:
     pre = block.get("preproc", None) or {}
     return TokenVizSettings(
         granularity=str(block.get("granularity", d.granularity)).lower().strip(),
+        span_resample=bool(block.get("span_resample", d.span_resample)),
         cap=int(block.get("cap", d.cap)),
         balance=str(block.get("balance", d.balance)).lower().strip(),
         center_by_position=bool(pre.get("center_by_position", d.center_by_position)),

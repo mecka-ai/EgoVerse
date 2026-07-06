@@ -202,8 +202,9 @@ def _build_quest_token_tsne(
     ds_cfg = next(iter(cfg.data.train_datasets.values()))
     resolver_cfg = _OCq.to_container(ds_cfg.resolver, resolve=True)
     resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match the latent store)
-    chunks, chunk_ep, chunk_frame, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
+    chunks, chunk_ep, chunk_frame, chunk_end, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
         resolver_cfg, CFG.remote_repo_dir, span_meta, H, cache_dir, tag,
+        span_resample=tvs.span_resample,
     )
     Nc = len(chunks)
 
@@ -213,8 +214,9 @@ def _build_quest_token_tsne(
     chunk_ep_idx = _np.asarray([ep_idx_of[e] for e in chunk_ep], dtype=_np.int32)
     tok_key = tv.cache_key({
         "data": read_info["data_tag"], "eps": ep_order,
-        "chunks": tv.array_key(chunk_ep_idx, chunk_frame),
+        "chunks": tv.array_key(chunk_ep_idx, chunk_frame, chunk_end),
         "ckpt": str(ae.checkpoint_path), "horizon": H,
+        "span_resample": tvs.span_resample,
     })
     cached = tv.cache_load_npz(cache_dir, "tokens", tok_key)
     if cached is not None:
@@ -335,7 +337,7 @@ def _build_quest_token_tsne(
         cids.append(cid)
         # start/end: the chunk window for token/chunk points (frame-precise hover +
         # time coloring), the span itself for span points.
-        s0, e0 = ((int(chunk_frame[ci]), int(chunk_frame[ci]) + H) if ci >= 0
+        s0, e0 = ((int(chunk_frame[ci]), int(chunk_end[ci])) if ci >= 0
                   else (int(m["start"]), int(m["end"])))
         rec = {
             "id": f"{sid}#c{ci}t{tj}" if ci >= 0 else sid,

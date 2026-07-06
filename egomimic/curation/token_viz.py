@@ -105,6 +105,41 @@ def plan_span_chunks(start: int, end: int, n_valid: int, horizon: int):
     return sorted(set(frames)), snapped, start >= n_valid
 
 
+def extract_span_sequence(arr: np.ndarray, s: int, e: int) -> np.ndarray:
+    """Contiguous per-frame action sequence for span ``[s, e)`` from the stored chunk
+    array ``(T, H, D)``.
+
+    Global frame ``g`` lives at ``arr[min(g, T-1), g - min(g, T-1)]`` — NOT column 0
+    (step-0 is a degenerate near-identity delta in wrist-frame representations). The
+    last stored row covers the episode tail, so frames up to ``T-1+H`` are reachable.
+    """
+    n_valid, H = arr.shape[0], arr.shape[1]
+    end_max = n_valid - 1 + H            # one past the last representable frame
+    e2 = max(min(e, end_max), 1)
+    s2 = min(max(s, 0), e2 - 1)
+    g = np.arange(s2, e2)
+    rows = np.minimum(g, n_valid - 1)
+    return np.asarray(arr[rows, g - rows], dtype=np.float32)  # (T_span, D)
+
+
+def resample_sequence(seq: np.ndarray, L: int) -> np.ndarray:
+    """Uniform temporal resample (linear interp per dim) of ``(T, D)`` to ``(L, D)``.
+
+    The temporal normalization: spans of any duration map to a fixed L-step sequence,
+    removing duration/speed so the tokenizer sees one same-length input per span."""
+    seq = np.asarray(seq, dtype=np.float32)
+    T = len(seq)
+    if T == L:
+        return seq
+    if T == 1:
+        return np.repeat(seq, L, axis=0)
+    src = np.linspace(0.0, T - 1.0, L)
+    i0 = np.floor(src).astype(np.int64)
+    i1 = np.minimum(i0 + 1, T - 1)
+    w = (src - i0).astype(np.float32)[:, None]
+    return ((1.0 - w) * seq[i0] + w * seq[i1]).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # 2. Chunk read — spawn process pool, per-episode cache, per-episode slicing
 # ---------------------------------------------------------------------------
@@ -113,7 +148,7 @@ _W: dict = {}  # per-worker-process state (set by _worker_init)
 
 
 def _worker_init(repo_dir: str, resolver_cfg_json: str, action_key: str,
-                 image_key: str, chunk_cache_dir: str) -> None:
+                 image_key: str, chunk_cache_dir: str, span_resample: bool) -> None:
     import sys
     if repo_dir and repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
@@ -122,6 +157,7 @@ def _worker_init(repo_dir: str, resolver_cfg_json: str, action_key: str,
         action_key=action_key,
         image_key=image_key,
         chunk_cache_dir=chunk_cache_dir,
+        span_resample=span_resample,
     )
 
 
@@ -141,7 +177,9 @@ def _worker_read(job):
     """Read one episode's chunk array (cache-first), plan + slice its spans' chunks.
 
     job: ``(ep_hash, [(span_idx, start, end), ...], horizon)``
-    Returns ``(ep, {frame: (horizon, D) float32}, {span_idx: [frames]}, stats, err)``.
+    Returns ``(ep, {key: (horizon, D) float32}, {span_idx: [keys]}, stats, err)`` where
+    ``key`` is ``(frame,)`` for snap-tiled chunks or ``(start, end)`` for span-resampled
+    chunks (one temporally-normalized chunk per span).
     """
     ep, spans, horizon = job
     try:
@@ -171,16 +209,29 @@ def _worker_read(job):
             raise ValueError(f"stored horizon {arr.shape[1]} < requested {horizon}")
 
         n_valid = arr.shape[0]
-        span_map: dict[int, list[int]] = {}
+        span_map: dict[int, list[tuple]] = {}
+        chunks: dict[tuple, np.ndarray] = {}
         n_snapped = n_dropped_old = 0
-        needed: set[int] = set()
-        for span_idx, s, e in spans:
-            frames, snapped, would_drop = plan_span_chunks(int(s), int(e), n_valid, horizon)
-            span_map[int(span_idx)] = frames
-            n_snapped += int(snapped)
-            n_dropped_old += int(would_drop)
-            needed.update(frames)
-        chunks = {int(f): np.array(arr[f, :horizon], dtype=np.float32) for f in sorted(needed)}
+        if _W["span_resample"]:
+            # Temporal normalization: one chunk per span — the span's exact per-frame
+            # sequence uniformly resampled to `horizon` steps. No chunk sharing between
+            # spans, no out-of-span frames.
+            for span_idx, s, e in spans:
+                key = (int(s), int(e))
+                if key not in chunks:
+                    chunks[key] = resample_sequence(
+                        extract_span_sequence(arr, int(s), int(e)), horizon)
+                span_map[int(span_idx)] = [key]
+        else:
+            needed: set[int] = set()
+            for span_idx, s, e in spans:
+                frames, snapped, would_drop = plan_span_chunks(int(s), int(e), n_valid, horizon)
+                span_map[int(span_idx)] = [(f,) for f in frames]
+                n_snapped += int(snapped)
+                n_dropped_old += int(would_drop)
+                needed.update(frames)
+            chunks = {(int(f),): np.array(arr[f, :horizon], dtype=np.float32)
+                      for f in sorted(needed)}
         stats = {"spans": len(spans), "snapped": n_snapped, "dropped_old": n_dropped_old,
                  "n_valid": int(n_valid)}
         return ep, chunks, span_map, stats, None
@@ -192,13 +243,19 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
                      horizon: int, cache_dir: str, tag: str,
                      action_key: str = "actions_cartesian",
                      image_key: str = "observations.images.front_img_1",
-                     workers: int | None = None):
+                     workers: int | None = None, span_resample: bool = False):
     """Read every span's action chunks with snapping + dedupe + caching.
 
-    Returns ``(chunks, chunk_ep, chunk_frame, chunk_owner, span_chunks, info)``:
+    With ``span_resample`` each span becomes exactly ONE chunk: its per-frame sequence
+    uniformly resampled to ``horizon`` steps (temporal normalization — no chunk sharing,
+    no out-of-span frames). Otherwise spans are tiled at ``horizon`` stride with
+    snap-to-nearest-full-chunk and deduped by ``(episode, frame)``.
+
+    Returns ``(chunks, chunk_ep, chunk_frame, chunk_end, chunk_owner, span_chunks, info)``:
       chunks       (Nc, horizon, D) float32 — unique chunks across all spans
       chunk_ep     list[str] (Nc,)          — episode hash per chunk
       chunk_frame  (Nc,) int32              — chunk start frame per chunk
+      chunk_end    (Nc,) int32              — chunk end frame (exclusive)
       chunk_owner  (Nc,) int32              — first span (index into span_meta) claiming it
       span_chunks  {span_idx: [chunk idx]}  — every span → its (possibly shared) chunks
       info         dict                     — data_tag, failures, snap/dedupe counters
@@ -227,12 +284,13 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
     results = []
     with ProcessPoolExecutor(
         max_workers=n_workers, mp_context=ctx, initializer=_worker_init,
-        initargs=(repo_dir, json.dumps(resolver_cfg), action_key, image_key, chunk_cache_dir),
+        initargs=(repo_dir, json.dumps(resolver_cfg), action_key, image_key,
+                  chunk_cache_dir, span_resample),
     ) as pool:
         results = list(pool.map(_worker_read, jobs))
 
     key2idx: dict[tuple, int] = {}
-    chunk_rows, chunk_ep, chunk_frame, chunk_owner = [], [], [], []
+    chunk_rows, chunk_ep, chunk_frame, chunk_end, chunk_owner = [], [], [], [], []
     span_chunks: dict[int, list[int]] = {}
     failed, spans_lost = [], 0
     tot_snapped = tot_dropped_old = tot_refs = 0
@@ -243,15 +301,16 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
             continue
         tot_snapped += stats["snapped"]
         tot_dropped_old += stats["dropped_old"]
-        for span_idx, frames in span_map.items():
+        for span_idx, keys in span_map.items():
             idxs = []
-            for f in frames:
-                k = (ep, f)
+            for key in keys:
+                k = (ep, *key)
                 if k not in key2idx:
                     key2idx[k] = len(chunk_rows)
-                    chunk_rows.append(chunks_d[f])
+                    chunk_rows.append(chunks_d[key])
                     chunk_ep.append(ep)
-                    chunk_frame.append(f)
+                    chunk_frame.append(int(key[0]))
+                    chunk_end.append(int(key[1]) if len(key) > 1 else int(key[0]) + horizon)
                     chunk_owner.append(span_idx)
                 idxs.append(key2idx[k])
             span_chunks[span_idx] = idxs
@@ -262,17 +321,19 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
     if not chunk_rows:
         raise RuntimeError(f"no chunks read ({len(failed)} episode failures)")
     chunks = np.stack(chunk_rows).astype(np.float32)
+    mode = "span-resampled (temporal norm)" if span_resample else \
+        f"{tot_snapped} snapped, {tot_dropped_old} previously dropped now recovered"
     print(
         f"{tag} chunk read: {len(jobs) - len(failed)}/{len(jobs)} episodes ok in "
         f"{time.perf_counter() - t0:.1f}s — {len(span_chunks)} spans mapped "
-        f"({tot_snapped} snapped, {tot_dropped_old} previously dropped now recovered, "
-        f"{spans_lost} lost to episode failures); {len(chunks)} unique chunks "
+        f"({mode}, {spans_lost} lost to episode failures); {len(chunks)} unique chunks "
         f"({tot_refs - len(chunks)} duplicate refs deduped)"
     )
     info = {"data_tag": data_tag, "failed": failed, "spans_lost": spans_lost,
             "snapped": tot_snapped, "dropped_old": tot_dropped_old,
-            "deduped": tot_refs - len(chunks)}
+            "deduped": tot_refs - len(chunks), "span_resample": span_resample}
     return chunks, chunk_ep, np.asarray(chunk_frame, dtype=np.int32), \
+        np.asarray(chunk_end, dtype=np.int32), \
         np.asarray(chunk_owner, dtype=np.int32), span_chunks, info
 
 
