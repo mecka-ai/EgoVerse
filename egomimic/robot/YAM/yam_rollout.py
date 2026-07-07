@@ -11,20 +11,23 @@ Launch (from the repo root):
         --annotation-path <prompt.txt> \\
         --yam-left-can can_follower_l --yam-right-can can_follower_r
 """
+
 import os
 import sys
 
 # --- Make sibling (YAM/), robot/, eva src, and the vendored i2rt importable ---
 # This file lives at <repo>/egomimic/robot/YAM/yam_rollout.py.
-_THIS = os.path.dirname(os.path.abspath(__file__))            # .../egomimic/robot/YAM
-_ROBOT_DIR = os.path.dirname(_THIS)                           # .../egomimic/robot
-_EGOMIMIC_DIR = os.path.dirname(_ROBOT_DIR)                   # .../egomimic
-_REPO_ROOT = os.path.dirname(_EGOMIMIC_DIR)                   # .../<repo root>
+_THIS = os.path.dirname(os.path.abspath(__file__))  # .../egomimic/robot/YAM
+_ROBOT_DIR = os.path.dirname(_THIS)  # .../egomimic/robot
+_EGOMIMIC_DIR = os.path.dirname(_ROBOT_DIR)  # .../egomimic
+_REPO_ROOT = os.path.dirname(_EGOMIMIC_DIR)  # .../<repo root>
 for _p in (
-    _ROBOT_DIR,                                               # robot_utils
-    _THIS,                                                    # yam_interface, yam_cameras
-    os.path.join(_ROBOT_DIR, "eva", "eva_ws", "src", "eva"),  # robot_interface (ARX base)
-    os.path.join(_REPO_ROOT, "external", "i2rt"),             # i2rt SDK
+    _ROBOT_DIR,  # robot_utils
+    _THIS,  # yam_interface, yam_cameras
+    os.path.join(
+        _ROBOT_DIR, "eva", "eva_ws", "src", "eva"
+    ),  # robot_interface (ARX base)
+    os.path.join(_REPO_ROOT, "external", "i2rt"),  # i2rt SDK
 ):
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
@@ -48,17 +51,24 @@ def _quiet_thread_excepthook(args):
         return
     threading.__excepthook__(args)
 
+
+# (sys.path for robot_utils / robot_interface / yam_interface / i2rt is set up at
+# the top of this module so it applies before the imports above.)
+import select
+import termios
+import tty
+
 import cv2
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import default_collate
 from robot_utils import RateLoop
 from scipy.spatial.transform import Rotation as R
+from torch.utils.data import default_collate
 
 from egomimic.models.denoising_policy import DenoisingPolicy
-from egomimic.pl_utils.pl_model import ModelWrapper
 from egomimic.pl_utils.pl_data_utils import build_tokenized_collate
+from egomimic.pl_utils.pl_model import ModelWrapper
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.embodiment.eva import (
     Eva,
@@ -71,14 +81,6 @@ from egomimic.utils.egomimicUtils import (
     interpolate_arr,
 )
 from egomimic.utils.pose_utils import xyzw_to_wxyz
-
-# (sys.path for robot_utils / robot_interface / yam_interface / i2rt is set up at
-# the top of this module so it applies before the imports above.)
-
-import select
-import termios
-import tty
-
 
 R_t_e = np.array(
     [
@@ -114,6 +116,36 @@ def rot_ee_frame_to_ee_pose_batch(pose_rot):
 
 def ee_pose_to_rot_ee_frame(pose):
     return ee_pose_to_rot_ee_frame_batch(pose[None, ...])[0]
+
+
+# YAM-native flange -> EVA flange axis relabel (columns = EVA axes in YAM flange
+# coords): EVA X = -Z_yam, EVA Y = -X_yam, EVA Z = +Y_yam. Measured on the
+# training zarrs (grasp-event decomposition, 2026-07-05): EVA/ABC pre-grasp
+# descent is +Z in EE coords while YAM's is +Y, and the 180-deg roll ambiguity is
+# pinned by -Z_yam pointing world-down at level-approach frames. A constant LOCAL
+# relabel (right-multiply) commutes with every world/cam-side transform in the
+# pipeline (all left-multiplies), so remapping obs at ingestion and inverting on
+# the outgoing command is exact. Valid ONLY from the stock "default" grasp_site
+# convention the YAM demos were collected with (see --ee-convention).
+YAM_TO_EVA_FLANGE = np.array(
+    [
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+    ],
+    dtype=float,
+)
+
+
+def relabel_flange_ypr_batch(pose, E):
+    """Post-multiply the rotation of [..., xyz ypr(ZYX)] pose rows by the
+    constant axis relabel E. Pure frame relabel: xyz (and anything past index 6)
+    is untouched."""
+    pose = np.asarray(pose, dtype=np.float64).copy()
+    ypr = pose[..., 3:6]
+    R_m = R.from_euler("ZYX", ypr).as_matrix()
+    pose[..., 3:6] = R.from_matrix(R_m @ E).as_euler("ZYX")
+    return pose
 
 
 def _slerp_resample_cartesian(chunk, target_len):
@@ -156,7 +188,10 @@ DEFAULT_RESAMPLE_LENGTH = 45
 
 
 def _build_robot_interface(
-    arms_list, robot="eva", yam_channels=None, yam_ee_convention="default",
+    arms_list,
+    robot="eva",
+    yam_channels=None,
+    yam_ee_convention="default",
 ):
     if robot == "yam":
         # YAMInterface is a sibling module (this file lives in egomimic/robot/YAM/);
@@ -166,8 +201,9 @@ def _build_robot_interface(
         # YAMInterface always opens its cameras, so get_obs() includes
         # front_img_1 / left_wrist_img / right_wrist_img — the keys the obs
         # pipeline consumes (and it raises if no cameras are available).
-        return YAMInterface(arms=arms_list, channels=yam_channels,
-                            ee_frame_convention=yam_ee_convention)
+        return YAMInterface(
+            arms=arms_list, channels=yam_channels, ee_frame_convention=yam_ee_convention
+        )
 
     from robot_interface import ARXInterface
 
@@ -237,10 +273,36 @@ class PolicyRollout(Rollout):
         annotation_path=None,
         annotation_text=None,
         robot="eva",
+        no_embodiment_prompt=False,
+        flange_frame="native",
     ):
         super().__init__()
         self.arm = arm
         self.robot = robot
+        # Prompt parity knob: when True the tokenized collate drops the
+        # "Embodiment: <name>" block (Task/State blocks unchanged). Must match
+        # the checkpoint's data config (embodiment_label: false).
+        self.no_embodiment_prompt = no_embodiment_prompt
+        if flange_frame not in ("native", "eva"):
+            raise ValueError(f"unknown flange_frame '{flange_frame}'")
+        # "eva": the checkpoint speaks EVA's flange convention -> relabel the
+        # robot's native flange rotations into it on the obs side (R @ E) and
+        # back on the command side (R @ E^T). Identity for --robot eva.
+        self.flange_remap = (
+            YAM_TO_EVA_FLANGE if (flange_frame == "eva" and robot == "yam") else None
+        )
+        if flange_frame == "eva":
+            if robot != "yam":
+                print(
+                    "[rollout] --flange-frame eva is a no-op for --robot eva "
+                    "(the checkpoint convention IS the native one)."
+                )
+            else:
+                print(
+                    "[rollout] flange-frame remap ON: YAM-native flange -> EVA "
+                    "convention on obs, inverted on outgoing commands "
+                    "(EVA X=-Z_yam, Y=-X_yam, Z=+Y_yam)."
+                )
         self.policy_path = policy_path
         self.query_frequency = query_frequency
         self.cartesian = cartesian
@@ -260,7 +322,9 @@ class PolicyRollout(Rollout):
         # (Yam.EXTRINSICS_KEY = "yam") so self.extrinsics stays consistent with the
         # transform pipeline, which also uses embodiment_cls.EXTRINSICS_KEY.
         intrinsics_key = self.embodiment_cls.VIZ_INTRINSICS_KEY
-        emb_extrinsics_key = getattr(self.embodiment_cls, "EXTRINSICS_KEY", extrinsics_key)
+        emb_extrinsics_key = getattr(
+            self.embodiment_cls, "EXTRINSICS_KEY", extrinsics_key
+        )
         if extrinsics_key != emb_extrinsics_key:
             print(
                 f"[rollout] WARNING: --extrinsics-key='{extrinsics_key}' != "
@@ -347,7 +411,9 @@ class PolicyRollout(Rollout):
         self.collate_fn = default_collate
         if annotation_path is not None:
             if not os.path.isfile(annotation_path):
-                print(f"[rollout] WARNING: annotation file not found: {annotation_path}  (continuing without annotation)")
+                print(
+                    f"[rollout] WARNING: annotation file not found: {annotation_path}  (continuing without annotation)"
+                )
             else:
                 with open(annotation_path, "r") as f:
                     self.annotation = f.read().strip()
@@ -371,6 +437,9 @@ class PolicyRollout(Rollout):
         pathway the model learned to read). NOTE: proprio_keys must be passed
         explicitly here (this branch's collate has no default), and the batch's
         "embodiment" key must be the integer id for the Embodiment splice.
+
+        --no-embodiment-prompt drops ONLY the Embodiment block (for checkpoints
+        trained with embodiment_label: false); Task/State stay.
         """
         return build_tokenized_collate(
             max_length=128,
@@ -381,7 +450,7 @@ class PolicyRollout(Rollout):
             proprio_keys=["observations.state.ee_pose"],
             state_num_bins=256,
             proprio=True,
-            embodiment_label=True,
+            embodiment_label=not self.no_embodiment_prompt,
         )
 
     LOCAL_WEIGHT_PATH = os.path.join(
@@ -393,7 +462,8 @@ class PolicyRollout(Rollout):
         """Rewrite pytorch_weight_path in the checkpoint's saved config
         to point to the local base model weights."""
         import torch as _torch
-        from omegaconf import OmegaConf, DictConfig
+        from omegaconf import DictConfig, OmegaConf
+
         ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
         ht = ckpt.get("hyper_parameters", {}).get("config_tree")
         if ht is None:
@@ -408,7 +478,9 @@ class PolicyRollout(Rollout):
         old_path = config.get("pytorch_weight_path")
         if old_path is None or old_path == cls.LOCAL_WEIGHT_PATH:
             return ckpt_path
-        print(f"[rollout] Patching pytorch_weight_path: {old_path} -> {cls.LOCAL_WEIGHT_PATH}")
+        print(
+            f"[rollout] Patching pytorch_weight_path: {old_path} -> {cls.LOCAL_WEIGHT_PATH}"
+        )
         config["pytorch_weight_path"] = cls.LOCAL_WEIGHT_PATH
         ckpt["hyper_parameters"]["config_tree"] = OmegaConf.create(cfg)
         patched_path = ckpt_path + ".patched"
@@ -432,14 +504,18 @@ class PolicyRollout(Rollout):
         pi0 = policy.model.nets["policy"]
         if "sample_actions" in vars(pi0):
             del pi0.sample_actions
-            print("[rollout] Disabled torch.compile on sample_actions for rollout inference")
+            print(
+                "[rollout] Disabled torch.compile on sample_actions for rollout inference"
+            )
 
         # Verify model is on GPU
         try:
             p = next(pi0.parameters())
             print(f"[rollout] Model device: {p.device}, dtype: {p.dtype}")
             if not p.is_cuda:
-                print("[rollout] WARNING: model is NOT on GPU — inference will be very slow!")
+                print(
+                    "[rollout] WARNING: model is NOT on GPU — inference will be very slow!"
+                )
         except StopIteration:
             pass
 
@@ -520,6 +596,16 @@ class PolicyRollout(Rollout):
                     )
                     transformed_left = rot_ee_frame_to_ee_pose_batch(transformed_left)
                     transformed_right = rot_ee_frame_to_ee_pose_batch(transformed_right)
+                    if self.flange_remap is not None:
+                        # Commands leave the policy in the checkpoint's flange
+                        # convention; relabel back to the robot's native frame
+                        # (inverse of the obs-side remap) before IK.
+                        transformed_left = relabel_flange_ypr_batch(
+                            transformed_left, self.flange_remap.T
+                        )
+                        transformed_right = relabel_flange_ypr_batch(
+                            transformed_right, self.flange_remap.T
+                        )
                     gripper_left = left_actions[:, 6:7]
                     gripper_right = right_actions[:, 6:7]
                     if left_actions.shape[1] == 7:
@@ -537,6 +623,10 @@ class PolicyRollout(Rollout):
                     transformed_6dof = cam_frame_to_base_frame(
                         self.actions[:, :6].copy(), self.extrinsics[self.arm]
                     )
+                    if self.flange_remap is not None:
+                        transformed_6dof = relabel_flange_ypr_batch(
+                            transformed_6dof, self.flange_remap.T
+                        )
                     # Preserve gripper if present (7th value)
                     gripper = self.actions[:, 6:7]
                     if self.actions.shape[1] == 7:
@@ -553,7 +643,7 @@ class PolicyRollout(Rollout):
 
         act_i = i % self.query_frequency
         return self.actions[act_i]
-        
+
     def process_obs_for_transform_list(self, obs):
         # front camera: obs["front_img_1"] is BGR, shape [H, W, 3]
         front = torch.from_numpy(obs["front_img_1"][None, ...])  # [1, H, W, 3]
@@ -571,15 +661,19 @@ class PolicyRollout(Rollout):
         }
 
         eepose = obs["ee_poses"]
+        if self.flange_remap is not None:
+            # Relabel each arm's native flange rotation into the checkpoint's
+            # convention (base-frame [xyz ypr grip] blocks; xyz/grip untouched).
+            eepose = np.asarray(eepose, dtype=np.float64).copy()
+            eepose[0:6] = relabel_flange_ypr_batch(eepose[0:6], self.flange_remap)
+            eepose[7:13] = relabel_flange_ypr_batch(eepose[7:13], self.flange_remap)
 
         if self.arm in ["right", "both"]:
             right = torch.from_numpy(
                 obs["right_wrist_img"][None, ...]
             )  # [1, H, W, 3] BGR
             right = right[..., [2, 1, 0]]  # BGR -> RGB
-            right = (
-                right.permute(0, 3, 1, 2).to(dtype=torch.float32) / 255.0
-            )
+            right = right.permute(0, 3, 1, 2).to(dtype=torch.float32) / 255.0
             data["right_wrist_img"] = right.squeeze()
             data["right_wrist_0_rgb"] = data["right_wrist_img"]
             data["observations.images.right_wrist_img"] = data["right_wrist_img"]
@@ -623,10 +717,10 @@ class PolicyRollout(Rollout):
         # does int(sample["embodiment"]) — a string here would crash it.
         data["embodiment"] = self.embodiment_id
         data["metadata.robot_name"] = self.embodiment_id
-        
+
         if self.annotation is not None:
             data["annotations"] = [self.annotation]
-        
+
         return data
 
     def load_annotation(self, annotation_path):
@@ -646,7 +740,9 @@ class PolicyRollout(Rollout):
             self.annotation = f.read().strip()
         if self.collate_fn is default_collate:
             self.collate_fn = self._make_collate(self.annotation)
-        print(f"[rollout] Loaded new annotation from {annotation_path}: '{self.annotation}'")
+        print(
+            f"[rollout] Loaded new annotation from {annotation_path}: '{self.annotation}'"
+        )
         return True
 
     def reset(self):
@@ -736,7 +832,9 @@ def _compose_with_wrist_cams(overlay, obs, arms):
         scale = h / p.shape[0]
         p = cv2.resize(p, (max(1, int(round(p.shape[1] * scale))), h))
         cv2.putText(p, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-        cv2.putText(p, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(
+            p, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1
+        )
         return p
 
     panels = []
@@ -774,11 +872,11 @@ def preview_and_confirm(actions, obs, step_i, annotation=None, arms="both"):
     cv2.imshow(PREVIEW_WINDOW, overlay)
     while True:
         key = cv2.waitKey(50) & 0xFF
-        if key in (13, 32, ord("e")):   # Enter / Space / e
+        if key in (13, 32, ord("e")):  # Enter / Space / e
             return "execute"
         if key == ord("s"):
             return "skip"
-        if key in (ord("q"), 27):       # q / ESC
+        if key in (ord("q"), 27):  # q / ESC
             return "quit"
 
 
@@ -790,7 +888,9 @@ def preview_live_update(actions, obs, step_i, annotation=None, arms="both"):
     overlay = _compose_with_wrist_cams(overlay, obs, arms)
     banner = f"step {step_i} (LIVE)" + (f"  |  {annotation}" if annotation else "")
     cv2.putText(overlay, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
-    cv2.putText(overlay, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+    cv2.putText(
+        overlay, banner, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1
+    )
     cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
     cv2.imshow(PREVIEW_WINDOW, overlay)
     return (cv2.waitKey(1) & 0xFF) in (ord("q"), 27)
@@ -832,8 +932,19 @@ def main(
     preview=False,
     preview_live=False,
     no_execute=False,
+    no_embodiment_prompt=False,
+    flange_frame="native",
 ):
     threading.excepthook = _quiet_thread_excepthook
+
+    # YAM_TO_EVA_FLANGE was measured against demos collected with the stock
+    # "default" grasp_site convention; from any other hardware frame the
+    # constant is wrong, so refuse rather than silently command bad rotations.
+    if flange_frame == "eva" and robot == "yam" and yam_ee_convention != "default":
+        raise ValueError(
+            "--flange-frame eva requires --ee-convention default (the relabel "
+            f"constant is measured from that frame), got '{yam_ee_convention}'."
+        )
 
     # Default camera extrinsics per robot family (override with --extrinsics-key).
     if extrinsics_key is None:
@@ -865,14 +976,14 @@ def main(
             annotation_path=annotation_path,
             annotation_text=annotation_text,
             robot=robot,
+            no_embodiment_prompt=no_embodiment_prompt,
+            flange_frame=flange_frame,
         )
     elif dataset_path is not None:
         rollout_type = "replay"
         policy = ReplayRollout(dataset_path=dataset_path, cartesian=cartesian)
     else:
-        raise ValueError(
-            "Must provide either --policy-path or --dataset-path."
-        )
+        raise ValueError("Must provide either --policy-path or --dataset-path.")
 
     if no_execute:
         print(
@@ -917,7 +1028,9 @@ def main(
             elif cmd == "h":
                 print("Sending arms to home...")
                 ri.set_home()
-                print("Arms at home. Still paused — c to continue, r to restart, q to quit.")
+                print(
+                    "Arms at home. Still paused — c to continue, r to restart, q to quit."
+                )
             elif cmd == "r":
                 tty.setcbreak(kp.fd)
                 return "restart"
@@ -1009,7 +1122,9 @@ def main(
                                 return
                             chunk_approved = decision == "execute"
                             if not chunk_approved:
-                                print(f"[preview] Skipping chunk at step {step_i}; arm holds.")
+                                print(
+                                    f"[preview] Skipping chunk at step {step_i}; arm holds."
+                                )
 
                         # Live (non-blocking) preview: refresh the window with each
                         # new predicted chunk and KEEP executing. q/ESC in the window
@@ -1030,7 +1145,9 @@ def main(
 
                         if chunk_approved and not no_execute:
                             for arm in arms_list:
-                                arm_offset = 7 if (arm == "right" and arms == "both") else 0
+                                arm_offset = (
+                                    7 if (arm == "right" and arms == "both") else 0
+                                )
                                 arm_action = actions[arm_offset : arm_offset + 7]
                                 if cartesian:
                                     ri.set_pose(arm_action, arm)
@@ -1104,7 +1221,7 @@ def build_arg_parser(description="Rollout robot model."):
         "--annotation",
         type=str,
         default=None,
-        help="inline language prompt, e.g. --annotation \"Fold the shirt\". "
+        help='inline language prompt, e.g. --annotation "Fold the shirt". '
         "Used only if --annotation-path is not provided.",
     )
     parser.add_argument(
@@ -1163,6 +1280,26 @@ def build_arg_parser(description="Rollout robot model."):
         "convention the training demos were collected with. 'libero' = both arms "
         "x fwd / y left / z up (LIBERO/EVA-congruent); see yam_interface.",
     )
+    parser.add_argument(
+        "--no-embodiment-prompt",
+        action="store_true",
+        help="drop the 'Embodiment: <name>' block from the conditioning prompt "
+        "(Task/State blocks stay). Use with checkpoints trained with "
+        "embodiment_label: false; must match the checkpoint's data config.",
+    )
+    parser.add_argument(
+        "--flange-frame",
+        type=str,
+        default="native",
+        choices=["native", "eva"],
+        help="flange/wrist axis convention the CHECKPOINT speaks. 'native' "
+        "(default) = current behavior, poses pass through unchanged. 'eva' = "
+        "checkpoint trained on EVA-convention data (Z=approach): YAM-native obs "
+        "flange rotations are relabeled into the EVA convention before inference "
+        "and outgoing commands relabeled back (EVA X=-Z_yam, Y=-X_yam, Z=+Y_yam). "
+        "Distinct from --ee-convention, which changes the HARDWARE frame and "
+        "must stay 'default' when this is 'eva'.",
+    )
     return parser
 
 
@@ -1184,6 +1321,8 @@ def run_from_args(args):
         preview=args.preview,
         preview_live=args.preview_live,
         no_execute=args.no_execute,
+        no_embodiment_prompt=args.no_embodiment_prompt,
+        flange_frame=args.flange_frame,
     )
 
 
