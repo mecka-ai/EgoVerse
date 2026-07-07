@@ -228,12 +228,16 @@ class YAMInterface(Robot_Interface):
         ``.get_image()`` (latest BGR uint8 frame) and ``.res`` ((H, W)).
 
         Individual camera failures are warned-about and skipped inside
-        ``create_camera_recorders``; if the net result is empty this RAISES — a
-        rollout (or black-frame demos) must not run blind.
+        ``create_camera_recorders``; if the net result is empty, or is missing a
+        camera this interface's active arms require (e.g. a wrist RealSense that
+        failed to start), this RAISES — a rollout (or black-frame demos) must not
+        run blind, and silently dropping a required camera would otherwise only
+        surface later as a confusing ``KeyError`` deep in the obs pipeline.
 
         Raises:
-            RuntimeError: no cameras are available (USB links down / held by
-                another app or PipeWire).
+            RuntimeError: no cameras are available, or a required camera
+                (Atlas front cam / a needed wrist RealSense) is missing (USB
+                links down / held by another app or PipeWire).
         """
         from yam_cameras import create_camera_recorders
 
@@ -246,6 +250,15 @@ class YAMInterface(Robot_Interface):
                 "YAMInterface: NO cameras are available. Check the Atlas front cam "
                 "+ RealSense D405 wrists (USB links / another app or PipeWire "
                 "holding the devices)."
+            )
+        required = {"front_img_1"} | {f"{arm}_wrist_img" for arm in self.arms}
+        missing = required - self.recorders.keys()
+        if missing:
+            raise RuntimeError(
+                f"YAMInterface: required camera(s) {sorted(missing)} failed to "
+                "start and were skipped (see '[cameras] WARNING' above for why). "
+                "A rollout must not run with a missing camera — check the USB "
+                "link / serial mapping for that device and retry."
             )
         self.camera_res = {name: rec.res for name, rec in self.recorders.items()}
         # Wait for first frames (per-recorder; never raises).

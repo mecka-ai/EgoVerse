@@ -726,8 +726,8 @@ class AtlasStereoCamera(threading.Thread):
 # read.py) and replace the serials below.
 # =====================================================================
 DEFAULT_CAMERA_NAMES = {
-    "353322270967": "right_wrist_img",
-    "353322271563": "left_wrist_img",
+    "323622271310": "right_wrist_img",
+    "323622272053": "left_wrist_img",
 }
 
 # Per-camera RealSense resolution overrides, keyed by friendly name ->

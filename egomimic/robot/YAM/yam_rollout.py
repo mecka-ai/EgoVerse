@@ -56,9 +56,6 @@ from torch.utils.data import default_collate
 from robot_utils import RateLoop
 from scipy.spatial.transform import Rotation as R
 
-from egomimic.models.denoising_policy import DenoisingPolicy
-from egomimic.pl_utils.pl_model import ModelWrapper
-from egomimic.pl_utils.pl_data_utils import build_tokenized_collate
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.embodiment.eva import (
     Eva,
@@ -71,6 +68,8 @@ from egomimic.utils.egomimicUtils import (
     interpolate_arr,
 )
 from egomimic.utils.pose_utils import xyzw_to_wxyz
+
+from models.registry import MODEL_REGISTRY, load_policy
 
 # (sys.path for robot_utils / robot_interface / yam_interface / i2rt is set up at
 # the top of this module so it applies before the imports above.)
@@ -237,6 +236,7 @@ class PolicyRollout(Rollout):
         annotation_path=None,
         annotation_text=None,
         robot="eva",
+        model_type="pi05",
     ):
         super().__init__()
         self.arm = arm
@@ -280,8 +280,8 @@ class PolicyRollout(Rollout):
         )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy_device = self.device
-        print(f"[rollout] Loading policy from {self.policy_path}")
-        self.policy = self._load_policy()
+        print(f"[rollout] Loading policy from {self.policy_path} (model_type={model_type})")
+        self.model = load_policy(model_type, self.policy_path, device=self.policy_device)
         # Camera-frame copy of the latest predicted chunk (post-revert, pre
         # cam->base) — the frame the preview overlay projects in.
         self.debug_actions = None
@@ -296,7 +296,7 @@ class PolicyRollout(Rollout):
         # the preds key must use the checkpoint's 'eva_bimanual'. Without this,
         # process_batch would key the batch as 'yam_bimanual' (id 17) and
         # normalize_data raises "Missing normalization stats for embodiment 17".
-        model_domains = getattr(self.policy.model, "domains", None)
+        model_domains = self.model.domains
         model_domain = model_domains[0] if model_domains else self.embodiment_name
         if model_domain != self.embodiment_name:
             print(
@@ -316,13 +316,10 @@ class PolicyRollout(Rollout):
         # without a flag. The converter is reconstructed from the ckpt's own config
         # at load (action_registry), so it is authoritative — hardcoding a mode here
         # would silently mis-split the obs/action vectors for the other kind.
-        ac_key = self.policy.model.ac_keys[self.embodiment_id]
-        _conv = self.policy.model.action_registry.get(self.embodiment_id, ac_key)
-        self.use_6d = "6D" in type(_conv).__name__
+        self.use_6d = self.model.use_6d_for(self.embodiment_id)
         print(
             f"[rollout] action representation: "
-            f"{'6D wristframe' if self.use_6d else 'ypr wristframe'} "
-            f"(checkpoint converter = {type(_conv).__name__})"
+            f"{'6D wristframe' if self.use_6d else 'ypr wristframe'}"
         )
         if self.use_6d:
             # obs/proprio and the model's 32-block actions are continuous-6D
@@ -351,103 +348,13 @@ class PolicyRollout(Rollout):
             else:
                 with open(annotation_path, "r") as f:
                     self.annotation = f.read().strip()
-                self.collate_fn = self._make_collate(self.annotation)
+                self.collate_fn = self.model.make_collate(self.annotation)
         # Inline prompt (e.g. --annotation "Fold the shirt") takes effect only if
         # no annotation file was successfully loaded above.
         if self.annotation is None and annotation_text:
             self.annotation = annotation_text.strip()
-            self.collate_fn = self._make_collate(self.annotation)
+            self.collate_fn = self.model.make_collate(self.annotation)
             print(f"[rollout] Using inline annotation prompt: '{self.annotation}'")
-
-    def _make_collate(self, default_prompt):
-        """Tokenizing collate with the SAME prompt format the checkpoint trained on.
-
-        The pi0.5 training configs (e.g. data=yam_pick_hat_wrist_pi) set
-        ``proprio: true`` + ``embodiment_label: true``, so every training prompt
-        is ``"Task: <text>, Embodiment: <name>, State: <256-bin proprio>;\\nAction: "``.
-        Rollout previously built the collate WITHOUT those flags, so the model
-        was conditioned on a bare prompt it never saw in training — no Task
-        anchor, no Embodiment block, and no discretized State splice (a proprio
-        pathway the model learned to read). NOTE: proprio_keys must be passed
-        explicitly here (this branch's collate has no default), and the batch's
-        "embodiment" key must be the integer id for the Embodiment splice.
-        """
-        return build_tokenized_collate(
-            max_length=128,
-            model_name="google/paligemma-3b-mix-224",
-            sampling_mode="first",
-            annotation_key="annotations",
-            default_prompt=default_prompt,
-            proprio_keys=["observations.state.ee_pose"],
-            state_num_bins=256,
-            proprio=True,
-            embodiment_label=True,
-        )
-
-    LOCAL_WEIGHT_PATH = os.path.join(
-        _EGOMIMIC_DIR, "algo", "pi_checkpoints", "pi05_base_pytorch"
-    )
-
-    @classmethod
-    def _patch_checkpoint_paths(cls, ckpt_path):
-        """Rewrite pytorch_weight_path in the checkpoint's saved config
-        to point to the local base model weights."""
-        import torch as _torch
-        from omegaconf import OmegaConf, DictConfig
-        ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        ht = ckpt.get("hyper_parameters", {}).get("config_tree")
-        if ht is None:
-            return ckpt_path
-        if isinstance(ht, DictConfig):
-            cfg = OmegaConf.to_container(ht, resolve=True)
-        else:
-            cfg = ht
-        # Navigate to pytorch_weight_path in the config
-        robomimic = cfg.get("model", {}).get("robomimic_model", {})
-        config = robomimic.get("config", {})
-        old_path = config.get("pytorch_weight_path")
-        if old_path is None or old_path == cls.LOCAL_WEIGHT_PATH:
-            return ckpt_path
-        print(f"[rollout] Patching pytorch_weight_path: {old_path} -> {cls.LOCAL_WEIGHT_PATH}")
-        config["pytorch_weight_path"] = cls.LOCAL_WEIGHT_PATH
-        ckpt["hyper_parameters"]["config_tree"] = OmegaConf.create(cfg)
-        patched_path = ckpt_path + ".patched"
-        _torch.save(ckpt, patched_path)
-        print(f"[rollout] Patched checkpoint saved to {patched_path}")
-        return patched_path
-
-    def _load_policy(self):
-        patched_path = self._patch_checkpoint_paths(self.policy_path)
-        policy = ModelWrapper.load_from_checkpoint(
-            patched_path, weights_only=False, map_location="cpu"
-        )
-        policy = policy.to(self.policy_device)
-        policy.eval()
-        policy.model.device = self.policy_device
-
-        # Unwrap torch.compile on sample_actions to avoid massive first-call
-        # compilation overhead (~50s). The compiled version (instance attribute)
-        # shadows the original class method; deleting it restores the fast
-        # uncompiled path which is sufficient for real-time rollout.
-        pi0 = policy.model.nets["policy"]
-        if "sample_actions" in vars(pi0):
-            del pi0.sample_actions
-            print("[rollout] Disabled torch.compile on sample_actions for rollout inference")
-
-        # Verify model is on GPU
-        try:
-            p = next(pi0.parameters())
-            print(f"[rollout] Model device: {p.device}, dtype: {p.dtype}")
-            if not p.is_cuda:
-                print("[rollout] WARNING: model is NOT on GPU — inference will be very slow!")
-        except StopIteration:
-            pass
-
-        if getattr(policy.model, "diffusion", False):
-            for head in policy.model.nets.policy.heads:
-                if isinstance(policy.model.nets.policy.heads[head], DenoisingPolicy):
-                    policy.model.nets.policy.heads[head].num_inference_steps = 10
-        return policy
 
     def _downsample_chunk(self, chunk: np.ndarray, target_len: int) -> np.ndarray:
         if target_len is None or target_len <= 0 or chunk.shape[0] == target_len:
@@ -479,15 +386,7 @@ class PolicyRollout(Rollout):
                 transform_list_batch["observations.state.ee_pose"]
             )
             transform_list_batch = self.collate_fn([transform_list_batch])
-            embodiment_name = self.embodiment_name
-            batch = {
-                embodiment_name: transform_list_batch,
-            }
-            processed_batch = self.policy.model.process_batch_for_training(batch)
-            preds = self.policy.model.forward_eval(processed_batch)[
-                f"{embodiment_name}_actions_cartesian"
-            ]
-            self.actions = preds.detach().cpu().numpy().squeeze()
+            self.actions = self.model.predict_chunk(transform_list_batch, self.embodiment_name)
             # Predictions are eef/wrist-relative (6D (T,20) if self.use_6d, else
             # ypr (T,14)). Revert them to CAMERA frame by composing with the
             # current EE pose so the overlay (camera-frame pinhole projection) and
@@ -645,14 +544,14 @@ class PolicyRollout(Rollout):
         with open(annotation_path, "r") as f:
             self.annotation = f.read().strip()
         if self.collate_fn is default_collate:
-            self.collate_fn = self._make_collate(self.annotation)
+            self.collate_fn = self.model.make_collate(self.annotation)
         print(f"[rollout] Loaded new annotation from {annotation_path}: '{self.annotation}'")
         return True
 
     def reset(self):
         self.actions = None
         self.debug_actions = None
-        self.policy.eval()
+        self.model.reset()
 
 
 # Training front-image geometry: the zarr conversion (eva_to_zarr
@@ -821,6 +720,7 @@ def main(
     cartesian,
     query_frequency=None,
     policy_path=None,
+    model_type="pi05",
     dataset_path=None,
     resampled_action_len=None,
     annotation_path=None,
@@ -865,6 +765,7 @@ def main(
             annotation_path=annotation_path,
             annotation_text=annotation_text,
             robot=robot,
+            model_type=model_type,
         )
     elif dataset_path is not None:
         rollout_type = "replay"
@@ -1083,6 +984,13 @@ def build_arg_parser(description="Rollout robot model."):
         help="Frames which model does inference",
     )
     parser.add_argument("--policy-path", type=str, help="policy checkpoint path")
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="pi05",
+        choices=sorted(MODEL_REGISTRY),
+        help="Policy backend to load --policy-path with (see models/registry.py).",
+    )
     parser.add_argument("--dataset-path", type=str, help="dataset path for replay")
     parser.add_argument(
         "--cartesian",
@@ -1172,6 +1080,7 @@ def run_from_args(args):
         frequency=args.frequency,
         query_frequency=args.query_frequency,
         policy_path=args.policy_path,
+        model_type=args.model_type,
         dataset_path=args.dataset_path,
         cartesian=args.cartesian,
         resampled_action_len=args.resampled_action_len,
