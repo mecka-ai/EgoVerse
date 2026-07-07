@@ -52,7 +52,11 @@ image = (
 app = modal.App("egoverse-episode-preview-render", image=image)
 
 # Source episodes (read-only) and a dedicated previews volume (read/write).
-zarr_volume = modal.Volume.from_name("mecka_data_v2")
+# Zarr data volume: MODAL_ZARR_VOLUME env var (default mecka_data_v2), read at submit
+# time — same convention as modal_setup.py.
+zarr_volume = modal.Volume.from_name(
+    (__import__("os").environ.get("MODAL_ZARR_VOLUME", "mecka_data_v2").strip() or "mecka_data_v2")
+)
 previews_volume = modal.Volume.from_name("mecka-episode-previews", create_if_missing=True)
 
 ZARR_MOUNT = "/mnt/zarr-data"
