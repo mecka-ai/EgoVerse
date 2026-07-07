@@ -48,6 +48,10 @@ def _quiet_thread_excepthook(args):
         return
     threading.__excepthook__(args)
 
+import shutil
+import subprocess
+from pathlib import Path
+
 import cv2
 import h5py
 import numpy as np
@@ -55,6 +59,11 @@ import torch
 from torch.utils.data import default_collate
 from robot_utils import RateLoop
 from scipy.spatial.transform import Rotation as R
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
 
 from egomimic.models.denoising_policy import DenoisingPolicy
 from egomimic.pl_utils.pl_model import ModelWrapper
@@ -815,6 +824,251 @@ def reset_rollout(ri, policy):
         policy.debug_actions = None
 
 
+# ------------------------- Failure-dashboard logging -------------------------
+# Records commanded action / observed state / tracking error / images / system
+# resource usage at a LOW, independent rate (--log-hz) alongside the full-rate
+# control loop, so a long rollout doesn't produce a huge or redundant dataset.
+# Feeds the failure dashboard directly with precomputed errors, instead of that
+# dashboard reconstructing FK/pose error after the fact from raw joints (the
+# previous kinematics.py approach -- fragile, and easy to get the frame
+# convention wrong when redone offline).
+
+_LOG_ARM_OFFSET = {"left": 0, "right": 7}
+
+
+class SystemMonitor(threading.Thread):
+    """Background sampler for CPU/RAM/GPU/disk usage (same design as
+    collect_yam_demo.py's, duplicated here since this script runs standalone).
+
+    Samples at ~1Hz; get_latest() returns the most recent sample instantly, so
+    it's cheap to call from the rollout control loop.
+    """
+
+    def __init__(self, log_dir, interval=1.0):
+        super().__init__(daemon=True)
+        self.log_dir = log_dir
+        self.interval = interval
+        self.running = True
+        if psutil is not None:
+            psutil.cpu_percent(interval=None)  # prime the non-blocking baseline
+        self._latest = self._sample()
+
+    def run(self):
+        while self.running:
+            try:
+                self._latest = self._sample()
+            except Exception:  # noqa: BLE001 - thread must never die
+                pass
+            time.sleep(self.interval)
+
+    def _sample(self):
+        sample = {
+            "timestamp": time.time(),
+            "cpu_percent": np.nan,
+            "ram_percent": np.nan,
+            "ram_used_gb": np.nan,
+            "gpu_util_percent": np.nan,
+            "gpu_mem_used_mb": np.nan,
+            "gpu_mem_total_mb": np.nan,
+            "disk_free_gb": np.nan,
+        }
+        if psutil is not None:
+            vm = psutil.virtual_memory()
+            sample["cpu_percent"] = psutil.cpu_percent(interval=None)
+            sample["ram_percent"] = vm.percent
+            sample["ram_used_gb"] = vm.used / 1e9
+        try:
+            sample["disk_free_gb"] = shutil.disk_usage(self.log_dir).free / 1e9
+        except OSError:
+            pass
+        gpu = self._sample_gpu()
+        if gpu is not None:
+            sample.update(gpu)
+        return sample
+
+    @staticmethod
+    def _sample_gpu():
+        try:
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=1.0,
+            )
+            if out.returncode != 0 or not out.stdout.strip():
+                return None
+            util, mem_used, mem_total = out.stdout.strip().splitlines()[0].split(",")
+            return {
+                "gpu_util_percent": float(util),
+                "gpu_mem_used_mb": float(mem_used),
+                "gpu_mem_total_mb": float(mem_total),
+            }
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    def get_latest(self):
+        return dict(self._latest)
+
+    def stop(self):
+        self.running = False
+
+    def close(self):
+        self.stop()
+        self.join(timeout=1.0)
+
+
+SYSTEM_FIELDS = (
+    "timestamp", "cpu_percent", "ram_percent", "ram_used_gb",
+    "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "disk_free_gb",
+)
+
+
+def _commanded_ee_pose14(commanded14, arms_list, ri, cartesian):
+    """(14,) commanded EE pose [xyz(3) ypr(3) grip(1)] per arm, base frame --
+    directly comparable to obs["ee_poses"].
+
+    If cartesian, `commanded14` IS already this layout (rollout_step already
+    ran cam->base + rot_ee_frame_to_ee_pose on it). If joint-space, FK the
+    commanded joints via the same solver backing ri.get_pose(), so "commanded"
+    and "observed" always live in the same frame.
+    """
+    if cartesian:
+        return np.asarray(commanded14, dtype=np.float64)
+    ee = np.zeros(14)
+    for arm in arms_list:
+        off = _LOG_ARM_OFFSET[arm]
+        q = np.asarray(commanded14, dtype=np.float64)[off : off + 6]
+        T = ri.kinematics[arm].fk(q)
+        ypr = R.from_matrix(T[:3, :3]).as_euler("ZYX", degrees=False)
+        ee[off : off + 6] = np.concatenate([T[:3, 3], ypr])
+        ee[off + 6] = commanded14[off + 6]
+    return ee
+
+
+def _pose_error(commanded_ee14, observed_ee14, arms_list):
+    """(pos_err_mm, rot_err_deg) dicts keyed by arm, between two 14-dim
+    [xyz(3) ypr(3) grip(1)]-per-arm base-frame poses."""
+    pos_err, rot_err = {}, {}
+    for arm in arms_list:
+        off = _LOG_ARM_OFFSET[arm]
+        c_xyz, c_ypr = commanded_ee14[off : off + 3], commanded_ee14[off + 3 : off + 6]
+        o_xyz, o_ypr = observed_ee14[off : off + 3], observed_ee14[off + 3 : off + 6]
+        pos_err[arm] = float(np.linalg.norm(c_xyz - o_xyz) * 1000.0)
+        R_c = R.from_euler("ZYX", c_ypr).as_matrix()
+        R_o = R.from_euler("ZYX", o_ypr).as_matrix()
+        cos_theta = np.clip((np.trace(R_c @ R_o.T) - 1.0) / 2.0, -1.0, 1.0)
+        rot_err[arm] = float(np.degrees(np.arccos(cos_theta)))
+    return pos_err, rot_err
+
+
+class FailureDashboardLogger:
+    """Accumulates low-rate rollout samples and writes one HDF5 per rollout.
+
+    Call record() at whatever cadence you like (main() gates this to --log-hz,
+    independent of the control loop's --frequency) and save() once at the end.
+    Schema mirrors collect_yam_demo.py's demo HDF5 (observations/images/*,
+    observations/joints) plus rollout-specific fields: actions/commanded_ee_pose
+    and errors/{positional_mm,rotational_deg} per arm, precomputed here (not
+    reconstructed later from raw joints).
+    """
+
+    def __init__(self, log_dir, arms_list, cartesian):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.arms_list = arms_list
+        self.cartesian = cartesian
+        self.sysmon = SystemMonitor(str(self.log_dir))
+        self.sysmon.start()
+        self._reset()
+
+    def _reset(self):
+        self.data = {
+            "step": [], "images": [], "joint_positions": [], "observed_ee_pose": [],
+            "commanded_action": [], "commanded_ee_pose": [], "system": [],
+        }
+        self.data["pos_err_mm"] = {a: [] for a in self.arms_list}
+        self.data["rot_err_deg"] = {a: [] for a in self.arms_list}
+
+    def record(self, step_i, obs, ri, commanded14):
+        commanded14 = np.asarray(commanded14, dtype=np.float64)
+        observed14 = np.asarray(obs["ee_poses"], dtype=np.float64)
+        cmd_ee14 = _commanded_ee_pose14(commanded14, self.arms_list, ri, self.cartesian)
+        pos_err, rot_err = _pose_error(cmd_ee14, observed14, self.arms_list)
+
+        self.data["step"].append(step_i)
+        self.data["images"].append({
+            k: v for k, v in obs.items()
+            if k in ("front_img_1", "left_wrist_img", "right_wrist_img")
+        })
+        self.data["joint_positions"].append(np.asarray(obs["joint_positions"], dtype=np.float64))
+        self.data["observed_ee_pose"].append(observed14)
+        self.data["commanded_action"].append(commanded14)
+        self.data["commanded_ee_pose"].append(cmd_ee14)
+        self.data["system"].append(self.sysmon.get_latest())
+        for arm in self.arms_list:
+            self.data["pos_err_mm"][arm].append(pos_err[arm])
+            self.data["rot_err_deg"][arm].append(rot_err[arm])
+
+        pos_bad = bool(pos_err) and max(pos_err.values()) > 50.0
+        rot_bad = bool(rot_err) and max(rot_err.values()) > 15.0
+        if pos_bad or rot_bad:
+            print(f"[dashboard-log] step {step_i}: LARGE tracking error "
+                  f"pos_mm={pos_err} rot_deg={rot_err}")
+
+    def save(self):
+        n = len(self.data["step"])
+        if n == 0:
+            print("[dashboard-log] no samples recorded; skipping save.")
+            return
+        out_path = self.log_dir / f"rollout_{time.strftime('%Y%m%d_%H%M%S')}.hdf5"
+        print(f"[dashboard-log] writing {n} samples to {out_path}")
+        cam_names = sorted({k for step_imgs in self.data["images"] for k in step_imgs})
+        with h5py.File(str(out_path), "w") as root:
+            root.attrs["sim"] = False
+            root.attrs["cartesian"] = self.cartesian
+            root.create_dataset("step", data=np.asarray(self.data["step"], dtype=np.int64))
+
+            obs = root.create_group("observations")
+            obs.create_dataset("joint_positions", data=np.stack(self.data["joint_positions"]))
+            obs.create_dataset("ee_pose", data=np.stack(self.data["observed_ee_pose"]))
+            images = obs.create_group("images")
+            for cam_name in cam_names:
+                frames = [step_imgs.get(cam_name) for step_imgs in self.data["images"]]
+                sample = next((f for f in frames if f is not None), None)
+                if sample is None:
+                    continue
+                H, W = sample.shape[:2]
+                ds = images.create_dataset(
+                    cam_name, (n, H, W, 3), dtype="uint8", chunks=(1, H, W, 3)
+                )
+                for idx, frame in enumerate(frames):
+                    if frame is not None:
+                        ds[idx] = frame[..., ::-1]  # BGR -> RGB
+
+            actions = root.create_group("actions")
+            actions.create_dataset("commanded", data=np.stack(self.data["commanded_action"]))
+            actions.create_dataset("commanded_ee_pose", data=np.stack(self.data["commanded_ee_pose"]))
+
+            errors = root.create_group("errors")
+            for arm in self.arms_list:
+                errors.create_dataset(f"{arm}_positional_mm",
+                                      data=np.asarray(self.data["pos_err_mm"][arm]))
+                errors.create_dataset(f"{arm}_rotational_deg",
+                                      data=np.asarray(self.data["rot_err_deg"][arm]))
+
+            system = root.create_group("system")
+            for field in SYSTEM_FIELDS:
+                system.create_dataset(
+                    field,
+                    data=np.array([s.get(field, np.nan) for s in self.data["system"]], dtype="float64"),
+                )
+        print(f"[dashboard-log] done: {out_path}")
+        self._reset()
+
+    def close(self):
+        self.sysmon.close()
+
+
 def main(
     arms,
     frequency,
@@ -832,8 +1086,17 @@ def main(
     preview=False,
     preview_live=False,
     no_execute=False,
+    log_dir=None,
+    log_hz=2.0,
 ):
     threading.excepthook = _quiet_thread_excepthook
+
+    dashboard_logger = None
+    log_every = None
+    if log_dir is not None:
+        log_every = max(1, round(frequency / log_hz))
+        print(f"[dashboard-log] logging to {log_dir} every {log_every} steps "
+              f"(~{frequency / log_every:.2f}Hz of the {frequency}Hz control loop)")
 
     # Default camera extrinsics per robot family (override with --extrinsics-key).
     if extrinsics_key is None:
@@ -845,6 +1108,9 @@ def main(
         arms_list = ["right"]
     else:
         arms_list = ["left"]
+
+    if log_dir is not None:
+        dashboard_logger = FailureDashboardLogger(log_dir, arms_list, cartesian)
 
     ri = _build_robot_interface(
         arms_list=arms_list,
@@ -988,6 +1254,15 @@ def main(
                                 reset_rollout(ri, policy)
                             break
 
+                        # Low-rate failure-dashboard sample (independent of
+                        # preview/no_execute -- logs what WOULD be commanded).
+                        if (
+                            dashboard_logger is not None
+                            and rollout_type == "policy"
+                            and step_i % log_every == 0
+                        ):
+                            dashboard_logger.record(step_i, obs, ri, actions)
+
                         # Preview-and-confirm gate: once per predicted chunk, show
                         # the overlay and block until the operator approves. The
                         # decision holds for the whole chunk (the next prediction,
@@ -1051,6 +1326,12 @@ def main(
                 cv2.destroyAllWindows()
             except BaseException:
                 pass
+        if dashboard_logger is not None:
+            try:
+                dashboard_logger.save()
+            except BaseException as e:
+                print(f"[dashboard-log] save error: {e}")
+            dashboard_logger.close()
         closer = getattr(ri, "close", None)
         if callable(closer):
             try:
@@ -1163,6 +1444,24 @@ def build_arg_parser(description="Rollout robot model."):
         "convention the training demos were collected with. 'libero' = both arms "
         "x fwd / y left / z up (LIBERO/EVA-congruent); see yam_interface.",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="If set, record commanded action / observed joints+ee_pose / "
+        "positional+rotational tracking error / images / system (CPU/GPU/RAM/"
+        "disk) resource usage at --log-hz into one HDF5 per rollout under this "
+        "directory, for the failure dashboard. Independent of --frequency, so a "
+        "long rollout doesn't produce a huge dataset. Disabled by default.",
+    )
+    parser.add_argument(
+        "--log-hz",
+        type=float,
+        default=2.0,
+        help="Failure-dashboard sample rate (Hz), only used with --log-dir. "
+        "Downsampled from --frequency (e.g. 30Hz control / 2Hz log = every "
+        "15th step).",
+    )
     return parser
 
 
@@ -1184,6 +1483,8 @@ def run_from_args(args):
         preview=args.preview,
         preview_live=args.preview_live,
         no_execute=args.no_execute,
+        log_dir=args.log_dir,
+        log_hz=args.log_hz,
     )
 
 
