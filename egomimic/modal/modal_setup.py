@@ -308,7 +308,11 @@ image = (
     )
 )
 
-zarr_volume = modal.Volume.from_name("mecka_data_v2")
+# Zarr data volume: MODAL_ZARR_VOLUME env var (default mecka_data_v2). Read at submit
+# time — the mount binding is captured in the submitted function spec, so in-container
+# re-imports don't need the env var.
+_ZARR_VOLUME_NAME = os.environ.get("MODAL_ZARR_VOLUME", "mecka_data_v2").strip() or "mecka_data_v2"
+zarr_volume = modal.Volume.from_name(_ZARR_VOLUME_NAME)
 wds_volume = modal.Volume.from_name("mecka_data_wds_v2", create_if_missing=True)
 zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True, version=2)
 zip_fold_clothes_volume = modal.Volume.from_name(

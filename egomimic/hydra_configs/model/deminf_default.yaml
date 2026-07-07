@@ -56,9 +56,12 @@ action_embedder:
 # Pass 2 state image embedder. Set backbone; dinov3 block is used only when backbone=dinov3,
 # wes block only when backbone=wes.
 state_image:
-  backbone: dinov3  # resnet18 | dinov3 | wes
+  backbone: dinov3  # resnet18 | dinov3 | wes | siglip2
   dinov3:
     model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+    dtype: float16
+  siglip2:
+    model_name: google/siglip2-base-patch16-224
     dtype: float16
   wes:
     checkpoint_path: /root/wes_h_v3.0.pt  # baked into Modal image via modal_setup.py

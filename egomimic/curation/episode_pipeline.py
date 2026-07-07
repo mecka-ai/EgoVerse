@@ -110,6 +110,8 @@ def build_embedders(
         image_backbone=img.backbone,
         dinov3_model_name=img.dinov3_model_name,
         dinov3_dtype=img.dinov3_dtype,
+        siglip2_model_name=img.siglip2_model_name,
+        siglip2_dtype=img.siglip2_dtype,
         seed=seed,
         wes_checkpoint_path=img.wes_checkpoint_path,
     )

@@ -40,6 +40,8 @@ class StateImageSettings:
     backbone: str = "resnet18"
     dinov3_model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     dinov3_dtype: str = "float16"
+    siglip2_model_name: str = "google/siglip2-base-patch16-224"
+    siglip2_dtype: str = "float16"
     wes_checkpoint_path: str | None = None
 
 
@@ -257,6 +259,13 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
         dinov3_model_name = str(dinov3.get("model_name", dinov3_model_name))
         dinov3_dtype = str(dinov3.get("dtype", dinov3_dtype))
 
+    siglip2_model_name = defaults.siglip2_model_name
+    siglip2_dtype = defaults.siglip2_dtype
+    if backbone == "siglip2":
+        siglip2 = OmegaConf.select(cfg, "model.state_image.siglip2", default={}) or {}
+        siglip2_model_name = str(siglip2.get("model_name", siglip2_model_name))
+        siglip2_dtype = str(siglip2.get("dtype", siglip2_dtype))
+
     wes_checkpoint_path: str | None = None
     if backbone == "wes":
         wes = OmegaConf.select(cfg, "model.state_image.wes", default={}) or {}
@@ -268,6 +277,8 @@ def select_state_image_settings(cfg: Any) -> StateImageSettings:
         backbone=backbone,
         dinov3_model_name=dinov3_model_name,
         dinov3_dtype=dinov3_dtype,
+        siglip2_model_name=siglip2_model_name,
+        siglip2_dtype=siglip2_dtype,
         wes_checkpoint_path=wes_checkpoint_path,
     )
 

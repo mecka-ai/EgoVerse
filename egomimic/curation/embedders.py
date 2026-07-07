@@ -12,8 +12,9 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3", "wes"})
+_STATE_IMAGE_BACKBONES = frozenset({"resnet18", "dinov3", "wes", "siglip2"})
 _DINOV3_DEFAULT_MODEL = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+_SIGLIP2_DEFAULT_MODEL = "google/siglip2-base-patch16-224"
 
 
 def _parse_torch_dtype(name: str) -> "torch.dtype":
@@ -97,6 +98,8 @@ class StateEmbedder:
         image_backbone: str = "resnet18",
         dinov3_model_name: str = _DINOV3_DEFAULT_MODEL,
         dinov3_dtype: str = "float16",
+        siglip2_model_name: str = _SIGLIP2_DEFAULT_MODEL,
+        siglip2_dtype: str = "float16",
         seed: int = 42,
         norm_min_std: float = 1e-6,
         wes_checkpoint_path: str | None = None,
@@ -110,6 +113,8 @@ class StateEmbedder:
             self.image_backbone = "dinov3"
         self.dinov3_model_name = dinov3_model_name
         self.dinov3_dtype = dinov3_dtype
+        self.siglip2_model_name = siglip2_model_name
+        self.siglip2_dtype = siglip2_dtype
         self._seed = seed
         self.norm_min_std = norm_min_std
         self.wes_checkpoint_path = wes_checkpoint_path
@@ -158,6 +163,8 @@ class StateEmbedder:
                 self._fit_resnet()
             elif self.image_backbone == "wes":
                 self._fit_wes()
+            elif self.image_backbone == "siglip2":
+                self._fit_siglip2()
             else:
                 self._fit_dinov3()
         self._fitted = True
@@ -244,6 +251,83 @@ class StateEmbedder:
             self._num_patches, hidden_dim, self.latent_dim,
             resize_to, crop_h, crop_w,
         )
+
+
+    def _fit_siglip2(self) -> None:
+        """Build frozen SigLIP2 vision tower (get_image_features) + Xavier projection."""
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+        except ImportError as exc:
+            raise ImportError("transformers is required for siglip2 image backbone") from exc
+
+        dtype = _parse_torch_dtype(self.siglip2_dtype)
+        logger.info("Loading SigLIP2 for curation: %s", self.siglip2_model_name)
+        proc = AutoImageProcessor.from_pretrained(self.siglip2_model_name)
+        self._backbone = AutoModel.from_pretrained(
+            self.siglip2_model_name, torch_dtype=dtype
+        )
+        self._backbone.to(self.device).eval()
+        for p in self._backbone.parameters():
+            p.requires_grad_(False)
+
+        # SigLIP processors resize straight to a fixed square (no shortest-edge crop).
+        _sz = getattr(proc, "size", None) or {}
+        side = int(_sz.get("height", _sz.get("shortest_edge", 224))) if isinstance(_sz, dict) else int(_sz)
+        _mean = list(getattr(proc, "image_mean", None) or [0.5, 0.5, 0.5])
+        _std  = list(getattr(proc, "image_std",  None) or [0.5, 0.5, 0.5])
+        self._siglip_mean_t = torch.tensor(_mean, dtype=dtype, device=self.device).view(1, 3, 1, 1)
+        self._siglip_std_t  = torch.tensor(_std,  dtype=dtype, device=self.device).view(1, 3, 1, 1)
+        self._siglip_side = side
+
+        with torch.no_grad():
+            feat = self._backbone.get_image_features(
+                pixel_values=torch.zeros(1, 3, side, side, dtype=dtype, device=self.device)
+            )
+        feat_dim = int(feat.shape[-1])
+
+        self._proj_layer = nn.Linear(feat_dim, self.latent_dim, bias=True).to(self.device)
+        nn.init.xavier_uniform_(self._proj_layer.weight)
+        nn.init.zeros_(self._proj_layer.bias)
+        for p in self._proj_layer.parameters():
+            p.requires_grad_(False)
+
+        logger.info(
+            "StateEmbedder (image/siglip2): %s, %dx%d, features=%d -> %d",
+            self.siglip2_model_name, side, side, feat_dim, self.latent_dim,
+        )
+
+    def _embed_image_siglip2(self, data: np.ndarray) -> np.ndarray:
+        """Batched SigLIP2 image features -> latent_dim (GPU resize + normalize fast path).
+
+        Expects uint8 (N, C, H, W) in [0, 255] or float32 in [0, 1].
+        """
+        import torch.nn.functional as F
+
+        dtype = _parse_torch_dtype(self.siglip2_dtype)
+        n_total = data.shape[0]
+        side = self._siglip_side
+        outputs: list[np.ndarray] = []
+        t0 = time.perf_counter()
+        for start in range(0, n_total, self.image_batch_size):
+            chunk = data[start : start + self.image_batch_size]
+            if chunk.dtype == np.uint8:
+                tensor = torch.from_numpy(chunk).to(self.device, dtype=dtype, non_blocking=True).div_(255.0)
+            else:
+                tensor = torch.from_numpy(chunk.astype(np.float32)).to(self.device, dtype=dtype, non_blocking=True).clamp_(0.0, 1.0)
+            if tensor.shape[-2] != side or tensor.shape[-1] != side:
+                tensor = F.interpolate(tensor, size=(side, side), mode="bilinear", align_corners=False)
+            tensor = (tensor - self._siglip_mean_t) / self._siglip_std_t
+            with torch.no_grad():
+                feats = self._backbone.get_image_features(pixel_values=tensor)
+                proj_in = self._proj_layer.weight.dtype
+                outputs.append(self._proj_layer(feats.to(proj_in)).cpu().numpy())
+            del tensor, feats
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "[images] SigLIP2 embed: %d images in %.2fs (%.0f imgs/s, batch_size=%d)",
+            n_total, elapsed, n_total / elapsed if elapsed > 0 else 0, self.image_batch_size,
+        )
+        return np.concatenate(outputs, axis=0)
 
     def _fit_wes(self) -> None:
         """Load frozen WES (YOLO11-L-pose) backbone + Xavier projection (512 → latent_dim).
@@ -349,6 +433,8 @@ class StateEmbedder:
             return self._embed_image_resnet(data)
         if self.image_backbone == "wes":
             return self._embed_image_wes(data)
+        if self.image_backbone == "siglip2":
+            return self._embed_image_siglip2(data)
         return self._embed_image_dinov3(data)
 
     def _embed_image_resnet(self, data: np.ndarray) -> np.ndarray:

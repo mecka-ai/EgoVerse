@@ -43,12 +43,18 @@ import modal
 
 os.environ.setdefault("MODAL_ENVIRONMENT", "robotics")
 
+# Target volume: INGEST_VOLUME env var (default mecka_data_v2). Non-default volumes
+# are created on first use; the name is baked into the image env so the container's
+# module-level Volume handle (used by _volume.commit()) matches the mounted volume.
+_VOLUME_NAME = os.environ.get("INGEST_VOLUME", "mecka_data_v2")
+
 _image = (
     modal.Image.debian_slim()
     .pip_install("s5cmd", "sqlalchemy", "psycopg[binary]", "boto3")
+    .env({"INGEST_VOLUME": _VOLUME_NAME})
 )
 
-_volume = modal.Volume.from_name("mecka_data_v2")
+_volume = modal.Volume.from_name(_VOLUME_NAME, create_if_missing=(_VOLUME_NAME != "mecka_data_v2"))
 _app = modal.App("egomimic-ingest-zarr", image=_image)
 
 _VOLUME_MOUNT = "/mnt/zarr-data"
