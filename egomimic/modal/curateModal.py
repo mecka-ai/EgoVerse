@@ -620,11 +620,17 @@ def _score_task_clustered(
         span_action = [span_vecs[i][None, :] for i in range(len(span_vecs))]
         print(f"{tag} TCN span action latents: {span_vecs.shape}")
 
+    # Naive rule-based clustering (language_conditioning.naive_parse): exact
+    # (verb, hand, direction) triples parsed from the text — no Qwen3, no k-means;
+    # within a cluster all three words align perfectly by construction.
+    from omegaconf import OmegaConf as _OCn
+    naive_parse = bool(_OCn.select(cfg, "model.language_conditioning.naive_parse", default=False))
+
     # Language embeddings for clustering. Reuse a prior run's Qwen3 embeddings when
     # present (k-means re-runs deterministically → identical clusters), else embed now.
     text_embeddings = None
     reuse_npz = src_dir / "scores" / f"{task_name}_clustered_spans.npz"
-    if lang.reuse_clusters and reuse_npz.exists():
+    if not naive_parse and lang.reuse_clusters and reuse_npz.exists():
         z = _np.load(str(reuse_npz), allow_pickle=True)
         if "span_ids" in z and "lang_emb" in z:
             id2emb = {str(sid): z["lang_emb"][i] for i, sid in enumerate(z["span_ids"])}
@@ -633,7 +639,7 @@ def _score_task_clustered(
                 print(f"{tag} reusing language embeddings from {reuse_npz} → {text_embeddings.shape}")
             else:
                 print(f"{tag} reuse npz span_ids mismatch — recomputing language embeddings")
-    if text_embeddings is None:
+    if text_embeddings is None and not naive_parse:
         lemb = LanguageEmbedder(
             source="qwen3",
             latent_dim=4096,  # >= Qwen3 hidden size → no projection, full embedding for clustering
@@ -653,15 +659,22 @@ def _score_task_clustered(
     from omegaconf import OmegaConf as _OC2
     disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type == "quest_tokens"
     t_ksg = _time.perf_counter()
-    scorer = trajectory_scorer_from_cfg(cfg)
-    clustered = scorer.score_clusters(
-        span_state, span_action, span_ids, span_texts, span_meta, text_embeddings,
-        score=not disable_scoring,
-    )
-    print(
-        f"{tag} clustered {'(scoring DISABLED) ' if disable_scoring else ''}"
-        f"done in {_time.perf_counter() - t_ksg:.1f}s — {len(clustered)} clusters"
-    )
+    if naive_parse:
+        from egomimic.curation.naive_lang import naive_language_clusters
+        clustered = naive_language_clusters(span_ids, span_texts, span_meta)
+        print(f"{tag} naive (verb|hand|direction) clustering: {len(clustered)} exact-triple "
+              f"clusters over {len(span_ids)} spans; largest: "
+              + ", ".join(f"{v['label']} ({len(v['spans'])})" for v in list(clustered.values())[:5]))
+    else:
+        scorer = trajectory_scorer_from_cfg(cfg)
+        clustered = scorer.score_clusters(
+            span_state, span_action, span_ids, span_texts, span_meta, text_embeddings,
+            score=not disable_scoring,
+        )
+        print(
+            f"{tag} clustered {'(scoring DISABLED) ' if disable_scoring else ''}"
+            f"done in {_time.perf_counter() - t_ksg:.1f}s — {len(clustered)} clusters"
+        )
 
     scores_dir = Path(output_dir) / "scores"
     scores_dir.mkdir(parents=True, exist_ok=True)

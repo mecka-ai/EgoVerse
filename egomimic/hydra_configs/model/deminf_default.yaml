@@ -86,6 +86,9 @@ language_conditioning:
   # clustered mode: atomic unit is the annotation span. K-means clusters spans by
   # their Qwen3 language embedding, then KSG-scores each cluster independently and
   # ranks spans within it (output: scores_v2/<task>_clustered_scores.json).
+  # naive_parse=true: skip Qwen3+k-means; cluster by exact parsed (verb, hand,
+  # direction) triples — every span in a cluster aligns on all three words.
+  naive_parse: false
   n_clusters: auto        # "auto" (silhouette over 2..n_clusters_max) or an int
   n_clusters_max: 20      # upper bound for auto silhouette search
   clustered_min_spans: 8  # clusters with fewer spans are formed but not scored (logged)
