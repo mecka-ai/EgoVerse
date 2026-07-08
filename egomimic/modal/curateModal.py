@@ -624,7 +624,9 @@ def _score_task_clustered(
     # (verb, hand, direction) triples parsed from the text — no Qwen3, no k-means;
     # within a cluster all three words align perfectly by construction.
     from omegaconf import OmegaConf as _OCn
-    naive_parse = bool(_OCn.select(cfg, "model.language_conditioning.naive_parse", default=False))
+    _np_val = _OCn.select(cfg, "model.language_conditioning.naive_parse", default=False)
+    naive_parse = bool(_np_val)
+    naive_mode = _np_val if isinstance(_np_val, str) else "triple"  # triple | bimanual
 
     # Language embeddings for clustering. Reuse a prior run's Qwen3 embeddings when
     # present (k-means re-runs deterministically → identical clusters), else embed now.
@@ -661,8 +663,8 @@ def _score_task_clustered(
     t_ksg = _time.perf_counter()
     if naive_parse:
         from egomimic.curation.naive_lang import naive_language_clusters
-        clustered = naive_language_clusters(span_ids, span_texts, span_meta)
-        print(f"{tag} naive (verb|hand|direction) clustering: {len(clustered)} exact-triple "
+        clustered = naive_language_clusters(span_ids, span_texts, span_meta, mode=naive_mode)
+        print(f"{tag} naive [{naive_mode}] clustering: {len(clustered)} exact-match "
               f"clusters over {len(span_ids)} spans; largest: "
               + ", ".join(f"{v['label']} ({len(v['spans'])})" for v in list(clustered.values())[:5]))
     else:

@@ -49,14 +49,58 @@ def parse_motion_triple(text: str) -> tuple[str, str, str]:
     return verb, hand, direction
 
 
-def naive_language_clusters(span_ids: list[str], span_texts: list[str],
-                            span_meta: list[dict]) -> dict:
-    """Group spans by exact parsed triple → clustered-scores dict (viewer schema).
+# Bimanual verb groups (Mecka/preann199 annotations): normalize synonyms, keep
+# unknown verbs raw so exact matching still holds for the tail.
+_VERB_GROUPS = {
+    "hold": ("hold", "grip", "grasp", "steady", "support", "secure"),
+    "pick_up": ("pick", "grab", "lift", "take"),
+    "place": ("place", "put", "set", "insert", "hang", "stack", "return"),
+    "pass": ("pass", "hand", "transfer"),
+    "wipe": ("wipe", "scrub", "rub", "sand", "clean", "polish", "brush"),
+    "rotate": ("rotate", "turn", "flip", "twist"),
+    "adjust": ("shift", "reposition", "slide", "align", "straighten", "adjust", "move"),
+    "cut": ("cut", "slice", "chop", "trim"),
+    "push": ("press", "push"),
+    "pull": ("pull", "drag"),
+    "smoothen": ("smoothen", "smooth", "flatten"),
+    "fold": ("fold",),
+}
+_VERB_OF = {w: g for g, ws in _VERB_GROUPS.items() for w in ws}
 
-    Cluster ids are assigned by descending size; labels are the triple itself,
-    e.g. ``pick_up | left | diagonal``.
+
+def parse_bimanual_verbs(text: str) -> tuple[str, str]:
+    """Parse (left_verb, right_verb) from a bimanual annotation.
+
+    Clauses (comma-separated) each end with a hand mention; the clause's leading
+    verb is assigned to that hand ("both hands" → both sides). A hand keeps its
+    FIRST assigned verb; hands never mentioned get "none".
     """
-    triples = [parse_motion_triple(t) for t in span_texts]
+    verbs = {"left": "", "right": ""}
+    for clause in str(text).lower().split(","):
+        m = re.match(r"\s*(?:then\s+)?([a-z]+)", clause)
+        if not m:
+            continue
+        verb = _VERB_OF.get(m.group(1), m.group(1))
+        both = "both hand" in clause
+        for side in ("left", "right"):
+            if (both or f"{side} hand" in clause or f"{side} arm" in clause) and not verbs[side]:
+                verbs[side] = verb
+    return verbs["left"] or "none", verbs["right"] or "none"
+
+
+def naive_language_clusters(span_ids: list[str], span_texts: list[str],
+                            span_meta: list[dict], mode: str = "triple") -> dict:
+    """Group spans by exact parsed key → clustered-scores dict (viewer schema).
+
+    mode="triple":   (verb, hand, direction) — elmo-style single-action texts.
+    mode="bimanual": (left_verb, right_verb) — Mecka-style per-hand clause texts;
+                     both hands' verb+handedness must match exactly.
+    Cluster ids are assigned by descending size; labels are the parsed key itself.
+    """
+    if mode == "bimanual":
+        triples = [("L:" + lv, "R:" + rv) for lv, rv in map(parse_bimanual_verbs, span_texts)]
+    else:
+        triples = [parse_motion_triple(t) for t in span_texts]
     order = [t for t, _ in Counter(triples).most_common()]
     cid_of = {t: i for i, t in enumerate(order)}
 
