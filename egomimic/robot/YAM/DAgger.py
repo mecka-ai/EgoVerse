@@ -32,9 +32,11 @@ Example:
 """
 import json
 import os
+import queue
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 # collect_yam_demo.py/yam_interface.py already do this sys.path insert on
@@ -48,6 +50,8 @@ import numpy as np
 from collect_yam_demo import (
     DEFAULT_FOLLOWER_CHANNELS,
     DEFAULT_LEADER_CHANNELS,
+    SLOW_MOVE_DT,
+    SLOW_MOVE_STEPS,
     STUCK_FRAME_THRESHOLD,
     SYNC_BUTTON_THRESHOLD,
     YAMLeaderRobot,
@@ -55,7 +59,6 @@ from collect_yam_demo import (
     _has_stuck_frames,
     fk_eepose14,
     make_leader,
-    slow_move,
 )
 from i2rt.robots.utils import ArmType, GripperType
 from models.registry import MODEL_REGISTRY
@@ -92,18 +95,21 @@ def build_pipelines(arms_list, only):
     robometer is task-level (it judges the whole episode from the front camera).
     Fresh heuristic instances per arm/task — NOT the discover()'d singletons —
     so latch/EWMA state never bleeds between arms.
+
+    ee_error and action_variance are kept in SEPARATE per-arm Pipelines (each
+    a single-heuristic Pipeline, not bundled together) so update_pipelines can
+    gate action_variance on a MotionGate without also gating ee_error, which
+    must keep running every tick even while an arm is deliberately held still.
     """
     names = set(only) if only else set(DEFAULT_HEURISTICS)
 
-    per_arm = {}
+    per_arm_ee_error = {}
+    per_arm_action_variance = {}
     for arm in arms_list:
-        heuristics = []
         if "ee_error" in names:
-            heuristics.append(EeError())
+            per_arm_ee_error[arm] = Pipeline([EeError()])
         if "action_variance" in names:
-            heuristics.append(ActionVariance())
-        if heuristics:
-            per_arm[arm] = Pipeline(heuristics)
+            per_arm_action_variance[arm] = Pipeline([ActionVariance()])
 
     task_pipeline = None
     if "robometer" in names:
@@ -114,7 +120,7 @@ def build_pipelines(arms_list, only):
         else:
             task_pipeline = Pipeline([robometer])
 
-    return per_arm, task_pipeline
+    return per_arm_ee_error, per_arm_action_variance, task_pipeline
 
 
 def warmup_pipelines(*pipelines):
@@ -129,14 +135,121 @@ def warmup_pipelines(*pipelines):
                 print(f"[dagger] '{h.name}' ready.")
 
 
-def update_pipelines(per_arm_pipelines, task_pipeline, step_i, t, obs, commanded_joints):
+class AsyncPipelineWorker:
+    """Runs a Pipeline's update() on a background thread so a slow heuristic
+    (robometer's VLM call over a UNIX socket measures ~96ms per call on this
+    GPU — ~2.9x a 30Hz control tick's 33ms budget) never blocks the real-time
+    control loop.
+
+    Only the most recent submitted frame is kept: submit() is non-blocking and
+    replaces any not-yet-processed frame rather than queueing behind it, so a
+    busy worker never makes the backlog (and therefore the staleness of the
+    result the control loop reads) grow over time. The tradeoff this makes
+    real-time-safe is that failure detection here runs on the latest
+    completed result, not necessarily the latest frame — acceptable since
+    robometer's own signal is already smoothed/debounced over ~150 frames.
+    """
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self._mailbox = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self._latest_results = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, frame):
+        try:
+            self._mailbox.get_nowait()  # drop the stale not-yet-processed frame, if any
+        except queue.Empty:
+            pass
+        try:
+            self._mailbox.put_nowait(frame)
+        except queue.Full:
+            pass  # lost a race with _run draining the mailbox; harmless, resubmitted next tick
+
+    def latest_results(self):
+        with self._lock:
+            return dict(self._latest_results)
+
+    def reset(self):
+        with self._lock:
+            self._latest_results = {}
+        self.pipeline.reset()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                frame = self._mailbox.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            results = self.pipeline.update(frame)
+            with self._lock:
+                self._latest_results = results
+
+
+DEFAULT_ACTION_VARIANCE_MIN_MOTION_DEG = 0.5
+
+
+class MotionGate:
+    """Tracks each arm's recent commanded ARM-joint motion (radians, gripper
+    excluded — different units/scale) to tell whether an arm is genuinely
+    moving right now.
+
+    Exists because action_variance's jitter score has a normalization flaw
+    for a STATIONARY arm: jitter = sum(reversals * weight) / (sum(weight) +
+    1e-9), where weight is meant to "ignore near-still joints" but only
+    discriminates BETWEEN joints within one arm — it does nothing when the
+    WHOLE arm is still. A held-still arm's commanded value is ~constant, so
+    its tick-to-tick delta is pure noise (IK numerical noise, float
+    precision) around zero; that noise flips sign ~randomly, giving a
+    reversal rate near 1.0. Since weight and reversals end up roughly
+    proportional across joints in that case, the 1e-9 epsilon (meant only to
+    guard an exact 0/0) becomes negligible and the ratio converges toward
+    ~1.0 — i.e. a genuinely idle arm can score HIGHER jitter than a smoothly
+    moving one. Observed in practice: a stationary arm tripping
+    action_variance on the very first action of a run (the 20-tick window
+    fills starting at t=0, right after set_home(), so that first evaluation
+    is pure hold-noise with no real motion yet to dilute it).
+
+    update_pipelines uses is_moving() to skip feeding action_variance a
+    stationary arm's noise-only sample entirely (not just discard the
+    result) — action_variance's own StickyLatch is sticky, so a value that's
+    allowed to latch True internally would stay True forever even after real
+    motion resumes; the fix has to happen before that sample ever reaches it.
+    """
+
+    def __init__(self, min_motion_rad, window=20):
+        self.min_motion_rad = min_motion_rad
+        self.window = window
+        self._prev = {}
+        self._recent = {}
+
+    def is_moving(self, arm, action):
+        arm_joints = np.asarray(action, dtype=float)[:6]
+        prev = self._prev.get(arm)
+        self._prev[arm] = arm_joints
+        if prev is None:
+            return True  # no delta yet for this arm; nothing to gate on
+        recent = self._recent.setdefault(arm, deque(maxlen=self.window))
+        recent.append(np.abs(arm_joints - prev))
+        avg_motion = float(np.stack(recent).mean(axis=0).sum())
+        return avg_motion >= self.min_motion_rad
+
+
+def update_pipelines(per_arm_ee_error, per_arm_action_variance, motion_gate, task_worker,
+                      step_i, t, obs, commanded_joints):
     """Feed one control tick to every pipeline; return the (arm, heuristic_name,
     Outputs) triples for anything that just latched failed. arm is None for the
-    task-level pipeline.
+    task-level (robometer) worker.
     """
     failures = []
-    for arm, pipeline in per_arm_pipelines.items():
-        joints = commanded_joints.get(arm)
+    for arm, joints in commanded_joints.items():
         if joints is None:
             continue  # IK failed this tick — hold, don't feed a bogus action
         off = _ARM_OFFSET[arm]
@@ -147,17 +260,28 @@ def update_pipelines(per_arm_pipelines, task_pipeline, step_i, t, obs, commanded
                 "actions": np.asarray(joints, dtype=float),
             },
         )
-        for name, outputs in pipeline.update(frame).items():
-            if outputs.failed:
-                failures.append((arm, name, outputs))
 
-    if task_pipeline is not None:
+        ee_pipeline = per_arm_ee_error.get(arm)
+        if ee_pipeline is not None:
+            for name, outputs in ee_pipeline.update(frame).items():
+                if outputs.failed:
+                    failures.append((arm, name, outputs))
+
+        av_pipeline = per_arm_action_variance.get(arm)
+        if av_pipeline is not None and motion_gate.is_moving(arm, joints):
+            for name, outputs in av_pipeline.update(frame).items():
+                if outputs.failed:
+                    failures.append((arm, name, outputs))
+            # else: arm isn't meaningfully moving — skip the update entirely so
+            # this noise-only sample never enters action_variance's window/latch.
+
+    if task_worker is not None:
         image = obs.get("front_img_1")
         if image is not None:
-            frame = Frame(index=step_i, time=t, columns={"image": image})
-            for name, outputs in task_pipeline.update(frame).items():
-                if outputs.failed:
-                    failures.append((None, name, outputs))
+            task_worker.submit(Frame(index=step_i, time=t, columns={"image": image}))
+        for name, outputs in task_worker.latest_results().items():
+            if outputs.failed:
+                failures.append((None, name, outputs))
 
     return failures
 
@@ -239,11 +363,63 @@ def save_dagger_episode(demo_data, dagger_dir, episode_id, camera_res, robot_int
 # ------------------------- Failure -> teleop handoff -------------------------
 
 
-def handle_failure(ri, leaders, cameras, arms_list, kp, failures, policy, per_arm_pipelines,
-                    task_pipeline, dagger_dir, episode_id, policy_checkpoint, bilateral_kp,
-                    strict_cameras, frequency):
+def _slow_move_leader(leader, target6, current6, dt=SLOW_MOVE_DT):
+    """Slow-interpolate the LEADER teaching handle to the FOLLOWER's current
+    pose — the reverse of collect_yam_demo.py's slow_move(), which moves the
+    follower to the leader. In DAgger the follower is mid-task when a failure
+    triggers, while the passive leader could be resting anywhere; snapping the
+    follower to the leader's arbitrary pose would yank it out of the task, so
+    instead the (currently passive, back-drivable) handle repositions itself
+    to match the robot's current state before the operator takes hold of it.
+
+    ``dt`` (seconds/step, default matches collect_yam_demo.py's SLOW_MOVE_DT)
+    is exposed separately here — via --leader-sync-dt — because a fast sync
+    move here just needs to look/feel reasonable to a waiting operator,
+    unlike collect_yam_demo.py's follower-catch-up move.
+    """
+    for i in range(SLOW_MOVE_STEPS + 1):
+        alpha = i / SLOW_MOVE_STEPS
+        cmd6 = alpha * target6 + (1 - alpha) * current6
+        leader.command_joint_pos(cmd6)
+        time.sleep(dt)
+
+
+def _reset_triggered(failures, per_arm_ee_error, per_arm_action_variance, task_worker, policy):
+    """Clear the latch state of whichever heuristic(s) fired, and drop the
+    policy's stale action chunk so the next tick re-infers from scratch — used
+    both after a real correction and after an operator override/ignore.
+    """
+    # Only the triggered pipeline(s)/worker get their latch cleared — an
+    # untriggered heuristic's sliding window is left alone.
+    for arm, name, _outputs in failures:
+        if arm is None:
+            target = task_worker
+        elif name == "ee_error":
+            target = per_arm_ee_error.get(arm)
+        elif name == "action_variance":
+            target = per_arm_action_variance.get(arm)
+        else:
+            target = None
+        if target is not None:
+            target.reset()
+
+    if hasattr(policy, "actions"):
+        policy.actions = None
+    if hasattr(policy, "debug_actions"):
+        policy.debug_actions = None
+
+
+def handle_failure(ri, leaders, cameras, arms_list, kp, failures, policy, per_arm_ee_error,
+                    per_arm_action_variance, task_worker, dagger_dir, episode_id,
+                    policy_checkpoint, bilateral_kp, strict_cameras, frequency,
+                    leader_sync_dt):
     """Freeze the policy, hand control to the teaching-handle leaders, record the
     human's correction, then hand control back. Returns (episode_id, quit_requested).
+
+    An operator can also press 'i'+Enter instead of engaging the leader, to
+    override a misclassified/false-positive detection: the triggered
+    heuristic's latch is cleared and the rollout resumes immediately, with no
+    teleop and no episode saved.
     """
     trigger_summary = ", ".join(
         f"{(arm or 'task')}:{name}={outputs.scores}" for arm, name, outputs in failures
@@ -251,7 +427,8 @@ def handle_failure(ri, leaders, cameras, arms_list, kp, failures, policy, per_ar
     print("\n--- DAGGER INTERVENTION: policy failure detected ---")
     print(f"  triggered by: {trigger_summary}")
     print("  Press the teaching-handle sync button to take over and demonstrate "
-          "the correct continuation, or 'q'+Enter to quit.\n")
+          "the correct continuation, 'i'+Enter to ignore this and keep rolling "
+          "out (false positive), or 'q'+Enter to quit.\n")
 
     leader_kp = {a: leaders[a].kp for a in arms_list}
 
@@ -259,23 +436,57 @@ def handle_failure(ri, leaders, cameras, arms_list, kp, failures, policy, per_ar
         ch = kp.getch()
         return ch is not None and ch.lower() == "q"
 
-    # Wait for the operator to engage (sync button) or bail (keyboard 'q').
+    # Wait for the operator to engage (sync button), override (keyboard 'i'),
+    # or bail (keyboard 'q'). A single getch() per tick — checking 'q' and 'i'
+    # with two separate getch() calls would drop keystrokes, since the first
+    # call already drains the one buffered character.
     while True:
-        if _quit_requested():
-            print("[dagger] quit requested during intervention wait.")
-            return episode_id, True
+        ch = kp.getch()
+        if ch is not None:
+            ch = ch.lower()
+            if ch == "q":
+                print("[dagger] quit requested during intervention wait.")
+                return episode_id, True
+            if ch == "i":
+                print("[dagger] Ignoring detected failure; resuming rollout.\n")
+                _reset_triggered(failures, per_arm_ee_error, per_arm_action_variance,
+                                  task_worker, policy)
+                return episode_id, False
         leader_info = {a: leaders[a].get_info() for a in arms_list}
         if all(leader_info[a][1][0] > SYNC_BUTTON_THRESHOLD for a in arms_list):
             break
         time.sleep(0.01)
 
-    print("[dagger] Engaging teleop ...")
+    print("[dagger] Syncing leader to the follower's current pose ...")
     for a in arms_list:
         leaders[a].update_kp_kd(kp=leader_kp[a] * bilateral_kp, kd=np.zeros(6))
-        current7 = ri.get_joints(a)
-        slow_move(ri, a, leader_info[a][0], current7)
+        follower_current6 = ri.get_joints(a)[:6]
+        leader_current6 = leader_info[a][0][:6]
+        _slow_move_leader(leaders[a], follower_current6, leader_current6, dt=leader_sync_dt)
 
     # Debounce the engaging press.
+    while all(leaders[a].get_info()[1][0] > SYNC_BUTTON_THRESHOLD for a in arms_list):
+        time.sleep(0.01)
+
+    # The arm is now synced and holding (kp/kd active), but the gripper
+    # trigger is a passive encoder — not driven by kp/kd — so the operator
+    # can freely reposition it to match the follower's held gripper state
+    # before anything actually starts moving. Wait for a second press so
+    # they have that time, instead of driving off the handle immediately.
+    print("[dagger] Leader synced. Position the gripper trigger to match, then "
+          "press the sync button again to start driving.")
+    while True:
+        if _quit_requested():
+            print("[dagger] quit requested before teleop start.")
+            for a in arms_list:
+                leaders[a].update_kp_kd(kp=np.zeros(6), kd=np.zeros(6))
+            return episode_id, True
+        ready_info = {a: leaders[a].get_info() for a in arms_list}
+        if all(ready_info[a][1][0] > SYNC_BUTTON_THRESHOLD for a in arms_list):
+            break
+        time.sleep(0.01)
+
+    # Debounce the "start driving" press.
     while all(leaders[a].get_info()[1][0] > SYNC_BUTTON_THRESHOLD for a in arms_list):
         time.sleep(0.01)
 
@@ -327,17 +538,7 @@ def handle_failure(ri, leaders, cameras, arms_list, kp, failures, policy, per_ar
                             strict_cameras=strict_cameras):
         episode_id += 1
 
-    # Only the triggered pipeline(s) get their latch cleared — an untriggered
-    # heuristic's sliding window is left alone.
-    for arm, _name, _outputs in failures:
-        pipeline = per_arm_pipelines.get(arm) if arm is not None else task_pipeline
-        if pipeline is not None:
-            pipeline.reset()
-
-    if hasattr(policy, "actions"):
-        policy.actions = None
-    if hasattr(policy, "debug_actions"):
-        policy.debug_actions = None
+    _reset_triggered(failures, per_arm_ee_error, per_arm_action_variance, task_worker, policy)
 
     print("[dagger] Correction saved; resuming automated rollout.\n")
     return episode_id, False
@@ -417,6 +618,8 @@ def dagger_rollout(
     bilateral_kp,
     only,
     strict_cameras,
+    action_variance_min_motion_deg,
+    leader_sync_dt,
 ):
     threading.excepthook = _quiet_thread_excepthook
 
@@ -464,8 +667,13 @@ def dagger_rollout(
     if policy.annotation:
         os.environ["ROBOMETER_TASK"] = policy.annotation
 
-    per_arm_pipelines, task_pipeline = build_pipelines(arms_list, only)
-    warmup_pipelines(task_pipeline, *per_arm_pipelines.values())
+    per_arm_ee_error, per_arm_action_variance, task_pipeline = build_pipelines(arms_list, only)
+    warmup_pipelines(task_pipeline, *per_arm_ee_error.values(), *per_arm_action_variance.values())
+    # robometer's VLM call measures ~96ms/call on this GPU (~2.9x a 30Hz tick
+    # budget) — run it off the control-loop thread so it can never stall
+    # robot commands; see AsyncPipelineWorker.
+    task_worker = AsyncPipelineWorker(task_pipeline) if task_pipeline is not None else None
+    motion_gate = MotionGate(min_motion_rad=np.deg2rad(action_variance_min_motion_deg))
 
     episode_id = episode_id_start
 
@@ -526,14 +734,15 @@ def dagger_rollout(
                                 commanded_joints[arm] = arm_action
 
                         failures = update_pipelines(
-                            per_arm_pipelines, task_pipeline, step_i,
-                            step_i / frequency, obs, commanded_joints,
+                            per_arm_ee_error, per_arm_action_variance, motion_gate,
+                            task_worker, step_i, step_i / frequency, obs, commanded_joints,
                         )
                         if failures:
                             episode_id, quit_requested = handle_failure(
                                 ri, leaders, cameras, arms_list, kp, failures, policy,
-                                per_arm_pipelines, task_pipeline, dagger_dir, episode_id,
-                                policy_path, bilateral_kp, strict_cameras, frequency,
+                                per_arm_ee_error, per_arm_action_variance, task_worker,
+                                dagger_dir, episode_id, policy_path, bilateral_kp,
+                                strict_cameras, frequency, leader_sync_dt,
                             )
                             if quit_requested:
                                 return
@@ -544,6 +753,8 @@ def dagger_rollout(
         return
     finally:
         _SHUTTING_DOWN.set()
+        if task_worker is not None:
+            task_worker.close()
         underlying = [ri.controller[a] for a in arms_list]
         underlying += [leaders[a]._robot for a in arms_list]
         for r in underlying:
@@ -565,7 +776,7 @@ def dagger_rollout(
         _safe("followers", ri.close)
         print("[dagger] Done.")
 
-
+#python DAgger.py --arms both --policy-path /home/mecka/EgoVerse/logs/yam_pick_hat_wrist/pi05_yam_pick_hat_wrist_2026-07-03_05-41-12/checkpoints/step10000.ckpt --cartesian --annotation "pick up the black hat using the left arm and drop it into a brown box" --left-follower-can can_follower_l --right-follower-can can_follower_r --left-leader-can can_leader_l --right-leader-can can_leader_r --ee-convention libero --strict-cameras
 def build_arg_parser():
     import argparse
 
@@ -612,6 +823,25 @@ def build_arg_parser():
         "--strict-cameras", action="store_true",
         help="Abort (don't save) a correction if any camera stalls during it.",
     )
+    parser.add_argument(
+        "--action-variance-min-motion-deg", type=float,
+        default=DEFAULT_ACTION_VARIANCE_MIN_MOTION_DEG,
+        help="Minimum average per-tick arm-joint motion (degrees, gripper excluded) "
+        "for action_variance to run at all on that arm this tick. Below this, an "
+        "arm is treated as stationary and its noise floor is never fed to "
+        "action_variance (see MotionGate) — a genuinely still arm's IK/numerical "
+        "noise otherwise trips action_variance's jitter score even though nothing "
+        "is actually moving. Lower this if a real slow jitter needs to be caught "
+        "closer to standstill; raise it if idle arms are still triggering.",
+    )
+    parser.add_argument(
+        "--leader-sync-dt", type=float, default=3 * SLOW_MOVE_DT,
+        help="Seconds per interpolation step (100 steps total) when syncing the "
+        "leader handle to the follower's current pose after a failure triggers "
+        "(default: 3x collect_yam_demo.py's follower-catch-up speed, since this "
+        "just needs to look reasonable to a waiting operator, not track a live "
+        "human). Raise this further if the handle still snaps too fast.",
+    )
     return parser
 
 
@@ -637,6 +867,8 @@ def run_from_args(args):
         bilateral_kp=args.bilateral_kp,
         only=args.only,
         strict_cameras=args.strict_cameras,
+        action_variance_min_motion_deg=args.action_variance_min_motion_deg,
+        leader_sync_dt=args.leader_sync_dt,
     )
 
 
