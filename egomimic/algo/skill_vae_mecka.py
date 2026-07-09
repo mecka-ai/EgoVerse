@@ -21,11 +21,30 @@ from quest.algos.quest_modules.skill_vae import SkillVAE
 
 
 class SkillVAEMecka(SkillVAE):
-    """SkillVAE with an optional encoder positional embedding."""
+    """SkillVAE with optional encoder positional embedding + pre-quant LayerNorm.
 
-    def __init__(self, *args, use_positional_emb: bool = True, **kwargs):
+    ``normalize_pre_quant``: LayerNorm the encoder output before FSQ. QueST's
+    SkillVAE has nothing bounding the encoder scale; when activations drift large
+    (observed |x|~137 at FSQ's tanh bound), every scalar saturates to its extreme
+    level, the codebook collapses to a handful of corner codes, the straight-
+    through gradient dies, and reconstructions collapse to the dataset mean.
+    LayerNorm keeps the FSQ input O(1) so intermediate levels stay reachable.
+    """
+
+    def __init__(
+        self,
+        *args,
+        use_positional_emb: bool = True,
+        normalize_pre_quant: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.use_positional_emb = bool(use_positional_emb)
+        self.pre_quant_norm = (
+            nn.LayerNorm(kwargs["encoder_dim"], elementwise_affine=False)
+            if normalize_pre_quant
+            else None
+        )
 
     def encode(self, act, obs_emb=None):
         # Mirrors SkillVAE.encode, with add_positional_emb gated by the flag.
@@ -47,6 +66,8 @@ class SkillVAEMecka(SkillVAE):
             x = self.encoder(x)
 
         x = x[:, -H:]
+        if self.pre_quant_norm is not None:
+            x = self.pre_quant_norm(x)
         return x
 
 
@@ -92,9 +113,11 @@ class ImageObsEncoder(nn.Module):
             x = x / 255.0
         if x.shape[-2] != self.image_size or x.shape[-1] != self.image_size:
             x = F.interpolate(
-                x, size=(self.image_size, self.image_size),
-                mode="bilinear", align_corners=False,
+                x,
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
             )
         x = (x - self.img_mean) / self.img_std
         feat = self.backbone(x).flatten(start_dim=1)  # (B, 512)
-        return self.proj(feat).unsqueeze(1)           # (B, 1, emb_dim)
+        return self.proj(feat).unsqueeze(1)  # (B, 1, emb_dim)

@@ -32,6 +32,7 @@ robomimic_model:
     _target_: egomimic.algo.skill_vae_mecka.SkillVAEMecka
     action_dim: 48
     use_positional_emb: false
+    normalize_pre_quant: true  # LayerNorm before FSQ: prevents saturation collapse
     encoder_dim: 384
     decoder_dim: 384
     skill_block_size: 100

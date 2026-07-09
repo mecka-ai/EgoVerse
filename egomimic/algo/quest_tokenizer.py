@@ -45,7 +45,9 @@ class QuestTokenizerTrainer(Algo):
         # Per-block reconstruction weighting: list of {name, start, end, weight}.
         # Loss = sum_b weight_b * mean(MSE over dims [start:end]) / sum_b weight_b,
         # so each block contributes by weight, not by dim count / raw scale.
-        self.loss_blocks = [dict(b) for b in loss_block_weights] if loss_block_weights else None
+        self.loss_blocks = (
+            [dict(b) for b in loss_block_weights] if loss_block_weights else None
+        )
         self.image_key = image_key
 
         device_arg = kwargs.get("device")
@@ -223,6 +225,11 @@ class QuestTokenizerTrainer(Algo):
             for k, v in predictions.items():
                 if k.startswith(prefix):
                     loss_dict[k] = v
+            # Surface codebook perplexity (fraction of codes used per batch) so
+            # FSQ saturation collapse is visible in W&B, not just in val videos.
+            pp_key = f"{embodiment_name}_perplexity"
+            if pp_key in predictions:
+                loss_dict[pp_key] = predictions[pp_key].detach()
             total = total + combined
         loss_dict["action_loss"] = total / max(len(self.domains), 1)
         return loss_dict
