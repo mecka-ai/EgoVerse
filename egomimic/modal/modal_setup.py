@@ -91,17 +91,28 @@ class _Config:
     timeout_seconds: int = 86400  # 24 h (Modal max)
 
     secret_names: list[str] = field(
-        default_factory=lambda: [
-            "egoverse-r2",
-            "egoverse-mongodb",
-            "egoverse-db",
-            "egoverse-sql",
-            # HF_TOKEN for the gated paligemma tokenizer used by
-            # build_tokenized_collate (pi0.5 language conditioning). Create with:
-            #   modal secret create egoverse-hf HF_TOKEN=<token>
-            # (token must have accepted google/paligemma-3b-mix-224's license).
-            "egoverse-hf",
-        ]
+        default_factory=lambda: (
+            # EGOVERSE_GT=1 targets the legacy GT egoverse database instead of
+            # the new Mecka stack: egoverse-gt-keys injects SECRETS_ARN + AWS
+            # keys (legacy RDS via Secrets Manager) and the old rldb R2 creds.
+            # egoverse-db/egoverse-sql must be dropped — their DATABASE_URL
+            # takes priority over SECRETS_ARN in aws_sql.create_default_engine,
+            # and egoverse-gt-keys is listed last so its R2_* override
+            # egoverse-r2's.
+            ["egoverse-r2", "egoverse-mongodb", "egoverse-hf", "egoverse-gt-keys"]
+            if os.environ.get("EGOVERSE_GT") == "1"
+            else [
+                "egoverse-r2",
+                "egoverse-mongodb",
+                "egoverse-db",
+                "egoverse-sql",
+                # HF_TOKEN for the gated paligemma tokenizer used by
+                # build_tokenized_collate (pi0.5 language conditioning). Create with:
+                #   modal secret create egoverse-hf HF_TOKEN=<token>
+                # (token must have accepted google/paligemma-3b-mix-224's license).
+                "egoverse-hf",
+            ]
+        )
     )
 
 
@@ -578,27 +589,44 @@ def _prepare_repo(
     if "oat" in submodules:
         # external/oat: small (no sub-submodules), needed by OATTokenizerTrainer.
         subprocess.run(
-            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
-             "external/oat"],
+            [
+                "git",
+                "-C",
+                CFG.remote_repo_dir,
+                "submodule",
+                "update",
+                "--init",
+                "external/oat",
+            ],
             check=True,
         )
         oat_dir = f"{CFG.remote_repo_dir}/external/oat"
         if Path(oat_dir).is_dir():
             subprocess.run(
-                [CFG.python_bin, "-c",
-                 "import sysconfig, os, sys; "
-                 "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_oat.pth'); "
-                 "open(p, 'w').write(sys.argv[1]); "
-                 "print('registered oat path ->', sys.argv[1])",
-                 oat_dir],
+                [
+                    CFG.python_bin,
+                    "-c",
+                    "import sysconfig, os, sys; "
+                    "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_oat.pth'); "
+                    "open(p, 'w').write(sys.argv[1]); "
+                    "print('registered oat path ->', sys.argv[1])",
+                    oat_dir,
+                ],
                 check=True,
             )
 
     if "openpi" in submodules:
         # external/openpi: Pi0.5 model runs only. No aloha/libero sub-submodules.
         subprocess.run(
-            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
-             "external/openpi"],
+            [
+                "git",
+                "-C",
+                CFG.remote_repo_dir,
+                "submodule",
+                "update",
+                "--init",
+                "external/openpi",
+            ],
             check=True,
         )
 
@@ -606,19 +634,29 @@ def _prepare_repo(
         # external/quest: QueST SkillVAE tokenizer. Uses vector_quantize_pytorch
         # (pre-installed in the image), einops, and positional-encodings.
         subprocess.run(
-            ["git", "-C", CFG.remote_repo_dir, "submodule", "update", "--init",
-             "external/quest"],
+            [
+                "git",
+                "-C",
+                CFG.remote_repo_dir,
+                "submodule",
+                "update",
+                "--init",
+                "external/quest",
+            ],
             check=True,
         )
         quest_dir = f"{CFG.remote_repo_dir}/external/quest"
         if Path(quest_dir).is_dir():
             subprocess.run(
-                [CFG.python_bin, "-c",
-                 "import sysconfig, os, sys; "
-                 "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_quest.pth'); "
-                 "open(p, 'w').write(sys.argv[1]); "
-                 "print('registered quest path ->', sys.argv[1])",
-                 quest_dir],
+                [
+                    CFG.python_bin,
+                    "-c",
+                    "import sysconfig, os, sys; "
+                    "p = os.path.join(sysconfig.get_paths()['purelib'], 'egoverse_quest.pth'); "
+                    "open(p, 'w').write(sys.argv[1]); "
+                    "print('registered quest path ->', sys.argv[1])",
+                    quest_dir,
+                ],
                 check=True,
             )
 
@@ -775,7 +813,15 @@ def _prepare_repo_light(
     )
     for sm in submodules:
         subprocess.run(
-            ["git", "-C", str(repo_dir), "submodule", "update", "--init", f"external/{sm}"],
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "submodule",
+                "update",
+                "--init",
+                f"external/{sm}",
+            ],
             check=True,
         )
     # Register egomimic via a .pth instead of `pip install -e .`. The editable
