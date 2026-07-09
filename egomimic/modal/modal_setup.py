@@ -333,6 +333,12 @@ VOLUME_MAP: dict[str, tuple] = {
     "mecka_data_zip": (zip_volume, "/mnt/zarr-zip"),
     # Standalone single-task zip volume (folding_clothes); same /mnt/zarr-zip mount.
     "mecka_data_zip_fold_clothes": (zip_fold_clothes_volume, "/mnt/zarr-zip"),
+    # ELMO GT-annotated ARIA episodes (Mecka-schema zarrs, timestamp ids); same
+    # /mnt/zarr-data mount so LocalEpisodeResolver data configs work unchanged.
+    "elmo_data_v2": (
+        modal.Volume.from_name("elmo_data_v2"),
+        "/mnt/zarr-data",
+    ),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
