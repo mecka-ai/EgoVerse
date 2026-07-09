@@ -36,6 +36,12 @@ class EMBODIMENT(Enum):
 
 EMBODIMENT_ID_TO_KEY = {member.value: member.name for member in EMBODIMENT}
 
+# Metadata aliases: the ELMO GT aria episodes (elmo_data_v2) are Mecka-schema
+# zarrs converted from Aria MANO recordings but written with
+# embodiment="human_bimanual"; they are treated as MECKA_BIMANUAL end to end
+# (same keys, keymaps, and schematic — matching the deminf_elmo_gt curation).
+_EMBODIMENT_ALIASES = {"HUMAN_BIMANUAL": "MECKA_BIMANUAL"}
+
 
 def get_embodiment(index):
     return EMBODIMENT_ID_TO_KEY.get(index, None)
@@ -43,6 +49,7 @@ def get_embodiment(index):
 
 def get_embodiment_id(embodiment_name):
     embodiment_name = embodiment_name.upper()
+    embodiment_name = _EMBODIMENT_ALIASES.get(embodiment_name, embodiment_name)
     return EMBODIMENT[embodiment_name].value
 
 
