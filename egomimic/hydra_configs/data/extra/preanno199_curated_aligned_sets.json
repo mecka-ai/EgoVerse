@@ -1,0 +1,47 @@
+{
+  "description": "Curated subsets of preanno199 episodes with strong verb+handedness alignment across annotation spans (cosine similarity over parsed (verb, hand) token histograms).",
+  "primary_set": {
+    "name": "bimanual_pick_and_place",
+    "pattern": "pick up <object> with both hands -> place <object> on <surface> with both hands",
+    "avg_pairwise_similarity": 0.927,
+    "min_pairwise_similarity": 0.83,
+    "episodes": {
+      "68c991876f55ccdbb27de284": "stocking_shelves",
+      "68c9a671f7aeb085b60fcb95": "stocking_snacks",
+      "68d3f78a6df2d7f2057a209d": "picking_items (shopping_for_groceries)",
+      "68d3ff88bdac7d9d657e03fd": "organizing_shelves (placing_items_on_shelf)",
+      "68c9b871841616b2c4f83ef0": "stocking_shelves (showing_product/box stacking)",
+      "68d3edc112af763ea5dca391": "organizing_shelves (removing_items)",
+      "68c9c16ba1ea367a01cd62a2": "examining_kettles (arranging_kettles)",
+      "68d3dfabf4abd6e6ceedfe19": "organizing_counters (restocking_shelf)"
+    }
+  },
+  "alternate_sets": {
+    "hold_left_scrub_right_shoe_cleaning": {
+      "pattern": "hold shoe with left hand + scrub with brush in right hand",
+      "avg_pairwise_similarity": 0.897,
+      "episodes": [
+        "68d1d3a21d29a1390d685fe2",
+        "68d3f7a39ad4e83f3cd10e4b",
+        "68d3e672347ceea1609f6f74",
+        "68d3a7ffcea1f16ac771f48a",
+        "68d401769743ff69a2c94972",
+        "68d3eb4c593c576a5a68f356",
+        "68d3fe3bcfdb743f0cb0e35b",
+        "68d21711e692e6458598d6fa"
+      ]
+    },
+    "hold_left_wipe_right": {
+      "pattern": "hold item with left hand + wipe with cloth in right hand",
+      "avg_pairwise_similarity": 0.866,
+      "episodes": [
+        "68c9a75462a648b8057c6743",
+        "68d3e59e91a44281fe3dfd1c",
+        "68d3d436caff909a814b3439",
+        "68d176255dd0b4fb0e66fe11",
+        "68d3bc9f17b2c483236ea060",
+        "68c9a2d184ecc9125e1e0bd4"
+      ]
+    }
+  }
+}

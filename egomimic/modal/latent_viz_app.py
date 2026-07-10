@@ -35,24 +35,28 @@ FRAME_STRIDE = 10
 FRAME_MAX_W = 640
 
 _HERE = Path(__file__).resolve().parent
-_BUILDER         = _HERE.parent / "scripts" / "build_latent_viz.py"
-_SPAN_BUILDER    = _HERE.parent / "scripts" / "build_span_viz.py"
+_BUILDER = _HERE.parent / "scripts" / "build_latent_viz.py"
+_SPAN_BUILDER = _HERE.parent / "scripts" / "build_span_viz.py"
 _CLUSTER_BUILDER = _HERE.parent / "scripts" / "build_cluster_viz.py"
-_VAL_JSON        = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.json"
+_VAL_JSON = _HERE.parent / "hydra_configs" / "data" / "extra" / "mecka_d64_val.json"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg")
     .pip_install("fastapi[standard]", "sqlalchemy", "psycopg2-binary", "scikit-learn")
-    .add_local_file(_BUILDER,         remote_path="/root/build_latent_viz.py",  copy=True)
-    .add_local_file(_SPAN_BUILDER,    remote_path="/root/build_span_viz.py",    copy=True)
-    .add_local_file(_CLUSTER_BUILDER, remote_path="/root/build_cluster_viz.py", copy=True)
-    .add_local_file(_VAL_JSON,        remote_path="/root/mecka_d64_val.json",   copy=True)
+    .add_local_file(_BUILDER, remote_path="/root/build_latent_viz.py", copy=True)
+    .add_local_file(_SPAN_BUILDER, remote_path="/root/build_span_viz.py", copy=True)
+    .add_local_file(
+        _CLUSTER_BUILDER, remote_path="/root/build_cluster_viz.py", copy=True
+    )
+    .add_local_file(_VAL_JSON, remote_path="/root/mecka_d64_val.json", copy=True)
 )
 
 app = modal.App("egoverse-viewer", image=image)
 outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
-previews_volume = modal.Volume.from_name("mecka-episode-previews", create_if_missing=True)
+previews_volume = modal.Volume.from_name(
+    "mecka-episode-previews", create_if_missing=True
+)
 
 
 def _list_curation_runs(outputs_root: Path) -> list[str]:
@@ -120,12 +124,16 @@ def _run_mtime(run_dir: Path) -> float:
     return latest
 
 
-def _landing_html(runs: list[str], default_run: str, error: str = "",
-                  span_runs: list[str] | None = None,
-                  cluster_runs: list[str] | None = None) -> str:
+def _landing_html(
+    runs: list[str],
+    default_run: str,
+    error: str = "",
+    span_runs: list[str] | None = None,
+    cluster_runs: list[str] | None = None,
+) -> str:
     import html
 
-    span_runs    = span_runs    or []
+    span_runs = span_runs or []
     cluster_runs = cluster_runs or []
     safe_default = html.escape(default_run, quote=True)
     n_runs = len(runs)
@@ -135,6 +143,7 @@ def _landing_html(runs: list[str], default_run: str, error: str = "",
         for r in runs[:80]
     )
     err = f'<div class="err">{html.escape(error)}</div>' if error else ""
+
     # Parse timestamp suffix from run name for display (format: …_YYYY-MM-DD_HH-MM-SS)
     def _run_date(r: str) -> str:
         parts = r.replace("_", "-").split("-")
@@ -149,23 +158,23 @@ def _landing_html(runs: list[str], default_run: str, error: str = "",
         f'<div class="run-row" onclick="pick(\'{html.escape(r, quote=True)}\')">'
         f'<span class="run-name">{html.escape(r)}</span>'
         f'<span class="run-date">{_run_date(r)}</span>'
-        f'</div>'
+        f"</div>"
         for r in runs[:60]
     )
     span_rows = "\n".join(
         f'<div class="run-row" style="border-left:3px solid #7c3aed" '
-        f'onclick="window.location.href=\'/view_spans?run={html.escape(r, quote=True)}\'">'
+        f"onclick=\"window.location.href='/view_spans?run={html.escape(r, quote=True)}'\">"
         f'<span class="run-name" style="color:#c4b5fd">{html.escape(r)}</span>'
         f'<span class="run-date">{_run_date(r)}</span>'
-        f'</div>'
+        f"</div>"
         for r in span_runs[:20]
     )
     cluster_rows = "\n".join(
         f'<div class="run-row" style="border-left:3px solid #06b6d4" '
-        f'onclick="window.location.href=\'/view_clusters?run={html.escape(r, quote=True)}\'">'
+        f"onclick=\"window.location.href='/view_clusters?run={html.escape(r, quote=True)}'\">"
         f'<span class="run-name" style="color:#67e8f9">{html.escape(r)}</span>'
         f'<span class="run-date">{_run_date(r)}</span>'
-        f'</div>'
+        f"</div>"
         for r in cluster_runs[:20]
     )
     return f"""<!doctype html>
@@ -270,11 +279,15 @@ def _fetch_episode_metadata(hashes: list[str]) -> dict:
     try:
         import os
         from urllib.parse import quote_plus
-        from sqlalchemy import create_engine, text as sql_text
+
+        from sqlalchemy import create_engine
+        from sqlalchemy import text as sql_text
 
         database_url = os.environ.get("DATABASE_URL")
         if database_url:
-            database_url = database_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+psycopg2://", 1
+            )
         else:
             user = os.environ["PG_USER"]
             password = quote_plus(os.environ["PG_PASSWORD"])
@@ -328,9 +341,21 @@ def _render_frames_for(episode_hash: str) -> str:
     outdir.mkdir(parents=True, exist_ok=True)
 
     r = subprocess.run(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(mp4),
-         "-vf", f"select=not(mod(n\\,{FRAME_STRIDE})),scale='min({FRAME_MAX_W},iw)':-2",
-         "-vsync", "0", "-q:v", "5", str(outdir / "%06d.jpg")],
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-i",
+            str(mp4),
+            "-vf",
+            f"select=not(mod(n\\,{FRAME_STRIDE})),scale='min({FRAME_MAX_W},iw)':-2",
+            "-vsync",
+            "0",
+            "-q:v",
+            "5",
+            str(outdir / "%06d.jpg"),
+        ],
         capture_output=True,
     )
     n = len(list(outdir.glob("*.jpg")))
@@ -395,11 +420,12 @@ def regen_language_tsne(run: str, dims: int | None = None) -> dict:
       MODAL_ENVIRONMENT=robotics modal run egomimic/modal/latent_viz_app.py::regen_language_tsne --run <run>
     """
     import json
+
     import numpy as np
     import torch
-    from transformers import AutoModel, AutoTokenizer
     from sklearn.decomposition import PCA
     from sklearn.manifold import TSNE as SkTSNE
+    from transformers import AutoModel, AutoTokenizer
 
     run = run.strip().strip("/")
     outputs_volume.reload()
@@ -415,8 +441,14 @@ def regen_language_tsne(run: str, dims: int | None = None) -> dict:
     uidx = {t: i for i, t in enumerate(uniq)}
     print(f"[lang] {run}: {len(spans)} spans, {len(uniq)} unique texts, dims={dims}")
 
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", padding_side="left")
-    model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", dtype=torch.float16).to("cuda").eval()
+    tok = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen3-Embedding-0.6B", padding_side="left"
+    )
+    model = (
+        AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B", dtype=torch.float16)
+        .to("cuda")
+        .eval()
+    )
 
     def _pool(h, mask):
         left = bool((mask[:, -1].sum() == mask.shape[0]).item())
@@ -429,20 +461,32 @@ def regen_language_tsne(run: str, dims: int | None = None) -> dict:
     with torch.no_grad():
         for st in range(0, len(uniq), 64):
             batch = uniq[st : st + 64]
-            t = tok(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to("cuda")
+            t = tok(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            ).to("cuda")
             h = model(**t).last_hidden_state
-            p = torch.nn.functional.normalize(_pool(h, t["attention_mask"]).float(), p=2, dim=1)
+            p = torch.nn.functional.normalize(
+                _pool(h, t["attention_mask"]).float(), p=2, dim=1
+            )
             embs.append(p.cpu().numpy().astype(np.float32))
     U = np.concatenate(embs, axis=0)
     print(f"[lang] embedded {U.shape}")
 
     X = PCA(n_components=50, random_state=42).fit_transform(U) if U.shape[1] > 50 else U
     perp = max(5.0, min(30.0, (len(U) - 1) / 3.0))
-    coords = SkTSNE(n_components=dims, perplexity=perp, init="pca", random_state=42).fit_transform(X)
+    coords = SkTSNE(
+        n_components=dims, perplexity=perp, init="pca", random_state=42
+    ).fit_transform(X)
 
     # broadcast unique-text coords back to every span
     def _col(axis):
-        return [round(float(coords[uidx[texts[k]], axis]), 3) for k in range(len(spans))]
+        return [
+            round(float(coords[uidx[texts[k]], axis]), 3) for k in range(len(spans))
+        ]
 
     lang = {"x": _col(0), "y": _col(1)}
     if dims == 3:
@@ -470,12 +514,18 @@ def viewer():
 
     from fastapi import FastAPI, HTTPException, Query, Request
     from fastapi.middleware.gzip import GZipMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+    from fastapi.responses import (
+        FileResponse,
+        HTMLResponse,
+        JSONResponse,
+        PlainTextResponse,
+        RedirectResponse,
+    )
 
     sys.path.insert(0, "/root")
-    from build_latent_viz  import build_html
-    from build_span_viz    import build_span_html
     from build_cluster_viz import build_cluster_html
+    from build_latent_viz import build_html
+    from build_span_viz import build_span_html
 
     web = FastAPI(title="Meckaverse")
 
@@ -486,7 +536,9 @@ def viewer():
         JPEGs are already compressed. HTML/JSON still gzips ~5x."""
 
         async def __call__(self, scope, receive, send):
-            if scope.get("type") == "http" and scope.get("path", "").startswith(("/video/", "/frame/")):
+            if scope.get("type") == "http" and scope.get("path", "").startswith(
+                ("/video/", "/frame/")
+            ):
                 await self.app(scope, receive, send)
                 return
             await super().__call__(scope, receive, send)
@@ -505,10 +557,10 @@ def viewer():
         return response
 
     # run path → (mtime stamp, HTML); rebuilt when the run's outputs change.
-    html_cache:         dict[str, tuple[float, str]] = {}
-    span_html_cache:    dict[str, tuple[float, str]] = {}
+    html_cache: dict[str, tuple[float, str]] = {}
+    span_html_cache: dict[str, tuple[float, str]] = {}
     cluster_html_cache: dict[str, tuple[float, str]] = {}
-    frame_cache:        dict[str, bytes] = {}
+    frame_cache: dict[str, bytes] = {}
     val_list = json.load(open("/root/mecka_d64_val.json"))
 
     def _reload_volumes() -> None:
@@ -548,9 +600,19 @@ def viewer():
             all_hashes.update(task_scores.keys())
         metadata = _fetch_episode_metadata(list(all_hashes))
 
-        body = build_html(tsne_dir, scores, val_list, video_base="/video/", frame_base="/frame/", run_label=run, metadata=metadata)
+        body = build_html(
+            tsne_dir,
+            scores,
+            val_list,
+            video_base="/video/",
+            frame_base="/frame/",
+            run_label=run,
+            metadata=metadata,
+        )
         html_cache[run] = (stamp, body)
-        print(f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run} ({len(metadata)} metadata entries)")
+        print(
+            f"viewer: built {len(body)/1e6:.1f} MB HTML for run={run} ({len(metadata)} metadata entries)"
+        )
         return body
 
     @web.get("/")
@@ -559,13 +621,21 @@ def viewer():
         error: str | None = Query(default=None),
     ):
         _reload_volumes()
-        runs         = _list_curation_runs(Path(OUTPUTS_MOUNT))
-        span_runs    = _list_span_runs(Path(OUTPUTS_MOUNT))
+        runs = _list_curation_runs(Path(OUTPUTS_MOUNT))
+        span_runs = _list_span_runs(Path(OUTPUTS_MOUNT))
         cluster_runs = _list_cluster_runs(Path(OUTPUTS_MOUNT))
-        default      = (run or os.environ.get("LATENT_VIZ_RUN") or DEFAULT_RUN).strip()
+        default = (run or os.environ.get("LATENT_VIZ_RUN") or DEFAULT_RUN).strip()
         if run:
             return RedirectResponse(url=f"/view?run={run}", status_code=302)
-        return HTMLResponse(_landing_html(runs, default, error or "", span_runs=span_runs, cluster_runs=cluster_runs))
+        return HTMLResponse(
+            _landing_html(
+                runs,
+                default,
+                error or "",
+                span_runs=span_runs,
+                cluster_runs=cluster_runs,
+            )
+        )
 
     @web.get("/view", response_class=HTMLResponse)
     def view(run: str = Query(..., description="Volume-relative curation run path")):
@@ -580,7 +650,9 @@ def viewer():
         has_span_tsne = (tsne_dir / "spans_tsne3d.json").is_file()
         has_cluster_scores = _cluster_scores_dir(run_dir) is not None
         if has_span_tsne or has_cluster_scores:
-            return RedirectResponse(url=f"/view_clusters?run={run_clean}", status_code=302)
+            return RedirectResponse(
+                url=f"/view_clusters?run={run_clean}", status_code=302
+            )
         try:
             return _build_latent_html(run_clean)
         except HTTPException:
@@ -599,15 +671,23 @@ def viewer():
             return cached[1]
         json_path = Path(OUTPUTS_MOUNT) / run / "tsne3d" / "spans_tsne3d.json"
         if not json_path.is_file():
-            raise HTTPException(404, f"tsne3d/spans_tsne3d.json not found under {run!r}")
+            raise HTTPException(
+                404, f"tsne3d/spans_tsne3d.json not found under {run!r}"
+            )
         data = json.load(open(json_path))
-        body = build_span_html(data, video_base="/video/", frame_base="/frame/", run_label=run)
+        body = build_span_html(
+            data, video_base="/video/", frame_base="/frame/", run_label=run
+        )
         span_html_cache[run] = (stamp, body)
-        print(f"viewer: built span HTML {len(body)/1e6:.1f} MB for run={run} ({len(data.get('spans',[]))} spans)")
+        print(
+            f"viewer: built span HTML {len(body)/1e6:.1f} MB for run={run} ({len(data.get('spans',[]))} spans)"
+        )
         return body
 
     @web.get("/view_spans", response_class=HTMLResponse)
-    def view_spans(run: str = Query(..., description="Volume-relative clustered run path")):
+    def view_spans(
+        run: str = Query(..., description="Volume-relative clustered run path"),
+    ):
         try:
             return _build_span_cached(run)
         except HTTPException:
@@ -629,28 +709,48 @@ def viewer():
         data = json.load(open(tsne_path))
         spans = data["spans"]
         result: dict = {
-            "cid":   [s["cluster"]                        for s in spans],
-            "score": [s.get("score") or 0.0               for s in spans],
-            "start": [int(s.get("start", 0))              for s in spans],
-            "end":   [int(s.get("end",   s.get("start", 0) + 1)) for s in spans],
-            "ep":    [s.get("ep", s.get("episode", ""))   for s in spans],
-            "txt":   [str(s.get("text", ""))[:200]        for s in spans],
+            "cid": [s["cluster"] for s in spans],
+            "score": [s.get("score") or 0.0 for s in spans],
+            "start": [int(s.get("start", 0)) for s in spans],
+            "end": [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
+            "ep": [s.get("ep", s.get("episode", "")) for s in spans],
+            "txt": [str(s.get("text", ""))[:200] for s in spans],
             # ids carry span identity (and, for token-level plots, a '#t{k}' token
             # counter) — the builder derives span/token color modes from them
-            "id":    [str(s.get("id", ""))                for s in spans],
+            "id": [str(s.get("id", "")) for s in spans],
         }
         result["method"] = str(data.get("method", "tsne"))
         result["dims"] = int(data.get("dims", 3))
         # explicit per-point token/span fields (token/chunk-granularity runs)
         result["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
         result["sid"] = [str(s.get("sid", "")) for s in spans]
-        result["ntok"] = int(data.get("ntok", 25))       # QueST tokens per chunk
-        if data.get("metrics"):
-            result["metrics"] = data["metrics"]
+        result["ntok"] = int(data.get("ntok", 25))  # QueST tokens per chunk
+        # token-viz pipeline fields: explicit per-point token position / span identity
+        # and a run granularity tag (token | chunk | span)
+        if data.get("granularity"):
+            result["level"] = str(data["granularity"])
         if data.get("level"):
             result["level"] = str(data["level"])
+        if any("tok_idx" in s for s in spans):
+            result["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
+        if any(s.get("sid") for s in spans):
+            result["sid"] = [str(s.get("sid", "")) for s in spans]
         if any("n_chunks" in s for s in spans):
             result["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
+        metrics = data.get("metrics")
+        if not metrics:  # token-viz pipeline writes a metrics.json sidecar instead
+            for cand in (
+                tsne_path.parent / "metrics.json",
+                Path(OUTPUTS_MOUNT) / run / "metrics.json",
+            ):
+                if cand.is_file():
+                    try:
+                        metrics = json.load(open(cand))
+                    except Exception:
+                        metrics = None
+                    break
+        if metrics:
+            result["metrics"] = metrics
         for mode in ("state", "action", "language"):
             if mode in data:
                 t = data[mode]
@@ -658,8 +758,10 @@ def viewer():
                 if "z" in t:
                     m["z"] = t["z"]
                 result[mode] = m
-        print(f"[viewer] loaded cluster t-SNE for {run} ({len(spans)} spans, "
-              f"modes={[m for m in ('state','action','language') if m in result]})")
+        print(
+            f"[viewer] loaded cluster t-SNE for {run} ({len(spans)} spans, "
+            f"modes={[m for m in ('state','action','language') if m in result]})"
+        )
         return result
 
     def _build_cluster_cached(run: str) -> str:
@@ -674,19 +776,28 @@ def viewer():
             return cached[1]
         scores_dir = _cluster_scores_dir(run_dir)
         if scores_dir is None:
-            raise HTTPException(404, f"No *_clustered_scores.json found under {run!r} (checked scores/ and scores_v2/)")
+            raise HTTPException(
+                404,
+                f"No *_clustered_scores.json found under {run!r} (checked scores/ and scores_v2/)",
+            )
         clusters: dict = {}
         for sf in sorted(scores_dir.glob("*_clustered_scores.json")):
             clusters.update(json.load(open(sf)))
         tsne = _load_cluster_tsne(run)
-        body = build_cluster_html(clusters, tsne, video_base="/video/", frame_base="/frame/", run_label=run)
+        body = build_cluster_html(
+            clusters, tsne, video_base="/video/", frame_base="/frame/", run_label=run
+        )
         cluster_html_cache[run] = (stamp, body)
         n_spans = sum(len(c.get("spans", {})) for c in clusters.values())
-        print(f"[viewer] cluster HTML {len(body)/1e6:.1f} MB run={run} ({len(clusters)} clusters, {n_spans} spans, scores_dir={scores_dir.name}, tsne={'yes' if tsne else 'no'})")
+        print(
+            f"[viewer] cluster HTML {len(body)/1e6:.1f} MB run={run} ({len(clusters)} clusters, {n_spans} spans, scores_dir={scores_dir.name}, tsne={'yes' if tsne else 'no'})"
+        )
         return body
 
     @web.get("/view_clusters", response_class=HTMLResponse)
-    def view_clusters(run: str = Query(..., description="Volume-relative lang-cluster run path")):
+    def view_clusters(
+        run: str = Query(..., description="Volume-relative lang-cluster run path"),
+    ):
         try:
             return _build_cluster_cached(run)
         except HTTPException:
@@ -702,10 +813,10 @@ def viewer():
     @web.get("/health", response_class=PlainTextResponse)
     def health():
         _reload_volumes()
-        n_runs         = len(_list_curation_runs(Path(OUTPUTS_MOUNT)))
-        n_span_runs    = len(_list_span_runs(Path(OUTPUTS_MOUNT)))
+        n_runs = len(_list_curation_runs(Path(OUTPUTS_MOUNT)))
+        n_span_runs = len(_list_span_runs(Path(OUTPUTS_MOUNT)))
         n_cluster_runs = len(_list_cluster_runs(Path(OUTPUTS_MOUNT)))
-        n_mp4          = len(list(Path(PREVIEW_MOUNT).glob("*.mp4")))
+        n_mp4 = len(list(Path(PREVIEW_MOUNT).glob("*.mp4")))
         return f"ok runs={n_runs} span_runs={n_span_runs} cluster_runs={n_cluster_runs} mp4s={n_mp4} cached_html={len(html_cache)}"
 
     @web.get("/episodes", response_class=HTMLResponse)
@@ -746,6 +857,7 @@ def viewer():
     @web.get("/frame/{episode_hash}/{frame_num}")
     def frame(episode_hash: str, frame_num: int):
         import subprocess
+
         from fastapi.responses import Response
 
         safe = Path(episode_hash).name
@@ -757,7 +869,8 @@ def viewer():
             _reload_volumes()
         if jpg.exists():
             return FileResponse(
-                str(jpg), media_type="image/jpeg",
+                str(jpg),
+                media_type="image/jpeg",
                 headers={"Cache-Control": "public, max-age=86400"},
             )
 
@@ -776,10 +889,27 @@ def viewer():
         # to ≤640px (preview popup is 400px, thumbs ~320px) so we don't decode/encode/
         # ship a full-res frame; -nostdin/-loglevel trim per-process overhead.
         result = subprocess.run(
-            ["ffmpeg", "-nostdin", "-loglevel", "error",
-             "-ss", str(frame_num / 30.0), "-i", str(path),
-             "-frames:v", "1", "-vf", "scale='min(640,iw)':-2",
-             "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-ss",
+                str(frame_num / 30.0),
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale='min(640,iw)':-2",
+                "-q:v",
+                "5",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "pipe:1",
+            ],
             capture_output=True,
         )
         if result.returncode != 0 or not result.stdout:
@@ -787,7 +917,8 @@ def viewer():
 
         frame_cache[cache_key] = result.stdout
         return Response(
-            result.stdout, media_type="image/jpeg",
+            result.stdout,
+            media_type="image/jpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
 

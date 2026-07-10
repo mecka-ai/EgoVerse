@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from projectaria_tools.core.sophus import SE3
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 from egomimic.utils.pose_utils import (
     _interpolate_euler,
@@ -31,8 +32,8 @@ from egomimic.utils.pose_utils import (
     _matrix_to_xyz6d,
     _matrix_to_xyzwxyz,
     _matrix_to_xyzypr,
-    _xyz_to_matrix,
     _xyz6d_to_matrix,
+    _xyz_to_matrix,
     _xyzwxyz_to_matrix,
     _xyzypr_to_matrix,
     wxyz_to_xyzw,
@@ -112,7 +113,7 @@ class InterpolatePose(Transform):
     def transform_batch(self, batch: dict) -> dict:
         """Vectorized: (B, H, D) → (B, new_chunk_length, D) after stride."""
         actions = np.asarray(batch[self.action_key])  # (B, H, D)
-        actions = actions[:, :: self.stride, :]        # (B, H//stride, D)
+        actions = actions[:, :: self.stride, :]  # (B, H//stride, D)
         if self.mode == "xyzwxyz":
             if actions.shape[-1] != 7:
                 raise ValueError(
@@ -293,7 +294,9 @@ class ActionChunkCoordinateFrameTransform(Transform):
         """
         batch.update(self.extra_batch_key or {})
         target_world = np.asarray(batch[self.target_world], dtype=np.float64)  # (B, D)
-        chunk_world  = np.asarray(batch[self.chunk_world],  dtype=np.float64)  # (B, H, D) or (B, D)
+        chunk_world = np.asarray(
+            batch[self.chunk_world], dtype=np.float64
+        )  # (B, H, D) or (B, D)
         B = target_world.shape[0]
 
         chunk_3d = chunk_world.ndim == 3
@@ -305,27 +308,29 @@ class ActionChunkCoordinateFrameTransform(Transform):
 
         _to_mat = {
             "xyzwxyz": _xyzwxyz_to_matrix,
-            "xyzypr":  _xyzypr_to_matrix,
-            "xyz":     _xyz_to_matrix,
+            "xyzypr": _xyzypr_to_matrix,
+            "xyz": _xyz_to_matrix,
         }[self.mode]
         _from_mat = {
             "xyzwxyz": _matrix_to_xyzwxyz,
-            "xyzypr":  _matrix_to_xyzypr,
-            "xyz":     _matrix_to_xyz,
+            "xyzypr": _matrix_to_xyzypr,
+            "xyz": _matrix_to_xyz,
         }[self.mode]
-        _tgt_to_mat = _xyzwxyz_to_matrix if target_world.shape[-1] == 7 else _xyzypr_to_matrix
+        _tgt_to_mat = (
+            _xyzwxyz_to_matrix if target_world.shape[-1] == 7 else _xyzypr_to_matrix
+        )
 
         # SE3 inverse: [[R, t], [0,1]]^{-1} = [[R^T, -R^T t], [0, 1]]
         tgt_mats = _tgt_to_mat(target_world)  # (B, 4, 4)
-        R   = tgt_mats[:, :3, :3]             # (B, 3, 3)
-        t   = tgt_mats[:, :3, 3:]             # (B, 3, 1)
-        R_T = R.swapaxes(-1, -2)              # (B, 3, 3)
+        R = tgt_mats[:, :3, :3]  # (B, 3, 3)
+        t = tgt_mats[:, :3, 3:]  # (B, 3, 1)
+        R_T = R.swapaxes(-1, -2)  # (B, 3, 3)
         tgt_inv = np.zeros_like(tgt_mats)
         tgt_inv[:, :3, :3] = R_T
         tgt_inv[:, :3, 3:] = -(R_T @ t)
-        tgt_inv[:, 3, 3]   = 1.0
+        tgt_inv[:, 3, 3] = 1.0
 
-        chunk_mats = _to_mat(chunk_2d)        # (B*H, 4, 4) or (B, 4, 4)
+        chunk_mats = _to_mat(chunk_2d)  # (B*H, 4, 4) or (B, 4, 4)
 
         if chunk_3d:
             chunk_mats = chunk_mats.reshape(B, H, 4, 4)
@@ -334,7 +339,9 @@ class ActionChunkCoordinateFrameTransform(Transform):
             else:
                 result_mats = (tgt_mats[:, None] @ chunk_mats).reshape(B * H, 4, 4)
         else:
-            result_mats = (tgt_inv @ chunk_mats) if self.inverse else (tgt_mats @ chunk_mats)
+            result_mats = (
+                (tgt_inv @ chunk_mats) if self.inverse else (tgt_mats @ chunk_mats)
+            )
 
         result_flat = _from_mat(result_mats)  # (B*H, D) or (B, D)
 
@@ -469,7 +476,10 @@ class PoseCoordinateFrameTransform(Transform):
 
     def transform_batch(self, batch: dict) -> dict:
         """Vectorized: target (B, 7), pose (B, D) → transformed pose (B, D)."""
-        sub = {self.target_world: batch[self.target_world], self.pose_world: batch[self.pose_world]}
+        sub = {
+            self.target_world: batch[self.target_world],
+            self.pose_world: batch[self.pose_world],
+        }
         result = self._chunk_transform.transform_batch(sub)
         batch[self.transformed_key_name] = result[self.transformed_key_name]
         return batch
@@ -805,7 +815,9 @@ class SanitizeQuatPoseChunk(Transform):
     preserving the obs == chunk[0] anchor invariant.
     """
 
-    def __init__(self, chunk_key: str, anchor_key: str | None = None, eps: float = 1e-6):
+    def __init__(
+        self, chunk_key: str, anchor_key: str | None = None, eps: float = 1e-6
+    ):
         self.chunk_key = chunk_key
         self.anchor_key = anchor_key
         self.eps = float(eps)
@@ -860,10 +872,10 @@ class ConsecutiveDeltaChunk(Transform):
                 f"'{self.chunk_key}'"
             )
         width = chunk.shape[-1]
-        mats = _pose_to_matrix_by_width(chunk)              # (T, 4, 4)
-        deltas = _se3_inverse_batch(mats[:-1]) @ mats[1:]   # (T-1, 4, 4)
+        mats = _pose_to_matrix_by_width(chunk)  # (T, 4, 4)
+        deltas = _se3_inverse_batch(mats[:-1]) @ mats[1:]  # (T-1, 4, 4)
         eye = np.broadcast_to(np.eye(4, dtype=mats.dtype), (1, 4, 4))
-        out = np.concatenate([eye, deltas], axis=0)         # (T, 4, 4), A_0 = I
+        out = np.concatenate([eye, deltas], axis=0)  # (T, 4, 4), A_0 = I
         batch[self.output_key] = _matrix_to_pose_by_width(out, width)
         return batch
 
@@ -888,15 +900,17 @@ class PerTimestepCoordinateFrameTransform(Transform):
         inverse: bool = True,
     ):
         if mode != "xyz":
-            raise ValueError("PerTimestepCoordinateFrameTransform supports mode='xyz' only")
+            raise ValueError(
+                "PerTimestepCoordinateFrameTransform supports mode='xyz' only"
+            )
         self.target_chunk = target_chunk
         self.chunk = chunk
         self.transformed_key_name = transformed_key_name
         self.inverse = inverse
 
     def transform(self, batch: dict) -> dict:
-        target = np.asarray(batch[self.target_chunk])   # (T, 6|7|9)
-        points = np.asarray(batch[self.chunk])          # (T, K, 3)
+        target = np.asarray(batch[self.target_chunk])  # (T, 6|7|9)
+        points = np.asarray(batch[self.chunk])  # (T, K, 3)
         if points.ndim != 3 or points.shape[-1] != 3:
             raise ValueError(
                 f"PerTimestepCoordinateFrameTransform expects (T, K, 3) points, got "
@@ -906,7 +920,7 @@ class PerTimestepCoordinateFrameTransform(Transform):
             raise ValueError(
                 f"target/chunk timestep mismatch: {target.shape[0]} vs {points.shape[0]}"
             )
-        mats = _pose_to_matrix_by_width(target)          # (T, 4, 4)
+        mats = _pose_to_matrix_by_width(target)  # (T, 4, 4)
         if self.inverse:
             mats = _se3_inverse_batch(mats)
         R = mats[:, :3, :3]
@@ -930,17 +944,94 @@ class CumulativeComposeChunk(Transform):
         self.output_key = output_key
 
     def transform(self, batch: dict) -> dict:
-        anchor = np.asarray(batch[self.anchor_key])   # (6|7|9,)
-        deltas = np.asarray(batch[self.delta_key])    # (T, 6|7|9)
+        anchor = np.asarray(batch[self.anchor_key])  # (6|7|9,)
+        deltas = np.asarray(batch[self.delta_key])  # (T, 6|7|9)
         width = anchor.shape[-1]
-        anchor_mat = _pose_to_matrix_by_width(anchor[None])[0]   # (4, 4)
-        delta_mats = _pose_to_matrix_by_width(deltas)            # (T, 4, 4)
+        anchor_mat = _pose_to_matrix_by_width(anchor[None])[0]  # (4, 4)
+        delta_mats = _pose_to_matrix_by_width(deltas)  # (T, 4, 4)
         out = np.empty_like(delta_mats)
         running = anchor_mat
         for i in range(delta_mats.shape[0]):
             running = running @ delta_mats[i]
             out[i] = running
         batch[self.output_key] = _matrix_to_pose_by_width(out, width)
+        return batch
+
+
+class ArcLengthResampleChunks(Transform):
+    """Resample chunks at equal ARC-LENGTH spacing over a fixed path distance.
+
+    Distance-based action sampling: instead of a chunk covering a fixed number of
+    frames, it covers a fixed travelled distance (``total_distance`` metres),
+    resampled to ``num_samples`` points equally spaced along the path — so speed
+    and duration are erased and the spatial SHAPE of the motion is retained
+    (the same idea as ActionNorms' arc_length resample, applied to raw chunks).
+
+    The metric is the COMBINED path of ``distance_keys``: the R^{3n} norm of the
+    concatenated translations' per-step deltas (for both wrists: sqrt(|dL|²+|dR|²)).
+    One shared time-warp keeps all keys synchronized. ``pose_keys`` ((T,7) xyzwxyz)
+    are resampled with xyz linear-in-s and rotation slerp-in-s; ``point_keys``
+    ((T,K,3)) linearly-in-s. Zero-motion plateaus (pauses, repeat-padded rows) add
+    no distance and are deduped, so end-of-episode padding is harmless.
+
+    Raises ValueError when the window covers less than ``total_distance`` (a
+    still/pause anchor with no 30 cm of shape) — the dataset's retry-with-random-
+    index fallback then picks a new anchor. Run zero-quat sanitization BEFORE this
+    transform: an all-zero dropout row would otherwise fake a huge jump to the
+    origin and corrupt the metric.
+    """
+
+    def __init__(
+        self,
+        distance_keys: list[str],
+        pose_keys: list[str],
+        point_keys: list[str],
+        total_distance: float,
+        num_samples: int,
+    ):
+        self.distance_keys = list(distance_keys)
+        self.pose_keys = list(pose_keys)
+        self.point_keys = list(point_keys)
+        self.total_distance = float(total_distance)
+        self.num_samples = int(num_samples)
+
+    def transform(self, batch: dict) -> dict:
+        # Combined per-step travelled distance over the distance keys' translations.
+        xyz = np.concatenate(
+            [np.asarray(batch[k], dtype=np.float64)[:, :3] for k in self.distance_keys],
+            axis=-1,
+        )  # (T, 3n)
+        ds = np.linalg.norm(np.diff(xyz, axis=0), axis=-1)  # (T-1,)
+        s = np.concatenate([[0.0], np.cumsum(ds)])  # (T,)
+        if s[-1] < self.total_distance:
+            raise ValueError(
+                f"ArcLengthResampleChunks: window covers {s[-1]:.3f} m "
+                f"< required {self.total_distance:.3f} m (still/pause anchor)"
+            )
+
+        # Equal-arc-length query positions and a strictly-increasing key grid
+        # (dedupe zero-motion steps for interp/slerp validity).
+        u = np.linspace(0.0, self.total_distance, self.num_samples)
+        keep = np.concatenate([[True], ds > 1e-12])
+        s_k = s[keep]
+
+        for k in self.pose_keys:
+            chunk = np.asarray(batch[k], dtype=np.float64)[keep]  # (Tk, 7)
+            xyz_i = np.stack([np.interp(u, s_k, chunk[:, d]) for d in range(3)], axis=1)
+            rots = R.from_quat(chunk[:, [4, 5, 6, 3]])  # wxyz -> xyzw
+            quat_i = Slerp(s_k, rots)(u).as_quat()  # (num_samples, 4) xyzw
+            batch[k] = np.concatenate(
+                [xyz_i, quat_i[:, [3, 0, 1, 2]]], axis=1
+            )  # (num_samples, 7) xyzwxyz
+
+        for k in self.point_keys:
+            pts = np.asarray(batch[k], dtype=np.float64)[keep]  # (Tk, K, 3)
+            flat = pts.reshape(len(s_k), -1)
+            out = np.stack(
+                [np.interp(u, s_k, flat[:, d]) for d in range(flat.shape[1])], axis=1
+            )
+            batch[k] = out.reshape(self.num_samples, *pts.shape[1:])
+
         return batch
 
 

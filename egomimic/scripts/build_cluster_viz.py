@@ -20,6 +20,7 @@ Payload layout: episode hashes and annotation texts are deduplicated into the
 shared ``EPS`` / ``TXTS`` tables; spans and t-SNE points store integer indices
 (``ei`` / ``ti``). For a 60k-span run this halves the embedded-JSON size.
 """
+
 from __future__ import annotations
 
 import json
@@ -234,6 +235,19 @@ const txtOf = ti => TXTS[ti] || '';
 
 const HAS_TSNE = !!(TSNE && TSNE.cid && TSNE.cid.length);
 const IS2D = ((TSNE && TSNE.dims) || 3) === 2;
+
+/* per-span full frame extent — token/chunk-granularity points carry chunk-level
+   windows; clicking any of them should play the WHOLE span's clip */
+const SID_EXT=(()=>{
+  if(!HAS_TSNE||!TSNE.sid) return null;
+  const m={};
+  for(let k=0;k<TSNE.sid.length;k++){
+    const s=TSNE.sid[k], e=m[s];
+    if(e){ if(TSNE.start[k]<e[0])e[0]=TSNE.start[k]; if(TSNE.end[k]>e[1])e[1]=TSNE.end[k]; }
+    else m[s]=[TSNE.start[k],TSNE.end[k]];
+  }
+  return m;
+})();
 const ALL_CID = Object.keys(CLUSTERS).sort((a,b)=>
   parseInt(a.replace('cluster_','')) - parseInt(b.replace('cluster_',''))
 );
@@ -481,7 +495,10 @@ function renderTsne(preserveToggles){
       if(el._drag) return;
       const p=ev.points[0]; if(!p||p.curveNumber!==0) return;   // only ACTIVE trace is clickable
       const k=p.customdata[0];
-      const ep=epOf(TSNE.ei[k]), start=TSNE.start[k], end=TSNE.end[k], txt=txtOf(TSNE.ti[k]);
+      const ep=epOf(TSNE.ei[k]), txt=txtOf(TSNE.ti[k]);
+      // play the whole span's clip, not just this point's chunk window
+      const ext=SID_EXT?SID_EXT[TSNE.sid[k]]:null;
+      const start=ext?ext[0]:TSNE.start[k], end=ext?ext[1]:TSNE.end[k];
       const sc=isFinite(TSNE.score[k])?TSNE.score[k].toFixed(3):'?';
       document.getElementById('info').innerHTML=
         `<b>cluster_${TSNE.cid[k]}</b> &middot; f<b>${start}&ndash;${end}</b> &middot; ${sc}`+
@@ -917,13 +934,15 @@ def build_cluster_html(
         for s in c.get("spans", {}).values():
             raw = s.get("score")
             score_f = float(raw) if raw is not None else float("nan")
-            spans_list.append({
-                "ei":    _index_of(eps, eps_idx, s["episode"]),
-                "ti":    _index_of(txts, txts_idx, str(s.get("text", ""))[:200]),
-                "start": int(s["start"]),
-                "end":   int(s["end"]),
-                "score": score_f if score_f == score_f else 0.0,  # nan→0 for JSON
-            })
+            spans_list.append(
+                {
+                    "ei": _index_of(eps, eps_idx, s["episode"]),
+                    "ti": _index_of(txts, txts_idx, str(s.get("text", ""))[:200]),
+                    "start": int(s["start"]),
+                    "end": int(s["end"]),
+                    "score": score_f if score_f == score_f else 0.0,  # nan→0 for JSON
+                }
+            )
         clusters_js[cluster_id] = {
             "label": c.get("label", cluster_id),
             "spans": sorted(spans_list, key=lambda x: -x["score"]),
@@ -932,37 +951,40 @@ def build_cluster_html(
     tsne_js: dict = {}
     if tsne:
         tsne_js = {
-            "cid":    tsne["cid"],
-            "score":  tsne["score"],
-            "start":  tsne["start"],
-            "end":    tsne["end"],
-            "ei":     [_index_of(eps, eps_idx, e) for e in tsne["ep"]],
-            "ti":     [_index_of(txts, txts_idx, t) for t in tsne["txt"]],
-            "dims":   tsne.get("dims", 3),
+            "cid": tsne["cid"],
+            "score": tsne["score"],
+            "start": tsne["start"],
+            "end": tsne["end"],
+            "ei": [_index_of(eps, eps_idx, e) for e in tsne["ep"]],
+            "ti": [_index_of(txts, txts_idx, t) for t in tsne["txt"]],
+            "dims": tsne.get("dims", 3),
             "method": tsne.get("method", "tsne"),
         }
-        # Span identity + token index. Preferred source: the explicit per-point
-        # 'sid' (span id string) and 'tok' (position within chunk, -1 = n/a) fields
-        # written by the token_viz pipeline. Fallback for older runs: parse
-        # '<span_id>#t<k>' point ids (k = flat token counter, position = k % ntok).
-        if tsne.get("sid") and any(tsne["sid"]):
+        # Span identity + token index. Explicit per-point fields (token-viz pipeline:
+        # tok = chunk position, sid = span-id string) take precedence; otherwise both
+        # are derived from '<span_id>#t<k>' ids (k % ntok = position within chunk).
+        ntok = int(tsne.get("ntok", 25))
+        sids_raw = tsne.get("sid")
+        toks = [int(t) for t in tsne["tok"]] if tsne.get("tok") else None
+        if sids_raw and any(sids_raw):
             sid_idx: dict = {}
-            tsne_js["sid"] = [sid_idx.setdefault(s, len(sid_idx)) for s in tsne["sid"]]
-            toks = [int(t) for t in (tsne.get("tok") or [])]
-            if any(t >= 0 for t in toks):
-                tsne_js["tok"] = toks
-                tsne_js["ntok"] = int(tsne.get("ntok") or (max(toks) + 1))
+            tsne_js["sid"] = [
+                sid_idx.setdefault(s or f"__pt{i}", len(sid_idx))
+                for i, s in enumerate(sids_raw)
+            ]
         elif tsne.get("id"):
             sid_idx = {}
-            sids, toks = [], []
+            sids, id_toks = [], []
             for pid in tsne["id"]:
                 base, _, tsuf = pid.partition("#t")
                 sids.append(sid_idx.setdefault(base, len(sid_idx)))
-                toks.append(int(tsuf) % int(tsne.get("ntok", 25)) if tsuf.isdigit() else -1)
+                id_toks.append(int(tsuf) % ntok if tsuf.isdigit() else -1)
             tsne_js["sid"] = sids
-            if any(t >= 0 for t in toks):
-                tsne_js["tok"] = toks
-                tsne_js["ntok"] = int(tsne.get("ntok", 25))
+            if toks is None and any(t >= 0 for t in id_toks):
+                toks = id_toks
+        if toks is not None and any(t >= 0 for t in toks):
+            tsne_js["tok"] = toks
+            tsne_js["ntok"] = ntok
         if tsne.get("nch"):
             tsne_js["nch"] = tsne["nch"]
         if tsne.get("metrics"):
@@ -973,7 +995,9 @@ def build_cluster_html(
             if mode in tsne:
                 tsne_js[mode] = tsne[mode]
 
-    run_escaped = run_label.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+    run_escaped = (
+        run_label.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+    )
     run_nav = (
         f'<span style="color:#9aa">{run_label}</span>'
         f' &middot; <a href="/">change run</a>'
@@ -982,15 +1006,14 @@ def build_cluster_html(
 
     j = lambda o: json.dumps(o, separators=(",", ":"))
     return (
-        _TEMPLATE
-        .replace("__EPS__",                j(eps))
-        .replace("__TXTS__",               j(txts))
-        .replace("__CLUSTERS__",           j(clusters_js))
-        .replace("__TSNE__",               j(tsne_js))
-        .replace("__VIDEO_BASE__",         video_base)
-        .replace("__FRAME_BASE__",         frame_base)
-        .replace("__RUN_LABEL_ESCAPED__",  run_escaped)
-        .replace("__RUN_LABEL__",          run_nav)
+        _TEMPLATE.replace("__EPS__", j(eps))
+        .replace("__TXTS__", j(txts))
+        .replace("__CLUSTERS__", j(clusters_js))
+        .replace("__TSNE__", j(tsne_js))
+        .replace("__VIDEO_BASE__", video_base)
+        .replace("__FRAME_BASE__", frame_base)
+        .replace("__RUN_LABEL_ESCAPED__", run_escaped)
+        .replace("__RUN_LABEL__", run_nav)
     )
 
 
@@ -1011,29 +1034,36 @@ if __name__ == "__main__":
         raw = json.load(open(args.tsne))
         spans = raw["spans"]
         tsne = {
-            "cid":    [s["cluster"] for s in spans],
-            "score":  [s.get("score") or 0.0 for s in spans],
-            "start":  [int(s.get("start", 0)) for s in spans],
-            "end":    [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
-            "ep":     [s.get("ep", s.get("episode", "")) for s in spans],
-            "txt":    [str(s.get("text", ""))[:200] for s in spans],
-            "id":     [str(s.get("id", "")) for s in spans],
-            "dims":   int(raw.get("dims", 3)),
+            "cid": [s["cluster"] for s in spans],
+            "score": [s.get("score") or 0.0 for s in spans],
+            "start": [int(s.get("start", 0)) for s in spans],
+            "end": [int(s.get("end", s.get("start", 0) + 1)) for s in spans],
+            "ep": [s.get("ep", s.get("episode", "")) for s in spans],
+            "txt": [str(s.get("text", ""))[:200] for s in spans],
+            "id": [str(s.get("id", "")) for s in spans],
+            "dims": int(raw.get("dims", 3)),
             "method": str(raw.get("method", "tsne")),
-            "ntok":   int(raw.get("ntok", 25)),
+            "ntok": int(raw.get("ntok", 25)),
         }
         if raw.get("metrics"):
             tsne["metrics"] = raw["metrics"]
-        if raw.get("level"):
-            tsne["level"] = str(raw["level"])
+        if raw.get("level") or raw.get("granularity"):
+            tsne["level"] = str(raw.get("level") or raw["granularity"])
+        if any("tok_idx" in s for s in spans):
+            tsne["tok"] = [int(s.get("tok_idx", -1)) for s in spans]
+        if any(s.get("sid") for s in spans):
+            tsne["sid"] = [str(s.get("sid", "")) for s in spans]
         if any("n_chunks" in s for s in spans):
             tsne["nch"] = [int(s.get("n_chunks", 0)) for s in spans]
         for mode in ("state", "action", "language"):
             if mode in raw:
-                tsne[mode] = {k: raw[mode][k] for k in raw[mode] if k in ("x", "y", "z")}
+                tsne[mode] = {
+                    k: raw[mode][k] for k in raw[mode] if k in ("x", "y", "z")
+                }
 
     html = build_cluster_html(
-        data, tsne,
+        data,
+        tsne,
         video_base=args.video_base,
         frame_base=args.frame_base,
         run_label=args.clustered_scores_json,
