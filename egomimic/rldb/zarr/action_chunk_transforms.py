@@ -958,6 +958,118 @@ class CumulativeComposeChunk(Transform):
         return batch
 
 
+class ArcTokenizer(Transform):
+    """Arc Tokenizer: sequence actions by PROGRESS (distance) instead of time.
+
+    Faithful implementation of the Arc Tokenizer algorithm for one anchor window:
+      1. Cumulative arc length s over the window (combined ``distance_keys``
+         translation metric, sqrt(|dL|²+|dR|²) per step).
+      2. ``s_end = min(delta_s, s_T)`` — the token covers up to ``delta_s`` metres
+         of travel; ``N_t`` = frames needed to cover it.
+      3. STILL branch — if ``s_end < eps`` (no motion available) or
+         ``N_t > n_max`` (motion too slow / pause): the token is the anchor pose
+         repeated ``num_waypoints`` times with velocity 0. Pauses become a valid,
+         representable token instead of a rejected sample.
+      4. Else RESAMPLE the spatial path at ``linspace(0, s_end, num_waypoints)``
+         in arc length (xyz linear-in-s, rotation slerp-in-s, points linear-in-s)
+         — pure SHAPE, time removed — and compute velocity features
+         (``velocity_mode``: "per_waypoint" = local speed ds/dframe at each
+         waypoint; "mean" = scalar mean speed broadcast). Partial paths near the
+         data end (eps <= s_end < delta_s) are resampled, not rejected.
+      5. Pack: resampled keys are written back; ``speed_key`` gets the
+         (num_waypoints, 1) velocity feature to be concatenated downstream.
+
+    Run zero-quat sanitization BEFORE this transform: an all-zero dropout row
+    would otherwise fake a huge jump to the origin and corrupt the metric.
+    Zero-motion plateaus / repeat-padding add no distance and are deduped.
+    """
+
+    def __init__(
+        self,
+        distance_keys: list[str],
+        pose_keys: list[str],
+        point_keys: list[str],
+        speed_key: str,
+        delta_s: float = 0.30,
+        num_waypoints: int = 100,
+        eps: float = 0.03,
+        n_max: int = 450,
+        velocity_mode: Literal["per_waypoint", "mean"] = "per_waypoint",
+    ):
+        self.distance_keys = list(distance_keys)
+        self.pose_keys = list(pose_keys)
+        self.point_keys = list(point_keys)
+        self.speed_key = speed_key
+        self.delta_s = float(delta_s)
+        self.num_waypoints = int(num_waypoints)
+        self.eps = float(eps)
+        self.n_max = int(n_max)
+        self.velocity_mode = velocity_mode
+
+    def transform(self, batch: dict) -> dict:
+        M = self.num_waypoints
+        xyz = np.concatenate(
+            [np.asarray(batch[k], dtype=np.float64)[:, :3] for k in self.distance_keys],
+            axis=-1,
+        )  # (T, 3n)
+        ds = np.linalg.norm(np.diff(xyz, axis=0), axis=-1)  # (T-1,)
+        s = np.concatenate([[0.0], np.cumsum(ds)])  # (T,)
+        s_end = min(self.delta_s, float(s[-1]))
+        # Frames needed to FIRST reach s_end (searchsorted-left, not right: a
+        # zero-motion plateau sitting exactly at s_end must not inflate N_t —
+        # the shape up to s_end is still covered by the frames before it).
+        n_t = int(np.searchsorted(s, s_end, side="left")) + 1
+
+        if s_end < self.eps or n_t > self.n_max:
+            # STILL / pause token: repeat the anchor, zero velocity.
+            for k in self.pose_keys:
+                anchor = np.asarray(batch[k], dtype=np.float64)[0:1]
+                batch[k] = np.repeat(anchor, M, axis=0)
+            for k in self.point_keys:
+                anchor = np.asarray(batch[k], dtype=np.float64)[0:1]
+                batch[k] = np.repeat(anchor, M, axis=0)
+            batch[self.speed_key] = np.zeros((M, 1), dtype=np.float64)
+            return batch
+
+        # Strictly-increasing arc grid (dedupe zero-motion steps).
+        keep = np.concatenate([[True], ds > 1e-12])
+        s_k = s[keep]
+        f_k = np.arange(len(s))[keep].astype(np.float64)  # frame index per kept row
+        u = np.linspace(0.0, s_end, M)
+
+        for k in self.pose_keys:
+            chunk = np.asarray(batch[k], dtype=np.float64)[keep]  # (Tk, 7)
+            xyz_i = np.stack([np.interp(u, s_k, chunk[:, d]) for d in range(3)], axis=1)
+            rots = R.from_quat(chunk[:, [4, 5, 6, 3]])  # wxyz -> xyzw
+            quat_i = Slerp(s_k, rots)(u).as_quat()
+            batch[k] = np.concatenate([xyz_i, quat_i[:, [3, 0, 1, 2]]], axis=1)
+
+        for k in self.point_keys:
+            pts = np.asarray(batch[k], dtype=np.float64)[keep]  # (Tk, K, 3)
+            flat = pts.reshape(len(s_k), -1)
+            out = np.stack(
+                [np.interp(u, s_k, flat[:, d]) for d in range(flat.shape[1])],
+                axis=1,
+            )
+            batch[k] = out.reshape(M, *pts.shape[1:])
+
+        # Velocity features: frame-time at each waypoint via the inverse map
+        # t(s), then local speed ds/dframe.
+        t_m = np.interp(u, s_k, f_k)  # (M,) nondecreasing
+        if self.velocity_mode == "mean":
+            speed = np.full(M, s_end / max(n_t - 1, 1))
+        else:  # per_waypoint: central differences, one-sided at the ends
+            speed = np.empty(M)
+            dt = np.maximum(t_m[1:] - t_m[:-1], 1e-9)
+            du = u[1:] - u[:-1]
+            inner = (u[2:] - u[:-2]) / np.maximum(t_m[2:] - t_m[:-2], 1e-9)
+            speed[1:-1] = inner
+            speed[0] = du[0] / dt[0]
+            speed[-1] = du[-1] / dt[-1]
+        batch[self.speed_key] = speed[:, None]  # (M, 1) m/frame
+        return batch
+
+
 class ArcLengthResampleChunks(Transform):
     """Resample chunks at equal ARC-LENGTH spacing over a fixed path distance.
 
