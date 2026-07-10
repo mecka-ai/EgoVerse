@@ -29,11 +29,3 @@ try:
     )
 except ImportError:
     pass  # quest submodule not initialized (init_submodules=quest) — non-quest run
-
-try:
-    # ArcTok's network internals come from the quest submodule (SkillVAE fork),
-    # so the same init_submodules=quest guard applies.
-    from egomimic.algo.arc_tokenizer import ArcTok as ArcTok
-    from egomimic.algo.arc_tokenizer import ArcTokenizerTrainer as ArcTokenizerTrainer
-except ImportError:
-    pass  # quest submodule not initialized — non-arctok run
