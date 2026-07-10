@@ -1,0 +1,32 @@
+# Visualization for ARC TOKENIZER actions (49-dim). The revert splits off the speed
+# channel, re-anchors the anchor-frame palm poses by the head-frame wrist anchor and
+# each waypoint's fingertips by that waypoint's recovered wrist pose. Overlays show
+# the 30 cm path shape; STILL tokens draw as a stationary hand (correct).
+eva_bimanual:
+  _target_: egomimic.rldb.embodiment.eva.Eva.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+aria_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Aria.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
+mecka_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Mecka.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: fingertips
+  transform_list:
+    _target_: egomimic.rldb.embodiment.human._build_mecka_revert_wf6d_ft_arctok_transform_list
+    # process_batch_for_training maps observations.state.ee_pose -> keyname "ee_pose"
+    obs_key: "ee_pose"
+scale_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Scale.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
