@@ -106,6 +106,9 @@ class TokenVizSettings:
     arclen_distance: float | None = None
     cap: int = 60000
     balance: str = "span"
+    # chunk-level embedding: "mean" (per-position standardize → token mean) or
+    # "concat" (flatten the waypoint sequence — for pure-geometry arc tokens).
+    chunk_pool: str = "mean"
     center_by_position: bool = False
     l2norm: bool = False
     whiten: bool = False
@@ -343,6 +346,7 @@ def select_token_viz_settings(cfg: Any) -> TokenVizSettings:
                          if block.get("arclen_distance") is not None else None),
         cap=int(block.get("cap", d.cap)),
         balance=str(block.get("balance", d.balance)).lower().strip(),
+        chunk_pool=str(block.get("chunk_pool", d.chunk_pool)).lower().strip(),
         center_by_position=bool(pre.get("center_by_position", d.center_by_position)),
         l2norm=bool(pre.get("l2norm", d.l2norm)),
         whiten=bool(pre.get("whiten", d.whiten)),

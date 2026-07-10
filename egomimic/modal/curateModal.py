@@ -218,26 +218,37 @@ def _build_quest_token_tsne(
         "ckpt": str(ae.checkpoint_path), "horizon": H,
         "span_resample": tvs.span_resample,
     })
-    cached = tv.cache_load_npz(cache_dir, "tokens", tok_key)
-    if cached is not None:
-        emb = cached["emb"].astype(_np.float32)
-        codes = cached["codes"] if "codes" in cached else None
-        codebook_size = int(cached["codebook_size"]) if "codebook_size" in cached else None
-        print(f"{tag} QueST: token cache HIT ({tok_key}) → {emb.shape}")
+    if ae.type == "arc_identity":
+        # Pure (non-learned) Arc Tokenizer: the transform's waypoints ARE the tokens —
+        # the "embedding" is the identity on the (Nc, num_waypoints, D) chunk output.
+        emb, codes, codebook_size = chunks.astype(_np.float32), None, None
+        print(f"{tag} arc_identity: waypoints as tokens → {emb.shape}")
     else:
-        qt = QuestTokenEmbedder(ae.checkpoint_path, device=device)
-        qt.fit()
-        emb, codes, codebook_size = qt.embed_chunks_with_codes(chunks)
-        if cache_dir:
-            extra = {} if codes is None else {"codes": codes, "codebook_size": codebook_size}
-            p = tv.cache_save_npz(cache_dir, "tokens", tok_key, emb=emb, **extra)
-            print(f"{tag} QueST: token cache write → {p}")
+        cached = tv.cache_load_npz(cache_dir, "tokens", tok_key)
+        if cached is not None:
+            emb = cached["emb"].astype(_np.float32)
+            codes = cached["codes"] if "codes" in cached else None
+            codebook_size = int(cached["codebook_size"]) if "codebook_size" in cached else None
+            print(f"{tag} QueST: token cache HIT ({tok_key}) → {emb.shape}")
+        else:
+            qt = QuestTokenEmbedder(ae.checkpoint_path, device=device)
+            qt.fit()
+            emb, codes, codebook_size = qt.embed_chunks_with_codes(chunks)
+            if cache_dir:
+                extra = {} if codes is None else {"codes": codes, "codebook_size": codebook_size}
+                p = tv.cache_save_npz(cache_dir, "tokens", tok_key, emb=emb, **extra)
+                print(f"{tag} QueST: token cache write → {p}")
     ntok = emb.shape[1]
     print(f"{tag} QueST: horizon={H}, {Nc} chunks × {ntok} tok from {len(span_chunks)} spans "
           f"(granularity={tvs.granularity})")
 
-    # 4. Granularity pooling (the one pooling path) + point metadata.
-    chunk_emb = tv.pool_chunks(emb)                              # (Nc, D)
+    # 4. Granularity pooling + point metadata. chunk_pool=concat keeps the raw
+    # waypoint sequence as one flat vector per chunk (for pure-geometry tokens);
+    # mean is the standardize→mean path.
+    if tvs.chunk_pool == "concat":
+        chunk_emb = emb.reshape(len(emb), -1).astype(_np.float32)  # (Nc, ntok*D)
+    else:
+        chunk_emb = tv.pool_chunks(emb)                            # (Nc, D)
     span_emb, span_order = tv.pool_spans(chunk_emb, span_chunks)  # (Ns, D)
     if tvs.granularity == "token":
         X = emb.reshape(-1, emb.shape[2]).astype(_np.float32)
@@ -659,7 +670,7 @@ def _score_task_clustered(
         text_embeddings = lemb.embed(span_texts)
 
     from omegaconf import OmegaConf as _OC2
-    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type == "quest_tokens"
+    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type in ("quest_tokens", "arc_identity")
     t_ksg = _time.perf_counter()
     if naive_parse:
         from egomimic.curation.naive_lang import naive_language_clusters
@@ -702,7 +713,7 @@ def _score_task_clustered(
 
     # QueST token mode: one point per QueST token (multiple per span, variable by span
     # length), colored by the span's language cluster. Distinct token-level t-SNE artifact.
-    if ae.type == "quest_tokens":
+    if ae.type in ("quest_tokens", "arc_identity"):
         _build_quest_token_tsne(
             cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
             output_dir, task_name, tag, device, select_seed(cfg),

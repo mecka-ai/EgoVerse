@@ -29,6 +29,7 @@ token_viz:
   arclen_distance: null # metres per chunk for keymap *_arclen modes (e.g. 0.30)
   cap: 60000
   balance: span       # span | cluster | none
+  chunk_pool: mean    # mean | concat (concat: flatten waypoints — pure arc tokens)
   preproc:
     center_by_position: false  # token granularity: subtract per-token-position mean
     l2norm: false

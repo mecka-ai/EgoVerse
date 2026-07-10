@@ -352,6 +352,7 @@ class Mecka(Human):
             "cartesian_wristframe_6d",
             "cartesian_wristframe_6d_fingertips_nointerp",
         ],
+        **arctok_kwargs,
     ) -> list[Transform]:
         if mode == "cartesian":
             return _build_aria_cartesian_bimanual_transform_list(
@@ -386,7 +387,10 @@ class Mecka(Human):
             # ARC TOKENIZER: progress-based sampling (30 cm / token, 100 waypoints)
             # with a STILL branch for pauses (no rejection) and packed per-waypoint
             # velocity features. Shape-first: 48 spatial dims + 1 speed dim = 49.
-            return _build_mecka_wf6d_fingertips_arctok_transform_list()
+            # arctok_kwargs (delta_s, num_waypoints, eps, n_max, velocity_mode)
+            # forward straight to the ArcTokenizer — e.g. hydra override
+            # data.…transform_list.delta_s=1.23 …transform_list.num_waypoints=5.
+            return _build_mecka_wf6d_fingertips_arctok_transform_list(**arctok_kwargs)
 
     @classmethod
     def get_keymap(
