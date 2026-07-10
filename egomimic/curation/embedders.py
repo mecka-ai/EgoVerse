@@ -1120,7 +1120,17 @@ class TCNActionEmbedder:
         self._model.nets.eval()
         for p in self._model.nets.parameters():
             p.requires_grad_(False)
-        self.latent_dim = int(self._model.nets["autoencoder"].latent_dim)
+        # Latent width: TemporalCNNAutoencoderTrainer keeps it on nets["autoencoder"]
+        # .latent_dim; ActionContrastiveTrainer on nets["encoder"].embed_dim.
+        nets = self._model.nets
+        if "autoencoder" in nets:
+            self.latent_dim = int(nets["autoencoder"].latent_dim)
+        elif "encoder" in nets:
+            self.latent_dim = int(nets["encoder"].embed_dim)
+        else:
+            raise KeyError(
+                f"no autoencoder/encoder net in checkpoint (nets: {list(nets.keys())})"
+            )
         self._fitted = True
         logger.info(
             "TCNActionEmbedder: ready, latent_dim=%d, norms=%s",
