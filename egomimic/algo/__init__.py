@@ -13,13 +13,27 @@ from egomimic.algo.hpt import HPT as HPT
 # (egomimic.algo.oat_tokenizer.OATTokenizerTrainer), so the tokenizer run does
 # not rely on these re-exports.
 try:
+    from egomimic.algo.autoregressive import (
+        AutoregressivePolicy as AutoregressivePolicy,
+    )
+    from egomimic.algo.autoregressive import (
+        oattok_from_egomimic_lightning_ckpt as oattok_from_egomimic_lightning_ckpt,
+    )
     from egomimic.algo.oat_tokenizer import OATTokenizerTrainer as OATTokenizerTrainer
-    from egomimic.algo.autoregressive import AutoregressivePolicy as AutoregressivePolicy
-    from egomimic.algo.autoregressive import oattok_from_egomimic_lightning_ckpt as oattok_from_egomimic_lightning_ckpt
 except ImportError:
     pass  # oat submodule not initialized (init_submodules=false) — non-oat run
 
 try:
-    from egomimic.algo.quest_tokenizer import QuestTokenizerTrainer as QuestTokenizerTrainer
+    from egomimic.algo.quest_tokenizer import (
+        QuestTokenizerTrainer as QuestTokenizerTrainer,
+    )
 except ImportError:
     pass  # quest submodule not initialized (init_submodules=quest) — non-quest run
+
+try:
+    # ArcTok's network internals come from the quest submodule (SkillVAE fork),
+    # so the same init_submodules=quest guard applies.
+    from egomimic.algo.arc_tokenizer import ArcTok as ArcTok
+    from egomimic.algo.arc_tokenizer import ArcTokenizerTrainer as ArcTokenizerTrainer
+except ImportError:
+    pass  # quest submodule not initialized — non-arctok run
