@@ -144,6 +144,8 @@ def resample_sequence(seq: np.ndarray, L: int) -> np.ndarray:
 # 2. Chunk read — spawn process pool, per-episode cache, per-episode slicing
 # ---------------------------------------------------------------------------
 
+_ARC_MAX_FRAMES = 450  # ArcTokenizer n_max: max frames per arc window (STILL-token cap)
+
 _W: dict = {}  # per-worker-process state (set by _worker_init)
 
 
@@ -281,7 +283,9 @@ def _worker_read(job):
                 while True:
                     f = int(kept[pos])
                     end = int(np.searchsorted(s_cum, s_cum[min(f, len(s_cum) - 1)] + arclen, side="left"))
-                    end = min(max(end, f + 1), len(s_cum) - 1)
+                    # ArcTokenizer n_max bound: slower-than-cap anchors become STILL
+                    # tokens, so a chunk never spans more than _ARC_MAX_FRAMES frames.
+                    end = min(max(end, f + 1), f + _ARC_MAX_FRAMES, len(s_cum) - 1)
                     key = (f, end)
                     if key not in chunks:
                         chunks[key] = _row_chunk(pos)
