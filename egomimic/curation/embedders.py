@@ -1126,7 +1126,7 @@ class TCNActionEmbedder:
         if "autoencoder" in nets:
             self.latent_dim = int(nets["autoencoder"].latent_dim)
         elif "encoder" in nets:
-            self.latent_dim = int(nets["encoder"].embed_dim)
+            self.latent_dim = int(nets["encoder"].to_embed.out_features)
         else:
             raise KeyError(
                 f"no autoencoder/encoder net in checkpoint (nets: {list(nets.keys())})"
