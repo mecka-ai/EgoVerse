@@ -1,0 +1,45 @@
+# InfoNCE self-supervised action-segment encoder (SimCLR-style, no labels).
+# Two augmented views per annotation span (crop / shared-hand rotation / noise +
+# ActionNorms); NT-Xent pulls views together, pushes other spans apart — the
+# embedding aligns segments by bimanual MOTION SHAPE across episodes.
+#
+#   python egomimic/modal/trainModal.py \
+#       model=action_contrastive data=span_action_contrastive_zarr \
+#       trainer=ddp_modal logger=wandb \
+#       evaluator=eval_action_contrastive "~evaluator@train_viz_evaluator" \
+#       name=action_nce description=preann199 \
+#       trainer.check_val_every_n_epoch=30 callbacks.model_checkpoint.every_n_epochs=30 \
+#       +modal_gpu=L40S +modal_cpu=8 +modal_memory_gb=32 +modal_volume=mecka_data_v2 \
+#       init_submodules=false reject_outliers=false launch_params.gpus_per_node=1
+#
+# Watch in W&B: Train/..retrieval_acc should climb toward 1; ..emb_std is the
+# collapse alarm (near 0 = every segment maps to one point); pos_sim >> neg_sim.
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+
+robomimic_model:
+  _target_: egomimic.algo.action_contrastive.ActionContrastiveTrainer
+  data_schematic: _${data.dataset.data_schematic}
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  temperature: 0.15
+
+  encoder:
+    _target_: egomimic.algo.action_contrastive.ActionEncoderTCN
+    action_dim: 12          # bimanual cartesian [L xyz ypr | R xyz ypr]
+    seq_len: 100            # must match data ActionNorms resample_len
+    channels: [64, 128, 256]
+    kernel_size: 5
+    embed_dim: 128          # backbone embedding (downstream / curation)
+    proj_dim: 128           # projection head output (loss only)
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.95]
+
+scheduler: null

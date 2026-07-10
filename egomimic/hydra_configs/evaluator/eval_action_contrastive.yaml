@@ -1,0 +1,3 @@
+# Minimal evaluator for the InfoNCE action encoder: enables Valid/ logging
+# (InfoNCE loss + pos_sim / neg_sim / retrieval_acc / emb_std on held-out spans).
+_target_: egomimic.eval.eval_action_contrastive.EvalActionContrastive

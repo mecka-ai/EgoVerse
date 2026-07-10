@@ -1,5 +1,0 @@
-# Validation evaluator for the Arc Tokenizer. Reuses the tokenizer video evaluator
-# (ArcTokenizerTrainer exposes the same interface: forward_eval, ac_keys_by_id,
-# viz_func, data_schematic). Pair with visualization=fingertips_wrist_6d_arctok
-# so the revert re-anchors palm+tips to the camera frame before drawing.
-_target_: egomimic.eval.eval_tokenizer_video.EvalTokenizerVideo

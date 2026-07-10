@@ -1,3 +1,0 @@
-# Train-viz leg (dataloader_idx=1) for the Arc Tokenizer — same overlay logic,
-# writes to videos_train_viz/ under train_viz/Valid/ metric keys.
-_target_: egomimic.eval.eval_tokenizer_video.TrainVizTokenizerEvalVideo
