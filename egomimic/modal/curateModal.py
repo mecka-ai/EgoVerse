@@ -198,15 +198,38 @@ def _build_quest_token_tsne(
     dims = int(_OCq.select(cfg, "model.projection_dims", default=3))
     cache_dir = tvs.cache_dir if tvs.cache else ""
 
-    # 1+2. Chunk plan + read (snap-to-full-chunk, dedupe, per-episode cache, process pool).
-    ds_cfg = next(iter(cfg.data.train_datasets.values()))
-    resolver_cfg = _OCq.to_container(ds_cfg.resolver, resolve=True)
-    resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match the latent store)
-    chunks, chunk_ep, chunk_frame, chunk_end, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
-        resolver_cfg, CFG.remote_repo_dir, span_meta, H, cache_dir, tag,
-        span_resample=tvs.span_resample, arclen_distance=tvs.arclen_distance,
-    )
-    Nc = len(chunks)
+    if ae.type == "span_encoder":
+        # Span-trajectory encoder (e.g. the InfoNCE ActionContrastiveTrainer): one raw
+        # executed trajectory per span -> ActionNorms (must match training's norms
+        # block) -> model.encode -> ONE embedding per span, treated as a single-token
+        # "chunk" spanning exactly the annotation (clip = the span itself).
+        from egomimic.curation.embedders import TCNActionEmbedder
+        trajectories = _read_span_action_trajectories(cfg, span_meta, tag)
+        enc = TCNActionEmbedder(ae.checkpoint_path, norms=ae.norms, device=device)
+        enc.fit()
+        span_vecs = enc.embed_spans(trajectories)            # (Ns, E)
+        emb = span_vecs[:, None, :].astype(_np.float32)      # one token per span
+        codes, codebook_size = None, None
+        chunks = emb  # unused beyond counting
+        chunk_ep = [m["episode"] for m in span_meta]
+        chunk_frame = _np.asarray([m["start"] for m in span_meta], dtype=_np.int32)
+        chunk_end = _np.asarray([m["end"] for m in span_meta], dtype=_np.int32)
+        chunk_owner = _np.arange(len(span_meta), dtype=_np.int32)
+        span_chunks = {i: [i] for i in range(len(span_meta))}
+        read_info = {"data_tag": "span_encoder", "failed": [], "spans_lost": 0,
+                     "snapped": 0, "dropped_old": 0, "deduped": 0}
+        Nc = len(emb)
+        print(f"{tag} span_encoder: {Nc} span embeddings ({emb.shape[2]}-dim) from {ae.checkpoint_path}")
+    else:
+        # 1+2. Chunk plan + read (snap-to-full-chunk, dedupe, per-episode cache, process pool).
+        ds_cfg = next(iter(cfg.data.train_datasets.values()))
+        resolver_cfg = _OCq.to_container(ds_cfg.resolver, resolve=True)
+        resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match the latent store)
+        chunks, chunk_ep, chunk_frame, chunk_end, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
+            resolver_cfg, CFG.remote_repo_dir, span_meta, H, cache_dir, tag,
+            span_resample=tvs.span_resample, arclen_distance=tvs.arclen_distance,
+        )
+        Nc = len(chunks)
 
     # 3. QueST encode + FSQ codes (cached on chunk identity + checkpoint + horizon).
     ep_order = sorted(set(chunk_ep))
@@ -218,7 +241,9 @@ def _build_quest_token_tsne(
         "ckpt": str(ae.checkpoint_path), "horizon": H,
         "span_resample": tvs.span_resample,
     })
-    if ae.type == "arc_identity":
+    if ae.type == "span_encoder":
+        pass  # already embedded above
+    elif ae.type == "arc_identity":
         # Pure (non-learned) Arc Tokenizer: the transform's waypoints ARE the tokens —
         # the "embedding" is the identity on the (Nc, num_waypoints, D) chunk output.
         emb, codes, codebook_size = chunks.astype(_np.float32), None, None
@@ -670,7 +695,7 @@ def _score_task_clustered(
         text_embeddings = lemb.embed(span_texts)
 
     from omegaconf import OmegaConf as _OC2
-    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type in ("quest_tokens", "arc_identity")
+    disable_scoring = bool(_OC2.select(cfg, "model.cluster_scoring.disable", default=False)) or ae.type in ("quest_tokens", "arc_identity", "span_encoder")
     t_ksg = _time.perf_counter()
     if naive_parse:
         from egomimic.curation.naive_lang import naive_language_clusters
@@ -713,7 +738,7 @@ def _score_task_clustered(
 
     # QueST token mode: one point per QueST token (multiple per span, variable by span
     # length), colored by the span's language cluster. Distinct token-level t-SNE artifact.
-    if ae.type in ("quest_tokens", "arc_identity"):
+    if ae.type in ("quest_tokens", "arc_identity", "span_encoder"):
         _build_quest_token_tsne(
             cfg, span_meta, span_ids, span_cluster, cluster_labels, ae,
             output_dir, task_name, tag, device, select_seed(cfg),
