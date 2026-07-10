@@ -6,8 +6,8 @@ from typing import Literal
 from egomimic.rldb.embodiment.embodiment import Embodiment
 from egomimic.rldb.zarr.action_chunk_transforms import (
     ActionChunkCoordinateFrameTransform,
+    ApplyArcTokenizer,
     ArcLengthResampleChunks,
-    ArcTokenizer,
     BatchQuaternionPoseToYPR,
     ConcatKeys,
     ConsecutiveDeltaChunk,
@@ -1935,7 +1935,7 @@ def _build_mecka_wf6d_fingertips_arctok_transform_list(
     # Arc Tokenizer: one shared progress axis; still branch instead of rejection;
     # velocity features packed as an extra channel.
     transform_list.append(
-        ArcTokenizer(
+        ApplyArcTokenizer(
             distance_keys=["left.action_wrist_pose", "right.action_wrist_pose"],
             pose_keys=["left.action_wrist_pose", "right.action_wrist_pose"],
             point_keys=["left.fingertips", "right.fingertips"],
