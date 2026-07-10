@@ -100,6 +100,10 @@ class TokenVizSettings:
     # Temporal normalization: resample each span's action sequence to ONE quest_horizon-
     # length chunk (no chunk sharing between spans, no out-of-span frames).
     span_resample: bool = False
+    # Arc-length chunk representation (keymap *_arclen modes): the tokenizer's chunks
+    # each cover this many METRES of combined wrist travel, not a fixed frame count.
+    # Enables kept-frame-aware end-to-end tiling + true per-chunk clip extents.
+    arclen_distance: float | None = None
     cap: int = 60000
     balance: str = "span"
     center_by_position: bool = False
@@ -335,6 +339,8 @@ def select_token_viz_settings(cfg: Any) -> TokenVizSettings:
     return TokenVizSettings(
         granularity=str(block.get("granularity", d.granularity)).lower().strip(),
         span_resample=bool(block.get("span_resample", d.span_resample)),
+        arclen_distance=(float(block["arclen_distance"])
+                         if block.get("arclen_distance") is not None else None),
         cap=int(block.get("cap", d.cap)),
         balance=str(block.get("balance", d.balance)).lower().strip(),
         center_by_position=bool(pre.get("center_by_position", d.center_by_position)),

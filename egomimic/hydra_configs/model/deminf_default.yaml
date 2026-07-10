@@ -26,6 +26,7 @@ span_filter:
 token_viz:
   granularity: span   # token | chunk | span
   span_resample: false  # temporal norm: one horizon-length resampled chunk per span
+  arclen_distance: null # metres per chunk for keymap *_arclen modes (e.g. 0.30)
   cap: 60000
   balance: span       # span | cluster | none
   preproc:

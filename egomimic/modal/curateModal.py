@@ -204,7 +204,7 @@ def _build_quest_token_tsne(
     resolver_cfg["pause_removal_epsilon"] = None  # raw frame indices (match the latent store)
     chunks, chunk_ep, chunk_frame, chunk_end, chunk_owner, span_chunks, read_info = tv.read_span_chunks(
         resolver_cfg, CFG.remote_repo_dir, span_meta, H, cache_dir, tag,
-        span_resample=tvs.span_resample,
+        span_resample=tvs.span_resample, arclen_distance=tvs.arclen_distance,
     )
     Nc = len(chunks)
 

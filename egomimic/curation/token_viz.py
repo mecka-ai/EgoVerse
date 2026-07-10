@@ -148,7 +148,8 @@ _W: dict = {}  # per-worker-process state (set by _worker_init)
 
 
 def _worker_init(repo_dir: str, resolver_cfg_json: str, action_key: str,
-                 image_key: str, chunk_cache_dir: str, span_resample: bool) -> None:
+                 image_key: str, chunk_cache_dir: str, span_resample: bool,
+                 arclen_distance: float | None) -> None:
     import sys
     if repo_dir and repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
@@ -158,7 +159,30 @@ def _worker_init(repo_dir: str, resolver_cfg_json: str, action_key: str,
         image_key=image_key,
         chunk_cache_dir=chunk_cache_dir,
         span_resample=span_resample,
+        arclen_distance=arclen_distance,
     )
+
+
+def _wrist_arc_cumsum(ds) -> np.ndarray:
+    """Cumulative combined wrist-travel arc length per raw frame (metres).
+
+    Mirrors ArcLengthResampleChunks' metric: the R^6 norm of both wrists' world
+    translation deltas. Zero/invalid pose rows (tracking dropouts) hold the previous
+    position so they add no distance — matching the transforms' zero-quat sanitizer.
+    """
+    store = ds.episode_reader._store
+    sides = []
+    for side in ("left", "right"):
+        p = np.asarray(store[f"{side}.obs_wrist_pose"][:], dtype=np.float64)
+        xyz = p[:, :3].copy()
+        bad = ~np.isfinite(p).all(axis=1) | (np.abs(p).sum(axis=1) < 1e-9)
+        for i in range(1, len(xyz)):
+            if bad[i]:
+                xyz[i] = xyz[i - 1]
+        sides.append(xyz)
+    xyz = np.concatenate(sides, axis=-1)
+    d = np.linalg.norm(np.diff(xyz, axis=0), axis=-1)
+    return np.concatenate([[0.0], np.cumsum(d)])
 
 
 def _worker_episodes() -> dict:
@@ -183,36 +207,58 @@ def _worker_read(job):
     """
     ep, spans, horizon = job
     try:
+        arclen = _W["arclen_distance"]
         cache_dir = _W["chunk_cache_dir"]
-        cache_p = Path(cache_dir) / f"{ep}.npy" if cache_dir else None
+        cache_p = Path(cache_dir) / f"{ep}.npz" if cache_dir else None
         if cache_p is not None and cache_p.exists():
-            arr = np.load(str(cache_p), mmap_mode="r")
+            z = np.load(str(cache_p))
+            arr, kept = z["arr"], z["kept"]
+            s_cum = z["s_cum"] if "s_cum" in z.files else None
         else:
             episodes = _worker_episodes()
             if ep not in episodes:
                 raise KeyError(f"episode not resolvable ({len(episodes)} episodes resolved)")
-            actions, _, _ = episodes[ep]._collect_curation_batched(
+            ds = episodes[ep]
+            actions, _, _ = ds._collect_curation_batched(
                 action_key=_W["action_key"],
                 image_key=_W["image_key"],
                 image_decode_workers=0,
                 load_images=False,
             )
-            arr = np.asarray(actions, dtype=np.float32)  # (T, stored_horizon, D)
+            arr = np.asarray(actions, dtype=np.float32)  # (T_kept, stored_horizon, D)
             if arr.ndim != 3:
                 raise ValueError(f"expected (T, horizon, D) chunks, got shape {arr.shape}")
+            # Row i of arr is the chunk anchored at ORIGINAL frame kept[i] — transforms
+            # (e.g. arclen still-anchor rejection, zero-pose filtering) drop rows, so
+            # row index != frame index in general.
+            kept = np.asarray(
+                getattr(ds, "_curation_kept_indices", np.arange(len(arr))), dtype=np.int64)
+            if len(kept) != len(arr):
+                raise ValueError(f"kept-index map {len(kept)} != rows {len(arr)}")
+            s_cum = _wrist_arc_cumsum(ds) if arclen else None
             if cache_p is not None:
                 cache_p.parent.mkdir(parents=True, exist_ok=True)
-                tmp = cache_p.with_suffix(f".{os.getpid()}.tmp.npy")
-                np.save(str(tmp), arr)
+                tmp = cache_p.with_suffix(f".{os.getpid()}.tmp.npz")
+                extra = {} if s_cum is None else {"s_cum": s_cum}
+                np.savez(str(tmp), arr=arr, kept=kept, **extra)
                 os.replace(str(tmp), str(cache_p))
         if arr.shape[1] < horizon:
             raise ValueError(f"stored horizon {arr.shape[1]} < requested {horizon}")
+        if arclen and s_cum is None:
+            raise ValueError("arclen cache entry missing s_cum — delete stale cache")
 
         n_valid = arr.shape[0]
         span_map: dict[int, list[tuple]] = {}
         chunks: dict[tuple, np.ndarray] = {}
         n_snapped = n_dropped_old = 0
+
+        def _row_chunk(pos: int) -> np.ndarray:
+            return np.array(arr[pos, :horizon], dtype=np.float32)
+
         if _W["span_resample"]:
+            if arclen:
+                raise ValueError("span_resample is incompatible with arc-length chunks "
+                                 "(rows are arc samples, not frames)")
             # Temporal normalization: one chunk per span — the span's exact per-frame
             # sequence uniformly resampled to `horizon` steps. No chunk sharing between
             # spans, no out-of-span frames.
@@ -222,16 +268,50 @@ def _worker_read(job):
                     chunks[key] = resample_sequence(
                         extract_span_sequence(arr, int(s), int(e)), horizon)
                 span_map[int(span_idx)] = [key]
-        else:
-            needed: set[int] = set()
+        elif arclen:
+            # Arc-length chunks: anchor at kept frames, each covering [anchor, end)
+            # where end is the first frame reaching +`arclen` metres of combined wrist
+            # travel. Tile a span end-to-end by true window extents (variable frames).
             for span_idx, s, e in spans:
-                frames, snapped, would_drop = plan_span_chunks(int(s), int(e), n_valid, horizon)
-                span_map[int(span_idx)] = [(f,) for f in frames]
+                pos = int(np.searchsorted(kept, int(s), side="left"))
+                if pos >= n_valid or kept[pos] >= int(e):
+                    pos = max(0, min(pos, n_valid - 1) - (1 if pos >= n_valid or (pos > 0 and kept[pos] >= int(e)) else 0))
+                    n_snapped += 1
+                keys = []
+                while True:
+                    f = int(kept[pos])
+                    end = int(np.searchsorted(s_cum, s_cum[min(f, len(s_cum) - 1)] + arclen, side="left"))
+                    end = min(max(end, f + 1), len(s_cum) - 1)
+                    key = (f, end)
+                    if key not in chunks:
+                        chunks[key] = _row_chunk(pos)
+                    keys.append(key)
+                    if end >= int(e):
+                        break
+                    nxt = int(np.searchsorted(kept, end, side="left"))
+                    if nxt <= pos:
+                        nxt = pos + 1
+                    if nxt >= n_valid:
+                        break
+                    pos = nxt
+                span_map[int(span_idx)] = keys
+        else:
+            # Position-space snap tiling: spans index ORIGINAL frames; map to kept-row
+            # positions first (kept == arange when nothing was dropped).
+            needed: set[int] = set()
+            pos_of: dict[int, int] = {}
+            for span_idx, s, e in spans:
+                pos_lo = int(np.searchsorted(kept, int(s), side="left"))
+                pos_hi = int(np.searchsorted(kept, int(e), side="left"))
+                positions, snapped, would_drop = plan_span_chunks(
+                    pos_lo, max(pos_hi, pos_lo + 1), n_valid, horizon)
+                span_map[int(span_idx)] = [(int(kept[p]),) for p in positions]
+                for pp in positions:
+                    pos_of[int(kept[pp])] = pp
                 n_snapped += int(snapped)
                 n_dropped_old += int(would_drop)
-                needed.update(frames)
-            chunks = {(int(f),): np.array(arr[f, :horizon], dtype=np.float32)
-                      for f in sorted(needed)}
+                needed.update(int(kept[p]) for p in positions)
+            chunks = {(f,): _row_chunk(pos_of[f]) for f in sorted(needed)}
         stats = {"spans": len(spans), "snapped": n_snapped, "dropped_old": n_dropped_old,
                  "n_valid": int(n_valid)}
         return ep, chunks, span_map, stats, None
@@ -243,7 +323,8 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
                      horizon: int, cache_dir: str, tag: str,
                      action_key: str = "actions_cartesian",
                      image_key: str = "observations.images.front_img_1",
-                     workers: int | None = None, span_resample: bool = False):
+                     workers: int | None = None, span_resample: bool = False,
+                     arclen_distance: float | None = None):
     """Read every span's action chunks with snapping + dedupe + caching.
 
     With ``span_resample`` each span becomes exactly ONE chunk: its per-frame sequence
@@ -264,7 +345,8 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
     import multiprocessing as mp
 
     t0 = time.perf_counter()
-    data_tag = cache_key({"resolver": resolver_cfg, "action_key": action_key})
+    data_tag = cache_key({"resolver": resolver_cfg, "action_key": action_key,
+                          "arclen": arclen_distance})
     chunk_cache_dir = str(Path(cache_dir) / "chunks" / data_tag) if cache_dir else ""
 
     by_ep: dict[str, list] = {}
@@ -272,7 +354,7 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
         by_ep.setdefault(m["episode"], []).append((i, int(m["start"]), int(m["end"])))
     jobs = [(ep, spans, horizon) for ep, spans in sorted(by_ep.items())]
 
-    n_cached = sum(1 for ep in by_ep if chunk_cache_dir and (Path(chunk_cache_dir) / f"{ep}.npy").exists())
+    n_cached = sum(1 for ep in by_ep if chunk_cache_dir and (Path(chunk_cache_dir) / f"{ep}.npz").exists())
     n_workers = workers or min(12, os.cpu_count() or 8)
     print(f"{tag} chunk read: {len(jobs)} episodes ({n_cached} cached, tag={data_tag}), "
           f"{n_workers} worker processes")
@@ -285,7 +367,7 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
     with ProcessPoolExecutor(
         max_workers=n_workers, mp_context=ctx, initializer=_worker_init,
         initargs=(repo_dir, json.dumps(resolver_cfg), action_key, image_key,
-                  chunk_cache_dir, span_resample),
+                  chunk_cache_dir, span_resample, arclen_distance),
     ) as pool:
         results = list(pool.map(_worker_read, jobs))
 
