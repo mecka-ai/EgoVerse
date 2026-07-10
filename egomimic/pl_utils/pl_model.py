@@ -147,8 +147,10 @@ class ModelWrapper(LightningModule):
 
         info = {}
         info["losses"] = TensorUtils.detach(losses)
+        # on_step=True: stream train metrics every log_every_n_steps instead of once
+        # per epoch — long-epoch runs otherwise show nothing on W&B for hours.
         for k, v in self.model.log_info(info).items():
-            self.log("Train/" + k, v, sync_dist=True, on_step=False, on_epoch=True)
+            self.log("Train/" + k, v, sync_dist=True, on_step=True, on_epoch=True)
 
         return losses["action_loss"]
 
