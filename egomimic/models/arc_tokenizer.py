@@ -16,11 +16,16 @@ Algorithm (per anchor window):
   1. Cumulative arc length s over the window: the combined translation metric of
      ``distance poses`` (both wrists: sqrt(|dL|^2 + |dR|^2) per step).
   2. s_end = min(delta_s, s_T); N_t = frames to FIRST reach s_end.
-  3. STILL branch — s_end < eps (no motion) or N_t > n_max (pause/too slow):
-     token = anchor repeated ``num_waypoints`` times, velocity 0.
-  4. Else RESAMPLE at linspace(0, s_end, num_waypoints) in arc length (xyz
-     linear-in-s, rotation slerp-in-s, points linear-in-s) and compute velocity
-     features. Partial paths (eps <= s_end < delta_s) resample as-is.
+  3. STILL branch — s_end < eps (no EEF motion) or N_t > n_max (pause/too slow):
+     translation = anchor repeated ``num_waypoints`` times, velocity 0 — but
+     rotation and extra dims (fingertips/joints) are NOT repeated or resampled:
+     they pass through as raw time samples (first ``num_waypoints`` frames), so
+     in-place wrist rotation and finger articulation survive the still token.
+  4. Else RESAMPLE at linspace(0, s_end, num_waypoints): the interpolation warp
+     is computed from the EEF translations ONLY, and the SAME interpolating
+     factor is applied to rotation (slerp keyed on s) and all extra dims
+     (linear keyed on s) — hybrid actions never get their own metric. Partial
+     paths (eps <= s_end < delta_s) resample as-is.
 """
 
 from __future__ import annotations
@@ -111,15 +116,25 @@ class ArcTokenizer(nn.Module):
         n_t = int(np.searchsorted(s, s_end, side="left")) + 1
 
         if s_end < self.eps or n_t > self.n_max:
-            # STILL / pause token: repeat the anchor, zero velocity.
-            poses_out = {
-                k: np.repeat(np.asarray(v, dtype=np.float64)[0:1], M, axis=0)
-                for k, v in poses.items()
-            }
-            points_out = {
-                k: np.repeat(np.asarray(v, dtype=np.float64)[0:1], M, axis=0)
-                for k, v in points.items()
-            }
+            # STILL / pause token. Translation is repeated at the anchor and
+            # velocity is 0 (no EEF progress) — but rotation and extra dims are
+            # NOT repeated or resampled: they pass through as raw time samples
+            # (first M frames), so in-place wrist rotation and finger
+            # articulation survive the still token.
+            def first_m(v):
+                v = np.asarray(v, dtype=np.float64)
+                if len(v) >= M:
+                    return v[:M].copy()
+                return np.concatenate(
+                    [v, np.repeat(v[-1:], M - len(v), axis=0)], axis=0
+                )
+
+            poses_out = {}
+            for k, v in poses.items():
+                raw = first_m(v)
+                raw[:, :3] = np.asarray(v, dtype=np.float64)[0, :3]  # anchor xyz
+                poses_out[k] = raw  # rotation columns stay raw time samples
+            points_out = {k: first_m(v) for k, v in points.items()}
             return poses_out, points_out, np.zeros((M, 1), dtype=np.float64)
 
         keep = np.concatenate([[True], np.diff(s) > 1e-12])
