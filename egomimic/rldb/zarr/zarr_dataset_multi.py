@@ -1922,6 +1922,68 @@ class ZarrDataset(torch.utils.data.Dataset):
                 return int(horizon)
         return 1
 
+
+    def _curation_repair_dropout_rows(self) -> int:
+        """Interpolate tracking-dropout rows in the cached raw pose/keypoint arrays.
+
+        Dropout rows (zero-quat / sentinel poses, all-zero keypoints) are repaired
+        IN PLACE before validity checking: xyz and keypoints linearly interpolated
+        between the surrounding valid rows, quaternions sign-aligned nlerp'd, edge
+        gaps clamped to the nearest valid row. Windows that previously failed the
+        all-rows-valid anchor check (a single dropout invalidates every window
+        covering it — fatal for 600-frame arc windows) become usable.
+        Returns the number of repaired rows across keys.
+        """
+        cache = self._zarr_bulk_cache
+        if cache is None:
+            return 0
+
+        def _interp_rows(a: np.ndarray, ok: np.ndarray) -> np.ndarray:
+            good = np.flatnonzero(ok)
+            out = np.asarray(a, dtype=np.float64).copy()
+            xs = np.flatnonzero(~ok)
+            for c in range(out.shape[1]):
+                out[xs, c] = np.interp(xs, good, out[good, c])
+            return out
+
+        repaired = 0
+        for key in list(cache.keys()):
+            a = np.asarray(cache[key])
+            if a.ndim == 2 and a.shape[-1] == 7 and "pose" in key:
+                ok = self._pose_rows_valid(
+                    a, min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+                    sentinel=self._CURATION_POSE_SENTINEL,
+                )
+                if ok.all() or ok.sum() < 2:
+                    continue
+                a = np.asarray(a, dtype=np.float64)
+                # sign-align valid quats so nlerp interpolates the short way round
+                q = a[:, 3:7].copy()
+                good = np.flatnonzero(ok)
+                for i, j in zip(good[:-1], good[1:]):
+                    if np.dot(q[i], q[j]) < 0:
+                        q[j] = -q[j]
+                a[:, 3:7] = q
+                out = _interp_rows(a, ok)
+                n = np.linalg.norm(out[:, 3:7], axis=1, keepdims=True)
+                out[:, 3:7] /= np.maximum(n, 1e-12)
+                cache[key] = out.astype(np.asarray(cache[key]).dtype, copy=False)
+                repaired += int((~ok).sum())
+            elif "keypoints" in key and a.ndim >= 2:
+                flat = np.asarray(a, dtype=np.float64).reshape(len(a), -1)
+                ok = np.isfinite(flat).all(axis=1) & (np.abs(flat).sum(axis=1) > 1e-9)
+                if ok.all() or ok.sum() < 2:
+                    continue
+                out = _interp_rows(flat, ok).reshape(a.shape)
+                cache[key] = out.astype(np.asarray(cache[key]).dtype, copy=False)
+                repaired += int((~ok).sum())
+        if repaired:
+            logger.info(
+                "curation ep=%s: interpolated %d dropout rows in raw pose/keypoint arrays",
+                Path(self.episode_path).name, repaired,
+            )
+        return repaired
+
     def _curation_valid_logical_indices(self) -> np.ndarray:
         """Logical timestep indices with valid pose windows (skip zero-quat / cut rows)."""
         n_logical = len(self)
@@ -2179,6 +2241,10 @@ class ZarrDataset(torch.utils.data.Dataset):
         n_logical = len(self)
         if n_logical == 0:
             return None, None, None
+
+        # Repair tracking dropouts by interpolation BEFORE validity checking — a
+        # repaired row is a valid row, so windows spanning dropouts stay usable.
+        self._curation_repair_dropout_rows()
 
         logical_valid = self._curation_valid_logical_indices()
         n_skipped_pose = n_logical - len(logical_valid)

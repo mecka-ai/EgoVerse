@@ -350,7 +350,7 @@ def read_span_chunks(resolver_cfg: dict, repo_dir: str, span_meta: list[dict],
 
     t0 = time.perf_counter()
     data_tag = cache_key({"resolver": resolver_cfg, "action_key": action_key,
-                          "arclen": arclen_distance})
+                          "arclen": arclen_distance, "dropout_interp": 1})
     chunk_cache_dir = str(Path(cache_dir) / "chunks" / data_tag) if cache_dir else ""
 
     by_ep: dict[str, list] = {}
