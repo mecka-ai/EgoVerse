@@ -90,12 +90,21 @@ def _find_viz_image_key(algo, embodiment_id: int, batch: dict) -> str | None:
 class ActionVAEEvalVideo(EvalVideo):
     """Validation evaluator for ActionVAETrainer."""
 
+    def on_validation_epoch_start(self):
+        self._viz_rendered = False
+        if hasattr(super(), "on_validation_epoch_start"):
+            super().on_validation_epoch_start()
+
     def compute_metrics_and_viz(self, batch):
         algo = self.model
         preds = algo.forward_eval(batch)
 
         metrics: dict = {}
         images_dict: dict = {}
+        # Reconstruction plots/videos cost ~25s per batch — render on the FIRST val
+        # batch of each epoch only; every batch still contributes to the metrics.
+        render_viz = not getattr(self, "_viz_rendered", False)
+        self._viz_rendered = True
 
         for embodiment_id, _batch in batch.items():
             embodiment_name = get_embodiment(embodiment_id).lower()
@@ -110,7 +119,7 @@ class ActionVAEEvalVideo(EvalVideo):
             recons = preds[recon_key]
             metrics[f"Valid/{embodiment_name}_recon_mse"] = F.mse_loss(recons, actions)
 
-            if not self.trainer.is_global_zero:
+            if not self.trainer.is_global_zero or not render_viz:
                 continue
 
             unnorm_batch = algo.data_schematic.unnormalize_data(_batch, embodiment_id)
