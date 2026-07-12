@@ -1428,15 +1428,26 @@ def run_score(
         f"Resume scoring {len(tasks)} task(s): store={src_dir} → output={output_dir}: {tasks}"
     )
 
+    scores_by_task: dict = {}
     for task_name in tasks:
         print(f"\n── [{task_name}] scoring …")
         try:
-            _score_task.remote(
+            _, scores = _score_task.remote(
                 task_name, run_name, hydra_args,
                 [], [], output_dir, git_remote, git_commit, hf_token, latents_source,
             )
+            if scores:
+                scores_by_task[task_name] = scores
         except Exception as exc:
             print(f"[{task_name}] scoring FAILED: {exc}")
+
+    # Aggregate for the episode-level task viewer (/view needs scores_by_task.json).
+    if scores_by_task:
+        import json as _json
+        _p = _Path(output_dir) / "scores_by_task.json"
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.write_text(_json.dumps(scores_by_task, indent=1))
+        print(f"wrote {_p} ({len(scores_by_task)} tasks)")
 
     training_outputs_volume.commit()
     print(f"\nResume scoring done — {output_dir}")
