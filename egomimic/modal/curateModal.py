@@ -981,6 +981,7 @@ def _score_task(
         from egomimic.curation.config import select_tsne_viz_config
 
         tsne_cfg = select_tsne_viz_config(cfg)
+        from omegaconf import OmegaConf as _OCt
         viz_settings = TsneVizSettings(
             every_n=tsne_cfg.every_n,
             seed=select_seed(cfg),
@@ -988,6 +989,7 @@ def _score_task(
             include_language=tsne_cfg.include_language,
             include_state_by_lang=tsne_cfg.include_state_by_lang,
             state_color_by=tsne_cfg.state_color_by,
+            dims=int(_OCt.select(cfg, "model.projection_dims", default=3)),
         )
         tsne_dir = Path(output_dir) / "tsne"
         tsne3d_dir = Path(output_dir) / "tsne3d"

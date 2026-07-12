@@ -446,6 +446,14 @@ const LAYOUT=title=>({
   showlegend:false,
   margin:{l:0,r:0,t:28,b:0},
 });
+const LAYOUT2D=title=>({
+  title:{text:title,font:{color:"#ddd",size:12},pad:{t:2}},
+  paper_bgcolor:"#101014",plot_bgcolor:"#101014",
+  xaxis:{visible:false},yaxis:{visible:false,scaleanchor:"x"},
+  showlegend:false,margin:{l:0,r:0,t:28,b:0},hovermode:"closest",
+});
+// 2-D export (dims=2 in the tsne3d json): flat scattergl panels, no camera sync.
+function is2D(task){return (DATA[task]&&DATA[task].dims||3)===2;}
 
 let camLock=false;
 
@@ -506,15 +514,15 @@ function renderTsne(task,preserveToggles){
     if(!m||!el)continue;
     const{d,tables,custom}=m;
     const colors=colorTableForMod(m,u.mode);
-    Plotly.newPlot(el,[
-      {type:"scatter3d",mode:"markers",
-       x:d.x,y:d.y,z:d.z,customdata:custom,
+    const flat=is2D(task);
+    const tType=flat?"scattergl":"scatter3d";
+    const main={type:tType,mode:"markers",x:d.x,y:d.y,customdata:custom,
        marker:{size:u.size,color:colors,line:{width:0}},
-       hovertemplate:"ep %{customdata[2]} · f%{customdata[0]} (%{customdata[1]}%)<br>%{customdata[4]}<extra></extra>"},
-      {type:"scatter3d",mode:"markers",name:"sel",
-       x:[],y:[],z:[],hoverinfo:"skip",
-       marker:{size:12,color:"rgba(255,200,0,0.95)",symbol:"diamond",line:{width:0}}},
-    ],LAYOUT((MOD_LABELS[mod]||mod)+" — "+task),{responsive:true});
+       hovertemplate:"ep %{customdata[2]} · f%{customdata[0]} (%{customdata[1]}%)<br>%{customdata[4]}<extra></extra>"};
+    const selT={type:tType,mode:"markers",name:"sel",x:[],y:[],hoverinfo:"skip",
+       marker:{size:flat?13:12,color:"rgba(255,200,0,0.95)",symbol:"diamond",line:{width:0}}};
+    if(!flat){main.z=d.z;selT.z=[];}
+    Plotly.newPlot(el,[main,selT],(flat?LAYOUT2D:LAYOUT)((MOD_LABELS[mod]||mod)+" — "+task),{responsive:true});
 
     el.onpointerdown=e=>{el._px=e.clientX;el._py=e.clientY;};
     el.onpointerup=e=>{el._drag=Math.hypot(e.clientX-(el._px??e.clientX),e.clientY-(el._py??e.clientY))>5;};
@@ -621,7 +629,8 @@ function crossHighlight(task,epIdx,frame){
     for(let k=0;k<d.x.length;k++){
       if(d.ep[k]===epIdx&&d.frame[k]===frame){xs.push(d.x[k]);ys.push(d.y[k]);zs.push(d.z[k]);break;}
     }
-    Plotly.restyle("panel_"+mod,{x:[xs],y:[ys],z:[zs]},[1]);
+    const upd=is2D(task)?{x:[xs],y:[ys]}:{x:[xs],y:[ys],z:[zs]};
+    Plotly.restyle("panel_"+mod,upd,[1]);
   }
 }
 

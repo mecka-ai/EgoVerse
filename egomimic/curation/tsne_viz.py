@@ -40,6 +40,8 @@ class TsneVizSettings:
     # How to color the standard ``state`` panel when instruction texts exist.
     # ``auto`` → ``language`` for stratified scoring runs, else ``episode``.
     state_color_by: str = "auto"
+    # Projection dimensionality for the viewer export (2 or 3; model.projection_dims).
+    dims: int = 3
 
 
 def _resolve_state_color_by(
@@ -447,6 +449,7 @@ def export_task_tsne3d(
         "every_n": every_n,
         "language_enabled": has_lang,
         "language_mode": language_mode,
+        "dims": int(cfg.dims),
     }
 
     if has_texts:
@@ -481,7 +484,7 @@ def export_task_tsne3d(
             latents,
             every_n,
             seed,
-            n_components=3,
+            n_components=int(cfg.dims),
             language_texts_by_episode=texts,
         )
         if block is None:
