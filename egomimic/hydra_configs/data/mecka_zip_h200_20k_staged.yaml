@@ -46,6 +46,8 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
+      read_block_size: 128
+      read_block_cache_blocks: 2
     mode: train
     episodes_per_epoch: 20000   # == full subset → prepare_epoch(0) stages all before training
     epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
@@ -53,6 +55,8 @@ train_datasets:
     pool_size_gb: 2900          # holds all ~18k train eps (no eviction)
     lookahead_epochs: 1.0       # window is the whole set; filler stages it once then idles
     n_copy_threads: 48
+    index_map_order: episode_block
+    index_map_block_size: 128
     prepare_timeout_s: 21600    # 6h — staging ~20k eps from the ~150 MB/s volume takes
                                 # ~3h, far over the 1h default; raise so prepare_epoch
                                 # waits out the full initial stage instead of crashing
@@ -71,6 +75,8 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
+      read_block_size: 128
+      read_block_cache_blocks: 2
     mode: valid
     episodes_per_epoch: 2000    # == full valid split → staged before validation
     cache_dir: /cache/zarr_cache_valid
@@ -84,7 +90,7 @@ train_dataloader_params:
     num_workers: 12          # × 4 ranks = 48 workers (Modal cpu cap is 64)
     persistent_workers: false  # workers respawn each epoch to inherit the fresh index_map
     prefetch_factor: 6
-    shuffle: true
+    shuffle: false          # PrefetchedMapDataset now shuffles by episode/block for sequential disk reads
 
 valid_dataloader_params:
   mecka_bimanual:

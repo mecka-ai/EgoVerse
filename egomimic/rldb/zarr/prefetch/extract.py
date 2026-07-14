@@ -6,6 +6,7 @@ and the dataset (synchronous valid-mode extraction).
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import tarfile
@@ -68,4 +69,25 @@ class _ENOSPCError(Exception):
 _FILLER_REGISTRY: dict[str, "PoolFillerThread"] = {}
 _FILLER_REGISTRY_LOCK = threading.Lock()
 
+
+def shutdown_registered_fillers() -> None:
+    """Stop all registered background pool fillers.
+
+    The filler thread is daemonized, but its ThreadPoolExecutor workers are
+    normal threads. If the global registry keeps a filler reachable after
+    training, relying on ``__del__`` is not enough to let the interpreter exit.
+    """
+    with _FILLER_REGISTRY_LOCK:
+        fillers = list(_FILLER_REGISTRY.items())
+        _FILLER_REGISTRY.clear()
+
+    for cache_dir, filler in fillers:
+        try:
+            filler.stop()
+            logger.info("Stopped PoolFillerThread for %s", cache_dir)
+        except Exception:
+            logger.exception("Failed to stop PoolFillerThread for %s", cache_dir)
+
+
+atexit.register(shutdown_registered_fillers)
 

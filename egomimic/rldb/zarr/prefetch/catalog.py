@@ -43,6 +43,8 @@ class ZipEpisodeResolver(EpisodeResolver):
         debug: int | None = None,
         min_frames: int | None = None,
         seed: int = 42,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
     ):
         super().__init__(
             Path(zip_dir),
@@ -50,6 +52,8 @@ class ZipEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
         )
         self.zip_dir = Path(zip_dir)
         self.valid_ratio = valid_ratio
@@ -133,5 +137,4 @@ class ZipEpisodeResolver(EpisodeResolver):
             "ZipEpisodeResolver does not support resolve(). "
             "Use PrefetchedMapDataset(resolver=...) instead."
         )
-
 
