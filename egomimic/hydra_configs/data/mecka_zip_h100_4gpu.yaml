@@ -34,7 +34,7 @@ _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
   mecka_bimanual:
-    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedIterableDataset
     resolver:
       _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
       zip_dir: /mnt/zarr-zip
@@ -46,6 +46,8 @@ train_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
+      read_block_size: 128
+      read_block_cache_blocks: 2
     mode: train
     episodes_per_epoch: 1500
     epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
@@ -53,6 +55,10 @@ train_datasets:
     pool_size_gb: 1500
     lookahead_epochs: 4.0
     n_copy_threads: 48
+    index_map_order: episode_block
+    index_map_block_size: 128
+    preload_image_cache_gb: 0.0
+    prewarm_page_cache_gb: 0.0
 
 valid_datasets:
   mecka_bimanual:
@@ -68,6 +74,8 @@ valid_datasets:
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
         mode: cartesian
+      read_block_size: 128
+      read_block_cache_blocks: 2
     mode: valid
     episodes_per_epoch: 400
     cache_dir: /cache/zarr_cache_valid
@@ -82,7 +90,7 @@ train_dataloader_params:
     persistent_workers: false  # REQUIRED: workers respawn each epoch to inherit
                                # PrefetchEpochCallback's fresh index_map via fork
     prefetch_factor: 6       # 16 × 6 = 96 batches buffered per rank
-    shuffle: true
+    shuffle: false          # PrefetchedMapDataset now shuffles by episode/block for sequential disk reads
 
 valid_dataloader_params:
   mecka_bimanual:

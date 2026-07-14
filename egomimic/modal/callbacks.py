@@ -142,3 +142,19 @@ class PrefetchEpochCallback(Callback):
         # All ranks call this before the val loop → identical valid index_map +
         # a synchronized barrier point, preventing the DDP collective desync.
         self._prepare(self._valid_datasets, trainer.current_epoch, "valid")
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        self._shutdown_fillers()
+
+    def on_exception(self, trainer, pl_module, exception) -> None:
+        self._shutdown_fillers()
+
+    def _shutdown_fillers(self) -> None:
+        try:
+            from egomimic.rldb.zarr.prefetch.extract import (
+                shutdown_registered_fillers,
+            )
+
+            shutdown_registered_fillers()
+        except Exception:
+            log.exception("PrefetchEpochCallback: failed to shut down pool fillers")

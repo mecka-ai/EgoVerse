@@ -26,6 +26,7 @@ import os
 import random
 import subprocess
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
@@ -37,6 +38,7 @@ import zarr
 
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.filters import DatasetFilter
+from egomimic.rldb.zarr.shard_index_cache import install_zarr_shard_index_cache
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.aws.aws_sql import (
     create_default_engine,
@@ -251,12 +253,29 @@ class EpisodeResolver:
         transform_list: list | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         self.folder_path = Path(folder_path)
         self.key_map = key_map
         self.transform_list = transform_list
         self.norm_stats = norm_stats
         self.pause_removal_epsilon = pause_removal_epsilon
+        self.read_block_size = max(1, int(read_block_size))
+        self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+        self.decode_images = bool(decode_images)
+
+    def _dataset_kwargs(self) -> dict:
+        return {
+            "key_map": self.key_map,
+            "transform_list": self.transform_list,
+            "norm_stats": self.norm_stats,
+            "pause_removal_epsilon": self.pause_removal_epsilon,
+            "read_block_size": self.read_block_size,
+            "read_block_cache_blocks": self.read_block_cache_blocks,
+            "decode_images": self.decode_images,
+        }
 
     def _load_zarr_datasets(self, search_path: Path, valid_folder_names: set[str]):
         """
@@ -294,10 +313,7 @@ class EpisodeResolver:
             try:
                 ds_obj = dataset_class(
                     p,
-                    key_map=self.key_map,
-                    transform_list=self.transform_list,
-                    norm_stats=self.norm_stats,
-                    pause_removal_epsilon=self.pause_removal_epsilon,
+                    **self._dataset_kwargs(),
                 )
                 datasets[name] = ds_obj
             except Exception as e:
@@ -452,6 +468,9 @@ class S3EpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         norm_stats: dict | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         self.bucket_name = bucket_name
         self.main_prefix = main_prefix
@@ -462,6 +481,9 @@ class S3EpisodeResolver(EpisodeResolver):
             transform_list=transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
 
     def resolve(
@@ -702,6 +724,9 @@ class LocalEpisodeResolver(EpisodeResolver):
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
         pause_removal_epsilon: float | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         super().__init__(
             folder_path,
@@ -709,6 +734,9 @@ class LocalEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
         self.debug = debug
         self.allowed_episode_ids = (
@@ -800,10 +828,7 @@ class LocalEpisodeResolver(EpisodeResolver):
                         try:
                             datasets[episode_hash] = dataset_class(
                                 candidate,
-                                key_map=self.key_map,
-                                transform_list=self.transform_list,
-                                norm_stats=self.norm_stats,
-                                pause_removal_epsilon=self.pause_removal_epsilon,
+                                **self._dataset_kwargs(),
                             )
                         except Exception as e:
                             logger.error(
@@ -863,6 +888,9 @@ class ModalEpisodeResolver(EpisodeResolver):
         eps_to_ignore: str | None = None,
         eps_to_use: str | None = None,
         allowed_episode_ids: list[str] | None = None,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         super().__init__(
             folder_path,
@@ -870,6 +898,9 @@ class ModalEpisodeResolver(EpisodeResolver):
             transform_list,
             norm_stats=norm_stats,
             pause_removal_epsilon=pause_removal_epsilon,
+            read_block_size=read_block_size,
+            read_block_cache_blocks=read_block_cache_blocks,
+            decode_images=decode_images,
         )
         self.debug = debug
         self.exclude_hashes: set[str] = set(exclude_hashes) if exclude_hashes else set()
@@ -974,10 +1005,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                 continue
             datasets[episode_hash] = dataset_class(
                 local_path,
-                key_map=self.key_map,
-                transform_list=self.transform_list,
-                norm_stats=self.norm_stats,
-                pause_removal_epsilon=self.pause_removal_epsilon,
+                **self._dataset_kwargs(),
                 _total_frames=num_frames,
                 _embodiment=robot_name,
             )
@@ -1157,9 +1185,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                 try:
                     datasets[episode_hash] = dataset_class(
                         Path(path_str),
-                        key_map=self.key_map,
-                        transform_list=self.transform_list,
-                        norm_stats=self.norm_stats,
+                        **self._dataset_kwargs(),
                         precomputed_metadata=metadata,
                     )
                 except Exception as e:
@@ -1582,6 +1608,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         _embodiment: str | None = None,
         precomputed_metadata: dict | None = None,
         defer_open: bool = False,
+        read_block_size: int = 1,
+        read_block_cache_blocks: int = 2,
+        decode_images: bool = True,
     ):
         """
         Args:
@@ -1604,6 +1633,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             defer_open: if True, do not mmap the zarr store until the first ``__getitem__``
                 (used by PrefetchedIterableDataset workers).
         """
+        install_zarr_shard_index_cache()
         self.episode_path = Episode_path
         self.metadata = None
         self._image_keys = None
@@ -1634,6 +1664,11 @@ class ZarrDataset(torch.utils.data.Dataset):
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
         self._zarr_bulk_cache: dict[str, np.ndarray] | None = None
+        self.read_block_size = max(1, int(read_block_size))
+        self.read_block_cache_blocks = max(0, int(read_block_cache_blocks))
+        self.decode_images = bool(decode_images)
+        self._zarr_block_cache: OrderedDict[tuple[str, int], np.ndarray] = OrderedDict()
+        self._logged_bulk_cache_hit = False
         super().__init__()
 
     def _ensure_episode_reader(self):
@@ -1652,6 +1687,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             self.episode_reader.close()
             self.episode_reader = None
         self._zarr_bulk_cache = None
+        self._zarr_block_cache.clear()
         self._annotations = None
 
     def _init_from_metadata(self, metadata: dict) -> None:
@@ -1751,6 +1787,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             if v.get("key_type") not in ("camera_keys", "annotation_keys")
         }
         view._zarr_bulk_cache = None
+        view._zarr_block_cache = OrderedDict()
         return view
 
     def preload_zarr_arrays(self) -> None:
@@ -1764,15 +1801,91 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
             cache[zarr_key] = np.asarray(store[zarr_key][:])
         self._zarr_bulk_cache = cache
+        self._zarr_block_cache.clear()
+
+    def preload_image_arrays(self) -> int:
+        """Load camera zarr arrays into the bulk cache and return payload bytes.
+
+        This is intended to run in the rank parent immediately before
+        DataLoader workers fork. The compressed JPEG arrays then live in
+        copy-on-write memory and workers can serve sample reads without
+        touching the zarr shard file for every frame.
+        """
+        self._ensure_episode_reader()
+        store = self.episode_reader._store
+        cache = self._zarr_bulk_cache if self._zarr_bulk_cache is not None else {}
+        bytes_loaded = 0
+        for spec in self.key_map.values():
+            zarr_key = spec.get("zarr_key")
+            if (
+                not zarr_key
+                or zarr_key in cache
+                or zarr_key not in (self._image_keys or set())
+            ):
+                continue
+            arr = np.asarray(store[zarr_key][:])
+            cache[zarr_key] = arr
+            bytes_loaded += self._estimate_cached_array_bytes(arr)
+        self._zarr_bulk_cache = cache
+        self._zarr_block_cache.clear()
+        return bytes_loaded
+
+    @staticmethod
+    def _estimate_cached_array_bytes(arr: np.ndarray) -> int:
+        if arr.dtype.hasobject:
+            total = int(arr.nbytes)
+            for item in arr.flat:
+                if isinstance(item, np.void):
+                    total += len(item.tobytes())
+                elif isinstance(item, memoryview):
+                    total += item.nbytes
+                elif isinstance(item, (bytes, bytearray)):
+                    total += len(item)
+            return total
+        if arr.dtype.kind == "V":
+            return int(arr.nbytes)
+        return int(arr.nbytes)
 
     def _read_key_slice(self, zarr_key: str, start: int, end: int | None) -> np.ndarray:
         if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
+            if (
+                not self._logged_bulk_cache_hit
+                and zarr_key in (self._image_keys or set())
+            ):
+                logger.info(
+                    "Serving camera zarr reads from inherited bulk cache for %s",
+                    Path(self.episode_path).name,
+                )
+                self._logged_bulk_cache_hit = True
             arr = self._zarr_bulk_cache[zarr_key]
             if end is not None:
                 return arr[start:end]
             return arr[start : start + 1][0]
+        if (
+            end is None
+            and self.read_block_size > 1
+            and self.read_block_cache_blocks > 0
+            and zarr_key in (self._image_keys or set())
+        ):
+            return self._read_single_from_block_cache(zarr_key, start)
         read_dict = {zarr_key: (start, end)}
         return self.episode_reader.read(read_dict)[zarr_key]
+
+    def _read_single_from_block_cache(self, zarr_key: str, start: int) -> np.ndarray:
+        block_start = (int(start) // self.read_block_size) * self.read_block_size
+        cache_key = (zarr_key, block_start)
+        cached = self._zarr_block_cache.get(cache_key)
+        if cached is not None:
+            self._zarr_block_cache.move_to_end(cache_key)
+            return cached[int(start) - block_start]
+
+        block_end = min(self.total_frames, block_start + self.read_block_size)
+        arr = self.episode_reader._store[zarr_key]
+        block = np.asarray(arr[block_start:block_end])
+        self._zarr_block_cache[cache_key] = block
+        while len(self._zarr_block_cache) > self.read_block_cache_blocks:
+            self._zarr_block_cache.popitem(last=False)
+        return block[int(start) - block_start]
 
     _CURATION_POSE_SENTINEL = 1e8
     _CURATION_MIN_QUAT_NORM = 1e-6
@@ -2109,6 +2222,20 @@ class ZarrDataset(torch.utils.data.Dataset):
         decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
         return np.transpose(decoded, (2, 0, 1)).astype(np.float32) / 255.0
 
+    @staticmethod
+    def _jpeg_entry_to_bytes(jpeg_bytes: object) -> bytes:
+        if isinstance(jpeg_bytes, np.ndarray):
+            jpeg_bytes = jpeg_bytes.item() if jpeg_bytes.ndim == 0 else jpeg_bytes[0]
+        if isinstance(jpeg_bytes, np.void):
+            jpeg_bytes = jpeg_bytes.item()
+        if isinstance(jpeg_bytes, memoryview):
+            jpeg_bytes = jpeg_bytes.tobytes()
+        if isinstance(jpeg_bytes, bytearray):
+            jpeg_bytes = bytes(jpeg_bytes)
+        if not isinstance(jpeg_bytes, bytes):
+            raise TypeError(f"Expected JPEG bytes, got {type(jpeg_bytes).__name__}")
+        return jpeg_bytes
+
     def collect_curation_episode(
         self,
         action_key: str = "actions_cartesian",
@@ -2276,6 +2403,9 @@ class ZarrDataset(torch.utils.data.Dataset):
 
             if zarr_key in self._image_keys:
                 jpeg_bytes = data[k]
+                if not self.decode_images:
+                    data[k] = self._jpeg_entry_to_bytes(jpeg_bytes)
+                    continue
                 try:
                     data[k] = self._decode_jpeg_to_chw(jpeg_bytes)
                 except Exception:

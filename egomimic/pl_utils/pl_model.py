@@ -1,3 +1,4 @@
+import logging
 import random
 import time
 from collections import OrderedDict, deque
@@ -11,6 +12,8 @@ from omegaconf import DictConfig, OmegaConf
 
 import egomimic.utils.tensor_utils as TensorUtils
 from egomimic.rldb.zarr.utils import DataSchematic
+
+logger = logging.getLogger(__name__)
 
 
 class ModelWrapper(LightningModule):
@@ -37,6 +40,7 @@ class ModelWrapper(LightningModule):
         viz_func=None,
         evaluator=None,
         enable_grad_norm: bool = True,
+        gpu_jpeg_decode: bool = False,
     ):
         """
         Args:
@@ -64,6 +68,8 @@ class ModelWrapper(LightningModule):
         except Exception:
             pass
         self.enable_grad_norm = enable_grad_norm
+        self.gpu_jpeg_decode = bool(gpu_jpeg_decode)
+        self._gpu_jpeg_decode_logged = False
         self.grad_norm_history = deque(maxlen=self.grad_norm_mad_window)
 
         self.epoch_memory_stats = []  # Store memory stats per epoch
@@ -89,6 +95,85 @@ class ModelWrapper(LightningModule):
             data_schematic=data_schematic,
             viz_func=viz_func,
         )
+
+    @staticmethod
+    def _is_jpeg_byte_list(value: Any) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) > 0
+            and all(
+                isinstance(item, (bytes, bytearray, memoryview, np.void))
+                for item in value
+            )
+        )
+
+    @staticmethod
+    def _bytes_to_uint8_tensor(
+        value: bytes | bytearray | memoryview | np.void,
+    ) -> torch.Tensor:
+        if isinstance(value, np.void):
+            value = value.item()
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytearray):
+            value = bytes(value)
+        arr = np.frombuffer(value, dtype=np.uint8).copy()
+        return torch.from_numpy(arr)
+
+    def _decode_jpeg_byte_list(
+        self,
+        value: list[bytes | bytearray | memoryview | np.void],
+        device: torch.device,
+    ) -> torch.Tensor:
+        from torchvision.io import ImageReadMode, decode_jpeg
+
+        encoded = [self._bytes_to_uint8_tensor(item) for item in value]
+        decode_device = device if device.type == "cuda" else torch.device("cpu")
+        decoded = decode_jpeg(encoded, mode=ImageReadMode.RGB, device=decode_device)
+        if isinstance(decoded, torch.Tensor):
+            if decoded.ndim == 3:
+                decoded = decoded.unsqueeze(0)
+            images = decoded
+        else:
+            images = torch.stack(decoded, dim=0)
+        if images.device != device:
+            images = images.to(device, non_blocking=True)
+        return images.to(dtype=torch.float32).div_(255.0)
+
+    def _decode_jpegs_in_batch(self, batch: Any, device: torch.device) -> Any:
+        if self._is_jpeg_byte_list(batch):
+            is_global_zero = getattr(
+                getattr(self, "trainer", None),
+                "is_global_zero",
+                True,
+            )
+            if not self._gpu_jpeg_decode_logged and is_global_zero:
+                logger.info(
+                    "Decoding JPEG batches with torchvision.io.decode_jpeg on %s",
+                    "CUDA/nvJPEG" if device.type == "cuda" else "CPU",
+                )
+                self._gpu_jpeg_decode_logged = True
+            return self._decode_jpeg_byte_list(batch, device)
+        if isinstance(batch, dict):
+            return {
+                key: self._decode_jpegs_in_batch(value, device)
+                for key, value in batch.items()
+            }
+        if isinstance(batch, tuple):
+            return tuple(self._decode_jpegs_in_batch(value, device) for value in batch)
+        if isinstance(batch, list):
+            return [self._decode_jpegs_in_batch(value, device) for value in batch]
+        return batch
+
+    def transfer_batch_to_device(
+        self,
+        batch: Any,
+        device: torch.device,
+        dataloader_idx: int,
+    ) -> Any:
+        if self.gpu_jpeg_decode:
+            batch = self._decode_jpegs_in_batch(batch, torch.device(device))
+        return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
     # batch is now a dict, handle on model side
     def training_step(self, batch, batch_idx):
