@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import math
 import os
 import random
 import shutil
 import time
 from pathlib import Path
+from typing import Iterator
 
 import torch
 import torch.utils.data
@@ -82,6 +84,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         n_copy_threads: int = 16,
         seed: int = 42,
         prepare_timeout_s: float = 3600.0,
+        index_map_order: str = "random",
+        index_map_block_size: int = 128,
+        preload_image_cache_gb: float = 0.0,
+        prewarm_page_cache_gb: float = 0.0,
+        jpeg_pack_cache_gb: float = 0.0,
     ):
         super().__init__()
         self.resolver = resolver
@@ -90,6 +97,20 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.n_copy_threads = int(n_copy_threads)
         self.seed = seed
+        self.index_map_order = str(index_map_order)
+        self.index_map_block_size = max(1, int(index_map_block_size))
+        self.preload_image_cache_bytes = max(
+            0,
+            int(float(preload_image_cache_gb) * 1_000_000_000),
+        )
+        self.prewarm_page_cache_bytes = max(
+            0,
+            int(float(prewarm_page_cache_gb) * 1_000_000_000),
+        )
+        self.jpeg_pack_cache_bytes = max(
+            0,
+            int(float(jpeg_pack_cache_gb) * 1_000_000_000),
+        )
         # Max time prepare_epoch blocks waiting for the window to materialize.
         # Default 1h is plenty for a normal sliding window; raise it for
         # stage-all-first configs where episodes_per_epoch == a large subset
@@ -203,12 +224,32 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         logger.info(
             "PrefetchedMapDataset [%s]: %d episodes, %d total frames, "
             "episodes_per_epoch=%d, lookahead_epochs=%.1f, "
-            "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s)",
+            "pool_size=%.0f GB, cache_dir=%s, rank=%d (filler=%s), "
+            "index_map_order=%s, index_map_block_size=%d, "
+            "preload_image_cache_gb=%.1f, prewarm_page_cache_gb=%.1f, "
+            "jpeg_pack_cache_gb=%.1f",
             mode, len(self._episodes), total_frames,
             self.episodes_per_epoch, lookahead_epochs,
             pool_size_gb, cache_dir, self._rank,
             "yes" if self._is_filler_rank else "no",
+            self.index_map_order, self.index_map_block_size,
+            self.preload_image_cache_bytes / 1_000_000_000,
+            self.prewarm_page_cache_bytes / 1_000_000_000,
+            self.jpeg_pack_cache_bytes / 1_000_000_000,
         )
+
+    def _zarr_dataset_kwargs(self) -> dict:
+        return {
+            "key_map": self.resolver.key_map,
+            "transform_list": self.resolver.transform_list,
+            "norm_stats": self.resolver.norm_stats,
+            "pause_removal_epsilon": self.resolver.pause_removal_epsilon,
+            "read_block_size": getattr(self.resolver, "read_block_size", 1),
+            "read_block_cache_blocks": getattr(
+                self.resolver, "read_block_cache_blocks", 2
+            ),
+            "decode_images": getattr(self.resolver, "decode_images", True),
+        }
 
     # ------------------------------------------------------------------
     # DataSchematic wiring (matches MultiDataset API)
@@ -251,12 +292,14 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if self._probe_zarr_path is None:
                 self._probe_zarr_path = self._extract_probe()
             if not hasattr(self, "_probe_ds"):
+                probe_kwargs = self._zarr_dataset_kwargs()
+                # Schema inference samples dataset[0] before training starts.
+                # Keep that probe decoded so image shapes remain CHW tensors,
+                # even when training workers later return raw JPEG bytes.
+                probe_kwargs["decode_images"] = True
                 self._probe_ds = ZarrDataset(
                     self._probe_zarr_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **probe_kwargs,
                 )
             return self._probe_ds[idx % len(self._probe_ds)]
 
@@ -272,10 +315,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                     try:
                         self._zarr_cache[ep_path] = ZarrDataset(
                             ep_path,
-                            key_map=self.resolver.key_map,
-                            transform_list=self.resolver.transform_list,
-                            norm_stats=self.resolver.norm_stats,
-                            pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                            **self._zarr_dataset_kwargs(),
                         )
                     except Exception as e:
                         logger.warning(
@@ -317,10 +357,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             if ep_path not in self._zarr_cache:
                 self._zarr_cache[ep_path] = ZarrDataset(
                     ep_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **self._zarr_dataset_kwargs(),
                 )
             return self._zarr_cache[ep_path][frame_idx]
         except Exception as e:
@@ -387,7 +424,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 shutil.rmtree(dest, ignore_errors=True)
             dest.mkdir(parents=True, exist_ok=True)
             try:
-                size = _extract_tar_to_dir(entry.tar_path, dest)
+                size = _extract_tar_to_dir(
+                    entry.tar_path,
+                    dest,
+                    expected_size_bytes=entry.tar_size_bytes,
+                )
             except Exception:
                 shutil.rmtree(dest, ignore_errors=True)
                 raise
@@ -430,6 +471,48 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 else:
                     n_ok += 1
         logger.info("Valid extractor: window ready (%d ok, %d failed).", n_ok, n_err)
+
+    def _build_index_map(
+        self,
+        window_eps: list[EpisodeCatalogEntry],
+        epoch: int,
+    ) -> list[tuple[str, int]]:
+        rng = random.Random(self.seed + epoch + 99999)
+
+        if self.mode != "train" or self.index_map_order == "random":
+            index_map: list[tuple[str, int]] = []
+            for ep in window_eps:
+                ep_path = str(self._pool.episode_path(ep.episode_hash))
+                for frame_idx in range(ep.n_frames):
+                    index_map.append((ep_path, frame_idx))
+            if self.mode == "train":
+                rng.shuffle(index_map)
+            return index_map
+
+        episodes = list(window_eps)
+        rng.shuffle(episodes)
+        index_map = []
+        for ep in episodes:
+            ep_path = str(self._pool.episode_path(ep.episode_hash))
+            frames = list(range(ep.n_frames))
+            if self.index_map_order == "episode_random":
+                rng.shuffle(frames)
+            elif self.index_map_order == "episode_block":
+                blocks = [
+                    frames[i : i + self.index_map_block_size]
+                    for i in range(0, len(frames), self.index_map_block_size)
+                ]
+                rng.shuffle(blocks)
+                frames = [frame_idx for block in blocks for frame_idx in block]
+            elif self.index_map_order == "episode_sequential":
+                pass
+            else:
+                raise ValueError(
+                    "index_map_order must be one of: random, episode_random, "
+                    "episode_block, episode_sequential"
+                )
+            index_map.extend((ep_path, frame_idx) for frame_idx in frames)
+        return index_map
 
     # ------------------------------------------------------------------
     # Epoch lifecycle — called from Lightning callback on main process
@@ -506,6 +589,9 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
 
         # Drop stale ZarrDataset handles (episodes that left the window).
         new_paths = {str(self._pool.episode_path(h)) for h in ep_hashes}
+        entry_by_path = {
+            str(self._pool.episode_path(e.episode_hash)): e for e in window_eps
+        }
         self._zarr_cache = {k: v for k, v in self._zarr_cache.items() if k in new_paths}
 
         # Block until every episode in this window is materialized. Episodes
@@ -566,16 +652,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 gen_label, len(window_eps), wait_s,
             )
 
-        # Build frame-level index_map (deterministic per-epoch shuffle).
+        # Build frame-level index_map. The default preserves legacy global
+        # frame shuffle; storage-local modes shuffle at episode/block granularity
+        # so DataLoader reads can become larger sequential zarr ranges.
         t_build = time.perf_counter()
-        index_map: list[tuple[str, int]] = []
-        for ep in window_eps:
-            ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
-                index_map.append((ep_path, fi))
-        if self.mode == "train":
-            rng = random.Random(self.seed + epoch + 99999)
-            rng.shuffle(index_map)
+        index_map = self._build_index_map(window_eps, epoch)
         self._index_map = index_map
         logger.info(
             "[Timing] prepare_epoch %d: index_map built in %.3fs (%d frames)",
@@ -595,10 +676,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             try:
                 self._zarr_cache[ep_path] = ZarrDataset(
                     ep_path,
-                    key_map=self.resolver.key_map,
-                    transform_list=self.resolver.transform_list,
-                    norm_stats=self.resolver.norm_stats,
-                    pause_removal_epsilon=self.resolver.pause_removal_epsilon,
+                    **self._zarr_dataset_kwargs(),
                 )
             except Exception as e:
                 logger.warning(
@@ -626,6 +704,154 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             gen_label, len(new_paths) - len(broken), time.perf_counter() - t_open,
         )
 
+        if self.mode == "train" and self.jpeg_pack_cache_bytes > 0:
+            t_pack = time.perf_counter()
+            packed_bytes = 0
+            packed_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                ds = self._zarr_cache.get(ep_path)
+                if ds is None:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    packed_bytes > 0
+                    and estimated_bytes > 0
+                    and packed_bytes + estimated_bytes > self.jpeg_pack_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = int(ds.build_jpeg_pack())
+                    ep_hash = Path(ep_path).name
+                    size_on_disk = sum(
+                        f.stat().st_size for f in Path(ep_path).rglob("*") if f.is_file()
+                    )
+                    self._pool.register(ep_hash, size_on_disk)
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: JPEG pack build failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                if bytes_this > 0:
+                    packed_bytes += bytes_this
+                    packed_eps += 1
+                if packed_bytes >= self.jpeg_pack_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: JPEG-packed %.1f GB from %d episodes "
+                "in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                packed_bytes / 1_000_000_000,
+                packed_eps,
+                time.perf_counter() - t_pack,
+                self.jpeg_pack_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
+
+        if self.mode == "train" and self.prewarm_page_cache_bytes > 0:
+            t_warm = time.perf_counter()
+            warmed_bytes = 0
+            warmed_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    warmed_bytes > 0
+                    and estimated_bytes > 0
+                    and warmed_bytes + estimated_bytes > self.prewarm_page_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = self._warm_episode_page_cache(Path(ep_path))
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: page-cache warm failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                warmed_bytes += bytes_this
+                warmed_eps += 1
+                if warmed_bytes >= self.prewarm_page_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: warmed %.1f GB into page cache "
+                "from %d episodes in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                warmed_bytes / 1_000_000_000,
+                warmed_eps,
+                time.perf_counter() - t_warm,
+                self.prewarm_page_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
+
+        if self.mode == "train" and self.preload_image_cache_bytes > 0:
+            t_preload = time.perf_counter()
+            loaded_bytes = 0
+            loaded_eps = 0
+            skipped_eps = 0
+            for ep_path in sorted(new_paths):
+                if ep_path in broken:
+                    continue
+                ds = self._zarr_cache.get(ep_path)
+                if ds is None:
+                    continue
+                entry = entry_by_path.get(ep_path)
+                estimated_bytes = (
+                    int(entry.tar_size_bytes)
+                    if entry is not None and entry.tar_size_bytes is not None
+                    else 0
+                )
+                if (
+                    loaded_bytes > 0
+                    and estimated_bytes > 0
+                    and loaded_bytes + estimated_bytes > self.preload_image_cache_bytes
+                ):
+                    skipped_eps += 1
+                    continue
+                try:
+                    bytes_this = int(ds.preload_image_arrays())
+                except Exception as e:
+                    logger.warning(
+                        "prepare_epoch %d: image preload failed for %s (%s: %s)",
+                        gen_label, Path(ep_path).name, type(e).__name__, e,
+                    )
+                    skipped_eps += 1
+                    continue
+                if bytes_this > 0:
+                    loaded_bytes += bytes_this
+                    loaded_eps += 1
+                if loaded_bytes >= self.preload_image_cache_bytes:
+                    break
+            logger.info(
+                "[Timing] prepare_epoch %d: preloaded %.1f GB of camera JPEG arrays "
+                "from %d episodes in %.3fs (budget=%.1f GB, skipped=%d)",
+                gen_label,
+                loaded_bytes / 1_000_000_000,
+                loaded_eps,
+                time.perf_counter() - t_preload,
+                self.preload_image_cache_bytes / 1_000_000_000,
+                skipped_eps,
+            )
+
         # Publish the new epoch number atomically so persistent_workers can
         # refresh themselves on the next __getitem__. Atomic via os.replace.
         if self._is_filler_rank:
@@ -635,6 +861,20 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
                 os.replace(tmp, self._epoch_file)
             except OSError as e:
                 logger.warning("Failed to publish epoch file %s: %s", self._epoch_file, e)
+
+    @staticmethod
+    def _warm_episode_page_cache(ep_path: Path, read_size: int = 4 * 1024 * 1024) -> int:
+        """Sequentially read episode files so later zarr random reads hit page cache."""
+        total = 0
+        files = [p for p in ep_path.rglob("*") if p.is_file()]
+        for file_path in sorted(files):
+            with file_path.open("rb", buffering=0) as f:
+                while True:
+                    chunk = f.read(read_size)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+        return total
 
     # ------------------------------------------------------------------
     # Persistent-worker epoch sync
@@ -658,15 +898,7 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
         # (ep_path, frame_idx) tuples match main's index_map exactly.
         full_window_eps = self._plan.epoch_episodes(published_epoch)
         window_eps = [e for e in full_window_eps if not self._pool.is_bad(e.episode_hash)]
-        index_map: list[tuple[str, int]] = []
-        for ep in window_eps:
-            ep_path = str(self._pool.episode_path(ep.episode_hash))
-            for fi in range(ep.n_frames):
-                index_map.append((ep_path, fi))
-        if self.mode == "train":
-            rng = random.Random(self.seed + published_epoch + 99999)
-            rng.shuffle(index_map)
-        self._index_map = index_map
+        self._index_map = self._build_index_map(window_eps, published_epoch)
 
         # Evict zarr handles for episodes not in the current+lookahead
         # window so the worker's cache doesn't grow without bound.
@@ -715,7 +947,11 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             os.close(fd)
             probe_dir.mkdir(parents=True, exist_ok=True)
             logger.info("Probe: extracting %s", entry.tar_path.name)
-            _extract_tar_to_dir(entry.tar_path, probe_dir)
+            _extract_tar_to_dir(
+                entry.tar_path,
+                probe_dir,
+                expected_size_bytes=entry.tar_size_bytes,
+            )
             done_file.touch()
         except FileExistsError:
             deadline = time.monotonic() + 120
@@ -740,8 +976,186 @@ class PrefetchedMapDataset(_BoundsCheckMixin, torch.utils.data.Dataset):
             pass
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat alias
-# ---------------------------------------------------------------------------
+class PrefetchedIterableDataset(PrefetchedMapDataset, torch.utils.data.IterableDataset):
+    """Iterable variant that assigns contiguous frame blocks to each worker.
 
-PrefetchedIterableDataset = PrefetchedMapDataset
+    ``PrefetchedMapDataset`` can build an episode/block-local ``index_map``, but
+    PyTorch's map-style DataLoader still distributes integer indices to workers
+    in a strided pattern. With 12 workers, worker 0 reads indices
+    ``0, 12, 24, ...``. That destroys the sequential locality the index map was
+    trying to create.
+
+    This iterable path shards *blocks* instead. Each DDP rank/DataLoader worker
+    gets whole contiguous runs from one episode, so slow filesystems see long
+    sequential reads instead of many workers doing random seeks into many shard
+    files at once.
+    """
+
+    def __len__(self) -> int:
+        return self.epoch_frames
+
+    @staticmethod
+    def _distributed_rank_world() -> tuple[int, int]:
+        """Return the actual DDP rank/world size for DataLoader workers.
+
+        Modal can expose unrelated ``WORLD_SIZE`` values in the container
+        environment. Once Lightning has initialized DDP, ``torch.distributed``
+        is the authoritative source and is inherited by forked workers.
+        """
+        dist = torch.distributed
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank()), int(dist.get_world_size())
+
+        if "LOCAL_WORLD_SIZE" in os.environ:
+            rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+            return rank, max(1, int(os.environ["LOCAL_WORLD_SIZE"]))
+
+        if "LOCAL_RANK" in os.environ:
+            local_rank = int(os.environ["LOCAL_RANK"])
+            env_world = int(os.environ.get("WORLD_SIZE", "1"))
+            try:
+                visible_gpus = int(torch.cuda.device_count())
+            except Exception:
+                visible_gpus = 0
+            if visible_gpus > 0 and env_world > visible_gpus:
+                return local_rank, visible_gpus
+            rank = int(os.environ.get("RANK", local_rank))
+            return rank, max(1, env_world)
+
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        return rank, max(1, world_size)
+
+    def __iter__(self) -> Iterator[dict]:
+        if torch.utils.data.get_worker_info() is not None:
+            self._maybe_reload_worker_epoch()
+
+        if self._index_map is None:
+            # Shape/norm probing path before PrefetchEpochCallback has prepared
+            # the first epoch. Keep this finite so an accidental early iterator
+            # does not hang a training loop.
+            if self._probe_zarr_path is None:
+                self._probe_zarr_path = self._extract_probe()
+            if not hasattr(self, "_probe_ds"):
+                self._probe_ds = ZarrDataset(
+                    self._probe_zarr_path,
+                    **self._zarr_dataset_kwargs(),
+                )
+            for i in range(len(self._probe_ds)):
+                yield self._probe_ds[i]
+            return
+
+        blocks = self._contiguous_index_blocks()
+        if not blocks:
+            return
+
+        worker = torch.utils.data.get_worker_info()
+        worker_id = int(worker.id) if worker is not None else 0
+        num_workers = int(worker.num_workers) if worker is not None else 1
+        rank, world_size = self._distributed_rank_world()
+        shard_count = max(1, world_size * num_workers)
+        shard_id = rank * num_workers + worker_id
+        # DataLoader/Lightning stop at ``__len__``/``limit_train_batches``, but
+        # multi-worker IterableDataset exhaustion is terminal if any real-world
+        # worker budget comes up short. Keep the published length exact while
+        # allowing workers to overproduce a bounded tail that is normally never
+        # consumed.
+        overfetch = max(
+            num_workers * self.index_map_block_size * 2,
+            math.ceil(self.epoch_frames * 0.25),
+        )
+        target_samples = max(1, self.epoch_frames + overfetch)
+        worker_target = (target_samples + num_workers - 1 - worker_id) // num_workers
+        if worker_target <= 0:
+            return
+
+        shard_blocks = blocks[shard_id::shard_count]
+        if not shard_blocks:
+            logger.warning(
+                "PrefetchedIterableDataset has no blocks for rank=%d worker=%d "
+                "(blocks=%d shard_count=%d).",
+                rank, worker_id, len(blocks), shard_count,
+            )
+            return
+
+        if worker_id == 0:
+            logger.info(
+                "PrefetchedIterableDataset rank=%d/%d worker=%d/%d target=%d "
+                "(epoch_frames=%d overfetch=%d blocks=%d shard_blocks=%d)",
+                rank,
+                world_size,
+                worker_id,
+                num_workers,
+                worker_target,
+                self.epoch_frames,
+                overfetch,
+                len(blocks),
+                len(shard_blocks),
+            )
+
+        n_yielded = 0
+        block_cursor = 0
+        full_passes_without_yield = 0
+        while n_yielded < worker_target:
+            yielded_at_pass_start = n_yielded
+            for _ in range(len(shard_blocks)):
+                start, stop = shard_blocks[block_cursor]
+                block_cursor = (block_cursor + 1) % len(shard_blocks)
+                for index_pos in range(start, stop):
+                    if n_yielded >= worker_target:
+                        break
+                    try:
+                        yield PrefetchedMapDataset.__getitem__(self, index_pos)
+                        n_yielded += 1
+                    except Exception:
+                        logger.exception(
+                            "PrefetchedIterableDataset: failed at index_map[%d]",
+                            index_pos,
+                        )
+                        continue
+                if n_yielded >= worker_target:
+                    break
+
+            if n_yielded == yielded_at_pass_start:
+                full_passes_without_yield += 1
+                if full_passes_without_yield >= 2:
+                    raise RuntimeError(
+                        "PrefetchedIterableDataset could not produce samples for "
+                        f"rank={rank} worker={worker_id} after scanning "
+                        f"{len(shard_blocks)} blocks"
+                    )
+            else:
+                full_passes_without_yield = 0
+
+        if n_yielded == 0:
+            logger.warning(
+                "PrefetchedIterableDataset yielded 0 samples for rank=%d worker=%d "
+                "(blocks=%d shard_count=%d). Increase episodes_per_epoch or reduce "
+                "num_workers/world_size.",
+                rank, worker_id, len(blocks), shard_count,
+            )
+
+    def _contiguous_index_blocks(self) -> list[tuple[int, int]]:
+        """Return ``[start, stop)`` index-map spans with sequential frames.
+
+        The span boundary is cut when the episode changes, frame numbers stop
+        increasing by one, or ``index_map_block_size`` is reached. That keeps
+        the block size aligned with the existing config knob while preserving
+        sequential disk access inside each span.
+        """
+        if not self._index_map:
+            return []
+
+        max_block = max(1, self.index_map_block_size)
+        blocks: list[tuple[int, int]] = []
+        start = 0
+        prev_ep, prev_frame = self._index_map[0]
+        for i, (ep_path, frame_idx) in enumerate(self._index_map[1:], start=1):
+            reached_limit = (i - start) >= max_block
+            broke_sequence = ep_path != prev_ep or frame_idx != prev_frame + 1
+            if reached_limit or broke_sequence:
+                blocks.append((start, i))
+                start = i
+            prev_ep, prev_frame = ep_path, frame_idx
+        blocks.append((start, len(self._index_map)))
+        return blocks

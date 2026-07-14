@@ -33,6 +33,13 @@ PrefetchedMapDataset
     workers fork after this returns and inherit the index_map + warm zarr
     handles.
 
+PrefetchedIterableDataset
+    Training-only streaming variant. It uses the same epoch preparation and
+    NVMe pool, but shards contiguous episode/frame blocks across DDP ranks and
+    DataLoader workers. This preserves sequential reads on slow filesystems
+    where map-style worker index striding would turn the same index map back
+    into random seeks.
+
 Disk safety
     The pool capacity is a hard byte ceiling. The filler refuses to start
     an extraction that would push usage past the ceiling and instead waits

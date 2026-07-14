@@ -210,6 +210,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         data_schematic_state=data_schematic.to_state(),
         viz_func=viz_func_dict,
         scheduler_interval=cfg.model.get("scheduler_interval", "step"),
+        enable_grad_norm=cfg.model.get("enable_grad_norm", True),
+        gpu_jpeg_decode=cfg.model.get("gpu_jpeg_decode", False),
     )
 
     _log_dataset_frame_counts(
