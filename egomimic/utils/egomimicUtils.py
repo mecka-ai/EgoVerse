@@ -248,13 +248,42 @@ EXTRINSICS = {
         "left": np.eye(4),
         "right": np.eye(4),
     },
+    # YAM robot: T_cam_base (camera -> per-arm base), base = T @ cam.
+    "yam": {
+        "left": np.array(
+            [
+                [0.0437291, -0.85821391, 0.5114261, 0.08690521],
+                [-0.99754573, -0.00948836, 0.06937217, -0.25327518],
+                [-0.05468356, -0.5132045, -0.85652253, 0.83357606],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+        "right": np.array(
+            [
+                [0.04251619, -0.84174054, 0.53820557, 0.04959916],
+                [-0.98836195, 0.04331659, 0.14582295, 0.27905066],
+                [-0.14605832, -0.53814174, -0.83010266, 0.87148985],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ),
+    },
 }
+
+# YAM rectified/re-aimed pinhole K (K | 0), valid at stored 640x480 front_img_1.
+YAM_INTRINSICS = np.array(
+    [
+        [250.158072, 0.0, 267.540984, 0.0],
+        [0.0, 260.017893, 152.727273, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ]
+)
 
 INTRINSICS = {
     "base": ARIA_INTRINSICS,
     "base_half": ARIA_INTRINSICS_HALF,
     "mecka": MECKA_INTRINSICS,
     "scale": SCALE_INTRINSICS,
+    "yam": YAM_INTRINSICS,
 }
 
 ARIA_T_RGB_CPF = np.array(
@@ -556,7 +585,14 @@ def draw_rotation_text(
 
 
 def draw_actions(
-    im, type, color, actions, extrinsics, intrinsics, arm="both", kinematics_solver=None,
+    im,
+    type,
+    color,
+    actions,
+    extrinsics,
+    intrinsics,
+    arm="both",
+    kinematics_solver=None,
     dot_size=5,
 ):
     """
@@ -603,7 +639,9 @@ def draw_actions(
         actions_drawable = actions
 
     actions_drawable = cam_frame_to_cam_pixels(actions_drawable, intrinsics)
-    im = draw_dot_on_frame(im, actions_drawable, show=False, palette=color, dot_size=dot_size)
+    im = draw_dot_on_frame(
+        im, actions_drawable, show=False, palette=color, dot_size=dot_size
+    )
 
     return im
 

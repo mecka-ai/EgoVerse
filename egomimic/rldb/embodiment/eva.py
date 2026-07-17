@@ -31,9 +31,12 @@ class Eva(Embodiment):
         mode: Literal[
             "cartesian", "cartesian_wristframe_ypr", "cartesian_wristframe_quat"
         ],
+        extrinsics_key: str = "x5Dec13_2",
     ) -> list[Transform]:
         if mode == "cartesian":
-            return _build_eva_bimanual_transform_list(is_quat=True)
+            return _build_eva_bimanual_transform_list(
+                is_quat=True, extrinsics_key=extrinsics_key
+            )
         elif mode == "cartesian_wristframe_ypr":
             return _build_eva_bimanual_eef_frame_transform_list(is_quat=False)
         elif mode == "cartesian_wristframe_quat":
