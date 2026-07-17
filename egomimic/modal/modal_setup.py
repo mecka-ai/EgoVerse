@@ -339,6 +339,13 @@ VOLUME_MAP: dict[str, tuple] = {
         modal.Volume.from_name("elmo_data_v2"),
         "/mnt/zarr-data",
     ),
+    # YAM robot episodes (EVA-schema zarrs, timestamp ids). Same /mnt/zarr-data
+    # mount so the ModalEpisodeResolver data config works unchanged; SQL rows
+    # carry robot_name="yam_bimanual" (aliased to EVA_BIMANUAL end to end).
+    "yam_zarr_data": (
+        modal.Volume.from_name("yam_zarr_data"),
+        "/mnt/zarr-data",
+    ),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True

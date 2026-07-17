@@ -40,7 +40,15 @@ EMBODIMENT_ID_TO_KEY = {member.value: member.name for member in EMBODIMENT}
 # zarrs converted from Aria MANO recordings but written with
 # embodiment="human_bimanual"; they are treated as MECKA_BIMANUAL end to end
 # (same keys, keymaps, and schematic — matching the deminf_elmo_gt curation).
-_EMBODIMENT_ALIASES = {"HUMAN_BIMANUAL": "MECKA_BIMANUAL"}
+#
+# yam_bimanual (yam_zarr_data volume) uses the identical zarr schema as EVA robot
+# episodes (images.front_1/left_wrist/right_wrist, left/right.{cmd,obs}_{ee_pose,
+# gripper}), so it is treated as EVA_BIMANUAL end to end — this is what lets the
+# cotrain checkpoints finetune directly on yam via the eva keymap/transform.
+_EMBODIMENT_ALIASES = {
+    "HUMAN_BIMANUAL": "MECKA_BIMANUAL",
+    "YAM_BIMANUAL": "EVA_BIMANUAL",
+}
 
 
 def get_embodiment(index):

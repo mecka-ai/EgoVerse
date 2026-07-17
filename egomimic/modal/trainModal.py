@@ -41,7 +41,6 @@ from modal_setup import (  # noqa: E402
     _uses_pi_model,
     app,
     app_name_from_hydra_args,
-    decode_submodules,
     encode_submodules,
     launch_detached,
     pop_init_submodules,
@@ -62,6 +61,7 @@ def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
     """Rewrite relative path overrides to absolute container paths."""
     _PATH_KEYS = {
         "ckpt_path",
+        "finetune_ckpt",
         "norm_stats.precomputed_norm_path",
         "model.robomimic_model.config.paligemma_weight_path",
         "model.robomimic_model.config.pytorch_weight_path",
@@ -297,7 +297,9 @@ def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
     transformers_replace check fires — so we validate the full pi path without a
     GPU. No PYTHONPATH: relies on the site-packages .pth (the DDP-child path).
     """
-    _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=frozenset({"openpi"}))
+    _prepare_repo(
+        git_remote=git_remote, git_commit=git_commit, submodules=frozenset({"openpi"})
+    )
 
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"

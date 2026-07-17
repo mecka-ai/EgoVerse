@@ -22,6 +22,7 @@ defaults:
 name: test
 description: test
 ckpt_path: null
+finetune_ckpt: null  # weights-only load (strict=False) into a FRESH run — finetune a cotrain ckpt on new data
 wandb_run_id: null  # set to resume an existing W&B run (auto-set on Modal auto-restart)
 mode: train
 

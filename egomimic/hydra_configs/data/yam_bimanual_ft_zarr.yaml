@@ -1,0 +1,75 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# YAM finetune data — 202 yam_bimanual robot episodes from the mecka SQL table,
+# zarrs on the yam_zarr_data volume (mounted at /mnt/zarr-data via
+# +modal_volume=yam_zarr_data). YAM zarrs use the EVA schema, so they are loaded
+# with the EVA keymap/transform and presented under the eva_bimanual embodiment
+# key (YAM_BIMANUAL is aliased to EVA_BIMANUAL end to end). This is what lets the
+# cotrain checkpoints finetune directly on yam.
+#
+#   train -> yam_bimanual_train.json (188)
+#   valid -> yam_bimanual_val.json   (14, disjoint from train)
+#   train_viz -> yam_bimanual_viz.json (3, subset of train)
+
+train_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva._get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/yam_bimanual_train.json
+    mode: total
+
+valid_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva._get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/yam_bimanual_val.json
+    mode: total
+
+train_viz_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva._get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+      eps_to_use: egomimic/hydra_configs/data/extra/yam_bimanual_viz.json
+    mode: total
+
+train_dataloader_params:
+  eva_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  eva_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+train_viz_dataloader_params:
+  eva_bimanual:
+    batch_size: 8
+    num_workers: 4
+    persistent_workers: true
