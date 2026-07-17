@@ -40,7 +40,7 @@ class Eva(Embodiment):
             return _build_eva_bimanual_eef_frame_transform_list(is_quat=True)
 
     @classmethod
-    def _get_keymap(cls, keymap_mode: str):
+    def _get_keymap(cls, keymap_mode: str, norm_mode: bool = False):
         key_map = {
             cls.VIZ_IMAGE_KEY: {
                 "key_type": "camera_keys",
@@ -92,6 +92,14 @@ class Eva(Embodiment):
             },
         }
 
+        # Norm-stat computation only touches numeric action/proprio keys; drop
+        # camera (and annotation) keys so the norm dataset doesn't decode images.
+        if norm_mode:
+            key_map = {
+                k: v
+                for k, v in key_map.items()
+                if v.get("key_type") not in ("camera_keys", "annotation_keys")
+            }
         return key_map
 
     @classmethod
