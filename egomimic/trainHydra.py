@@ -278,10 +278,15 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if os.environ.get("MODAL_IS_REMOTE") == "1" and os.environ.get(
         "MODAL_TIMEOUT_SECONDS"
     ):
-        from egomimic.modal.callbacks import ModalAutoRestartCallback
+        from egomimic.modal.callbacks import (
+            ModalAutoRestartCallback,
+            VolumeCommitCallback,
+        )
 
         callbacks.append(ModalAutoRestartCallback())
+        callbacks.append(VolumeCommitCallback())
         log.info("[ModalAutoRestart] Callback registered")
+        log.info("[VolumeCommit] Callback registered")
 
     _train_viz_ds = getattr(datamodule, "train_viz_datasets", {}) or {}
     if any(
@@ -393,6 +398,21 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         # that don't match the new data reinitialize.
         resume_ckpt = cfg.get("ckpt_path")
         finetune_ckpt = cfg.get("finetune_ckpt")
+        # Preemption resilience: if this run's own output dir already holds a
+        # checkpoint, a prior (preempted/requeued) container of the SAME run made
+        # progress — resume its full trainer state instead of re-loading the
+        # ckpt_path / finetune_ckpt launch base. Requires a stable (non-timestamped)
+        # output dir so the restart reuses the same path, and VolumeCommitCallback
+        # so the checkpoint is durable on the volume. Bounds loss to the checkpoint
+        # interval rather than resetting to the launch checkpoint.
+        own_last = os.path.join(trainer.default_root_dir, "checkpoints", "last.ckpt")
+        if os.path.exists(own_last):
+            log.info(
+                f"[preemption-resume] found existing {own_last} — resuming trainer "
+                "state from it (ignoring launch ckpt_path/finetune_ckpt)"
+            )
+            resume_ckpt = own_last
+            finetune_ckpt = None
         if finetune_ckpt:
             checkpoint = torch.load(
                 finetune_ckpt, map_location="cpu", weights_only=False

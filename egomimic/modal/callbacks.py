@@ -76,7 +76,8 @@ class ModalAutoRestartCallback(Callback):
 
         raw_args: list = json.loads(os.environ.get("MODAL_HYDRA_ARGS", "[]"))
         new_args = [
-            a for a in raw_args
+            a
+            for a in raw_args
             if not a.startswith("ckpt_path=") and not a.startswith("wandb_run_id=")
         ]
         new_args.append(f"ckpt_path={ckpt_path}")
@@ -87,6 +88,7 @@ class ModalAutoRestartCallback(Callback):
         git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
         wandb_api_key = os.environ.get("WANDB_API_KEY", "")
         from modal_setup import decode_submodules
+
         submodules = decode_submodules(os.environ.get("MODAL_INIT_SUBMODULES", ""))
 
         if trainer.is_global_zero:
@@ -104,7 +106,9 @@ class ModalAutoRestartCallback(Callback):
                 log.error(f"[ModalAutoRestart] Failed to spawn continuation: {exc}")
 
         trainer.should_stop = True
-        log.info("[ModalAutoRestart] Stopping current run — continuation job is running")
+        log.info(
+            "[ModalAutoRestart] Stopping current run — continuation job is running"
+        )
 
     @staticmethod
     def _continuation_fn():
@@ -137,6 +141,30 @@ class ModalAutoRestartCallback(Callback):
             "run_hydra_train",
             environment_name="robotics",
         )
+
+
+class VolumeCommitCallback(Callback):
+    """Commit the training-outputs volume after every checkpoint save.
+
+    Modal volume writes are not durable across a container kill until committed.
+    Preemptible GPUs can reclaim the container at any time, so without an explicit
+    commit the most recent ModelCheckpoint save is lost and the restarted
+    container falls back to the launch checkpoint. Committing on each save makes
+    the run's own latest checkpoint durable, so trainHydra's resume-from-own-ckpt
+    logic can pick up where the preempted container left off (bounded to the
+    checkpoint interval). Rank-zero only; the mount is shared.
+    """
+
+    def on_save_checkpoint(self, trainer: Trainer, pl_module, checkpoint) -> None:
+        if not trainer.is_global_zero:
+            return
+        try:
+            import modal as _modal
+
+            _modal.Volume.from_name("egoverse-training-outputs").commit()
+            log.info("[VolumeCommit] Committed checkpoint to outputs volume")
+        except Exception as exc:  # noqa: BLE001 — commit is best-effort
+            log.error(f"[VolumeCommit] Volume commit failed: {exc}")
 
 
 class PrefetchEpochCallback(Callback):
@@ -173,7 +201,10 @@ class PrefetchEpochCallback(Callback):
         for name, ds in datasets.items():
             if hasattr(ds, "prepare_epoch"):
                 log.info(
-                    "PrefetchEpochCallback: prepare_epoch(%d) for %s/%s", epoch, split, name
+                    "PrefetchEpochCallback: prepare_epoch(%d) for %s/%s",
+                    epoch,
+                    split,
+                    name,
                 )
                 ds.prepare_epoch(epoch)
 
