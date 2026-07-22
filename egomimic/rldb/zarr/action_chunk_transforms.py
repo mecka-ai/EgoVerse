@@ -987,6 +987,44 @@ class SelectKeypoints(Transform):
 # ---------------------------------------------------------------------------
 
 
+class PadActionGripper(Transform):
+    """Pad a 12-D bimanual cartesian action chunk to 14-D with zero gripper columns.
+
+    Human (Mecka/Aria) cartesian actions are ``[L xyz+ypr, R xyz+ypr]`` (12-D, no
+    gripper), but the cotrain shared flow head operates in 14-D
+    ``[L xyz+ypr, L gripper, R xyz+ypr, R gripper]`` (the robot/yam layout). This
+    inserts a zero gripper column after each arm's pose so human data shares the
+    robot's 14-D action space — matching ``FMPolicy``'s own padding
+    (denoising_policy: ``[..:6], pad, [6:], pad``). Doing it at the data level (not
+    just in the loss) keeps the GT 14-D so validation metrics/viz compare against a
+    14-D prediction with no dimension mismatch or misaligned slicing.
+    """
+
+    def __init__(self, action_key: str = "actions_cartesian"):
+        self.action_key = action_key
+
+    def transform(self, batch: dict) -> dict:
+        a = batch[self.action_key]
+        d = a.shape[-1]
+        if d == 14:
+            return batch  # already padded (idempotent)
+        if d != 12:
+            raise ValueError(
+                f"PadActionGripper expects 12-D actions for key '{self.action_key}', "
+                f"got {d}-D {tuple(a.shape)}"
+            )
+        if isinstance(a, torch.Tensor):
+            z = torch.zeros((*a.shape[:-1], 1), dtype=a.dtype, device=a.device)
+            batch[self.action_key] = torch.cat((a[..., :6], z, a[..., 6:], z), dim=-1)
+        else:
+            a = np.asarray(a)
+            z = np.zeros((*a.shape[:-1], 1), dtype=a.dtype)
+            batch[self.action_key] = np.concatenate(
+                (a[..., :6], z, a[..., 6:], z), axis=-1
+            )
+        return batch
+
+
 class NumpyToTensor(Transform):
     def __init__(self, keys: list[str]):
         self.keys = keys

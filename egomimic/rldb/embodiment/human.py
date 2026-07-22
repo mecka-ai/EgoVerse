@@ -12,6 +12,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     CumulativeComposeChunk,
     DeleteKeys,
     InterpolatePose,
+    PadActionGripper,
     PerTimestepCoordinateFrameTransform,
     PoseCoordinateFrameTransform,
     QuaternionPoseToYPR,
@@ -350,11 +351,18 @@ class Mecka(Human):
             "cartesian_wristframe_6d",
             "cartesian_wristframe_6d_fingertips_nointerp",
         ],
+        pad_gripper: bool = False,
     ) -> list[Transform]:
         if mode == "cartesian":
-            return _build_aria_cartesian_bimanual_transform_list(
+            tl = _build_aria_cartesian_bimanual_transform_list(
                 stride=cls.ACTION_STRIDE,
             )
+            if pad_gripper:
+                # Cotrain with a 14-D shared head: pad human 12-D actions to the
+                # robot's 14-D [L6, gripper, R6, gripper] layout at the data level so
+                # GT stays 14-D (aligned with 14-D predictions in loss + val metrics).
+                tl.append(PadActionGripper(action_key="actions_cartesian"))
+            return tl
         elif mode == "cartesian_wristframe_6d":
             # The pi-6d 6D wrist-frame representation: each arm's ee-pose action chunk
             # expressed relative to the current ee pose (single-anchor delta), rotation

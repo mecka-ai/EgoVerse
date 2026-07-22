@@ -1,0 +1,52 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# Data-diversity human-only pretrain — set D4.
+# Stage-1 cotrain pretrain on MECKA (human) data only (no robot). Human 12-D cartesian
+# actions are padded to the shared head's 14-D [L6, gripper, R6, gripper] layout
+# (pad_gripper: true) so GT stays 14-D and matches 14-D predictions in loss + val metrics.
+# Legacy-SQL (69...) episode ids -> ModalEpisodeResolver on /mnt/zarr-data.
+#   train -> data_diversity/D4.json      valid -> data_diversity/D4_val.json
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/D4.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/D4_val.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
