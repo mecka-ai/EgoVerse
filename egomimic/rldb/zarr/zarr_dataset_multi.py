@@ -312,7 +312,9 @@ def check_sample_bounds(
             continue
 
         if torch.any(torch.isnan(arr)) or torch.any(torch.isinf(arr)):
-            return f"NaN/Inf violation ep={episode_name} frame={frame_idx} key={zarr_key}"
+            return (
+                f"NaN/Inf violation ep={episode_name} frame={frame_idx} key={zarr_key}"
+            )
 
         if torch.any(arr < q_low) or torch.any(arr > q_high):
             return (
@@ -823,9 +825,6 @@ class LocalEpisodeResolver(EpisodeResolver):
         filters: DatasetFilter | None = None,
         debug: int | bool | None = None,
     ):
-        import time
-        from concurrent.futures import ThreadPoolExecutor
-
         filters = _ensure_dataset_filter(filters)
         if not search_path.is_dir():
             logger.warning("Local path does not exist: %s", search_path)
@@ -971,20 +970,30 @@ class ModalEpisodeResolver(EpisodeResolver):
         if eps_to_ignore:
             with open(eps_to_ignore) as f:
                 self.exclude_hashes.update(json.load(f))
-            logger.info("eps_to_ignore: %d hashes from %s", len(self.exclude_hashes), eps_to_ignore)
+            logger.info(
+                "eps_to_ignore: %d hashes from %s",
+                len(self.exclude_hashes),
+                eps_to_ignore,
+            )
         self.include_hashes: set[str] | None = None
         if eps_to_use:
             with open(eps_to_use) as f:
                 self.include_hashes = set(json.load(f))
-            logger.info("eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use)
+            logger.info(
+                "eps_to_use: %d hashes from %s", len(self.include_hashes), eps_to_use
+            )
         # allowed_episode_ids: restrict to exactly these hashes (used by curation per-task scoping)
         if allowed_episode_ids is not None:
             allowed_set = set(allowed_episode_ids)
             self.include_hashes = (
-                allowed_set if self.include_hashes is None
+                allowed_set
+                if self.include_hashes is None
                 else self.include_hashes & allowed_set
             )
-            logger.info("allowed_episode_ids: restricted to %d episodes", len(self.include_hashes))
+            logger.info(
+                "allowed_episode_ids: restricted to %d episodes",
+                len(self.include_hashes),
+            )
 
     def resolve(
         self,
@@ -1041,6 +1050,18 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         datasets: dict[str, ZarrDataset] = {}
         n_missing = 0
+
+        def _safe_is_dir(p: Path) -> bool:
+            # Modal volumes are FUSE-mounted; is_dir() on a non-existent / flaky path
+            # can raise OSError (errno 5, EIO) instead of returning False. Treat any
+            # such probe error as "not a directory" so one bad probe doesn't abort the
+            # whole resolve over thousands of episodes (the next candidate / skip
+            # handles it).
+            try:
+                return p.is_dir()
+            except OSError:
+                return False
+
         for episode_hash, (num_frames, robot_name) in meta_lookup.items():
             local_path = next(
                 (
@@ -1049,7 +1070,7 @@ class ModalEpisodeResolver(EpisodeResolver):
                         self.folder_path / episode_hash,
                         self.folder_path / f"{episode_hash}.zarr",
                     )
-                    if p.is_dir()
+                    if _safe_is_dir(p)
                 ),
                 None,
             )
@@ -1301,9 +1322,8 @@ class ModalEpisodeResolver(EpisodeResolver):
 
     @staticmethod
     def _should_use_modal_pause_precompute(datasets: dict) -> bool:
-        inside_modal = (
-            os.environ.get("MODAL_IS_REMOTE") == "1"
-            or bool(os.environ.get("MODAL_TASK_ID"))
+        inside_modal = os.environ.get("MODAL_IS_REMOTE") == "1" or bool(
+            os.environ.get("MODAL_TASK_ID")
         )
         if not inside_modal:
             return False
@@ -1323,7 +1343,9 @@ class ModalEpisodeResolver(EpisodeResolver):
 
         work = [(name, str(ds.episode_path)) for name, ds in datasets.items()]
         n = len(work)
-        n_shards = min(int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n)
+        n_shards = min(
+            int(os.environ.get("EGOMIMIC_PAUSE_PRECOMPUTE_SHARDS", "100")), n
+        )
         shards = [work[i::n_shards] for i in range(n_shards)]
         shards = [s for s in shards if s]
         total_shards = len(shards)
@@ -1489,9 +1511,7 @@ class MultiDataset(torch.utils.data.Dataset):
             and self.index_map[g][1] not in rejected_local
         ]
 
-    def _build_index_map_from_datasets(
-        self, datasets: dict | None = None
-    ) -> None:
+    def _build_index_map_from_datasets(self, datasets: dict | None = None) -> None:
         """Rebuild flat (dataset_name, local_idx) index from ``self.datasets`` or override."""
         if datasets is not None:
             self.datasets = datasets
@@ -1881,9 +1901,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             cache[zarr_key] = np.asarray(store[zarr_key][:])
         self._zarr_bulk_cache = cache
 
-    def _read_key_slice(
-        self, zarr_key: str, start: int, end: int | None
-    ) -> np.ndarray:
+    def _read_key_slice(self, zarr_key: str, start: int, end: int | None) -> np.ndarray:
         if self._zarr_bulk_cache is not None and zarr_key in self._zarr_bulk_cache:
             arr = self._zarr_bulk_cache[zarr_key]
             if end is not None:
@@ -1937,8 +1955,14 @@ class ZarrDataset(torch.utils.data.Dataset):
         if "obs_head_pose" not in cache:
             return np.array([], dtype=np.int64)
         # keypoints keymap uses obs_wrist_pose; cartesian keymap uses obs_ee_pose
-        left_key = "left.obs_ee_pose" if "left.obs_ee_pose" in cache else "left.obs_wrist_pose"
-        right_key = "right.obs_ee_pose" if "right.obs_ee_pose" in cache else "right.obs_wrist_pose"
+        left_key = (
+            "left.obs_ee_pose" if "left.obs_ee_pose" in cache else "left.obs_wrist_pose"
+        )
+        right_key = (
+            "right.obs_ee_pose"
+            if "right.obs_ee_pose" in cache
+            else "right.obs_wrist_pose"
+        )
         if left_key not in cache or right_key not in cache:
             return np.array([], dtype=np.int64)
 
@@ -1946,13 +1970,19 @@ class ZarrDataset(torch.utils.data.Dataset):
         left = np.asarray(cache[left_key])
         right = np.asarray(cache[right_key])
         head_ok = self._pose_rows_valid(
-            head, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            head,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         left_ok = self._pose_rows_valid(
-            left, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            left,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
         right_ok = self._pose_rows_valid(
-            right, min_quat_norm=self._CURATION_MIN_QUAT_NORM, sentinel=self._CURATION_POSE_SENTINEL
+            right,
+            min_quat_norm=self._CURATION_MIN_QUAT_NORM,
+            sentinel=self._CURATION_POSE_SENTINEL,
         )
 
         valid: list[int] = []
@@ -1963,7 +1993,10 @@ class ZarrDataset(torch.utils.data.Dataset):
                 continue
             if not head_ok[real_idx]:
                 continue
-            if not left_ok[real_idx:end_idx].all() or not right_ok[real_idx:end_idx].all():
+            if (
+                not left_ok[real_idx:end_idx].all()
+                or not right_ok[real_idx:end_idx].all()
+            ):
                 continue
             if not left_ok[real_idx] or not right_ok[real_idx]:
                 continue
@@ -2034,7 +2067,9 @@ class ZarrDataset(torch.utils.data.Dataset):
                 if horizon is not None:
                     end_idx = self._chunk_end_idx(real_idx, int(horizon), key_type)
                     window = self._read_key_slice(zarr_key, real_idx, end_idx)
-                    window = self._pad_sequences({zarr_key: window}, int(horizon))[zarr_key]
+                    window = self._pad_sequences({zarr_key: window}, int(horizon))[
+                        zarr_key
+                    ]
                     rows.append(np.asarray(window))
                 else:
                     rows.append(
@@ -2065,7 +2100,11 @@ class ZarrDataset(torch.utils.data.Dataset):
                 data = batch
                 for transform in self.transform:
                     data = transform.transform_batch(data)
-                out = {k: np.asarray(v) for k, v in data.items() if isinstance(v, np.ndarray)}
+                out = {
+                    k: np.asarray(v)
+                    for k, v in data.items()
+                    if isinstance(v, np.ndarray)
+                }
                 return out, np.arange(batch_size, dtype=np.int64)
             except Exception as exc:
                 logger.debug(
@@ -2142,7 +2181,10 @@ class ZarrDataset(torch.utils.data.Dataset):
         """Per-valid-frame language: instruction strings or precomputed (T, D) embeddings."""
         if precomputed:
             self._ensure_zarr_key_cached(language_key)
-            if self._zarr_bulk_cache is None or language_key not in self._zarr_bulk_cache:
+            if (
+                self._zarr_bulk_cache is None
+                or language_key not in self._zarr_bulk_cache
+            ):
                 raise KeyError(
                     f"precomputed language key {language_key!r} missing in episode "
                     f"{Path(self.episode_path).name}"
@@ -2210,7 +2252,9 @@ class ZarrDataset(torch.utils.data.Dataset):
         # align latents/annotation spans/preview frames exactly (some rows are dropped
         # by pause removal and/or invalid-pose/transform filtering).
         if self.keep_indices is not None:
-            self._curation_kept_indices = np.asarray(self.keep_indices)[logical_valid].astype(np.int64)
+            self._curation_kept_indices = np.asarray(self.keep_indices)[
+                logical_valid
+            ].astype(np.int64)
         else:
             self._curation_kept_indices = np.asarray(logical_valid, dtype=np.int64)
 
@@ -2505,7 +2549,7 @@ class ZarrDataset(torch.utils.data.Dataset):
             for transform in self.transform:
                 try:
                     data = transform.transform(data)
-                except Exception as e:
+                except Exception:
                     origin = _fallback_origin if _fallback_origin is not None else idx
                     next_idx, attempts = get_fallback_idx(
                         idx=idx,
@@ -2734,7 +2778,9 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
             all_shards = all_shards[:n_shards]
             logger.info(
                 "TarShardMultiDataset debug=%d: using first %d shards (~%d episodes)",
-                debug, len(all_shards), len(all_shards) * _SHARD_EPISODES_NOMINAL,
+                debug,
+                len(all_shards),
+                len(all_shards) * _SHARD_EPISODES_NOMINAL,
             )
 
         rng = random.Random(seed)
@@ -2765,7 +2811,9 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
 
         logger.info(
             "TarShardMultiDataset [%s]: %d shards, shard_dir=%s",
-            mode, len(self._shards), shard_dir,
+            mode,
+            len(self._shards),
+            shard_dir,
         )
 
     # ------------------------------------------------------------------
@@ -2831,7 +2879,10 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         elapsed = time.perf_counter() - t0
         logger.info(
             "Extracted %s  %.0f MB in %.1fs (%.0f MB/s)",
-            shard_path.name, size_mb, elapsed, size_mb / elapsed if elapsed else 0,
+            shard_path.name,
+            size_mb,
+            elapsed,
+            size_mb / elapsed if elapsed else 0,
         )
 
     def _start_prefetch(self, shard_path: Path) -> None:
@@ -2878,7 +2929,10 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
 
         logger.info(
             "ShardEpoch %d: %d episodes, %d frames from %s",
-            self._epoch_gen, len(self.datasets), len(self.index_map), tar_dir.name,
+            self._epoch_gen,
+            len(self.datasets),
+            len(self.index_map),
+            tar_dir.name,
         )
 
     def _ensure_probe_shard(self) -> None:
@@ -2937,7 +2991,8 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                     logger.warning(
                         "ShardEpoch %d: waited %.1fs for prefetch — "
                         "extraction is slower than one epoch",
-                        gen, waited,
+                        gen,
+                        waited,
                     )
                 # Delete old current, rename next → current.
                 if self._current_dir.exists():
@@ -2946,7 +3001,10 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
                     self._next_dir.rename(self._current_dir)
                     logger.info("ShardEpoch %d: swapped prefetch → current", gen)
                 else:
-                    logger.warning("ShardEpoch %d: prefetch unavailable, extracting synchronously", gen)
+                    logger.warning(
+                        "ShardEpoch %d: prefetch unavailable, extracting synchronously",
+                        gen,
+                    )
                     self._extract(self._pick_shard(gen), self._current_dir)
 
             self._build_epoch_index(self._current_dir, shuffle=not sequential)
@@ -3035,7 +3093,11 @@ class TarShardMultiDataset(MultiDataset, torch.utils.data.IterableDataset):
         elapsed = time.perf_counter() - t_start
         logger.info(
             "Worker %d ShardEpoch %d: %d samples yielded, %d skipped in %.0fs (%.1f samples/s)",
-            worker_id, gen, sample_count, skip_count, elapsed,
+            worker_id,
+            gen,
+            sample_count,
+            skip_count,
+            elapsed,
             sample_count / elapsed if elapsed else 0,
         )
 
