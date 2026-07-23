@@ -106,6 +106,77 @@ MONGO_BODY_FIELDS = {
     "body_final": "pipeline_results.body.key_outputs.body_final",
 }
 
+# New body-pipeline schema: raw R2 keys for episodes that lack the legacy
+# post_processing.* artifacts. Each source falls back legacy -> new below.
+NEW_SCHEMA_FIELDS = {
+    # left cam is the body pipeline's reference camera (body.input_keys.wes_video),
+    # so its frames align with the hands_final/body_final camera frame.
+    "video": "split_results.left_video_key",
+    # the height-calibrated trajectory the body pipeline consumed to produce
+    # hands_final/body_final; same 11-col frame-indexed format as egomotion_client.
+    "egomotion": "pipeline_results.body.input_keys.egomotion",
+}
+
+
+def _resolve_source_keys(mongo_doc: dict) -> dict:
+    """
+    Resolve the R2 storage keys for an episode's assets, supporting BOTH the
+    legacy ``post_processing.*`` schema and the newer body-pipeline schema.
+
+    Each source prefers the legacy key and falls back to the new-schema key:
+      - video:     ``video_1``            -> ``split_results.left_video_key``
+      - egomotion: ``egomotion_client``   -> ``body.input_keys.egomotion``
+      - frames:    ``framesKey`` (both schemas)
+      - hands:     ``hands_camera_interpolated`` (download as hands.csv) OR
+                   ``hands_final`` + ``body_final`` (converted to hands.csv)
+
+    Returns a dict: ``video``, ``egomotion``, ``frames``, ``hands_mode``
+    ("interpolated" | "from_body"), and ``hands_interp`` / ``hands_final`` /
+    ``body_final``. Raises ValueError naming the missing source(s) if an episode
+    cannot be resolved under either schema.
+    """
+    def g(dotted: str):
+        v = _get_nested(mongo_doc, dotted)
+        return v if v else None  # treat "" the same as missing
+
+    video = mongo_doc.get("video_1") or g(NEW_SCHEMA_FIELDS["video"])
+    egomotion = g(MONGO_URL_FIELDS["egomotion"]) or g(NEW_SCHEMA_FIELDS["egomotion"])
+    frames = mongo_doc.get("framesKey") or None
+
+    hands_interp = g(MONGO_URL_FIELDS["hands"])
+    hands_final = g(MONGO_BODY_FIELDS["hands_final"])
+    body_final = g(MONGO_BODY_FIELDS["body_final"])
+
+    missing = [
+        name
+        for name, val in (("video", video), ("egomotion", egomotion), ("frames", frames))
+        if not val
+    ]
+    if missing:
+        raise ValueError(
+            f"Cannot resolve required source(s) {missing} under legacy or new schema"
+        )
+
+    if hands_interp:
+        hands_mode = "interpolated"
+    elif hands_final and body_final:
+        hands_mode = "from_body"
+    else:
+        raise ValueError(
+            "No hands source: neither hands_camera_interpolated nor "
+            "hands_final+body_final present"
+        )
+
+    return {
+        "video": video,
+        "egomotion": egomotion,
+        "frames": frames,
+        "hands_mode": hands_mode,
+        "hands_interp": hands_interp,
+        "hands_final": hands_final,
+        "body_final": body_final,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Subset routing
@@ -480,6 +551,44 @@ def _resolve_intrinsics_key(db, episode_hash: str, mongo_doc: dict) -> str:
     return key
 
 
+# New-schema (ATLAS multicam) intrinsics: a fisheye calibration JSON rather than
+# a phone-model pinhole entry. Ordered by preference.
+NEW_INTRINSICS_FIELDS = (
+    "pipeline_results.body.input_keys.ds_intrinsics",
+    "calibration_key",
+)
+
+
+def _resolve_intrinsics_source(
+    db, episode_hash: str, mongo_doc: dict
+) -> "str | None":
+    """
+    Best-effort intrinsics R2 key, resolved across schemas.
+
+    Tries the legacy path first (``intrinsicsKey`` / device-model chain, which
+    keeps old episodes byte-identical), then the new-schema multicam calibration
+    keys. Intrinsics are metadata-only (never used to compute any zarr array), so
+    this returns ``None`` rather than raising when no source exists — the episode
+    still converts, just without an intrinsics entry in its metadata.
+    """
+    try:
+        return _resolve_intrinsics_key(db, episode_hash, mongo_doc)
+    except Exception as e:
+        logger.info(
+            f"[{episode_hash}] legacy intrinsics unavailable ({e}); "
+            f"trying new-schema calibration"
+        )
+    for field in NEW_INTRINSICS_FIELDS:
+        key = _get_nested(mongo_doc, field)
+        if key:
+            logger.info(f"[{episode_hash}] intrinsics resolved via {field} → {key}")
+            return key
+    logger.warning(
+        f"[{episode_hash}] no intrinsics source found; proceeding without intrinsics"
+    )
+    return None
+
+
 def _classify_task_types(episodes_col, episode_hashes: list[str]) -> dict[str, str]:
     """Return {hash: 'freeform' | 'flagship'} by deliveryBatch lookup."""
     from bson import ObjectId
@@ -756,24 +865,22 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
     if mongo_doc is None:
         raise ValueError(f"Episode {episode_hash} not found in MongoDB")
 
-    # ---- 2. Sign R2 URLs ----
+    # ---- 2. Resolve + sign R2 URLs (legacy or new body-pipeline schema) ----
+    src = _resolve_source_keys(mongo_doc)
+    logger.info(
+        f"[{episode_hash}] schema sources: hands_mode={src['hands_mode']}, "
+        f"video={src['video']}, egomotion={src['egomotion']}"
+    )
     r2 = _get_r2_client()
-    urls = {}
-    for url_key, mongo_field in MONGO_URL_FIELDS.items():
-        storage_key = _get_nested(mongo_doc, mongo_field)
-        if storage_key is None:
-            raise ValueError(
-                f"MongoDB doc missing field '{mongo_field}' for episode {episode_hash}"
-            )
-        bucket, key = _parse_storage_key(storage_key)
-        logger.info(
-            f"[{episode_hash}] {url_key}: s3://{bucket}/{key} "
-            f"(mongo value: {storage_key})"
-        )
-        urls[url_key] = _sign_url(r2, storage_key)
+    urls = {
+        "video": _sign_url(r2, src["video"]),
+        "egomotion": _sign_url(r2, src["egomotion"]),
+        "frames": _sign_url(r2, src["frames"]),
+    }
 
-    intrinsics_key = _resolve_intrinsics_key(db, episode_hash, mongo_doc)
-    urls["intrinsics"] = _sign_url(r2, intrinsics_key)
+    intrinsics_key = _resolve_intrinsics_source(db, episode_hash, mongo_doc)
+    if intrinsics_key:
+        urls["intrinsics"] = _sign_url(r2, intrinsics_key)
 
     # ---- 3. VLM annotations ----
     vlm_annotations = _fetch_vlm_annotations(db, episode_hash)
@@ -795,31 +902,34 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
     )
 
     # ---- 5. Parallel download of raw assets ----
-    hands_final_key = _get_nested(mongo_doc, MONGO_BODY_FIELDS["hands_final"])
-    body_final_key = _get_nested(mongo_doc, MONGO_BODY_FIELDS["body_final"])
-    use_hands_final = bool(hands_final_key and body_final_key)
+    use_hands_final = src["hands_mode"] == "from_body"
 
     downloads = [
         (urls["video"], os.path.join(download_dir, "video.mp4")),
         (urls["egomotion"], os.path.join(download_dir, "egomotion.txt")),
         (urls["frames"], os.path.join(download_dir, "frames.csv")),
-        (urls["intrinsics"], os.path.join(download_dir, "intrinsics.json")),
     ]
+    if "intrinsics" in urls:
+        downloads.append(
+            (urls["intrinsics"], os.path.join(download_dir, "intrinsics.json"))
+        )
     if use_hands_final:
         downloads.append(
             (
-                _sign_url(r2, hands_final_key),
+                _sign_url(r2, src["hands_final"]),
                 os.path.join(download_dir, "hands_final.json"),
             )
         )
         downloads.append(
             (
-                _sign_url(r2, body_final_key),
+                _sign_url(r2, src["body_final"]),
                 os.path.join(download_dir, "body_final.json"),
             )
         )
     else:
-        downloads.append((urls["hands"], os.path.join(download_dir, "hands.csv")))
+        downloads.append(
+            (_sign_url(r2, src["hands_interp"]), os.path.join(download_dir, "hands.csv"))
+        )
 
     logger.info(f"[{episode_hash}] Downloading {len(downloads)} files in parallel...")
     with ThreadPoolExecutor(max_workers=len(downloads)) as pool:
@@ -837,9 +947,10 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
                 ) from e
 
     # Validate JSON files actually contain JSON (catches 404 XML bodies, empties)
-    for json_name in ("intrinsics.json",) + (
+    json_checks = (("intrinsics.json",) if "intrinsics" in urls else ()) + (
         ("hands_final.json", "body_final.json") if use_hands_final else ()
-    ):
+    )
+    for json_name in json_checks:
         p = os.path.join(download_dir, json_name)
         try:
             with open(p) as fh:
@@ -889,6 +1000,9 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
         )
 
     # ---- 7. Run conversion ----
+    # Feed the converter the already-downloaded files directly (local_data_dir),
+    # so it never re-dereferences signed URLs. This is required for new-schema
+    # episodes, which have no hands_camera_interpolated URL to download.
     output_dir = os.path.join(tmp_dir, "output")
     os.makedirs(output_dir, exist_ok=True)
     MeckaDatasetConverter(
@@ -897,6 +1011,7 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
         repo_id="mecka/zarr",
         arm="both",
         task_description=task_description,
+        local_data_dir=download_dir,
     ).extract_episode()
 
     local_zarr_dir = os.path.join(output_dir, f"{episode_hash}.zarr")
@@ -936,7 +1051,10 @@ def _prepare_episode(episode_hash: str, task_type: str, tmp_dir: str) -> dict:
     timeout=3600,
     memory=8192,
     cpu=2,
-    max_containers=4000,
+    # New-schema episodes download 300-400MB reference videos; 4000 concurrent
+    # workers saturate R2 egress and get their runners terminated mid-download.
+    # Cap concurrency so sustained egress stays within limits.
+    max_containers=300,
     retries=modal.Retries(max_retries=2, initial_delay=5.0, backoff_coefficient=2.0),
 )
 def convert_episode(episode_hash: str, task_type: str, subset_name: str) -> dict:

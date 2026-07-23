@@ -421,7 +421,9 @@ class MeckaExtractor:
             hand_poses_world = hand_poses_world[:num_frames]
             wrist_poses_world = wrist_poses_world[:num_frames]
             hand_keypoints_world = hand_keypoints_world[:num_frames]
-            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(egomotion)
+            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(egomotion)[
+                :num_frames
+            ]
             # Flatten 21×3 keypoints to 63 per hand for Zarr schema
             # hand_index 0=left, 1=right
             right_keypoints = hand_keypoints_world[:, 1, :, :].reshape(num_frames, 63)
