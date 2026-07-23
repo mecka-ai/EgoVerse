@@ -1,0 +1,56 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# YAM fold_tshirt finetune data — CALIBRATED, NO-TRAIN-VIZ variant.
+# Identical to yam_ft_cal_fold_tshirt_zarr.yaml but with train_viz_datasets removed
+# so NO second (train_viz) val dataloader is created — validation runs only the
+# 6-episode main val. Pair with `~evaluator@train_viz_evaluator` at launch so the
+# train_viz evaluator callback is also dropped, and trainer.limit_val_batches=100
+# to cap the main-val video count.
+#
+#   train -> yam_fold_tshirt_train.json (34)
+#   valid -> yam_fold_tshirt_val.json   (6, disjoint from train)
+#   (no train_viz)
+
+train_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva._get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+        extrinsics_key: yam
+      eps_to_use: egomimic/hydra_configs/data/extra/yam_fold_tshirt_train.json
+    mode: total
+
+valid_datasets:
+  eva_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.eva.Eva._get_keymap
+        keymap_mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.eva.Eva.get_transform_list
+        mode: cartesian
+        extrinsics_key: yam
+      eps_to_use: egomimic/hydra_configs/data/extra/yam_fold_tshirt_val.json
+    mode: total
+
+train_dataloader_params:
+  eva_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  eva_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
