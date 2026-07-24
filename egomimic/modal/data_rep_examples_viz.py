@@ -191,12 +191,12 @@ PAGE = r"""<!doctype html>
   .cell .sc{position:absolute;top:4px;left:4px;background:rgba(0,0,0,.6);padding:1px 6px;border-radius:4px;font-size:11px;font-variant-numeric:tabular-nums}
 </style></head>
 <body>
-<header><h1>Repetitiveness examples · columns = high / medium / low · grouped by task · 3 examples each</h1></header>
+<header><h1>Repetitiveness examples · per task: top-5 highest / median-5 / bottom-5 score · grouped by task</h1></header>
 <div id="bar">
   <button class="ctl" id="pauseall">⏸ pause all</button>
-  <span>click a row's <b style="color:var(--fg)">⬇ load</b> to fetch its 3 clips (high/med/low), then play them together. score shown top-left of each clip.</span>
+  <span>click a row's <b style="color:var(--fg)">⬇ load</b> to fetch its 3 clips (one per column), then play them together. repetitiveness score shown top-left of each clip.</span>
 </div>
-<div id="head"><div>example</div><div class="hi">HIGH</div><div class="me">MEDIUM</div><div class="lo">LOW</div></div>
+<div id="head"><div>rank</div><div class="hi">HIGH · top-5 score</div><div class="me">MEDIUM · median-5</div><div class="lo">LOW · bottom-5</div></div>
 <div id="tasks"></div>
 <script>
 let M=null;
@@ -208,7 +208,7 @@ async function boot(){
     sec.innerHTML=`<div class="taskh">${t}</div>`;
     for(let j=0;j<M.n;j++){
       const row=document.createElement("div"); row.className="row"; row.dataset.t=t; row.dataset.j=j;
-      let html=`<div class="rowctl"><button class="load">⬇ load</button><span class="s">ex ${j+1}</span></div>`;
+      let html=`<div class="rowctl"><button class="load">⬇ load</button><span class="s">#${j+1}</span></div>`;
       ["high","medium","low"].forEach(lvl=>{
         const arr=M.examples[t][lvl]||[]; const sc=(M.scores[t][lvl]||[])[j];
         if(arr[j]) html+=`<div class="cell" data-ep="${arr[j]}" data-sc="${sc!==undefined?sc:''}"><div class="slot">not loaded</div></div>`;
