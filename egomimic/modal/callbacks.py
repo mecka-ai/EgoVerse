@@ -16,6 +16,23 @@ from lightning import Callback, Trainer
 log = logging.getLogger(__name__)
 
 
+# Mirror of modal_setup.decode_submodules, inlined so this callback never imports
+# modal_setup. modal_setup builds the container image at module import time
+# (`image = modal.Image.from_registry(...)`), which raises AttributeError inside
+# the training container and previously crashed the auto-restart mid-run. This
+# module is intentionally dependency-free (see module docstring).
+_KNOWN_SUBMODULES = {"oat", "openpi", "quest"}
+
+
+def _decode_submodules(value: str) -> "frozenset[str]":
+    """Decode the MODAL_INIT_SUBMODULES env var back to a frozenset."""
+    if not value or value == "0":
+        return frozenset()
+    if value == "1":
+        return frozenset(_KNOWN_SUBMODULES)
+    return frozenset(p.strip() for p in value.split(",") if p.strip())
+
+
 class ModalAutoRestartCallback(Callback):
     """Save a checkpoint and spawn a detached continuation job ~30 min before
     the Modal container timeout, then stop the current run gracefully.
@@ -87,9 +104,7 @@ class ModalAutoRestartCallback(Callback):
         git_remote = os.environ.get("MODAL_GIT_REMOTE", "")
         git_commit = os.environ.get("MODAL_GIT_COMMIT", "")
         wandb_api_key = os.environ.get("WANDB_API_KEY", "")
-        from modal_setup import decode_submodules
-
-        submodules = decode_submodules(os.environ.get("MODAL_INIT_SUBMODULES", ""))
+        submodules = _decode_submodules(os.environ.get("MODAL_INIT_SUBMODULES", ""))
 
         if trainer.is_global_zero:
             try:
