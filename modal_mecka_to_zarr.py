@@ -140,7 +140,15 @@ def _resolve_source_keys(mongo_doc: dict) -> dict:
         return v if v else None  # treat "" the same as missing
 
     video = mongo_doc.get("video_1") or g(NEW_SCHEMA_FIELDS["video"])
-    egomotion = g(MONGO_URL_FIELDS["egomotion"]) or g(NEW_SCHEMA_FIELDS["egomotion"])
+    # egomotion, preferring height-calibrated trajectories (Z ~= camera height) so
+    # head pose is consistent across schemas: legacy post_processing -> multicam
+    # body pipeline -> mono/hloc pipeline.
+    egomotion = (
+        g(MONGO_URL_FIELDS["egomotion"])
+        or g(NEW_SCHEMA_FIELDS["egomotion"])
+        or g("pipeline_results.hloc.post_processing.height_calibrated_trajectory.output_trajectory_uri")
+        or g("pipeline_results.hloc.egomotion_client_key")
+    )
     frames = mongo_doc.get("framesKey") or None
 
     hands_interp = g(MONGO_URL_FIELDS["hands"])
@@ -157,14 +165,19 @@ def _resolve_source_keys(mongo_doc: dict) -> dict:
             f"Cannot resolve required source(s) {missing} under legacy or new schema"
         )
 
-    if hands_interp:
-        hands_mode = "interpolated"
-    elif hands_final and body_final:
+    # Prefer the body-pipeline hands_final+body_final (produces camera-frame
+    # world_x/y/z that _extract_hand_data expects). Fall back to the legacy
+    # interpolated CSV only when the body outputs are absent — matches the
+    # original converter's use_hands_final preference. (Some episodes' legacy
+    # interpolated CSV has an incompatible column layout, so from_body must win.)
+    if hands_final and body_final:
         hands_mode = "from_body"
+    elif hands_interp:
+        hands_mode = "interpolated"
     else:
         raise ValueError(
-            "No hands source: neither hands_camera_interpolated nor "
-            "hands_final+body_final present"
+            "No hands source: neither hands_final+body_final nor "
+            "hands_camera_interpolated present"
         )
 
     return {
