@@ -1600,7 +1600,33 @@ class MultiDataset(torch.utils.data.Dataset):
             return self.__getitem__(next_idx, _attempts=attempts)
 
         dataset = self.datasets[dataset_name]
-        data = dataset[local_idx]
+        try:
+            data = dataset[local_idx]
+        except Exception as e:
+            # A sample whose load/transform fails (e.g. an all-zero / non-finite
+            # pose chunk that SanitizeQuatPoseChunk cannot fill) is unusable.
+            # Reject this index and retry a different one instead of crashing the
+            # run. Bounded by max_attempts, so a systematic failure still raises
+            # ("Entire dataset bad") rather than looping forever.
+            logger.warning(
+                "Dropping unusable sample idx=%s (dataset=%s local_idx=%s): %s",
+                idx,
+                dataset_name,
+                local_idx,
+                e,
+            )
+            self._mark_rejected_index(idx)
+            candidates = self._valid_fallback_candidates(dataset_name)
+            next_idx, attempts = get_fallback_idx(
+                idx=idx,
+                candidates=candidates,
+                _attempts=_attempts,
+                max_attempts=len(candidates),
+                exhausted_error=(
+                    f"Entire dataset bad (no valid indices): dataset={dataset_name}"
+                ),
+            )
+            return self.__getitem__(next_idx, _attempts=attempts)
 
         if isinstance(dataset, MultiDataset):
             return data
