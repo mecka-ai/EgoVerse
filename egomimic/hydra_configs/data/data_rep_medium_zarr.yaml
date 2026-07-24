@@ -1,0 +1,55 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# Repetitiveness experiment — medium-repetitiveness human-only pretrain.
+# EXACT same training setup as the data-diversity val5 runs, but the TRAIN set is the
+# medium-repetitiveness episode subset (repetitiveness/medium.json, 1332 eps).
+# These episodes are Mongo-ingested (6a.../68... hashes, NOT in the legacy SQL table)
+# but ARE present as .zarr dirs on mecka_data_v2, so the train set uses
+# LocalEpisodeResolver (volume-direct) instead of ModalEpisodeResolver. Human 12-D
+# cartesian actions are gripper-padded to 14-D (pad_gripper: true). Validation is the
+# SAME shared 5-task held-out set as data_div (val_5task.json, ModalEpisodeResolver);
+# cap it at launch with trainer.limit_val_batches=80. No train viz.
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.LocalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/repetitiveness/medium.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/val_5task.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true

@@ -792,6 +792,7 @@ class LocalEpisodeResolver(EpisodeResolver):
         norm_stats: dict | None = None,
         debug: int | bool | None = None,
         allowed_episode_ids: list[str] | None = None,
+        eps_to_use: str | None = None,
         pause_removal_epsilon: float | None = None,
         snap_horizon_to_end: bool = False,
     ):
@@ -804,6 +805,13 @@ class LocalEpisodeResolver(EpisodeResolver):
             snap_horizon_to_end=snap_horizon_to_end,
         )
         self.debug = debug
+        # eps_to_use: path to a JSON list of episode hashes to restrict to, merged
+        # with any inline allowed_episode_ids (mirrors ModalEpisodeResolver.eps_to_use
+        # so configs can point at a json file instead of inlining every hash).
+        if eps_to_use:
+            with open(eps_to_use) as f:
+                file_ids = json.load(f)
+            allowed_episode_ids = list(allowed_episode_ids or []) + list(file_ids)
         self.allowed_episode_ids = (
             set(allowed_episode_ids) if allowed_episode_ids else None
         )
