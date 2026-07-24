@@ -343,6 +343,9 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                     f"{cfg.wandb_run_id}?_step={int(rewind_step)}"
                 )
                 cfg.logger.wandb.id = None
+                # WandbLogger hard-defaults resume="allow"; wandb rejects resume +
+                # resume_from together, so null it (resume_from carries the run id).
+                cfg.logger.wandb.resume = None
                 log.info(
                     f"[WandB] Rewinding run {cfg.wandb_run_id} to _step={int(rewind_step)} "
                     "(overwriting anything logged after it)"
