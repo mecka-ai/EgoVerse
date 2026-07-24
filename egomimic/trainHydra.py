@@ -330,12 +330,27 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             cfg.trainer.num_sanity_val_steps = 0
             cfg.logger = None
 
-    # Configure WandB to resume an existing run when wandb_run_id is provided
+    # Configure WandB to resume an existing run when wandb_run_id is provided.
+    # If wandb_rewind_step is also set, rewind the run to that step and OVERWRITE
+    # everything logged after it (used to discard a dark/preempted tail, then resume
+    # training from a checkpoint at that same point). resume_from carries the run id,
+    # so id/resume are left unset in that branch.
     if OmegaConf.select(cfg, "wandb_run_id") and OmegaConf.select(cfg, "logger.wandb"):
+        rewind_step = OmegaConf.select(cfg, "wandb_rewind_step")
         with open_dict(cfg):
-            cfg.logger.wandb.id = str(cfg.wandb_run_id)
-            cfg.logger.wandb["resume"] = "allow"
-        log.info(f"[WandB] Resuming run id={cfg.wandb_run_id}")
+            if rewind_step is not None:
+                cfg.logger.wandb.resume_from = (
+                    f"{cfg.wandb_run_id}?_step={int(rewind_step)}"
+                )
+                cfg.logger.wandb.id = None
+                log.info(
+                    f"[WandB] Rewinding run {cfg.wandb_run_id} to _step={int(rewind_step)} "
+                    "(overwriting anything logged after it)"
+                )
+            else:
+                cfg.logger.wandb.id = str(cfg.wandb_run_id)
+                cfg.logger.wandb["resume"] = "allow"
+                log.info(f"[WandB] Resuming run id={cfg.wandb_run_id}")
 
     log.info("Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
