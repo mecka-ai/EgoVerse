@@ -1053,6 +1053,13 @@ def _build_aria_cartesian_bimanual_transform_list(
             keys_to_delete.append(target_world_ypr)
 
     transform_list: list[Transform] = [
+        # Tracking-dropout rows (all-zero / non-finite quats) in some episodes make
+        # scipy from_quat raise "Found zero norm quaternions" inside the SE3
+        # conversion of the coordinate-frame transforms below. Forward/backward-fill
+        # those rows first (holds the last valid pose = no motion). No-op on clean
+        # data; the obs anchor (== action_chunk[0]) is kept consistent via anchor_key.
+        SanitizeQuatPoseChunk(chunk_key=left_action_world, anchor_key=left_obs_pose),
+        SanitizeQuatPoseChunk(chunk_key=right_action_world, anchor_key=right_obs_pose),
         ActionChunkCoordinateFrameTransform(
             target_world=target_pose_key,
             chunk_world=left_action_world,
