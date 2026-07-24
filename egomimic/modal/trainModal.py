@@ -54,7 +54,15 @@ from modal_setup import (  # noqa: E402
 
 
 def _build_train_cmd(hydra_args: tuple[str, ...]) -> list[str]:
-    return [CFG.python_bin, CFG.train_script, *hydra_args]
+    # Run trainHydra as a module (cwd is the repo root, set by run_hydra_train's
+    # subprocess call) rather than as a bare script. Running the script directly
+    # puts the egomimic/ package dir on sys.path[0], which shadows the real
+    # `modal` SDK with the empty local egomimic.modal package inside the
+    # container — breaking every in-container `import modal` in the Lightning
+    # callbacks (VolumeCommit + ModalAutoRestart). `-m` keeps sys.path[0] at the
+    # repo root so `import modal` resolves to the real SDK and
+    # `import egomimic.modal` still works.
+    return [CFG.python_bin, "-m", "egomimic.trainHydra", *hydra_args]
 
 
 def _resolve_volume_paths(hydra_args: tuple[str, ...]) -> tuple[str, ...]:
