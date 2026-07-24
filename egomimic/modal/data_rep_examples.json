@@ -1,0 +1,329 @@
+{
+  "tasks": [
+    "cleaning_dishes",
+    "cleaning_table",
+    "cooking",
+    "folding_clothes",
+    "hanging_clothes",
+    "mopping_floor",
+    "scrubbing_floor",
+    "sweeping_floor",
+    "washing_dishes"
+  ],
+  "levels": [
+    "high",
+    "medium",
+    "low"
+  ],
+  "examples": {
+    "cleaning_dishes": {
+      "high": [
+        "6a2da31e2b32b22c1dd1bd46",
+        "6a1cdad27cb8a42df5f6c90f",
+        "6a28796c61049d0983d7fd67"
+      ],
+      "medium": [
+        "6a30e48a943ee8a8152ac97b",
+        "6a20983f1f5eaa7986bd4aac",
+        "69f1c6e4a1cd95518d20b479"
+      ],
+      "low": [
+        "6a2ecc81004687909509810d",
+        "6a32374dfd839e437a402ac4",
+        "6a3273a6f8f9bf1d9873a623"
+      ]
+    },
+    "cleaning_table": {
+      "high": [
+        "6a32b8df5b0e61c7b6a4eea2",
+        "6a11778e0df1f23f6b918038",
+        "6a1c7c5dd5b6bb31b9f526ba"
+      ],
+      "medium": [
+        "6a36023f53a0c01e5dc506b5",
+        "6a36109e81966c16e9b01ecb",
+        "6a240e3a33fd359a95a4d4f9"
+      ],
+      "low": [
+        "6a2ba019fe4dbd0004f2ee93",
+        "6a1cf95c47d76c74ea842e46",
+        "6a35fe83639c90c311437407"
+      ]
+    },
+    "cooking": {
+      "high": [
+        "6a320ddb37076cfc4f77f282",
+        "6a2f6cfbceb3708b81731c0c",
+        "6a32087b5473bcb44b36bb47"
+      ],
+      "medium": [
+        "691a39422713b08c1b70f865",
+        "69ed830da7823af8d63eccd4",
+        "6a23c0eea2c545cf0829ab60"
+      ],
+      "low": [
+        "69ebbc450680a7db95db48c3",
+        "6a2d803ed7779ccc689992bc",
+        "6a324df99780a57d9348234f"
+      ]
+    },
+    "folding_clothes": {
+      "high": [
+        "6a2d5087511db65fc4a1e5ac",
+        "6a31afbfcf65701c26e6eed9",
+        "6a1e8bb84294f82a9a955fc4"
+      ],
+      "medium": [
+        "6a30d9279e69e7994f1d08e4",
+        "6a20bc1c40abc36490a9373a",
+        "6a04fb0c6e83f9afaeb21091"
+      ],
+      "low": [
+        "6a1485b41195f527355d3e17",
+        "693a3c2d546281679912e112",
+        "69f87d974b3f7a63f4009d77"
+      ]
+    },
+    "hanging_clothes": {
+      "high": [
+        "6a30f18422fba33cafbdf521",
+        "6a39814db6af9f449da7275e",
+        "6a35129dfea3be303a4fd70a"
+      ],
+      "medium": [
+        "6a3301b0c4e6bfedc50ed469",
+        "69fafa0f94b8c7a8c85aafc3",
+        "6a2321cce60d940efaed84f0"
+      ],
+      "low": [
+        "6a23ff9ebec5a92690a4b811",
+        "6a318b08e928443c1c0408db",
+        "6a0146ed9372d452afbe66cd"
+      ]
+    },
+    "mopping_floor": {
+      "high": [
+        "6a148f7c081ec5deb7ffe6b3",
+        "6a23502c73a1c8c1fc253ac5",
+        "6a307edcf491d011103a1f16"
+      ],
+      "medium": [
+        "69ba00680be35b2d5bc65a06",
+        "6a355094240f5dc4d13351f1",
+        "6a30fa0ce163254f5c8504d3"
+      ],
+      "low": [
+        "6a1c5f5ca89cdc984ccefe91",
+        "6a1ca77fe5aee5a7eec615a2",
+        "6a32e6878384cb077af97b8e"
+      ]
+    },
+    "scrubbing_floor": {
+      "high": [
+        "6a3656cd706e1c95f356569a",
+        "6a1d3115b0abdccd8b04a843",
+        "6a1c7c362e41b81474a1f989"
+      ],
+      "medium": [
+        "69f78f7326d7b8c9fe4b9bbe",
+        "6a2f556f55637ed76ca4bd7a",
+        "6a317540411d64817d861b39"
+      ],
+      "low": [
+        "6a334170619311c36dc8b2e8",
+        "6a30bc476d8fae30a7248e7b",
+        "6a2bc378fe3e5da6c683e64e"
+      ]
+    },
+    "sweeping_floor": {
+      "high": [
+        "6a38d368c969790bd6d22712",
+        "6a22fb7e05e47bbfb84e9bc5",
+        "6a28c03713b28cc34c708dd2"
+      ],
+      "medium": [
+        "6a3247df6a2461020e493aff",
+        "6a2302ca7d3b6c39a58d2259",
+        "6a3304975b0e61c7b6a4f0ff"
+      ],
+      "low": [
+        "6a35bd5ebe2da911a7912b45",
+        "6a2b9b8ad1ad4c7d30942938",
+        "6a2dce687ef5ba59eec56e1d"
+      ]
+    },
+    "washing_dishes": {
+      "high": [
+        "6a31c587e33c8662556e5a2a",
+        "6a179a5cb56ff9eac3f94321",
+        "6a36429b9297bdf867597e77"
+      ],
+      "medium": [
+        "6a39387692fed3050757868e",
+        "6a1d5232c16630a567dcf7d2",
+        "6a31d23ca969e6f293b1bbd5"
+      ],
+      "low": [
+        "6a31fbd6d37e39250f68f16e",
+        "6a2f8dca09fd53c3152d7def",
+        "6a2d99245108edf6b92a82d1"
+      ]
+    }
+  },
+  "scores": {
+    "cleaning_dishes": {
+      "high": [
+        0.481,
+        0.56,
+        0.703
+      ],
+      "medium": [
+        0.303,
+        0.363,
+        0.415
+      ],
+      "low": [
+        0.141,
+        0.176,
+        0.205
+      ]
+    },
+    "cleaning_table": {
+      "high": [
+        0.597,
+        0.773,
+        0.974
+      ],
+      "medium": [
+        0.268,
+        0.336,
+        0.407
+      ],
+      "low": [
+        0.143,
+        0.176,
+        0.202
+      ]
+    },
+    "cooking": {
+      "high": [
+        0.464,
+        0.5,
+        0.563
+      ],
+      "medium": [
+        0.24,
+        0.277,
+        0.341
+      ],
+      "low": [
+        0.138,
+        0.17,
+        0.2
+      ]
+    },
+    "folding_clothes": {
+      "high": [
+        0.473,
+        0.529,
+        0.693
+      ],
+      "medium": [
+        0.235,
+        0.263,
+        0.311
+      ],
+      "low": [
+        0.152,
+        0.184,
+        0.205
+      ]
+    },
+    "hanging_clothes": {
+      "high": [
+        0.5,
+        0.6,
+        0.857
+      ],
+      "medium": [
+        0.231,
+        0.253,
+        0.301
+      ],
+      "low": [
+        0.143,
+        0.172,
+        0.199
+      ]
+    },
+    "mopping_floor": {
+      "high": [
+        0.509,
+        0.666,
+        0.855
+      ],
+      "medium": [
+        0.261,
+        0.316,
+        0.394
+      ],
+      "low": [
+        0.145,
+        0.18,
+        0.201
+      ]
+    },
+    "scrubbing_floor": {
+      "high": [
+        0.569,
+        0.791,
+        0.983
+      ],
+      "medium": [
+        0.265,
+        0.333,
+        0.394
+      ],
+      "low": [
+        0.126,
+        0.183,
+        0.202
+      ]
+    },
+    "sweeping_floor": {
+      "high": [
+        0.5,
+        0.628,
+        0.829
+      ],
+      "medium": [
+        0.251,
+        0.311,
+        0.374
+      ],
+      "low": [
+        0.147,
+        0.191,
+        0.209
+      ]
+    },
+    "washing_dishes": {
+      "high": [
+        0.468,
+        0.514,
+        0.627
+      ],
+      "medium": [
+        0.254,
+        0.295,
+        0.346
+      ],
+      "low": [
+        0.154,
+        0.187,
+        0.207
+      ]
+    }
+  },
+  "n": 3
+}
