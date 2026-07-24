@@ -281,12 +281,23 @@ image = (
         "augmax>=0.3.4",
         "pytest",  # openpi.models_pytorch.gemma_pytorch imports pytest at module load
     )
-    # Large model weights (rarely change — keep above code files for better caching).
-    .add_local_file(
-        "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt",
-        remote_path="/root/wes_h_v3.0.pt",
-        copy=True,
+)
+# Large model weights (rarely change). The DemInf checkpoint below is consumed only by
+# deminf_default.yaml (DemInf / curation runs); plain training images never load it.
+# Bake it only when the local file is present, so a missing checkpoint doesn't fail every
+# image build — warn loudly instead of failing silently.
+_WES_H_LOCAL = "/Users/anikethcheluva/Downloads/wes_h_v3.0_20250920_014814.pt"
+if os.path.exists(_WES_H_LOCAL):
+    image = image.add_local_file(
+        _WES_H_LOCAL, remote_path="/root/wes_h_v3.0.pt", copy=True
     )
+else:
+    print(
+        f"[modal_setup] WARNING: {_WES_H_LOCAL} not found — NOT baking /root/wes_h_v3.0.pt. "
+        "Training images are unaffected; DemInf/curation (deminf_default.yaml) needs it restored."
+    )
+image = (
+    image
     # Bake modal scripts into the image so they can be imported at module-load time
     # (before the repo is cloned via _prepare_repo). Ordered least→most frequently
     # changed so that a single-file edit only invalidates the tail layers.
