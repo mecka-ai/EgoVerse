@@ -514,7 +514,11 @@ class MeckaExtractor:
                 - hand_poses_world: (T, 14) [left_7dof, right_7dof] xyz+quat(WXYZ) in world frame.
                 - hand_keypoints_world: (T, 2, 21, 3) [left_21kp, right_21kp] in world.
         """
-        num_frames = len(frames_df)
+        # Bound by the number of available camera transforms: some trajectories
+        # (e.g. the da3 SLAM stage) are shorter than the frame list, and indexing
+        # camera_transforms[frame_idx] past its end would raise IndexError.
+        # process_episode re-syncs all streams to their common min afterward.
+        num_frames = min(len(frames_df), len(camera_transforms))
         hand_poses = np.zeros((num_frames, 14))
         hand_keypoints = np.zeros((num_frames, 2, 21, 3))
         wrist_poses = np.zeros((num_frames, 14))

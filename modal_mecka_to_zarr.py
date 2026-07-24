@@ -118,6 +118,42 @@ NEW_SCHEMA_FIELDS = {
 }
 
 
+def _find_egomotion_key(mongo_doc: dict) -> "str | None":
+    """
+    Resolve the egomotion/trajectory R2 key across all known pipeline schemas.
+
+    Different SLAM stages (``basalt``, ``hloc``, ``da3``, …) all expose the same
+    ``post_processing.height_calibrated_trajectory.output_trajectory_uri`` (an
+    11-col, frame-indexed, height-calibrated trajectory — the format the converter
+    and head-pose extraction expect). We prefer, in order:
+      1. legacy ``post_processing.egomotion_client``
+      2. multicam ``body.input_keys.egomotion`` (basalt height-adjusted)
+      3. the height-calibrated trajectory of ANY pipeline stage
+      4. any stage's ``egomotion_client_key``
+    Height-calibrated is preferred so head-pose Z matches across schemas.
+    """
+    for path in (
+        "pipeline_results.post_processing.egomotion_client",
+        "pipeline_results.body.input_keys.egomotion",
+    ):
+        v = _get_nested(mongo_doc, path)
+        if v:
+            return v
+    pr = mongo_doc.get("pipeline_results")
+    if isinstance(pr, dict):
+        for stage in pr.values():
+            if isinstance(stage, dict):
+                uri = _get_nested(
+                    stage, "post_processing.height_calibrated_trajectory.output_trajectory_uri"
+                )
+                if uri:
+                    return uri
+        for stage in pr.values():
+            if isinstance(stage, dict) and stage.get("egomotion_client_key"):
+                return stage["egomotion_client_key"]
+    return None
+
+
 def _resolve_source_keys(mongo_doc: dict) -> dict:
     """
     Resolve the R2 storage keys for an episode's assets, supporting BOTH the
@@ -140,15 +176,7 @@ def _resolve_source_keys(mongo_doc: dict) -> dict:
         return v if v else None  # treat "" the same as missing
 
     video = mongo_doc.get("video_1") or g(NEW_SCHEMA_FIELDS["video"])
-    # egomotion, preferring height-calibrated trajectories (Z ~= camera height) so
-    # head pose is consistent across schemas: legacy post_processing -> multicam
-    # body pipeline -> mono/hloc pipeline.
-    egomotion = (
-        g(MONGO_URL_FIELDS["egomotion"])
-        or g(NEW_SCHEMA_FIELDS["egomotion"])
-        or g("pipeline_results.hloc.post_processing.height_calibrated_trajectory.output_trajectory_uri")
-        or g("pipeline_results.hloc.egomotion_client_key")
-    )
+    egomotion = _find_egomotion_key(mongo_doc)
     frames = mongo_doc.get("framesKey") or None
 
     hands_interp = g(MONGO_URL_FIELDS["hands"])
