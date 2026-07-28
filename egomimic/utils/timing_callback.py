@@ -54,6 +54,11 @@ class DataLoaderStallLogger(Callback):
     def on_train_start(self, trainer, pl_module) -> None:
         self._train_start = time.perf_counter()
         self._total_frames = 0
+        if trainer.is_global_zero and trainer.logger and hasattr(trainer.logger, "experiment"):
+            try:
+                trainer.logger.experiment.define_metric("throughput/*", step_metric="wall_time_s")
+            except Exception:
+                pass
 
     def on_train_epoch_start(self, trainer, pl_module) -> None:
         self._epoch_start = time.perf_counter()
@@ -84,26 +89,28 @@ class DataLoaderStallLogger(Callback):
             self._was_stalled = False
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-        now = time.perf_counter()
+        self._last_batch_end = time.perf_counter()
         bs = self._collated_batch_size(batch)
-        if bs is not None and trainer.is_global_zero:
+        if bs is not None:
             world_size = int(os.environ.get("WORLD_SIZE", "1"))
-            frames = bs * world_size
-            self._epoch_frames += frames
-            self._total_frames += frames
-            # Per-step throughput: frames over this step's full cycle (data wait +
-            # compute), i.e. time since the previous batch ended (or epoch start).
-            ref = self._last_batch_end if self._last_batch_end is not None else self._epoch_start
-            step_s = (now - ref) if ref is not None else None
-            if step_s and step_s > 0.0 and trainer.logger:
-                trainer.logger.log_metrics(
-                    {
-                        "throughput/frames_per_sec": frames / step_s,
-                        "throughput/total_frames": self._total_frames,
-                    },
-                    step=trainer.global_step,
-                )
-        self._last_batch_end = now
+            self._epoch_frames += bs * world_size
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if not trainer.is_global_zero or self._train_start is None or self._epoch_start is None:
+            return
+        wall_time_s = time.perf_counter() - self._train_start
+        epoch_s = time.perf_counter() - self._epoch_start
+        self._total_frames += self._epoch_frames
+        fps = self._epoch_frames / max(epoch_s, 1e-6)
+        if trainer.logger:
+            trainer.logger.log_metrics(
+                {
+                    "wall_time_s": wall_time_s,
+                    "throughput/frames_per_sec": fps,
+                    "throughput/total_frames": self._total_frames,
+                },
+                step=trainer.global_step,
+            )
 
 
 class WandbProfilerLogger(Callback):
