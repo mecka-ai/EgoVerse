@@ -1,0 +1,59 @@
+# WAM (World-Action Model) — dreamzero CausalWanModel on the Wan2.2 TI2V-5B
+# backbone, mecka_bimanual embodiment. ONE joint DiT forward over
+# [video latent | action | state] predicts video + action velocities (rectified
+# flow). The pretrained video DiT is loaded + frozen (LoRA-adapted); the
+# state/action/decoder register modules train. Validation samples action + a
+# future frame; WAMEvalVideo renders both. Pair with data=mecka_wam.
+#
+# 5B geometry (Wan2.2 VAE38 = 16x spatial, 4x temporal; DiT patch (1,2,2)):
+#   frame 160x320 -> latent 10x20 -> DiT patch -> 5x10 = 50 tokens/frame (frame_seqlen)
+#   cam clip 17 frames -> 5 latent frames (1 cond + 4 predicted)
+#   action_horizon=16  (num_action_per_block=4 x 4 blocks)
+#   state_horizon=4    (num_state_per_block=1 x 4 blocks)
+#   => num_image_blocks == num_action_blocks == num_state_blocks == 4
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+robomimic_model:
+  _target_: egomimic.algo.wam.WAM
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  action_dim: 12
+  action_horizon: 16
+  state_dim: 12
+  target_h: 160            # Wan2.2 5B input resolution (non-square)
+  target_w: 320
+  world_loss_weight: 1.0
+  num_inference_steps: 16
+
+  # --- CausalWanModel DiT (Wan2.2 TI2V-5B, joint video+action) ------------
+  dit:
+    _target_: egomimic.models.wam_nets.build_wam_dit
+    arch: wan22_5b
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/diffusion_pytorch_model.safetensors.index.json
+    action_dim: 12
+    max_state_dim: 12
+    num_action_per_block: 4     # 4 actions per predicted-frame block (x4 blocks = 16)
+    num_state_per_block: 1      # 1 state obs per predicted-frame block (x4 = state_horizon 4)
+    frame_seqlen: 50            # (160/16/2) * (320/16/2) = 5*10
+    freeze_video: true          # train state/action/decoder; freeze pretrained blocks
+    lora: true                  # dreamzero-style LoRA adapters on the DiT blocks
+
+  # --- Wan2.2 VAE38 (frozen, z_dim=48): frame <-> latent ------------------
+  vae:
+    _target_: egomimic.models.wam_nets.build_wan_vae
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+    z_dim: 48
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  weight_decay: 1e-6
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _partial_: true
+  T_max: 1400
+  eta_min: 1e-5

@@ -368,7 +368,7 @@ Expected: DiT `diffusion_pytorch_model*.safetensors` (+ `*.index.json` if sharde
 - [ ] **Step 2: Launch the debug run**
 ```bash
 python egomimic/modal/trainModal.py \
-  model=wam_bc_human_wan22_5b data=mecka_wam trainer=debug logger=wandb evaluator=eval_wam \
+  --config-name=train_zarr_human_wam_wan22_5b trainer=debug logger=wandb \
   name=wam_wan22_debug description="wan22 5B wam debug" \
   +modal_gpu=H200 init_submodules=false
 ```
@@ -385,7 +385,7 @@ python egomimic/modal/trainModal.py \
 - [ ] **Step 2: Launch**
 ```bash
 python egomimic/modal/trainModal.py \
-  model=wam_bc_human_wan22_5b data=mecka_wam trainer=ddp_modal logger=wandb evaluator=eval_wam \
+  --config-name=train_zarr_human_wam_wan22_5b trainer=ddp_modal logger=wandb \
   name=wam_wan22 description="wan22 5B wam" \
   +modal_gpu=H200 init_submodules=false
 ```
