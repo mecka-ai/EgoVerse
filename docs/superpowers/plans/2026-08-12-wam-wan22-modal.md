@@ -351,7 +351,7 @@ def download_wan22_weights():
 
 - [ ] **Step 1: Run the downloader**
 ```bash
-modal run --env robotics egomimic/modal/modal_setup.py::download_wan22_weights
+modal run --env robotics egomimic/modal/trainModal.py::download_wan22_weights
 ```
 - [ ] **Step 2: Verify contents + capture exact filenames**
 ```bash

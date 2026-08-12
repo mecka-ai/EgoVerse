@@ -35,6 +35,7 @@ from modal_setup import (  # noqa: E402
     CFG,
     REPO_ROOT,
     VOLUME_MAP,
+    WAN_CKPT_MOUNT,
     _local_wandb_key,
     _prepare_repo,
     _resolve_git_state,
@@ -45,6 +46,7 @@ from modal_setup import (  # noqa: E402
     launch_detached,
     pop_init_submodules,
     training_outputs_volume,
+    wan_checkpoints_volume,
     zarr_volume,
 )
 
@@ -135,6 +137,9 @@ def _build_volumes() -> dict:
     return {
         mount_path: vol_obj,
         CFG.output_mount_path: training_outputs_volume,
+        # Wan2.2-5B pretrained weights for WAM (read-only). Harmless for non-WAM
+        # runs — the volume is just mounted, never read unless a WAM config loads it.
+        WAN_CKPT_MOUNT: wan_checkpoints_volume,
     }
 
 
@@ -334,6 +339,34 @@ def _verify_pi_import(git_remote: str, git_commit: str) -> dict:
         "stdout": proc.stdout[-2000:],
         "stderr": proc.stderr[-4000:],
     }
+
+
+@app.function(
+    volumes={WAN_CKPT_MOUNT: wan_checkpoints_volume},
+    timeout=3600,
+    secrets=[modal.Secret.from_name("egoverse-hf")],
+)
+def download_wan22_weights() -> list[str]:
+    """One-time: populate the wan-checkpoints volume with Wan2.2-TI2V-5B (DiT
+    shards + VAE + config). Idempotent — snapshot_download skips present files.
+    Run once before the first WAM training job:
+        modal run --env robotics egomimic/modal/trainModal.py::download_wan22_weights
+    """
+    import os
+
+    from huggingface_hub import snapshot_download
+
+    dest = f"{WAN_CKPT_MOUNT}/Wan2.2-TI2V-5B"
+    os.makedirs(dest, exist_ok=True)
+    snapshot_download(
+        repo_id="Wan-AI/Wan2.2-TI2V-5B",
+        local_dir=dest,
+        allow_patterns=["*.safetensors", "*.json", "*.pth", "*.txt"],
+    )
+    wan_checkpoints_volume.commit()
+    files = sorted(os.listdir(dest))
+    print(f"wan-checkpoints/Wan2.2-TI2V-5B: {files}")
+    return files
 
 
 # ---------------------------------------------------------------------------
