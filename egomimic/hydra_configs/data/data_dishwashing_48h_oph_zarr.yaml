@@ -1,0 +1,53 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# Data-diversity human-only pretrain — DISHWASHING-ONLY 48h, operator-holdout val.
+# Identical to data_diversity_D1_val5_zarr.yaml EXCEPT the train/val split:
+#   - Train = ~48h (5.17M frames, 1710 eps) of dishwashing from the D1-D5 pool.
+#   - One operator (693fb84a002f2af8ab18f635) held out ENTIRELY; val = 5 of their eps.
+#   
+# Legacy-SQL (69...) episode ids -> ModalEpisodeResolver on /mnt/zarr-data.
+#   train -> data_diversity/dishwashing_48h_train.json   valid -> data_diversity/dishwashing_val_ophold5.json
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/dishwashing_48h_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/dishwashing_val_ophold5.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
