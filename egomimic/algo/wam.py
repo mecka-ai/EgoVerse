@@ -39,7 +39,9 @@ class WAMModel(nn.Module):
         action_dim: int = 12,
         action_horizon: int = 100,
         state_dim: int = 12,
-        frame_size: int = 256,  # fixed world-model input resolution
+        frame_size: int = 256,  # square world-model input resolution (fallback)
+        target_h: int = None,  # non-square override (e.g. 160 for Wan2.2 5B)
+        target_w: int = None,  # non-square override (e.g. 320 for Wan2.2 5B)
         num_video_frames: int = 2,  # latent frames: 1 conditioning + 1 predicted
         text_len: int = 512,
         text_dim: int = 4096,
@@ -55,6 +57,9 @@ class WAMModel(nn.Module):
         self.action_horizon = action_horizon
         self.state_dim = state_dim
         self.frame_size = frame_size
+        # Non-square target (Wan2.2 5B needs 160x320); default to the square frame_size.
+        self.target_h = target_h or frame_size
+        self.target_w = target_w or frame_size
         self.num_video_frames = num_video_frames
         self.text_len = text_len
         self.text_dim = text_dim
@@ -79,10 +84,10 @@ class WAMModel(nn.Module):
         B, C, T, H, W = x.shape
         x = F.interpolate(
             x.reshape(B * T, C, H, W),
-            size=(self.frame_size, self.frame_size),
+            size=(self.target_h, self.target_w),
             mode="bilinear",
             align_corners=False,
-        ).reshape(B, C, T, self.frame_size, self.frame_size)
+        ).reshape(B, C, T, self.target_h, self.target_w)
         return (x * 2.0 - 1.0).to(self.device)
 
     @torch.no_grad()
@@ -239,6 +244,8 @@ class WAM(Algo):
         action_horizon: int = 100,
         state_dim: int = 12,
         frame_size: int = 256,
+        target_h: int = None,
+        target_w: int = None,
         world_loss_weight: float = 1.0,
         num_inference_steps: int = 16,
         domains: list = None,
@@ -260,6 +267,8 @@ class WAM(Algo):
             action_horizon=action_horizon,
             state_dim=state_dim,
             frame_size=frame_size,
+            target_h=target_h,
+            target_w=target_w,
             world_loss_weight=world_loss_weight,
             num_inference_steps=num_inference_steps,
         )
