@@ -25,6 +25,7 @@ import torch
 from egomimic.rldb.embodiment.embodiment import get_embodiment_id
 from egomimic.rldb.zarr.zarr_dataset_multi import (
     LocalEpisodeResolver,
+    ModalEpisodeResolver,
     MultiDataset,
     S3EpisodeResolver,
     ZarrDataset,
@@ -38,6 +39,7 @@ __all__ = [
     "WamMultiDataset",
     "S3WamEpisodeResolver",
     "LocalWamEpisodeResolver",
+    "ModalWamEpisodeResolver",
     "ZarrEpisode",
 ]
 
@@ -146,4 +148,11 @@ class S3WamEpisodeResolver(S3EpisodeResolver):
 
 
 class LocalWamEpisodeResolver(LocalEpisodeResolver):
+    _dataset_class = ZarrWamDataset
+
+
+class ModalWamEpisodeResolver(ModalEpisodeResolver):
+    """Modal-volume resolver (SQL filter + /mnt/zarr-data) building ZarrWamDataset
+    clip leaves. This is the WAM data path for the Modal training pipeline."""
+
     _dataset_class = ZarrWamDataset
