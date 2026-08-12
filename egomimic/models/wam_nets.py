@@ -24,7 +24,7 @@ from egomimic.models.wan.wan_video_dit import WanModel  # legacy (build_wan21_1_
 
 # --- WAN backbone (dreamzero) ----------------------------------------------
 from egomimic.models.wan.wan_video_dit_action_casual_chunk import CausalWanModel
-from egomimic.models.wan.wan_video_vae import WanVideoVAE
+from egomimic.models.wan.wan_video_vae import WanVideoVAE, WanVideoVAE38
 
 # ===========================================================================
 # CausalWanModel (the WAM DiT) — 1.3B Wan2.1 T2V architecture preset
@@ -52,9 +52,61 @@ WAM_DIT_1_3B = dict(
     max_num_embodiments=1,  # single (human) embodiment
 )
 
+# Canonical Wan2.2-TI2V-5B DiT dims. head_dim = 3072/24 = 128, identical to the
+# 1.3B preset (1536/12), so RoPE/patchify (both parametric) flow through
+# CausalWanModel unchanged. in_dim/out_dim = 48 for the Wan2.2 VAE38 latent.
+WAM_DIT_5B = dict(
+    model_type="ti2v",
+    patch_size=(1, 2, 2),
+    text_len=512,
+    in_dim=48,
+    dim=3072,
+    ffn_dim=14336,
+    freq_dim=256,
+    text_dim=4096,
+    out_dim=48,
+    num_heads=24,
+    num_layers=30,
+    qk_norm=True,
+    cross_attn_norm=True,
+    eps=1e-6,
+    num_frame_per_block=1,
+    concat_first_frame_latent=False,  # 5B: latent-only (first-frame via CLIP, not concat)
+    hidden_size=1024,
+    max_num_embodiments=1,
+)
+
+_WAM_DIT_PRESETS = {"wan21_1_3b": WAM_DIT_1_3B, "wan22_5b": WAM_DIT_5B}
+
+
+def _load_wan_state_dict(checkpoint_path: str) -> dict:
+    """Load a Wan DiT checkpoint: single ``.safetensors``, sharded
+    (``*.safetensors.index.json``), or ``.pth``. The Wan2.2-TI2V-5B DiT ships as
+    a sharded safetensors set with an index, which a single ``load_file`` cannot
+    read — walk the index and merge the shards."""
+    import json as _json
+    import os as _os
+
+    if checkpoint_path.endswith(".safetensors.index.json"):
+        from safetensors.torch import load_file
+
+        base = _os.path.dirname(checkpoint_path)
+        with open(checkpoint_path) as f:
+            index = _json.load(f)
+        sd = {}
+        for shard in sorted(set(index["weight_map"].values())):
+            sd.update(load_file(_os.path.join(base, shard)))
+        return sd
+    if checkpoint_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        return load_file(checkpoint_path)
+    return torch.load(checkpoint_path, map_location="cpu")
+
 
 def build_wam_dit(
     checkpoint_path: str = None,
+    arch: str = "wan21_1_3b",
     action_dim: int = 12,
     max_state_dim: int = 12,
     num_action_per_block: int = 100,
@@ -66,7 +118,8 @@ def build_wam_dit(
     lora_alpha: int = 4,
     **overrides,
 ):
-    """Build the CausalWanModel WAM DiT at the 1.3B Wan2.1 T2V preset.
+    """Build the CausalWanModel WAM DiT at the given ``arch`` preset
+    (``wan21_1_3b`` default, ``wan22_5b`` for the Wan2.2 TI2V-5B backbone).
 
     - Loads the pretrained video DiT weights from ``checkpoint_path`` (the
       official T2V-1.3B safetensors), converted via the Wan civitai converter;
@@ -77,7 +130,7 @@ def build_wam_dit(
       setup). ``num_action_per_block`` must equal the action horizon and
       ``num_state_per_block`` the state horizon (register-length invariant).
     """
-    cfg = dict(WAM_DIT_1_3B)
+    cfg = dict(_WAM_DIT_PRESETS[arch])
     cfg.update(
         action_dim=action_dim,
         max_state_dim=max_state_dim,
@@ -89,12 +142,7 @@ def build_wam_dit(
     model = CausalWanModel(**cfg)
 
     if checkpoint_path:
-        if checkpoint_path.endswith(".safetensors"):
-            from safetensors.torch import load_file
-
-            sd = load_file(checkpoint_path)
-        else:
-            sd = torch.load(checkpoint_path, map_location="cpu")
+        sd = _load_wan_state_dict(checkpoint_path)
         try:  # official Wan weights -> WanModel naming (filters vace, matches hash)
             sd, _ = WanModel.state_dict_converter().from_civitai(sd)
         except Exception as e:  # noqa: BLE001
@@ -143,8 +191,10 @@ def _inject_lora(model, rank, alpha, targets=("q", "k", "v", "o", "ffn.0", "ffn.
 def build_wan_vae(checkpoint_path: str = None, z_dim: int = 16):
     """Build the vendored Wan 3D causal VAE (frozen) for the frame<->latent path.
     encode(video in [-1,1]) -> latent ; decode(latent) -> frames in [-1,1].
+
+    z_dim=16 -> Wan2.1 VAE (8x spatial); z_dim=48 -> Wan2.2 VAE38 (16x spatial).
     """
-    vae = WanVideoVAE(z_dim=z_dim)
+    vae = WanVideoVAE38(z_dim=48, dim=160) if z_dim == 48 else WanVideoVAE(z_dim=z_dim)
     if checkpoint_path:
         sd = torch.load(checkpoint_path, map_location="cpu")
         if isinstance(sd, dict) and "state_dict" in sd:
@@ -160,6 +210,19 @@ def build_wan_vae(checkpoint_path: str = None, z_dim: int = 16):
         )
     vae.eval().requires_grad_(False)
     return vae
+
+
+def ensure_file(local_path: str | None, filename: str, repo_id: str) -> str:
+    """Return ``local_path`` if it exists, else HF-download ``filename`` from
+    ``repo_id`` (to the HF cache) and return that path. Lets builders/downloaders
+    fetch-if-missing without hardcoding a download step."""
+    import os as _os
+
+    if local_path and _os.path.exists(local_path):
+        return local_path
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=repo_id, filename=filename)
 
 
 # ===========================================================================
