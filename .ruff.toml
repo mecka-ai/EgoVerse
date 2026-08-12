@@ -4,7 +4,8 @@ exclude = [
   "external",
   "egomimic/robot/eva/stanford_repo",
   "*.ipynb",
-  "egomimic/robot/oculus_reader"
+  "egomimic/robot/oculus_reader",
+  "egomimic/models/wan"
 ]
 
 [lint]
