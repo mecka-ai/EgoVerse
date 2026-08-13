@@ -21,6 +21,12 @@ class WAMEvalVideo(EvalVideo):
          frames forward_eval stashes on the algo as ``_eval_frames[eid]``.
     """
 
+    def __init__(self, viz_func=None, limit_val_batches: int = 400):
+        # This fork's EvalVideo takes only limit_val_batches; the per-embodiment
+        # action-overlay viz callables come in via viz_func (evaluator/viz config).
+        super().__init__(limit_val_batches=limit_val_batches)
+        self.viz_func = viz_func
+
     def compute_metrics_and_viz(self, batch):
         algo = self.model
         preds = algo.forward_eval(batch)  # samples actions + future frames
@@ -32,7 +38,7 @@ class WAMEvalVideo(EvalVideo):
         n_loss = 0
 
         for embodiment_id, _batch in batch.items():
-            _batch = algo.norm_stats.unnormalize(_batch, embodiment_id)
+            _batch = algo.data_schematic.unnormalize_data(_batch, embodiment_id)
             name = get_embodiment(embodiment_id).lower()
             ac_key = algo.ac_keys[embodiment_id]
 
