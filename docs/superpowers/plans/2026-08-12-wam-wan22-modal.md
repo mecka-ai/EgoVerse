@@ -368,7 +368,7 @@ Expected: DiT `diffusion_pytorch_model*.safetensors` (+ `*.index.json` if sharde
 - [ ] **Step 2: Launch the debug run**
 ```bash
 python egomimic/modal/trainModal.py \
-  --config-name=train_zarr_human_wam_wan22_5b trainer=debug logger=wandb \
+  --config-name=train_zarr_human_wam_wan22_5b trainer=debug_modal logger=wandb \
   name=wam_wan22_debug description="wan22 5B wam debug" \
   +modal_gpu=H200 init_submodules=false
 ```
