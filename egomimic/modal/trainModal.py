@@ -358,10 +358,18 @@ def download_wan22_weights() -> list[str]:
 
     dest = f"{WAN_CKPT_MOUNT}/Wan2.2-TI2V-5B"
     os.makedirs(dest, exist_ok=True)
+    # Only the DiT (3 shards + index) + VAE + config. Skip the ~11GB T5 text
+    # encoder (models_t5_umt5-xxl-enc-bf16.pth) — WAM does joint video+action,
+    # no text conditioning, so it is never loaded.
     snapshot_download(
         repo_id="Wan-AI/Wan2.2-TI2V-5B",
         local_dir=dest,
-        allow_patterns=["*.safetensors", "*.json", "*.pth", "*.txt"],
+        allow_patterns=[
+            "diffusion_pytorch_model*.safetensors",
+            "diffusion_pytorch_model.safetensors.index.json",
+            "Wan2.2_VAE.pth",
+            "config.json",
+        ],
     )
     wan_checkpoints_volume.commit()
     files = sorted(os.listdir(dest))
