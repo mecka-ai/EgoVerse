@@ -491,8 +491,12 @@ class Mecka(Human):
                 delete_old_keys=True,
             ),
             ConcatKeys(
+                # "ee_pose" is the mecka schematic's canonical proprio key name
+                # (see the DataSchematic norm_keys); the model reads state from
+                # proprio_keys[eid], so the concatenated head-frame state must be
+                # named "ee_pose" or it won't match the schematic / the batch.
                 ["left.state_ee_pose_hf", "right.state_ee_pose_hf"],
-                "state_ee_pose",
+                "ee_pose",
                 delete_old_keys=True,
             ),
             # Drop the raw world-frame keys: ActionChunkCoordinateFrameTransform
