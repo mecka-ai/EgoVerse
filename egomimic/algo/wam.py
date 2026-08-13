@@ -234,10 +234,11 @@ class WAM(Algo):
 
     def __init__(
         self,
-        norm_stats,
+        data_schematic,
         camera_transforms=None,
         train_image_augs=None,
         eval_image_augs=None,
+        viz_func=None,
         dit=None,
         vae=None,
         action_dim: int = 12,
@@ -252,7 +253,10 @@ class WAM(Algo):
         ac_keys: dict = None,
         **kwargs,
     ):
-        self.norm_stats = norm_stats
+        # pl_model instantiates Algos with data_schematic= (the norm/keymap
+        # source) + viz_func=, like HPT — not the branch's norm_stats= arg.
+        self.data_schematic = data_schematic
+        self.viz_func = viz_func
         self.camera_transforms = camera_transforms
         self.domains = domains.copy()
         self.ac_keys = ac_keys or {}
@@ -280,13 +284,13 @@ class WAM(Algo):
             eid = get_embodiment_id(embodiment)
             self.camera_keys[eid] = [
                 k
-                for k in norm_stats.keys_of_type("camera_keys", eid)
-                if norm_stats.is_key_with_embodiment(k, eid)
+                for k in data_schematic.keys_of_type("camera_keys", eid)
+                if data_schematic.is_key_with_embodiment(k, eid)
             ]
             self.proprio_keys[eid] = [
                 k
-                for k in norm_stats.keys_of_type("proprio_keys", eid)
-                if norm_stats.is_key_with_embodiment(k, eid)
+                for k in data_schematic.keys_of_type("proprio_keys", eid)
+                if data_schematic.is_key_with_embodiment(k, eid)
             ]
             if embodiment in self.ac_keys:
                 self.ac_keys[eid] = self.ac_keys[embodiment]
@@ -303,7 +307,9 @@ class WAM(Algo):
             eid = get_embodiment_id(embodiment_name)
             processed[eid] = {}
             for key, value in _batch.items():
-                processed[eid][self.norm_stats.zarr_key_to_keyname(key, eid)] = value
+                processed[eid][self.data_schematic.zarr_key_to_keyname(key, eid)] = (
+                    value
+                )
             ac_key = self.ac_keys[eid]
             B, S, _ = processed[eid][ac_key].shape
             processed[eid]["pad_mask"] = torch.ones(B, S, 1, device=self.device)
@@ -371,7 +377,7 @@ class WAM(Algo):
             ref = _batch[ac_key]
             B, T, D = ref.shape
             preds = OrderedDict({ac_key: action[:, :T, :D]})
-            for key, val in self.norm_stats.unnormalize(preds, eid).items():
+            for key, val in self.data_schematic.unnormalize_data(preds, eid).items():
                 unnorm_preds[f"{name}_{key}"] = val
         return unnorm_preds
 
