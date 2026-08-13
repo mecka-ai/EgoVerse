@@ -209,7 +209,10 @@ def build_wan_vae(checkpoint_path: str = None, z_dim: int = 16):
             sd = WanVideoVAE.state_dict_converter().from_civitai(sd)
         except Exception:  # noqa: BLE001 — raw sd may already match
             pass
-        missing, unexpected = vae.model.load_state_dict(sd, strict=False)
+        # from_civitai prefixes keys with "model." to target the OUTER wrapper
+        # (self.model is the inner VideoVAE); load into `vae`, not `vae.model`,
+        # or every key is prefix-mismatched (all missing + all unexpected).
+        missing, unexpected = vae.load_state_dict(sd, strict=False)
         print(
             f"[build_wan_vae] loaded {checkpoint_path}: "
             f"{len(missing)} missing / {len(unexpected)} unexpected keys"
