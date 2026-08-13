@@ -24,6 +24,12 @@ from egomimic.models.wan.wan_video_dit import WanModel  # legacy (build_wan21_1_
 
 # --- WAN backbone (dreamzero) ----------------------------------------------
 from egomimic.models.wan.wan_video_dit_action_casual_chunk import CausalWanModel
+
+# Re-export FlowMatchScheduler (the module docstring lists it as a re-export and
+# egomimic.algo.wam imports it from here).
+from egomimic.models.wan.flow_match_scheduler import (
+    FlowMatchScheduler as FlowMatchScheduler,
+)
 from egomimic.models.wan.wan_video_vae import WanVideoVAE, WanVideoVAE38
 
 # ===========================================================================
