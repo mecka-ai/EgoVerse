@@ -62,6 +62,11 @@ class ZarrWamDataset(ZarrDataset):
         return np.transpose(d, (2, 0, 1)) / 255.0  # (C, H, W) in [0,1]
 
     def __getitem__(self, idx, _fallback_origin=None, _attempts=None):
+        # This fork's base ZarrDataset opens the reader lazily and derives
+        # total_frames / _image_keys / _json_keys in _init_from_metadata; the
+        # base __getitem__ calls this first. Our windowed override must too, or
+        # self.episode_reader is None and total_frames is 0.
+        self._ensure_episode_reader()
         origin = _fallback_origin if _fallback_origin is not None else idx
         attempts = _attempts
 
