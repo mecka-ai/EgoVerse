@@ -10,36 +10,89 @@ Deploy:
     MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/val_video_viewer.py
 
 Routes (single ASGI web function → one URL):
-    /            HTML viewer page
-    /api/index   {"runs": [...], "epochs": [...]} — volume scan, cached 60 s
-    /video?path= streams one mp4 from the volume (path relative to data_div_oss/)
+    /                HTML viewer page
+    /api/index       {"runs": [...], "epochs": [...]} — volume scan, cached 60 s
+    /api/annotations per-run, per-video language-annotation segments in video time
+    /video?path=     streams one mp4 from the volume (path relative to data_div_oss/)
+
+Annotation sync — how video frames map to episode frames
+--------------------------------------------------------
+egomimic/eval/eval_video.py buffers ONE image per val sample (viz_gt_preds stacks
+(B,H,W,3) per batch) and flushes the buffer to validation_video_<i>.mp4 whenever
+it holds >= 1000 frames; with full batches the flush lands at 1024 frames exactly
+(first multiple of the batch size >= 1000; batch 64 -> 16 steps, batch 32 -> 32
+steps). The val loader is sequential (shuffle=False), the val MultiDataset is the
+5 val episodes concatenated in sorted-episode-hash order (episode_table_to_df
+orders by episode_hash; == the json order), one sample per raw frame (no pause
+filter: pause_removal_epsilon unset in all 8 run configs), and
+limit_val_batches=100 caps the pass.
+
+  OSS runs (HPT; 1 GPU, val batch 64):  video i, frame k -> dataset sample
+      s = 1024*i + k, for s < 100*64 = 6400.   (verified: videos are 6x1024+256)
+  pi runs  (PI; 2 GPUs, val batch 32):  DistributedSampler(shuffle=False) gives
+      rank r samples [r, r+2, ...]; both ranks write the SAME video paths
+      (no rank guard in eval_video.py) so the surviving file is one rank's,
+      last-writer-wins. video i, frame k -> s = 2*(1024*i + k) + r, r unknown.
+      We assume r=0 -> at most 1 data frame (1/30 s) of error, but the rank
+      ambiguity makes pi-run sync approximate ("~" in the UI).
+      (verified: videos are 3x1024+128 = 100*32 per rank)
+
+  sample s -> episode via cumulative total_frames [1945,2099,2155,2245,2173]
+  (sum 10617), frame f = s - cum_start; annotation = segments with
+  start_idx <= f < end_idx from the episode zarr's `annotations` array.
+  Both data and videos are 30 fps, so video time t -> k = floor(30*t).
+
+Known imprecision (why the bar is "~" even on OSS runs): samples that fail the
+norm-stats bounds check or fail to load are silently replaced by a RANDOM other
+sample of the same episode set (MultiDataset fallback), so occasional frames show
+content the mapping cannot know about.
 """
 
 import modal
 
-image = modal.Image.debian_slim(python_version="3.11").pip_install("fastapi[standard]")
+image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "fastapi[standard]", "zarr>=3", "numpy"
+)
 
 app = modal.App("val-video-viewer", image=image)
 
 outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
+episodes_volume = modal.Volume.from_name("mecka_data_v2")
 
 MOUNT_PATH = "/data"
+EPISODES_MOUNT = "/episodes"
 BASE_PREFIX = "data_div_oss"
 INDEX_TTL_S = 60
 
-# (short label, run dir under data_div_oss/) — order defines row order on the page.
+# (short label, run dir under data_div_oss/, world_size, val batch size per rank)
+# world/batch read from each run's .hydra/config.yaml on the outputs volume
+# (launch_params.gpus_per_node, valid_dataloader_params.batch_size).
 RUNS = [
-    ("300M", "300M_mm_nobc_dw48"),
-    ("600M", "600M_mm_nobc_dw48"),
-    ("1B", "1B_mm_nobc_dw48"),
-    ("1.5B", "1_5B_mm_nobc_dw48"),
-    ("pi05", "pi05_dw48"),
-    ("pali", "pali_dw48"),
-    ("pi05_lang", "pi05_lang_dw48"),
-    ("pali_lang", "pali_lang_dw48"),
+    ("300M", "300M_mm_nobc_dw48", 1, 64),
+    ("600M", "600M_mm_nobc_dw48", 1, 64),
+    ("1B", "1B_mm_nobc_dw48", 1, 64),
+    ("1.5B", "1_5B_mm_nobc_dw48", 1, 64),
+    ("pi05", "pi05_dw48", 2, 32),
+    ("pali", "pali_dw48", 2, 32),
+    ("pi05_lang", "pi05_lang_dw48", 2, 32),
+    ("pali_lang", "pali_lang_dw48", 2, 32),
 ]
 
-PAGE_HTML = """<!doctype html>
+# Val episodes in resolver order = sorted episode_hash (== the json order), from
+# egomimic/hydra_configs/data/extra/data_diversity/dishwashing_val_ophold5.json
+VAL_EPISODES = [
+    "69b22fc5f4f4e149281a6635",
+    "69b3304abf7ebb83d8870280",
+    "69b34bd305ad590410f5939f",
+    "69b3c40fe1d17e38b58df9bd",
+    "69b3d54ab3480508b4a67111",
+]
+
+FPS = 30
+LIMIT_VAL_BATCHES = 100  # trainer.limit_val_batches in all 8 run configs
+BUFFER_FLUSH_AT = 1000  # eval_video.py flushes the frame buffer at >= 1000
+
+PAGE_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -86,6 +139,12 @@ PAGE_HTML = """<!doctype html>
   .vid-card.active-col video { outline: 2px solid var(--accent); }
   .col-ph { flex: 0 0 auto; width: 380px; }
   .vid-cap { color: var(--dim); font-size: 11px; margin-top: 3px; text-align: center; }
+  .ann-bar {
+    color: #ccd3de; background: #10131a; border: 1px solid var(--border);
+    border-radius: 4px; font-size: 11px; padding: 3px 6px; margin-top: 5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    text-align: center; min-height: 20px;
+  }
   .placeholder {
     color: var(--dim); border: 1px dashed var(--border); border-radius: 6px;
     padding: 28px 16px; text-align: center; font-size: 13px; width: 100%;
@@ -113,6 +172,7 @@ PAGE_HTML = """<!doctype html>
 <script>
 (function () {
   let index = null;          // {runs:[{label,dir,epochs:{ep:[paths]}}], epochs:[..]}
+  let annIndex = null;       // {runDir: {approx, videos: [[{s,e,t},..] per video idx]}}
   let currentEpoch = null;
   let columnMode = false;    // column mode: load/play one video column at a time
   let currentCol = 0;        // 0-based active column index
@@ -133,6 +193,16 @@ PAGE_HTML = """<!doctype html>
 
   function coverage(ep) {
     return index.runs.filter((r) => r.epochs[ep] && r.epochs[ep].length).length;
+  }
+
+  // Language-annotation segments for one video, looked up by the numeric index
+  // in its filename (validation_video_<i>.mp4) — robust to gaps in the listing.
+  function annFor(runDir, path) {
+    if (!annIndex || annIndex.error) return null;
+    const a = annIndex[runDir];
+    const m = path.match(/validation_video_(\d+)\.mp4$/);
+    if (!a || !m) return null;
+    return { segs: a.videos[Number(m[1])] || [], approx: a.approx };
   }
 
   function buildSelector() {
@@ -192,6 +262,21 @@ PAGE_HTML = """<!doctype html>
           v.title = p;
           if (!columnMode) observer.observe(v);
           card.appendChild(v);
+          const bar = document.createElement("div");
+          bar.className = "ann-bar";
+          bar.textContent = "—";
+          const updateBar = () => {
+            const ann = annFor(run.dir, p);
+            if (!ann) { bar.textContent = "—"; return; }
+            const t = v.currentTime;
+            const seg = ann.segs.find((s) => s.s <= t && t < s.e);
+            bar.textContent = (ann.approx ? "≈ " : "") + (seg ? seg.t : "—");
+            bar.title = seg ? seg.t : "";
+          };
+          v.addEventListener("timeupdate", updateBar);
+          v.addEventListener("seeked", updateBar);
+          v.addEventListener("loadeddata", updateBar);
+          card.appendChild(bar);
           const cap = document.createElement("div");
           cap.className = "vid-cap";
           cap.textContent = p.split("/").slice(-2).join(" / ");
@@ -329,6 +414,17 @@ PAGE_HTML = """<!doctype html>
     if (e.key === "ArrowRight") columnMode ? colStep(1) : step(1);
   });
 
+  fetch("api/annotations")
+    .then((r) => r.json())
+    .then((data) => {
+      annIndex = data;
+      // Refresh bars of already-rendered videos (listeners are per-video closures).
+      document.querySelectorAll("video").forEach((v) =>
+        v.dispatchEvent(new Event("loadeddata"))
+      );
+    })
+    .catch(() => { annIndex = null; });
+
   fetch("api/index")
     .then((r) => r.json())
     .then((data) => {
@@ -353,13 +449,19 @@ PAGE_HTML = """<!doctype html>
 
 
 @app.function(
-    volumes={MOUNT_PATH: outputs_volume.read_only()},
+    volumes={
+        MOUNT_PATH: outputs_volume.read_only(),
+        EPISODES_MOUNT: episodes_volume.read_only(),
+    },
     scaledown_window=300,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=50)
 @modal.asgi_app(label="val-video-viewer")
 def viewer():
+    import bisect
+    import json as jsonlib
+    import math
     import os
     import re
     import threading
@@ -373,6 +475,8 @@ def viewer():
 
     _cache = {"ts": 0.0, "data": None}
     _lock = threading.Lock()
+    _ann_cache = {"data": None}  # annotations are static — computed once
+    _ann_lock = threading.Lock()
 
     def _vid_sort_key(name):
         m = re.search(r"(\d+)\.mp4$", name)
@@ -381,7 +485,7 @@ def viewer():
     def _scan():
         runs_out = []
         all_epochs = set()
-        for label, run_dir in RUNS:
+        for label, run_dir, _world, _bs in RUNS:
             epochs = {}
             videos_dir = os.path.join(base_dir, run_dir, "videos")
             if os.path.isdir(videos_dir):
@@ -430,6 +534,104 @@ def viewer():
     @api.get("/api/index")
     def index():
         return _index()
+
+    # ---- language annotations, synced to video time (see module docstring) ----
+
+    def _load_episodes():
+        """Read (total_frames, [(start,end,text), ...]) per val episode, in order."""
+        import zarr
+
+        eps = []
+        for h in VAL_EPISODES:
+            path = next(
+                (
+                    p
+                    for p in (
+                        os.path.join(EPISODES_MOUNT, f"{h}.zarr"),
+                        os.path.join(EPISODES_MOUNT, h),
+                    )
+                    if os.path.isdir(p)
+                ),
+                None,
+            )
+            if path is None:
+                raise FileNotFoundError(f"val episode {h} not found on volume")
+            group = zarr.open_group(path, mode="r")
+            total_frames = int(dict(group.attrs)["total_frames"])
+            segs = []
+            for raw in group["annotations"][:]:
+                if isinstance(raw, (bytes, bytearray, memoryview)):
+                    raw = bytes(raw).decode("utf-8")
+                try:
+                    d = jsonlib.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(d, dict) and d.get("text"):
+                    segs.append(
+                        (int(d.get("start_idx", -1)), int(d.get("end_idx", -1)), str(d["text"]))
+                    )
+            eps.append((total_frames, segs))
+        return eps
+
+    def _build_annotations():
+        """{run_dir: {approx, videos: [[{s,e,t}, ...] per video index]}} — static."""
+        episodes = _load_episodes()
+        cum_starts = []
+        total = 0
+        for tf, _ in episodes:
+            cum_starts.append(total)
+            total += tf
+
+        def text_at(sample_idx):
+            if sample_idx >= total:
+                return ""
+            e = bisect.bisect_right(cum_starts, sample_idx) - 1
+            f = sample_idx - cum_starts[e]
+            active = [t for (s0, s1, t) in episodes[e][1] if s0 <= f < s1]
+            return " · ".join(active)
+
+        # eval_video.py flushes at >=1000 buffered frames; batches arrive whole, so
+        # with full batches the flush lands at the first multiple of bs >= 1000.
+        out = {}
+        for _label, run_dir, world, bs in RUNS:
+            flush = math.ceil(BUFFER_FLUSH_AT / bs) * bs  # 1024 for bs in {32, 64}
+            per_rank_cap = min(LIMIT_VAL_BATCHES * bs, math.ceil(total / world))
+            videos = []
+            for i in range(math.ceil(per_rank_cap / flush)):
+                p0, p1 = flush * i, min(flush * (i + 1), per_rank_cap)
+                segs = []
+                cur_text, cur_start = None, 0
+                for p in range(p0, p1):
+                    t = text_at(p * world)  # rank-0 assumption for world > 1
+                    k = p - p0
+                    if t != cur_text:
+                        if cur_text:
+                            segs.append(
+                                {"s": round(cur_start / FPS, 3), "e": round(k / FPS, 3), "t": cur_text}
+                            )
+                        cur_text, cur_start = t, k
+                if cur_text:
+                    segs.append(
+                        {
+                            "s": round(cur_start / FPS, 3),
+                            "e": round((p1 - p0) / FPS, 3),
+                            "t": cur_text,
+                        }
+                    )
+                videos.append(segs)
+            out[run_dir] = {"approx": world > 1, "videos": videos}
+        return out
+
+    @api.get("/api/annotations")
+    def annotations():
+        with _ann_lock:
+            if _ann_cache["data"] is None:
+                try:
+                    _ann_cache["data"] = _build_annotations()
+                except Exception as exc:
+                    # Don't cache failures — surface the error and retry next call.
+                    return {"error": f"{type(exc).__name__}: {exc}"}
+            return _ann_cache["data"]
 
     @api.get("/video")
     def video(path: str = Query(...)):
