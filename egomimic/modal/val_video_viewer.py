@@ -66,6 +66,9 @@ PAGE_HTML = """<!doctype html>
     border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
   }
   select:hover, button:hover { border-color: var(--accent); }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  #colctl { display: flex; align-items: center; gap: 6px; }
+  #colind { color: var(--dim); font-size: 12px; min-width: 96px; text-align: center; }
   .spacer { flex: 1; }
   #status { color: var(--dim); font-size: 12px; }
   main { padding: 12px 16px 40px; }
@@ -80,6 +83,8 @@ PAGE_HTML = """<!doctype html>
   .vids { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
   .vid-card { flex: 0 0 auto; width: 380px; }
   .vid-card video { width: 100%; border-radius: 6px; background: #000; display: block; }
+  .vid-card.active-col video { outline: 2px solid var(--accent); }
+  .col-ph { flex: 0 0 auto; width: 380px; }
   .vid-cap { color: var(--dim); font-size: 11px; margin-top: 3px; text-align: center; }
   .placeholder {
     color: var(--dim); border: 1px dashed var(--border); border-radius: 6px;
@@ -95,6 +100,12 @@ PAGE_HTML = """<!doctype html>
   <button id="next" title="next epoch">&#9654;</button>
   <button id="playall">Play all</button>
   <button id="pauseall">Pause all</button>
+  <button id="colmode" title="load and play one video column at a time">Column mode</button>
+  <span id="colctl" style="display:none">
+    <button id="colprev" title="previous column">&#9664; col</button>
+    <span id="colind">Column 1 of 1</span>
+    <button id="colnext" title="next column">col &#9654;</button>
+  </span>
   <span class="spacer"></span>
   <span id="status">loading…</span>
 </header>
@@ -103,6 +114,9 @@ PAGE_HTML = """<!doctype html>
 (function () {
   let index = null;          // {runs:[{label,dir,epochs:{ep:[paths]}}], epochs:[..]}
   let currentEpoch = null;
+  let columnMode = false;    // column mode: load/play one video column at a time
+  let currentCol = 0;        // 0-based active column index
+  let playToken = 0;         // guards synced play against rapid column switches
 
   const $ = (id) => document.getElementById(id);
   const grid = $("grid"), epochSel = $("epoch"), statusEl = $("status");
@@ -170,12 +184,13 @@ PAGE_HTML = """<!doctype html>
         vids.forEach((p, i) => {
           const card = document.createElement("div");
           card.className = "vid-card";
+          card.dataset.col = i;
           const v = document.createElement("video");
           v.controls = true; v.muted = true; v.loop = true;
           v.playsInline = true; v.preload = "none";
           v.dataset.src = "video?path=" + encodeURIComponent(p);
           v.title = p;
-          observer.observe(v);
+          if (!columnMode) observer.observe(v);
           card.appendChild(v);
           const cap = document.createElement("div");
           cap.className = "vid-cap";
@@ -198,7 +213,97 @@ PAGE_HTML = """<!doctype html>
     currentEpoch = ep;
     epochSel.value = ep;
     render();
+    if (columnMode) { currentCol = 0; applyColumn(); }
   }
+
+  // ---- column mode ----
+  const colmodeBtn = $("colmode"), colctl = $("colctl"), colind = $("colind");
+
+  function maxCols() {
+    return Math.max(0, ...index.runs.map((r) => (r.epochs[currentEpoch] || []).length));
+  }
+
+  function playSynced(videos) {
+    const token = ++playToken;
+    const ready = videos.map((v) => new Promise((res) => {
+      if (v.readyState >= 2) return res();
+      const on = () => { v.removeEventListener("loadeddata", on); res(); };
+      v.addEventListener("loadeddata", on);
+      setTimeout(res, 5000); // don't stall the column on one slow video
+    }));
+    Promise.all(ready).then(() => {
+      if (token !== playToken) return; // column changed meanwhile
+      videos.forEach((v) => {
+        try { v.currentTime = 0; } catch (e) {}
+        v.play().catch(() => {});
+      });
+    });
+  }
+
+  function applyColumn() {
+    document.querySelectorAll(".col-ph").forEach((e) => e.remove());
+    const active = [];
+    grid.querySelectorAll(".run-row").forEach((row) => {
+      const body = row.querySelector(".vids");
+      const cards = body.querySelectorAll(".vid-card");
+      let found = null;
+      cards.forEach((card) => {
+        const v = card.querySelector("video");
+        if (Number(card.dataset.col) === currentCol) {
+          found = card;
+          card.classList.add("active-col");
+          if (!v.getAttribute("src") && v.dataset.src) {
+            v.src = v.dataset.src; v.preload = "auto";
+          }
+          active.push(v);
+        } else {
+          card.classList.remove("active-col");
+          v.pause();
+          if (v.getAttribute("src")) { v.removeAttribute("src"); v.load(); } // unload buffer
+        }
+      });
+      if (found) {
+        found.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+      } else if (cards.length) {
+        // run has videos this epoch, just fewer than currentCol+1
+        const ph = document.createElement("div");
+        ph.className = "placeholder col-ph";
+        ph.textContent =
+          "no video #" + (currentCol + 1) + " for this run at epoch " + currentEpoch;
+        body.appendChild(ph);
+      }
+    });
+    colind.textContent = "Column " + (currentCol + 1) + " of " + maxCols();
+    playSynced(active);
+  }
+
+  function colStep(d) {
+    const n = maxCols();
+    if (!n) return;
+    const next = Math.min(n - 1, Math.max(0, currentCol + d));
+    if (next === currentCol) return;
+    currentCol = next;
+    applyColumn();
+  }
+
+  function setColumnMode(on) {
+    columnMode = on;
+    colmodeBtn.classList.toggle("on", on);
+    colctl.style.display = on ? "" : "none";
+    if (on) {
+      observer.disconnect(); // column mode manages loading itself
+      currentCol = 0;
+      applyColumn();
+    } else {
+      playToken++; // cancel any pending synced play
+      render();    // rebuild grid: clears highlights/placeholders, re-arms lazy-load
+    }
+  }
+
+  colmodeBtn.onclick = () => { if (index) setColumnMode(!columnMode); };
+  $("colprev").onclick = () => colStep(-1);
+  $("colnext").onclick = () => colStep(1);
+  // ---- end column mode ----
 
   function step(d) {
     const i = index.epochs.indexOf(currentEpoch) + d;
@@ -208,15 +313,20 @@ PAGE_HTML = """<!doctype html>
   $("prev").onclick = () => step(-1);
   $("next").onclick = () => step(1);
   epochSel.onchange = () => setEpoch(Number(epochSel.value));
-  $("playall").onclick = () => document.querySelectorAll("video").forEach((v) => {
-    if (!v.src && v.dataset.src) v.src = v.dataset.src;
-    v.play().catch(() => {});
-  });
-  $("pauseall").onclick = () =>
+  $("playall").onclick = () => {
+    if (columnMode) { applyColumn(); return; } // reload + re-sync the active column only
+    document.querySelectorAll("video").forEach((v) => {
+      if (!v.src && v.dataset.src) v.src = v.dataset.src;
+      v.play().catch(() => {});
+    });
+  };
+  $("pauseall").onclick = () => {
+    playToken++; // cancel any pending synced column play
     document.querySelectorAll("video").forEach((v) => v.pause());
+  };
   document.addEventListener("keydown", (e) => {
-    if (e.key === "ArrowLeft") step(-1);
-    if (e.key === "ArrowRight") step(1);
+    if (e.key === "ArrowLeft") columnMode ? colStep(-1) : step(-1);
+    if (e.key === "ArrowRight") columnMode ? colStep(1) : step(1);
   });
 
   fetch("api/index")
