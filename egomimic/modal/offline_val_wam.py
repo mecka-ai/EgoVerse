@@ -21,7 +21,7 @@ Usage (offline eval of one checkpoint, TF rolling, 3 held-out episodes):
         data=data_dishwashing_48h_wam evaluator=eval_dreamzero_tf \
         data_schematic.norm_mode=minmax reject_outliers=false \
         ckpt_path=data_div_oss/wam22_dw48/checkpoints/last.ckpt \
-        num_val_episodes=3 name=wam_offline_eval description=wam22_dw48_tf"
+        +num_val_episodes=3 name=wam_offline_eval description=wam22_dw48_tf"
 
     (evaluator=eval_dreamzero_ar for fully-autoregressive rolling; relative
     ckpt_path / checkpoints_dir / norm paths resolve against the outputs
@@ -33,7 +33,7 @@ Usage (val-metric sweep over a run's checkpoints):
         data=data_dishwashing_48h_wam \
         data_schematic.norm_mode=minmax reject_outliers=false \
         +checkpoints_dir=data_div_oss/wam22_dw48/checkpoints \
-        num_val_episodes=5 name=wam_val_sweep description=wam22_dw48"
+        +num_val_episodes=5 name=wam_val_sweep description=wam22_dw48"
 """
 
 from __future__ import annotations

@@ -38,7 +38,7 @@ Run (repo root; on Modal use egomimic/modal/offline_val_wam.py):
         --config-name=train_zarr_human_wam_wan22_5b \
         data=data_dishwashing_48h_wam evaluator=eval_dreamzero_tf \
         ckpt_path=/path/to/checkpoints/last.ckpt \
-        num_val_episodes=3 \
+        +num_val_episodes=3 \
         <training-time overrides...>
 """
 
