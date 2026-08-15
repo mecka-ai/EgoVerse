@@ -324,6 +324,7 @@ def _run_offline_val(
     submodules: frozenset,
     limit_val_batches: float,
     is_pi: bool,
+    out_prefix: str = OUT_PREFIX,
 ) -> dict:
     """Container body: clone repo, write + run the runner subprocess, commit."""
     import shlex
@@ -334,7 +335,7 @@ def _run_offline_val(
     # files, so the runner subprocess resolves them like training's DDP ranks.
     _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=submodules)
 
-    out_dir = f"{CFG.output_mount_path}/{OUT_PREFIX}/{run_tag}"
+    out_dir = f"{CFG.output_mount_path}/{out_prefix}/{run_tag}"
     os.makedirs(out_dir, exist_ok=True)
     eps_json = f"{out_dir}/offline_val_indist3.json"
     with open(eps_json, "w") as f:
@@ -404,7 +405,10 @@ def _run_offline_val(
 _COMMON = dict(
     cpu=12.0,
     memory=131072,
-    timeout=7200,
+    # 4h: generous headroom — zarr reads over the volume FUSE mount degrade
+    # heavily when several vals hit the same episodes concurrently (observed
+    # ~10x); prefer running vals sequentially.
+    timeout=14400,
     secrets=[modal.Secret.from_name(name) for name in CFG.secret_names],
     volumes={
         CFG.volume_mount_path: zarr_volume,
@@ -413,13 +417,17 @@ _COMMON = dict(
 )
 
 
-@app.function(gpu="A100-80GB", **_COMMON)
+# NOTE: originally A100-80GB; switched to H200 mid-campaign — the A100 pool's
+# volume FUSE reads were ~10x slower than H200 containers on the same episodes
+# (observed 2026-08-14), stalling OSS vals past their timeout.
+@app.function(gpu="H200", **_COMMON)
 def run_val_oss(
     run_tag: str,
     epoch: int,
     git_remote: str,
     git_commit: str,
     limit_val_batches: float = 1.0,
+    out_prefix: str = OUT_PREFIX,
 ) -> dict:
     return _run_offline_val(
         run_tag,
@@ -429,6 +437,7 @@ def run_val_oss(
         submodules=frozenset(),
         limit_val_batches=limit_val_batches,
         is_pi=False,
+        out_prefix=out_prefix,
     )
 
 
@@ -439,6 +448,7 @@ def run_val_pi(
     git_remote: str,
     git_commit: str,
     limit_val_batches: float = 1.0,
+    out_prefix: str = OUT_PREFIX,
 ) -> dict:
     return _run_offline_val(
         run_tag,
@@ -448,6 +458,7 @@ def run_val_pi(
         submodules=frozenset({"openpi"}),
         limit_val_batches=limit_val_batches,
         is_pi=True,
+        out_prefix=out_prefix,
     )
 
 
@@ -464,14 +475,18 @@ def run(
     run_tag: str = "300M_mm_nobc_dw48",
     epoch: int = COMMON_EPOCH,
     limit_val_batches: float = 1.0,
+    out_prefix: str = OUT_PREFIX,
 ) -> None:
     """Validate a single run. Blocks and prints the manifest."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
     if is_dirty:
         print("Warning: local repo dirty; the container runs the last pushed commit.")
-    print(f"Submitting offline val: {run_tag} @ epoch {epoch} (commit {git_commit[:12]})")
+    print(
+        f"Submitting offline val: {run_tag} @ epoch {epoch} -> {out_prefix}/ "
+        f"(commit {git_commit[:12]})"
+    )
     manifest = _fn_for(run_tag).remote(
-        run_tag, epoch, git_remote, git_commit, limit_val_batches
+        run_tag, epoch, git_remote, git_commit, limit_val_batches, out_prefix
     )
     print(json.dumps(manifest, indent=2))
 
@@ -481,6 +496,7 @@ def run_many(
     run_tags: str,
     epoch: int = COMMON_EPOCH,
     limit_val_batches: float = 1.0,
+    out_prefix: str = OUT_PREFIX,
 ) -> None:
     """Validate several runs in parallel (comma-separated run tags)."""
     git_remote, git_commit, is_dirty = _resolve_git_state()
@@ -490,7 +506,7 @@ def run_many(
     handles = {}
     for tag in tags:
         handles[tag] = _fn_for(tag).spawn(
-            tag, epoch, git_remote, git_commit, limit_val_batches
+            tag, epoch, git_remote, git_commit, limit_val_batches, out_prefix
         )
         print(f"spawned {tag}: {handles[tag].object_id}")
     failures = {}
