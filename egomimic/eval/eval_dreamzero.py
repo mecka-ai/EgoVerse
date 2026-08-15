@@ -440,9 +440,19 @@ def _force_ood_split(
         cfg.data.valid_datasets = OmegaConf.create(new_valid)
 
 
+def _force_valid_batch_size_one(cfg: DictConfig) -> None:
+    """Valid dataloaders at batch_size=1 so every episode window becomes its
+    own val step -> its own {predicted,validation}_video_<i>.mp4 pair. MUST be
+    applied BEFORE the datamodule is instantiated (the wrapper captures the
+    dataloader params at construction)."""
+    with open_dict(cfg):
+        if OmegaConf.select(cfg, "data.valid_dataloader_params") is not None:
+            for name in cfg.data.valid_dataloader_params:
+                cfg.data.valid_dataloader_params[name].batch_size = 1
+
+
 def _apply_eval_trainer_overrides(cfg: DictConfig, limit_val_batches: int) -> None:
-    """Force the trainer into a single-GPU one-epoch validate-only run and the
-    valid dataloaders into batch_size=1 (one episode per mp4 pair)."""
+    """Force the trainer into a single-GPU one-epoch validate-only run."""
     with open_dict(cfg):
         cfg.trainer.pop("_modal", None)  # Modal-submission sentinel
         cfg.trainer.strategy = "auto"
@@ -456,9 +466,6 @@ def _apply_eval_trainer_overrides(cfg: DictConfig, limit_val_batches: int) -> No
         cfg.trainer.num_sanity_val_steps = 0
         cfg.trainer.sync_batchnorm = False
         cfg.logger = None
-        if OmegaConf.select(cfg, "data.valid_dataloader_params") is not None:
-            for name in cfg.data.valid_dataloader_params:
-                cfg.data.valid_dataloader_params[name].batch_size = 1
 
 
 @hydra.main(
@@ -490,6 +497,7 @@ def main(cfg: DictConfig) -> None:
         _force_ood_split(cfg, valid_ratio=valid_ratio, valid_mode=valid_mode)
     else:
         valid_mode = "config"
+    _force_valid_batch_size_one(cfg)  # before the datamodule is built
 
     train_datasets = {
         name: hydra.utils.instantiate(cfg.data.train_datasets[name])

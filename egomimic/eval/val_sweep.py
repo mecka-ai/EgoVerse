@@ -54,6 +54,7 @@ from egomimic.eval.eval import Eval
 from egomimic.eval.eval_dreamzero import (
     _apply_eval_trainer_overrides,
     _force_ood_split,
+    _force_valid_batch_size_one,
     _patch_algo_use_sample_rolling,
     _restrict_to_first_n_episodes,
 )
@@ -138,6 +139,7 @@ def main(cfg: DictConfig) -> None:
             valid_ratio=float(cfg.get("valid_ratio", 0.2)),
             valid_mode=str(cfg.get("valid_mode", "valid")),
         )
+    _force_valid_batch_size_one(cfg)  # before the datamodule is built
 
     # ---- datasets ------------------------------------------------------------
     train_datasets = {
