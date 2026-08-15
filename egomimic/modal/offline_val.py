@@ -1,31 +1,48 @@
 """Offline (weights-only) validation for the 8 data_div_oss runs on Modal.
 
-For a given run_tag + epoch, re-composes that run's EXACT training config from
-its `.hydra/overrides.yaml` (stored on the egoverse-training-outputs volume),
-swaps the valid episodes for 3 IN-DISTRIBUTION episodes (seen-in-training
-operator — a control experiment against the operator-holdout val plateau),
-loads the checkpoint weights (strict=True) and runs `trainer.validate` on a
-single GPU. The run's own EvalVideo evaluator writes GT-vs-pred videos to
+For a given run_tag + epoch, loads that run's EXACT training config from its
+stored `.hydra/config.yaml` on the egoverse-training-outputs volume (the
+composed config Hydra wrote at launch; re-composing from overrides.yaml against
+today's hydra_configs is NOT safe — e.g. pi0.5_bc_mecka.yaml dropped the
+`model.pi05: true` flag after these runs launched, which silently builds a
+non-adaRMS action expert that cannot load the checkpoints). It then swaps the
+valid episodes for 3 IN-DISTRIBUTION episodes (seen-in-training operator — a
+control experiment against the operator-holdout val plateau), loads the
+checkpoint weights (strict=True) and runs `trainer.validate` on a single GPU.
+The run's own EvalVideo evaluator writes GT-vs-pred videos to
     <outputs volume>/offline_val_indist/<run_tag>/videos/epoch_0/MECKA_BIMANUAL/
 and Valid/* metrics land in a CSVLogger + manifest.json in the same dir.
 
-The live training runs and their dirs are NOT touched: their overrides.yaml /
+The validation itself runs in a FRESH SUBPROCESS inside the container (a
+runner script written at container runtime), exactly like training runs
+`python -m egomimic.trainHydra` as a subprocess. Building the pi model
+in-process silently produces a NON-adaRMS gemma expert (plain
+input_layernorm.weight instead of input_layernorm.dense.*) even though the
+transformers overlay is on disk — verified empirically: the same
+PI0Pytorch(pi05=True) build in the same container has adaRMS keys in a fresh
+subprocess and lacks them in-process. The subprocess also matches training's
+import environment (.pth-based egomimic/openpi resolution).
+
+The live training runs and their dirs are NOT touched: their config.yaml /
 checkpoints are only read, and all outputs go to the new offline_val_indist/
 prefix.
 
-Usage (single run — the debug loop):
-    MODAL_ENVIRONMENT=robotics modal run egomimic/modal/offline_val.py::run \
+Usage (single run):
+    MODAL_ENVIRONMENT=robotics modal run --detach egomimic/modal/offline_val.py::run \
         --run-tag 300M_mm_nobc_dw48 --epoch 539
 
-All / several runs in parallel:
+Several runs in parallel:
     MODAL_ENVIRONMENT=robotics modal run --detach egomimic/modal/offline_val.py::run_many \
-        --run-tags 300M_mm_nobc_dw48,600M_mm_nobc_dw48,...
+        --run-tags pi05_dw48,pali_dw48
 
 Notes
 -----
 - OSS (HPT) runs validate on A100-80GB, pi0.5-family runs on H200 (they were
   trained on 2 GPUs, but eval_video.py has no rank guard — 2 ranks corrupt the
   videos — so validation is single-GPU: trainer.devices=1, strategy=auto).
+- The runner initializes a world_size=1 gloo process group before validate:
+  ModelWrapper.on_validation_end calls torch.distributed.barrier()
+  unconditionally, which raises under a single-device strategy otherwise.
 - The pi runs need the openpi submodule + its patched transformers==4.53.2
   (applied by modal_setup._prepare_repo) and TORCHDYNAMO_DISABLE=1 (the image
   ships no C compiler; pi's sample_actions is wrapped in @torch.compile).
@@ -88,130 +105,37 @@ PI_RUNS = (
     "pali_lang_dw48",
 )
 
-# Original-run overrides stripped for the offline pass (replaced below, or not
-# applicable to a fresh weights-only validation).
-_DROP_KEYS = {
-    "wandb_run_id",
-    "ckpt_path",
-    "finetune_ckpt",
-    "launch_params.gpus_per_node",
-    "trainer.limit_train_batches",
-    "trainer.limit_val_batches",
-    "trainer.check_val_every_n_epoch",
-}
-_DROP_PREFIXES = ("logger.", "callbacks.")
+
+# =============================================================================
+# Runner script — written to /root/offline_val_runner.py at container runtime
+# and executed as a FRESH python subprocess (see module docstring for why).
+# Mirrors the validation-relevant parts of egomimic/trainHydra.py train().
+# =============================================================================
+RUNNER_SRC = r'''
+"""Offline-val runner: fresh-process validation of one run. See offline_val.py."""
+import argparse
+import copy
+import glob
+import json
+import os
+import sys
 
 
-def _fmt_limit(limit_val_batches: float) -> str:
-    """Format limit_val_batches for a hydra override: fraction <= 1.0, else int."""
-    if limit_val_batches <= 1.0:
-        return f"{float(limit_val_batches)}"
-    return f"{int(limit_val_batches)}"
-
-
-def _build_overrides(
-    run_tag: str, out_dir: str, eps_json: str, limit_val_batches: float
-) -> list[str]:
-    """Original run overrides, minus wandb/ckpt/logger keys, plus offline-val ones."""
-    import yaml
-
-    overrides_path = (
-        f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/.hydra/overrides.yaml"
-    )
-    with open(overrides_path) as f:
-        original = yaml.safe_load(f)
-    print(f"[offline_val] original overrides ({overrides_path}):")
-    for ov in original:
-        print(f"    {ov}")
-
-    kept = []
-    for ov in original:
-        key = ov.split("=", 1)[0].lstrip("+~")
-        if key in _DROP_KEYS or key == "logger" or key.startswith(_DROP_PREFIXES):
-            continue
-        kept.append(ov)
-
-    kept += [
-        # single GPU: eval_video.py has no rank guard, 2 ranks corrupt videos
-        "launch_params.gpus_per_node=1",
-        "trainer.devices=1",
-        "trainer.num_nodes=1",
-        "trainer.strategy=auto",
-        "trainer.num_sanity_val_steps=0",
-        "trainer.check_val_every_n_epoch=1",
-        f"trainer.limit_val_batches={_fmt_limit(limit_val_batches)}",
-        # all outputs to the offline_val_indist/<run_tag> prefix
-        f"paths.output_dir={out_dir}",
-        "norm_stats.save_cache_dir=null",
-        # 3 in-dist episodes for the val set; train set restricted to the same 3
-        # episodes — it is never iterated (validate only), but is still needed
-        # for shape inference (dataset[0], same embodiment => same shapes) and
-        # the norm-stats dataset construction (stats themselves load from the
-        # run's precomputed_norm_path, which stays untouched in the overrides).
-        f"data.train_datasets.mecka_bimanual.resolver.eps_to_use={eps_json}",
-        f"data.valid_datasets.mecka_bimanual.resolver.eps_to_use={eps_json}",
-    ]
-    print("[offline_val] final overrides:")
-    for ov in kept:
-        print(f"    {ov}")
-    return kept
-
-
-def _run_offline_val(
-    run_tag: str,
-    epoch: int,
-    git_remote: str,
-    git_commit: str,
-    submodules: frozenset,
-    limit_val_batches: float,
-    is_pi: bool,
-) -> dict:
-    """Container body: clone repo, compose the run's config, validate, commit."""
-    # --- env BEFORE any heavy import ---
-    os.environ["MODAL_IS_REMOTE"] = "1"
-    os.environ.setdefault("HYDRA_FULL_ERROR", "1")
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["NUMEXPR_NUM_THREADS"] = "1"
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    if is_pi:
-        # pi0.5's sample_actions is @torch.compile'd; the image has no C
-        # compiler, so TorchInductor would crash eval (see trainModal.py).
-        os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
-    # Clone the repo (+ openpi submodule and its transformers==4.53.2 overlay
-    # for pi runs — must happen before `import transformers`).
-    _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=submodules)
-    if CFG.remote_repo_dir not in sys.path:
-        sys.path.insert(0, CFG.remote_repo_dir)
-    openpi_src = f"{CFG.remote_repo_dir}/external/openpi/src"
-    if is_pi and openpi_src not in sys.path:
-        sys.path.insert(0, openpi_src)
-    os.chdir(CFG.remote_repo_dir)
-
-    out_dir = f"{CFG.output_mount_path}/{OUT_PREFIX}/{run_tag}"
-    os.makedirs(out_dir, exist_ok=True)
-    eps_json = f"{out_dir}/offline_val_indist3.json"
-    with open(eps_json, "w") as f:
-        json.dump(INDIST_EPISODES, f)
-
-    ckpt_path = (
-        f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/checkpoints/"
-        f"epoch_epoch={epoch}.ckpt"
-    )
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-
-    overrides = _build_overrides(run_tag, out_dir, eps_json, limit_val_batches)
-
-    # --- heavy imports (after repo clone / transformers swap) ---
-    import copy
-    import glob as _glob
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--run-tag", required=True)
+    ap.add_argument("--epoch", type=int, required=True)
+    ap.add_argument("--config-path", required=True)
+    ap.add_argument("--ckpt-path", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--eps-json", required=True)
+    ap.add_argument("--limit-val-batches", type=float, default=1.0)
+    ap.add_argument("--git-commit", default="")
+    args = ap.parse_args()
 
     import hydra
     import lightning as L
     import torch
-    from hydra import compose, initialize_config_dir
     from lightning.pytorch.loggers import CSVLogger
     from omegaconf import OmegaConf, open_dict
 
@@ -223,16 +147,39 @@ def _run_offline_val(
     from egomimic.utils.aws.aws_data_utils import load_env
     from egomimic.utils.dataloader_ipc import configure_dataloader_ipc
 
-    with initialize_config_dir(
-        config_dir=f"{CFG.remote_repo_dir}/egomimic/hydra_configs",
-        version_base="1.3",
-    ):
-        cfg = compose(config_name="train_zarr_cartesian", overrides=overrides)
-
+    # ---- load the run's stored launch config and apply offline-val edits ----
+    cfg = OmegaConf.load(args.config_path)
+    print(f"[offline_val] loaded launch config: {args.config_path}")
+    lvb = (
+        float(args.limit_val_batches)
+        if args.limit_val_batches <= 1.0
+        else int(args.limit_val_batches)
+    )
     with open_dict(cfg):
-        cfg.logger = None  # no wandb; CSVLogger is attached manually below
+        # all outputs to the offline_val_indist/<run_tag> prefix; this also
+        # replaces the ${hydra:runtime.output_dir} interpolations, which cannot
+        # resolve outside a hydra app run
+        cfg.paths.output_dir = args.out_dir
+        cfg.norm_stats.save_cache_dir = None
+        # no wandb; a CSVLogger is attached manually below
+        cfg.logger = None
         cfg.ckpt_path = None
         cfg.finetune_ckpt = None
+        # single GPU: eval_video.py has no rank guard, 2 ranks corrupt videos
+        cfg.launch_params.gpus_per_node = 1
+        cfg.trainer.devices = 1
+        cfg.trainer.num_nodes = 1
+        cfg.trainer.strategy = "auto"
+        cfg.trainer.num_sanity_val_steps = 0
+        cfg.trainer.check_val_every_n_epoch = 1
+        cfg.trainer.limit_val_batches = lvb
+        # 3 in-dist episodes for the val set; train set restricted to the same
+        # 3 episodes — it is never iterated (validate only), but is still
+        # needed for shape inference (dataset[0], same embodiment => same
+        # shapes) and the norm-stats dataset construction (stats themselves
+        # load from the run's precomputed_norm_path, which stays untouched).
+        cfg.data.train_datasets.mecka_bimanual.resolver.eps_to_use = args.eps_json
+        cfg.data.valid_datasets.mecka_bimanual.resolver.eps_to_use = args.eps_json
 
     # ---- mirror trainHydra.train() (validation-relevant parts) ----
     configure_dataloader_ipc()
@@ -264,7 +211,7 @@ def _run_offline_val(
         km["norm_mode"] = True
         instantiate_copy.resolver.key_map = km
         norm_dataset = hydra.utils.instantiate(instantiate_copy)
-        # Stats load from the run's precomputed_norm_path (norm_dataset unused then).
+        # Stats load from the run's precomputed_norm_path (dataset unused then).
         data_schematic.infer_norm_from_dataset(
             norm_dataset,
             dataset_name,
@@ -297,7 +244,7 @@ def _run_offline_val(
 
     th._log_dataset_frame_counts(datamodule.train_datasets, datamodule.valid_datasets)
 
-    csv_logger = CSVLogger(save_dir=out_dir, name="csv")
+    csv_logger = CSVLogger(save_dir=args.out_dir, name="csv")
     with open_dict(cfg):
         cfg.trainer.pop("_modal", None)
     trainer = hydra.utils.instantiate(cfg.trainer, callbacks=[], logger=[csv_logger])
@@ -308,13 +255,29 @@ def _run_offline_val(
     eval_obj.model = model.model
     model.evaluator = eval_obj
 
-    print(f"[offline_val] loading checkpoint weights (strict=True): {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    print(f"[offline_val] loading checkpoint weights (strict=True): {args.ckpt_path}")
+    checkpoint = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
     ckpt_epoch = checkpoint.get("epoch")
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     del checkpoint
 
-    print(f"[offline_val] validating {run_tag} @ epoch {epoch} (ckpt epoch counter: {ckpt_epoch})")
+    # ModelWrapper.on_validation_end calls torch.distributed.barrier()
+    # unconditionally; under a single-device strategy no process group exists
+    # and it raises. A world_size=1 gloo group makes the barrier a no-op
+    # without touching training code (single-device strategy ignores it).
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:29513",
+            rank=0,
+            world_size=1,
+        )
+        print("[offline_val] initialized world_size=1 gloo group (barrier no-op)")
+
+    print(
+        f"[offline_val] validating {args.run_tag} @ epoch {args.epoch} "
+        f"(ckpt epoch counter: {ckpt_epoch})"
+    )
     trainer.validate(model=model, datamodule=datamodule)
 
     metrics = {}
@@ -325,28 +288,116 @@ def _run_offline_val(
             pass
 
     videos = sorted(
-        os.path.relpath(p, out_dir)
-        for p in _glob.glob(f"{out_dir}/videos/**/*.mp4", recursive=True)
+        os.path.relpath(p, args.out_dir)
+        for p in glob.glob(f"{args.out_dir}/videos/**/*.mp4", recursive=True)
     )
+    with open(os.path.join(args.out_dir, "indist_meta.json")) as f:
+        meta = json.load(f)
     manifest = {
-        "run_tag": run_tag,
-        "epoch": epoch,
-        "ckpt_path": ckpt_path,
+        "run_tag": args.run_tag,
+        "epoch": args.epoch,
+        "ckpt_path": args.ckpt_path,
         "ckpt_epoch_counter": ckpt_epoch,
-        "operator": INDIST_OPERATOR,
-        "episodes": INDIST_EPISODES,
-        "total_frames": INDIST_TOTAL_FRAMES,
-        "limit_val_batches": limit_val_batches,
-        "git_commit": git_commit,
+        "operator": meta["operator"],
+        "episodes": meta["episodes"],
+        "total_frames": meta["total_frames"],
+        "limit_val_batches": args.limit_val_batches,
+        "git_commit": args.git_commit,
         "videos": videos,
         "metrics": metrics,
     }
-    with open(f"{out_dir}/manifest.json", "w") as f:
+    with open(os.path.join(args.out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+    print("[offline_val] RUNNER_DONE " + json.dumps(metrics))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _run_offline_val(
+    run_tag: str,
+    epoch: int,
+    git_remote: str,
+    git_commit: str,
+    submodules: frozenset,
+    limit_val_batches: float,
+    is_pi: bool,
+) -> dict:
+    """Container body: clone repo, write + run the runner subprocess, commit."""
+    import shlex
+    import subprocess
+
+    # Clone the repo (+ openpi submodule and its transformers==4.53.2 overlay
+    # for pi runs). _prepare_repo registers egomimic (and openpi) via .pth
+    # files, so the runner subprocess resolves them like training's DDP ranks.
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=submodules)
+
+    out_dir = f"{CFG.output_mount_path}/{OUT_PREFIX}/{run_tag}"
+    os.makedirs(out_dir, exist_ok=True)
+    eps_json = f"{out_dir}/offline_val_indist3.json"
+    with open(eps_json, "w") as f:
+        json.dump(INDIST_EPISODES, f)
+    with open(f"{out_dir}/indist_meta.json", "w") as f:
+        json.dump(
+            {
+                "operator": INDIST_OPERATOR,
+                "episodes": INDIST_EPISODES,
+                "total_frames": INDIST_TOTAL_FRAMES,
+            },
+            f,
+        )
+
+    config_path = f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/.hydra/config.yaml"
+    ckpt_path = (
+        f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/checkpoints/"
+        f"epoch_epoch={epoch}.ckpt"
+    )
+    for p in (config_path, ckpt_path):
+        if not os.path.exists(p):
+            raise FileNotFoundError(p)
+
+    runner_path = "/root/offline_val_runner.py"
+    with open(runner_path, "w") as f:
+        f.write(RUNNER_SRC)
+
+    env = os.environ.copy()
+    env["MODAL_IS_REMOTE"] = "1"
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("HYDRA_FULL_ERROR", "1")
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+    if is_pi:
+        # pi0.5's sample_actions is @torch.compile'd; the image has no C
+        # compiler, so TorchInductor would crash eval (see trainModal.py).
+        env["TORCHDYNAMO_DISABLE"] = "1"
+
+    cmd = [
+        CFG.python_bin,
+        runner_path,
+        "--run-tag", run_tag,
+        "--epoch", str(epoch),
+        "--config-path", config_path,
+        "--ckpt-path", ckpt_path,
+        "--out-dir", out_dir,
+        "--eps-json", eps_json,
+        "--limit-val-batches", str(limit_val_batches),
+        "--git-commit", git_commit,
+    ]
+    print(f"[offline_val] running: {shlex.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
 
     training_outputs_volume.commit()
-    print(f"[offline_val] DONE {run_tag}: {len(videos)} videos, metrics:")
-    print(json.dumps(metrics, indent=2))
+    if proc.returncode != 0:
+        raise RuntimeError(f"offline val runner failed (exit {proc.returncode})")
+
+    with open(f"{out_dir}/manifest.json") as f:
+        manifest = json.load(f)
+    print(f"[offline_val] DONE {run_tag}: {len(manifest['videos'])} videos, metrics:")
+    print(json.dumps(manifest["metrics"], indent=2))
     return manifest
 
 
