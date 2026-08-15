@@ -266,6 +266,18 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         scheduler_interval=cfg.model.get("scheduler_interval", "step"),
     )
 
+    # Optional: treat dataloader_idx=1 (the train_viz slot) as a FULL second
+    # val set — losses logged under `<second_val_prefix>/*` (e.g. Valid_oph/*).
+    # Gated on the new top-level `second_val_prefix` key (set via CLI with
+    # `+second_val_prefix=Valid_oph`); absent/None = exact legacy behavior.
+    second_val_prefix = OmegaConf.select(cfg, "second_val_prefix", default=None)
+    if second_val_prefix:
+        model.second_val_metric_prefix = str(second_val_prefix).rstrip("/") + "/"
+        log.info(
+            "second_val_prefix set — dataloader_idx=1 losses will log under "
+            f"'{model.second_val_metric_prefix}*'"
+        )
+
     _log_dataset_frame_counts(
         datamodule.train_datasets,
         datamodule.valid_datasets,

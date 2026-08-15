@@ -1,0 +1,10 @@
+# Second-val-set evaluator for the op-scaling runs: consumes dataloader_idx=1
+# (the train_viz slot, repurposed as the held-out-OPERATOR val set) and emits
+# the full HPT rollout metric family under Valid_oph/* (instead of the legacy
+# train_viz/Valid/*), with videos in <run>/videos_oph/. Pair with
+# `+second_val_prefix=Valid_oph` so Valid_oph/Loss etc. are logged too.
+_target_: egomimic.eval.train_viz_eval_video.TrainVizEvalVideo
+base:
+  _target_: egomimic.eval.eval_hpt.HPTEvalVideo
+metric_prefix: Valid_oph
+video_dirname: videos_oph

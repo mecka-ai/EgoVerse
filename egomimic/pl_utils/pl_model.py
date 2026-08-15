@@ -72,6 +72,11 @@ class ModelWrapper(LightningModule):
         # train_viz val pass). Wired by trainHydra.py when the data config
         # populates train_viz_datasets.
         self.train_viz_evaluator = None
+        # Optional metric prefix (e.g. "Valid_oph/") for logging validation
+        # LOSSES on dataloader_idx=1 as a full second val set. Wired by
+        # trainHydra.py from the top-level `second_val_prefix` config key.
+        # Default None = legacy behavior (no losses logged for idx=1).
+        self.second_val_metric_prefix = None
 
     @staticmethod
     def _as_config(cfg):
@@ -242,6 +247,23 @@ class ModelWrapper(LightningModule):
             for k, v in self.model.log_info(info).items():
                 self.log(
                     "Valid/" + k,
+                    v,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    add_dataloader_idx=False,
+                )
+        elif dataloader_idx == 1 and getattr(self, "second_val_metric_prefix", None):
+            # Second held-out val set (e.g. held-out-operator): log the same
+            # loss family under a separate prefix (e.g. "Valid_oph/"). Only
+            # active when `second_val_prefix` is set in the run config —
+            # legacy runs (prefix None) keep idx=1 as a rollout-only pass.
+            predictions = self.model.forward_training(batch)
+            losses = self.model.compute_losses(predictions, batch)
+            info = {"losses": TensorUtils.detach(losses)}
+            for k, v in self.model.log_info(info).items():
+                self.log(
+                    self.second_val_metric_prefix + k,
                     v,
                     on_step=False,
                     on_epoch=True,
