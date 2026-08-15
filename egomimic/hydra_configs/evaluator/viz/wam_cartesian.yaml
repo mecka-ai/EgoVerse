@@ -1,0 +1,13 @@
+# Cartesian action viz for WAM — human embodiment only (the universal
+# mecka/aria embodiment). No annotation_key: WAM.process_batch_for_training does
+# not emit `sampled_prompt`, and viz_gt_preds reads batch[annotation_key]
+# directly, so setting it would KeyError. Rendered with the Mecka renderer.
+mecka_bimanual:
+  _target_: egomimic.rldb.embodiment.human.Mecka.viz_gt_preds
+  _partial_: true
+  # viz_gt_preds reads the UNNORMALIZED, processed batch (keyed by key_name), so
+  # use the schematic key_name "front_img_1", not the zarr_key
+  # "observations.images.front_img_1" (matches the working fingertips viz config).
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj

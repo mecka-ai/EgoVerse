@@ -1,0 +1,13 @@
+# Primary config for Wan2.2-TI2V-5B WAM runs. Bundles the model/data/evaluator
+# group overrides and disables the HPT train_viz evaluator (mecka_wam defines no
+# train_viz_datasets). Launch with:
+#   python egomimic/modal/trainModal.py --config-name=train_zarr_human_wam_wan22_5b \
+#     trainer=ddp_modal logger=wandb name=<run> description=<desc> \
+#     +modal_gpu=H200 init_submodules=false
+defaults:
+  - train_zarr_cartesian
+  - override model: wam_bc_human_wan22_5b
+  - override data: mecka_wam           # WAM frame-clip + aligned action/state pipeline
+  - override evaluator: eval_wam
+  - override evaluator@train_viz_evaluator: null
+  - _self_

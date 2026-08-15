@@ -251,6 +251,10 @@ image = (
         "imageio-ffmpeg",
         "safetensors",
         "huggingface-hub",
+        # WAM (Wan2.2-5B world-action model) backbone deps.
+        "diffusers",
+        "accelerate",
+        "peft",
         "scaleapi",
         "openai",
         "pyzmq",
@@ -363,6 +367,12 @@ training_outputs_volume = modal.Volume.from_name(
 )
 deminf_v2_volume = modal.Volume.from_name("egoverse-deminf-v2", create_if_missing=True)
 DEMINF_V2_MOUNT = "/mnt/deminf-v2"
+# Wan2.2-TI2V-5B pretrained DiT + VAE for WAM. Populated once by
+# download_wan22_weights (trainModal.py), then mounted read-only into training.
+wan_checkpoints_volume = modal.Volume.from_name(
+    "wan-checkpoints", create_if_missing=True
+)
+WAN_CKPT_MOUNT = "/mnt/wan-ckpts"
 _modal_app_name = (
     os.environ.get("MODAL_APP_NAME", _MODAL_APP_DEFAULT).strip() or _MODAL_APP_DEFAULT
 )

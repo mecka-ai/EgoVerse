@@ -29,3 +29,8 @@ try:
     )
 except ImportError:
     pass  # quest submodule not initialized (init_submodules=quest) — non-quest run
+
+try:
+    from egomimic.algo.wam import WAM as WAM
+except ImportError:
+    pass  # wan backbone deps (diffusers/peft) absent — non-WAM run

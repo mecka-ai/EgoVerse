@@ -384,6 +384,139 @@ class Mecka(Human):
             # no resampling. Kills the cumulative-displacement signal.
             return _build_mecka_wf6d_fingertips_stepwise_transform_list()
 
+    # ----------------------------------------------------------------------
+    # WAM (World-Action Model) keymap/transform: a frame CLIP + frame-aligned
+    # action/state ee-pose chunks (world -> head frame), left-first 12-dim. The
+    # Wan VAE compresses 4x temporally, so cam_horizon = 4*k+1 pixel frames ->
+    # k+1 latent frames -> k predicted blocks; action_horizon = npb*k; state=k.
+    # ----------------------------------------------------------------------
+    @classmethod
+    def get_wam_keymap(
+        cls,
+        cam_horizon: int = 17,
+        action_horizon: int = 16,
+        state_horizon: int = 4,
+        norm_mode: bool = False,
+        annotation_key=None,
+    ):
+        key_map = {
+            cls.VIZ_IMAGE_KEY: {
+                "key_type": "camera_keys",
+                "zarr_key": "images.front_1",
+                "horizon": cam_horizon,
+            },
+            "right.action_ee_pose": {
+                "key_type": "action_keys",
+                "zarr_key": "right.obs_ee_pose",
+                "horizon": action_horizon,
+            },
+            "left.action_ee_pose": {
+                "key_type": "action_keys",
+                "zarr_key": "left.obs_ee_pose",
+                "horizon": action_horizon,
+            },
+            "right.state_ee_pose": {
+                "key_type": "proprio_keys",
+                "zarr_key": "right.obs_ee_pose",
+                "horizon": state_horizon,
+            },
+            "left.state_ee_pose": {
+                "key_type": "proprio_keys",
+                "zarr_key": "left.obs_ee_pose",
+                "horizon": state_horizon,
+            },
+            # Current head pose (single, xyz+quat) — target frame for the
+            # head/camera-frame transform; deleted after the transform runs.
+            "obs_head_pose": {
+                "key_type": "proprio_keys",
+                "zarr_key": "obs_head_pose",
+            },
+        }
+        if norm_mode:  # norm stats: drop the image clip (camera) key
+            for k in [
+                k for k, v in key_map.items() if v.get("key_type") == "camera_keys"
+            ]:
+                del key_map[k]
+        return key_map
+
+    @classmethod
+    def get_wam_transform_list(cls):
+        # Raw ee-poses are stored in the WORLD frame, so we reference both the
+        # action and state chunks to the current head pose (obs_head_pose) ->
+        # head/camera frame, exactly like the VLA cartesian pipeline
+        # (_build_human_cartesian_bimanual_transform_list). This is REQUIRED:
+        # the viz projects with intrinsics only (extrinsics=None), so points
+        # must be in the camera frame to land on the hands. We use
+        # ActionChunkCoordinateFrameTransform for BOTH (state is a chunk here,
+        # not a single pose) and SKIP InterpolatePose to keep the action/state
+        # horizons frame-aligned with the video clip. Then quat -> ypr
+        # (xyzwxyz 7 -> xyzypr 6) and concat L+R left-first -> 12-dim (6/arm),
+        # the layout _split_action_pose expects.
+        return [
+            ActionChunkCoordinateFrameTransform(
+                target_world="obs_head_pose",
+                chunk_world="left.action_ee_pose",
+                transformed_key_name="left.action_ee_pose_hf",
+                mode="xyzwxyz",
+            ),
+            ActionChunkCoordinateFrameTransform(
+                target_world="obs_head_pose",
+                chunk_world="right.action_ee_pose",
+                transformed_key_name="right.action_ee_pose_hf",
+                mode="xyzwxyz",
+            ),
+            ActionChunkCoordinateFrameTransform(
+                target_world="obs_head_pose",
+                chunk_world="left.state_ee_pose",
+                transformed_key_name="left.state_ee_pose_hf",
+                mode="xyzwxyz",
+            ),
+            ActionChunkCoordinateFrameTransform(
+                target_world="obs_head_pose",
+                chunk_world="right.state_ee_pose",
+                transformed_key_name="right.state_ee_pose_hf",
+                mode="xyzwxyz",
+            ),
+            XYZWXYZ_to_XYZYPR(
+                keys=[
+                    "left.action_ee_pose_hf",
+                    "right.action_ee_pose_hf",
+                    "left.state_ee_pose_hf",
+                    "right.state_ee_pose_hf",
+                ]
+            ),
+            ConcatKeys(
+                ["left.action_ee_pose_hf", "right.action_ee_pose_hf"],
+                "actions_cartesian",
+                delete_old_keys=True,
+            ),
+            ConcatKeys(
+                # Batch keys are ZARR keys; the data_schematic maps mecka proprio
+                # key_name "ee_pose" -> zarr_key "observations.state.ee_pose".
+                # Norm-stats (keyname_to_zarr_key) and process_batch
+                # (zarr_key_to_keyname) both key off that zarr_key, so the
+                # concatenated head-frame state must be named accordingly, or no
+                # proprio matches (KeyError 'state' in _prep_state_action).
+                ["left.state_ee_pose_hf", "right.state_ee_pose_hf"],
+                "observations.state.ee_pose",
+                delete_old_keys=True,
+            ),
+            # Drop the raw world-frame keys: ActionChunkCoordinateFrameTransform
+            # COPIES into the _hf keys (consumed by ConcatKeys above) but leaves
+            # the originals behind. _to_wam_data concatenates ALL proprio keys
+            # into the state, so stray raw left/right.state_ee_pose (7-dim each)
+            # would inflate state 12 -> 26. Delete them (+ obs_head_pose target).
+            DeleteKeys(
+                keys_to_delete=[
+                    "obs_head_pose",
+                    "left.action_ee_pose",
+                    "right.action_ee_pose",
+                    "left.state_ee_pose",
+                    "right.state_ee_pose",
+                ]
+            ),
+        ]
+
     @classmethod
     def get_keymap(
         cls,
