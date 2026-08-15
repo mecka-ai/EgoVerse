@@ -24,6 +24,10 @@ robomimic_model:
   state_dim: 12
   target_h: 160            # Wan2.2 5B input resolution (non-square)
   target_w: 320
+  # Latent frames per DiT forward: cam clip 17 -> 5 latents (1 cond + 4
+  # predicted). Also the rolling-window size F_total in sample_rolling
+  # (n_hist = num_video_frames - num_frame_per_block).
+  num_video_frames: 5
   world_loss_weight: 1.0
   num_inference_steps: 16
 

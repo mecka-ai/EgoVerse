@@ -216,7 +216,34 @@ class ModelWrapper(LightningModule):
             return self.train_viz_evaluator
         return None
 
+    def _rank_barrier(self, tag: str) -> None:
+        """Synchronize all ranks at a named point. Cheap when everyone gets
+        here at roughly the same time; useful to avoid NCCL ALLREDUCE timeouts
+        when one rank has been slower (e.g. first-epoch zarr JPEG read burst,
+        val-loop imbalance, sporadic filesystem stalls). No-op outside a
+        distributed run."""
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return
+        print(f"[BARRIER {tag}] rank={self.global_rank} entering", flush=True)
+        torch.distributed.barrier()
+        print(f"[BARRIER {tag}] rank={self.global_rank} released", flush=True)
+
+    @property
+    def _extra_rank_barriers(self) -> bool:
+        """Extra epoch/val-boundary barriers, opt-in per algo (e.g. WAM sets
+        ``_needs_rank_barriers = True``: its val loop encodes mp4s with high
+        per-rank time variance). Off for every other algo so non-WAM runs keep
+        their exact legacy synchronization behavior."""
+        return bool(getattr(self.model, "_needs_rank_barriers", False))
+
     def on_validation_start(self):
+        # Sync before the val loop so no rank enters validation while others
+        # are still finishing the previous training epoch's last step.
+        if self._extra_rank_barriers:
+            self._rank_barrier("on_validation_start")
         if self.evaluator is None:
             return
         self.model.device = self.device
@@ -285,15 +312,11 @@ class ModelWrapper(LightningModule):
         if self.train_viz_evaluator is not None:
             self.train_viz_evaluator.on_validation_end()
 
-        print(
-            f"Rank {self.global_rank} on validation end, waiting for all ranks to synchronize",
-            flush=True,
-        )
-        torch.distributed.barrier()
-        print(
-            f"Rank {self.global_rank} on validation end, all ranks synchronized",
-            flush=True,
-        )
+        # Sync after the val loop — mp4 writers on different ranks finish at
+        # different times, and without this wait the next train epoch's first
+        # ALLREDUCE can hit the 30-min NCCL default. Guarded (unlike the old
+        # bare barrier) so single-process runs without a process group work.
+        self._rank_barrier("on_validation_end")
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
@@ -344,16 +367,16 @@ class ModelWrapper(LightningModule):
 
     def on_fit_start(self):
         self.model.device = self.device
-        print(
-            f"Rank {self.global_rank} on fit start, waiting for all ranks to synchronize",
-            flush=True,
-        )
-        torch.distributed.barrier()
-        print(
-            f"Rank {self.global_rank} on fit start, all ranks synchronized", flush=True
-        )
+        # Guarded (unlike the old bare barrier) so single-process runs without
+        # a process group work; identical behavior under DDP.
+        self._rank_barrier("on_fit_start")
 
     def on_train_epoch_start(self):
+        # Barrier at the start of each epoch (WAM-gated) — the first-epoch
+        # zarr JPEG read burst is uneven across ranks, so this pulls the slow
+        # rank in before any per-step ALLREDUCE.
+        if self._extra_rank_barriers:
+            self._rank_barrier("on_train_epoch_start")
         for i, param_group in enumerate(self.optimizers().param_groups):
             self.log(
                 f"Optimizer/param_group_{i}_lr",
@@ -364,3 +387,11 @@ class ModelWrapper(LightningModule):
             )
 
         return super().on_train_epoch_start()
+
+    def on_train_epoch_end(self):
+        # Sync at epoch end (WAM-gated) so no rank races into
+        # on_validation_start or the next epoch's first step while another is
+        # still finishing its last backward pass.
+        if self._extra_rank_barriers:
+            self._rank_barrier("on_train_epoch_end")
+        return super().on_train_epoch_end()

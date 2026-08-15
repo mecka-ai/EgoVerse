@@ -14,7 +14,7 @@ Integration mirrors HPT / Pi0.5:
     forward_training, forward_eval, compute_losses, log_info) and the
     per-embodiment batch plumbing — identical contract to HPT.
 
-Hydra ``_target_: egomimic.algo.wam.WAM`` (see hydra_configs/model/wam_bc_human_wan21_1_3b.yaml).
+Hydra ``_target_: egomimic.algo.wam.WAM`` (see hydra_configs/model/wam_bc_human_wan22_5b.yaml).
 """
 
 from collections import OrderedDict
@@ -42,7 +42,7 @@ class WAMModel(nn.Module):
         frame_size: int = 256,  # square world-model input resolution (fallback)
         target_h: int = None,  # non-square override (e.g. 160 for Wan2.2 5B)
         target_w: int = None,  # non-square override (e.g. 320 for Wan2.2 5B)
-        num_video_frames: int = 2,  # latent frames: 1 conditioning + 1 predicted
+        num_video_frames: int = 2,  # latent frames per DiT forward (train clip length)
         text_len: int = 512,
         text_dim: int = 4096,
         world_loss_weight: float = 1.0,
@@ -107,17 +107,38 @@ class WAMModel(nn.Module):
         action = action[:, : self.action_horizon, : self.action_dim]
         return state, action
 
+    @staticmethod
+    def _emb_ids(data, B, device):
+        """DiT embodiment-embedding ids for a batch.
+
+        ``data["embodiment_id"]`` is the DOMAIN INDEX (position of the
+        embodiment in the model's ``domains`` list, set by ``WAM._to_wam_data``
+        / ``WAM.val_rollout``) — NOT the raw registry embodiment id. Using the
+        domain index keeps train and eval conditioning consistent: single-
+        domain runs always hit slot 0 (identical to the historical
+        ``torch.zeros`` behavior), cotrain runs get one trained slot per
+        domain in BOTH compute_loss and the rolling samplers. (Upstream's fix
+        passed the raw registry id at rollout time only, which diverged from
+        the zeros used at training time.)
+        """
+        eid = int(data.get("embodiment_id", 0))
+        return torch.full((B,), eid, dtype=torch.long, device=device)
+
     # --- training: two-target rectified-flow loss (dreamzero WANPolicyHead) -
     def compute_loss(self, batch):
         data = batch["data"]
         sched = self.scheduler
         latents = self._encode(data["video"])  # (B, Cz, F, h, w)
-        # CausalWanModel needs >=2 latent frames (frame0 conditioning + frame1
-        # predicted) so num_image_blocks == num_action_blocks == 1. Single obs
-        # frame -> duplicate temporally (world target = obs frame until
-        # multi-frame future clips are loaded).
+        # CausalWanModel needs exactly num_video_frames latents so the DiT's
+        # block layout (num_image_blocks x K) matches the action/state register
+        # lengths. Single obs frame -> duplicate temporally; val clips may be
+        # LONGER (val cam_horizon > train cam_horizon for the rolling-window
+        # rollout in sample_rolling) -> truncate so compute_loss stays
+        # consistent with the training-shape expectation.
         if latents.shape[2] < self.num_video_frames:
             latents = latents[:, :, :1].repeat(1, 1, self.num_video_frames, 1, 1)
+        elif latents.shape[2] > self.num_video_frames:
+            latents = latents[:, :, : self.num_video_frames]
         B, Cz, Fl, h, w = latents.shape
         device = latents.device
         state, action = self._prep_state_action(data)
@@ -149,7 +170,7 @@ class WAMModel(nn.Module):
 
         seq_len = Fl * (h // 2) * (w // 2)
         context = self._zero_context(B, device, x.dtype)
-        emb = torch.zeros(B, dtype=torch.long, device=device)
+        emb = self._emb_ids(data, B, device)
 
         # ---- joint DiT forward: video velocity + action velocity -----------
         # clean_x = the clean obs latents (teacher forcing): the model sees the
@@ -186,6 +207,133 @@ class WAMModel(nn.Module):
         loss = self.world_loss_weight * world_loss + action_loss
         return loss, {"action_loss": action_loss, "world_loss": world_loss}
 
+    # --- inference: rolling-window video prediction -------------------------
+    @torch.no_grad()
+    def sample_rolling(self, data, num_steps=None):
+        """DreamZero-style sliding-window inference. K-generic: predicts K
+        latent frames per DiT forward (K = num_frame_per_block), slides the
+        history window by K each step. Past-context slots use GT observations
+        from the val clip; when GT runs out we fall back to the model's own
+        last predictions.
+
+        Layout per DiT forward (num_video_frames = F_total, K = num_frame_per_block):
+            video   = [past_0..past_{n_hist-1}, noisy_0..noisy_{K-1}]  # (F_total frames)
+            clean_x = [past_0..past_{n_hist-1}, video_last_K]          # tf-prefix
+            ts_v    = [  0    ...     0        ,    t    ...   t   ]
+        with n_hist = F_total - K.
+
+        Returns:
+          actions (B, num_steps*num_action_per_block, action_dim) — assembled
+                  across rolling steps (num_action_per_block per step from the
+                  last DiT block)
+          frames  (B, C, T_pix, H, W) in [-1, 1] — VAE decode of
+                  [GT_cond_0] + [K * num_steps predicted latents]
+        """
+        sched = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
+        sched.set_timesteps(self.num_inference_steps, training=False)
+
+        # K = num predicted latents per DiT forward (chunk size).
+        K = getattr(self.dit, "num_frame_per_block", 1)
+        F_total = self.num_video_frames  # e.g. 5 (wan22_5b mecka: 1 cond + 4 pred)
+        n_hist = F_total - K
+
+        # Encode ALL available GT frames from the clip -> GT latent trajectory.
+        gt_latents = self._encode(data["video"])  # (B, Cz, F_gt, h, w)
+        B, Cz, F_gt, h, w = gt_latents.shape
+        device = gt_latents.device
+        dtype = gt_latents.dtype
+
+        # Dynamic step count: roll as long as the next slide can still pull in
+        # a full K-latent chunk from GT. Stops when GT context is exhausted.
+        # Bootstrap step 0 always happens; each subsequent step needs the next
+        # gt[step*K + 1 : step*K + K + 1] slice to exist inside F_gt.
+        max_steps_by_gt = max(1, (F_gt - 1) // K)
+        if num_steps is None:
+            num_steps = max_steps_by_gt
+        else:
+            num_steps = min(num_steps, max_steps_by_gt)
+
+        seq_len = F_total * (h // 2) * (w // 2)
+
+        # Bootstrap history: n_hist copies of g0.
+        history = gt_latents[:, :, :1].repeat(1, 1, n_hist, 1, 1)
+
+        state, _ = self._prep_state_action(data)
+        context = self._zero_context(B, device, dtype)
+        # Cross-embodiment conditioning: use the domain index the batch was
+        # trained with (see ``_emb_ids``) so val hits the same embedding slot
+        # as training. Single-domain runs -> slot 0 (unchanged behavior).
+        emb = self._emb_ids(data, B, device)
+
+        # num_action_per_block = actions the DiT allocates to one block. Per
+        # rolling step we take the actions from the LAST block (aligned with
+        # the currently-predicted chunk of K latents).
+        num_action_per_block = getattr(
+            self.dit,
+            "num_action_per_block",
+            self.action_horizon // ((F_total - 1) // K),
+        )
+
+        pred_latents = []
+        pred_actions_chunks = []
+        for step in range(num_steps):
+            # Build the F_total-frame video: n_hist clean history + K noise slots.
+            video = torch.randn(B, Cz, F_total, h, w, device=device, dtype=dtype)
+            video[:, :, :n_hist] = history
+            action = torch.randn(
+                B, self.action_horizon, self.action_dim, device=device, dtype=dtype
+            )
+
+            for t in sched.timesteps:
+                ts_v = torch.zeros(B, F_total, device=device)
+                ts_v[:, n_hist:] = t  # last K frames noisy
+                ts_a = t.to(device).expand(B, self.action_horizon)
+                clean_x = torch.cat([history, video[:, :, n_hist:]], dim=2)
+
+                v_vel, a_vel = self.dit(
+                    video,
+                    ts_v,
+                    ts_a,
+                    context,
+                    seq_len,
+                    action=action,
+                    state=state,
+                    embodiment_id=emb,
+                    clean_x=clean_x,
+                )
+                video = sched.step(v_vel, t, video)
+                video[:, :, :n_hist] = history  # keep past clean
+                action = sched.step(a_vel, t, action)
+
+            new_latents = video[:, :, n_hist:]  # (B, Cz, K, h, w)
+            pred_latents.append(new_latents)
+            pred_actions_chunks.append(action[:, -num_action_per_block:])
+
+            # Slide window by K: drop oldest K, add newest K.
+            # Chunk k semantically represents latents at times (k*K+1, ..., k*K+K)
+            # (starting after the initial g0 anchor at time 0). Teacher-forcing
+            # replaces those predicted positions with their GT counterparts.
+            next_gt_start = step * K + 1
+            next_gt_end = next_gt_start + K
+            if next_gt_end <= F_gt:
+                newest = gt_latents[:, :, next_gt_start:next_gt_end]
+            elif next_gt_start < F_gt:
+                # Partial GT + fall back to prediction for the tail.
+                newest_gt = gt_latents[:, :, next_gt_start:F_gt]
+                fill = K - (F_gt - next_gt_start)
+                newest = torch.cat([newest_gt, new_latents[:, :, -fill:]], dim=2)
+            else:
+                newest = new_latents  # fully autoregressive tail
+            history = torch.cat([history[:, :, K:], newest], dim=2)
+
+        pred_actions = torch.cat(
+            pred_actions_chunks, dim=1
+        )  # (B, num_steps*num_action_per_block, action_dim)
+        # Decode: initial GT cond + all predicted latents (in time order).
+        all_latents = torch.cat([gt_latents[:, :, :1]] + pred_latents, dim=2)
+        frames = self.vae.decode(all_latents)
+        return pred_actions, frames
+
     # --- inference: jointly sample action chunk + future frame --------------
     @torch.no_grad()
     def sample(self, data):
@@ -199,12 +347,12 @@ class WAMModel(nn.Module):
         state, _ = self._prep_state_action(data)
         seq_len = Fl * (h // 2) * (w // 2)
         context = self._zero_context(B, device, latents0.dtype)
-        emb = torch.zeros(B, dtype=torch.long, device=device)
+        emb = self._emb_ids(data, B, device)
 
         # Image-to-video conditioning: frame 0 = the CLEAN observed latent; only
-        # the future frames are sampled from noise (anchored to the real scene),
-        # so the predicted video shows the actual observation evolving forward
-        # rather than unconditional content.
+        # the future frames are sampled from noise. clean_x provides the same
+        # teacher-forcing prefix the DiT was trained with — without it the model
+        # has no scene reference and generates garbage.
         video = torch.randn_like(latents0)
         video[:, :, :1] = latents0[:, :, :1]
         action = torch.randn(B, self.action_horizon, self.action_dim, device=device)
@@ -221,6 +369,7 @@ class WAMModel(nn.Module):
                 action=action,
                 state=state,
                 embodiment_id=emb,
+                clean_x=latents0,  # teacher-forcing prefix, same as training
             )
             video = sched.step(v_vel, t, video)
             video[:, :, :1] = latents0[:, :, :1]  # keep the anchor clean
@@ -231,6 +380,12 @@ class WAMModel(nn.Module):
 
 class WAM(Algo):
     """EgoMimic Algo adapter for the WAM (CausalWanModel) world-action model."""
+
+    # pl_model reads this to enable guarded rank barriers around epoch/val
+    # boundaries (uneven per-rank val-video encode + first-epoch JPEG-decode
+    # bursts were tripping the 30-min NCCL watchdog on multi-GPU WAM runs).
+    # No-op on single-GPU runs; non-WAM algos are unaffected.
+    _needs_rank_barriers = True
 
     def __init__(
         self,
@@ -247,8 +402,10 @@ class WAM(Algo):
         frame_size: int = 256,
         target_h: int = None,
         target_w: int = None,
+        num_video_frames: int = 5,
         world_loss_weight: float = 1.0,
         num_inference_steps: int = 16,
+        val_rollout_chunks: int = None,  # override for sample_rolling num_steps
         domains: list = None,
         ac_keys: dict = None,
         **kwargs,
@@ -258,6 +415,7 @@ class WAM(Algo):
         self.data_schematic = data_schematic
         self.viz_func = viz_func
         self.camera_transforms = camera_transforms
+        self.val_rollout_chunks = val_rollout_chunks
         self.domains = domains.copy()
         self.ac_keys = ac_keys or {}
         self.device = kwargs.get(
@@ -273,6 +431,7 @@ class WAM(Algo):
             frame_size=frame_size,
             target_h=target_h,
             target_w=target_w,
+            num_video_frames=num_video_frames,
             world_loss_weight=world_loss_weight,
             num_inference_steps=num_inference_steps,
         )
@@ -280,8 +439,12 @@ class WAM(Algo):
 
         # per-embodiment key bookkeeping (same as HPT)
         self.camera_keys, self.proprio_keys = {}, {}
-        for embodiment in self.domains:
+        # DiT embodiment-embedding slot per registry embodiment id: the index
+        # of the embodiment in ``domains``. See ``WAMModel._emb_ids``.
+        self._dit_emb_index = {}
+        for domain_idx, embodiment in enumerate(self.domains):
             eid = get_embodiment_id(embodiment)
+            self._dit_emb_index[eid] = domain_idx
             self.camera_keys[eid] = [
                 k
                 for k in data_schematic.keys_of_type("camera_keys", eid)
@@ -307,9 +470,18 @@ class WAM(Algo):
             eid = get_embodiment_id(embodiment_name)
             processed[eid] = {}
             for key, value in _batch.items():
-                processed[eid][self.data_schematic.zarr_key_to_keyname(key, eid)] = (
-                    value
+                # zarr_key_to_keyname returns None for any batch key that isn't
+                # a registered schematic zarr key (e.g. ``intrinsics``,
+                # ``episode_hash``, ``obs_head_pose_chunk``). Fall back to the
+                # original key in that case — otherwise every non-registered
+                # key gets written under a single ``None`` slot that clobbers
+                # the others, and viz-time extras (per-frame head pose chunk,
+                # per-episode intrinsics) never reach the evaluator. Mirrors
+                # the upstream hpt.py fix (commit 532e288d).
+                key_name = (
+                    self.data_schematic.zarr_key_to_keyname(key, eid) or key
                 )
+                processed[eid][key_name] = value
             ac_key = self.ac_keys[eid]
             B, S, _ = processed[eid][ac_key].shape
             processed[eid]["pad_mask"] = torch.ones(B, S, 1, device=self.device)
@@ -339,6 +511,8 @@ class WAM(Algo):
         if states:
             data["state"] = torch.cat(states, dim=-1)
         data["action"] = batch[self.ac_keys[eid]]  # (B, A, action_dim)
+        # DiT embodiment-embedding slot (domain index; 0 for single-domain runs).
+        data["embodiment_id"] = self._dit_emb_index.get(eid, 0)
         return data
 
     @override
@@ -356,6 +530,56 @@ class WAM(Algo):
                 predictions[f"{name}_{pk}"] = pv
         return predictions
 
+    @torch.no_grad()
+    def val_rollout(self, eid, batch):
+        """DreamZero-style rolling-window val rollout using ``sample_rolling``.
+
+        Passes the FULL GT val clip (B, T, C, H, W) — NOT just the first frame
+        — so ``sample_rolling`` can encode all T pixel frames -> F_gt latents
+        and slide a K-frame GT history window across them (DreamZero Fig 14a:
+        each new chunk of K latents conditions on the PREVIOUS chunk's GT
+        latents, not on the model's own prior predictions). Before this change
+        ``val_rollout``/``forward_eval`` called ``model.sample()`` which
+        conditions ONLY on the first frame and generates the full clip in a
+        single denoising pass — which is why the training val_videos showed
+        the "recondition on old frames" artifact (predicted frames didn't
+        reset to GT at chunk boundaries, so drift accumulated). This aligns
+        the training val loop with the offline TF eval
+        (``eval_dreamzero._sample_rolling_tf``).
+
+        Returns:
+          pred_actions (B, num_steps*num_action_per_block, action_dim)
+          viz_video    (B, C, T_pred, H, W) — predicted future pixel frames
+                       (VAE recon of the GT anchor at idx 0 dropped).
+        """
+        model = self.nets["policy"]
+
+        video_clip = None
+        for key in self.camera_keys[eid]:
+            if key in batch:
+                video_clip = batch[key]
+                break
+
+        states = []
+        for key in self.proprio_keys[eid]:
+            if key in batch:
+                s = batch[key]
+                states.append(s.unsqueeze(1) if s.dim() == 2 else s)
+        full_state = torch.cat(states, dim=-1) if states else None
+
+        step_data = {
+            "video": video_clip,  # FULL clip -> sample_rolling encodes all frames
+            "state": full_state,
+            "action": batch[self.ac_keys[eid]],
+            # domain index for the DiT emb table (0 for single-domain runs)
+            "embodiment_id": self._dit_emb_index.get(eid, 0),
+        }
+        pred_actions, pred_frames = model.sample_rolling(
+            step_data, num_steps=self.val_rollout_chunks
+        )
+        viz_video = pred_frames[:, :, 1:]  # drop VAE recon of the GT anchor at idx 0
+        return pred_actions, viz_video
+
     @override
     def forward_eval(self, batch):
         unnorm_preds = {}
@@ -371,12 +595,18 @@ class WAM(Algo):
             unnorm_preds[f"{name}_loss"] = loss
             for pk, pv in parts.items():
                 unnorm_preds[f"{name}_{pk}"] = pv
-            # jointly sample action chunk + future frame
-            action, frames = self.nets["policy"].sample(data)
-            self._eval_frames[eid] = frames  # for WAMEvalVideo
+            # rolling val loop: predict conditioned on GT frames chunk-by-chunk
+            pred_actions, viz_video = self.val_rollout(eid, _batch)
+            self._eval_frames[eid] = viz_video  # (B,C,T_pred,H,W)
             ref = _batch[ac_key]
-            B, T, D = ref.shape
-            preds = OrderedDict({ac_key: action[:, :T, :D]})
+            _, _, D = ref.shape
+            # Keep the FULL rolled pred (sample_rolling produces
+            # num_steps*num_action_per_block actions, which can exceed ref's
+            # dataset action_horizon when val cam_horizon > train cam_horizon).
+            # Truncating to ref's length was killing the val_video overlay past
+            # the GT window. ``compute_metrics_and_viz`` slices to ref's length
+            # internally for the paired MSE.
+            preds = OrderedDict({ac_key: pred_actions[:, :, :D]})
             for key, val in self.data_schematic.unnormalize_data(preds, eid).items():
                 unnorm_preds[f"{name}_{key}"] = val
         return unnorm_preds

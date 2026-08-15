@@ -1,0 +1,13 @@
+# DDP trainer preset for WAM (5B DiT + VAE) on Modal — same as ddp_modal.yaml
+# but with ``accumulate_grad_batches`` wired. WAM's per-GPU physical batch is
+# small (VRAM-bound by the 5B backbone + VAE); accumulation multiplies the
+# effective batch so the flow-matching gradient sees more diverse noise levels
+# / action chunks per step without spilling VRAM.
+#
+# Effective batch = devices * per_gpu_batch_size * accumulate_grad_batches.
+# Override ``trainer.accumulate_grad_batches=<N>`` on the command line for a
+# different multiplier.
+defaults:
+  - ddp_modal
+
+accumulate_grad_batches: 2
