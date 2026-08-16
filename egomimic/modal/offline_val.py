@@ -35,6 +35,19 @@ Several runs in parallel:
     MODAL_ENVIRONMENT=robotics modal run --detach egomimic/modal/offline_val.py::run_many \
         --run-tags pi05_dw48,pali_dw48
 
+Operator-scaling levels (op_scaling/L1..L4) over the 8 TRAIN-set episodes that
+are shared by all four levels' train splits — one episode per L1 operator:
+    MODAL_ENVIRONMENT=robotics modal run --detach \
+        egomimic/modal/offline_val.py::run_opscale --run-tag L1 --epoch 779
+    MODAL_ENVIRONMENT=robotics modal run --detach \
+        egomimic/modal/offline_val.py::run_opscale_many --run-tags L2,L3,L4 --epoch 779
+
+The op-scaling pass differs from the dw48 pass in three parameterized ways:
+run_base (op_scaling instead of data_div_oss), the episode list, and
+flush_per_episode=True — see `_install_episode_flush` in the runner: instead of
+eval_video.py's fixed 1000-frame video chunks it emits exactly ONE video per
+val episode, so video index i is the same episode/operator in every level.
+
 Notes
 -----
 - OSS (HPT) runs validate on A100-80GB, pi0.5-family runs on H200 (they were
@@ -105,6 +118,31 @@ PI_RUNS = (
     "pali_lang_dw48",
 )
 
+# ---------------------------------------------------------------------------
+# op_scaling (operator-diversity) levels — TRAIN-SET offline val
+# ---------------------------------------------------------------------------
+# The 4 levels are supersets in OPERATORS (L1 8 ⊂ L2 24 ⊂ L3 72 ⊂ L4 160) but
+# each level's train json was built by round-robin over that level's operators,
+# so one operator contributes different (and fewer) episodes at higher levels.
+# These 8 episodes — one per L1 operator — are in the train split of ALL FOUR
+# levels, so every level has literally SEEN all 8: a like-for-like train-set
+# (fit) comparison across diversity levels. Listed in episode-hash order, which
+# is the order episode_table_to_df / the val dataloader resolve them in.
+OPSCALE_RUNS = ("L1", "L2", "L3", "L4")
+OPSCALE_RUN_BASE = "op_scaling"
+OPSCALE_OUT_PREFIX = "offline_val_opscale"
+OPSCALE_COMMON_EPOCH = 779  # largest epoch_epoch=N.ckpt present in all 4 runs
+OPSCALE_TRAINVAL_8 = {  # episode_hash -> (operator, num_frames)
+    "69b083e65a299178939432ae": ("696a8ab16adfd3c664a65c91", 3590),
+    "69b08bef2e8f3cdc83df98da": ("6963a33b83a9fdf2d863cb6b", 3295),
+    "69b0a0624d596b45d52ba551": ("6975db9bb393af9134ca5d21", 3598),
+    "69b8b2d61cf7f6f00d4364df": ("6954b58920b100982d80f170", 2699),
+    "69b8b325a52e1a2126f45ffe": ("6944be8574e27bfb2358061e", 2995),
+    "69b8c0beb3cc90fa8d9ac9ef": ("6776bf817d12b76c8e1be433", 3601),
+    "69b92e31e749b83b1a333011": ("6968000b0af001daaaad5168", 2605),
+    "69b9f1670ed8c646a6770f85": ("6980e0c57c6b5a6b3c8cf16c", 3295),
+}
+
 
 # =============================================================================
 # Runner script — written to /root/offline_val_runner.py at container runtime
@@ -117,8 +155,95 @@ import argparse
 import copy
 import glob
 import json
+import math
 import os
 import sys
+import types
+
+
+def _install_episode_flush(eval_obj, datamodule, cfg):
+    """Emit exactly ONE validation video per val episode.
+
+    eval_video.EvalVideo.on_validation_step flushes its frame buffer every
+    1000 buffered frames, so with N multi-thousand-frame episodes the videos
+    are fixed-size chunks whose boundaries have nothing to do with episodes.
+    For a cross-run comparison we want video i == episode i in every run, so
+    this replaces on_validation_step (on the instance only — the repo's
+    evaluator classes are untouched) with the same body plus a flush at the
+    batch that crosses each episode boundary, and no size-based flush.
+
+    Boundaries are derived from the val MultiDataset's own index_map layout:
+    datasets are concatenated in dict order (== episode-hash order, the order
+    episode_table_to_df pins) and the val DataLoader is shuffle=False, so the
+    global sample range of episode k is known exactly. A batch straddling a
+    boundary is attributed to the earlier episode, i.e. each video may carry
+    up to batch_size-1 frames of the next episode.
+    """
+    import torch
+    import torchvision.io as tvio
+
+    from egomimic.rldb.embodiment.embodiment import get_embodiment
+
+    ds_name = next(iter(datamodule.valid_datasets))
+    val_ds = datamodule.valid_datasets[ds_name]
+    batch_size = int(cfg.data.valid_dataloader_params[ds_name].batch_size)
+
+    ep_names = list(val_ds.datasets.keys())
+    ep_lens = [len(val_ds.datasets[n]) for n in ep_names]
+    flush_after = {}  # batch_idx -> episode hash whose video is closed here
+    cum = 0
+    for name, ln in zip(ep_names, ep_lens):
+        cum += ln
+        flush_after[math.ceil(cum / batch_size) - 1] = name
+    print(
+        "[offline_val] per-episode video flush: "
+        + json.dumps(
+            {
+                "batch_size": batch_size,
+                "episodes": ep_names,
+                "frames": ep_lens,
+                "flush_after_batch_idx": {str(k): v for k, v in flush_after.items()},
+            }
+        )
+    )
+
+    def _write(self, key):
+        buf = self.val_image_buffer.get(key) or []
+        if not buf:
+            return
+        out = os.path.join(
+            self.video_dir(),
+            f"epoch_{self.trainer.current_epoch}",
+            str(get_embodiment(key)),
+            f"validation_video_{self.val_counter[key]}.mp4",
+        )
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tvio.write_video(out, torch.stack(buf), fps=30, video_codec="h264")
+        print(f"[offline_val] wrote {out} ({len(buf)} frames)")
+        buf.clear()
+        self.val_counter[key] += 1
+
+    def on_validation_step(self, batch, batch_idx, dataloader_idx=0):
+        metrics, images_dict = self.compute_metrics_and_viz(batch)
+        device = self.trainer.lightning_module.device
+        metrics = {
+            k: (v.to(device) if torch.is_tensor(v) else torch.tensor(v, device=device))
+            for k, v in metrics.items()
+        }
+        for key, images in images_dict.items():
+            if self.val_image_buffer.get(key) is None:
+                self.val_image_buffer[key] = []
+                self.val_counter[key] = 0
+            self.val_image_buffer[key].extend(torch.from_numpy(images))
+        if batch_idx in flush_after:
+            for key in list(self.val_image_buffer):
+                _write(self, key)
+        self.trainer.lightning_module.log_dict(
+            metrics, sync_dist=True, add_dataloader_idx=False
+        )
+
+    eval_obj.on_validation_step = types.MethodType(on_validation_step, eval_obj)
+    return [{"episode": n, "frames": l} for n, l in zip(ep_names, ep_lens)]
 
 
 def main() -> None:
@@ -129,7 +254,9 @@ def main() -> None:
     ap.add_argument("--ckpt-path", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--eps-json", required=True)
+    ap.add_argument("--meta-json", default="")
     ap.add_argument("--limit-val-batches", type=float, default=1.0)
+    ap.add_argument("--flush-per-episode", action="store_true")
     ap.add_argument("--git-commit", default="")
     args = ap.parse_args()
 
@@ -180,6 +307,15 @@ def main() -> None:
         # load from the run's precomputed_norm_path, which stays untouched).
         cfg.data.train_datasets.mecka_bimanual.resolver.eps_to_use = args.eps_json
         cfg.data.valid_datasets.mecka_bimanual.resolver.eps_to_use = args.eps_json
+        # SINGLE val set. The op_scaling runs ship a second val loader
+        # (train_viz = held-out-operator, logged as Valid_oph/* into videos_oph/
+        # by train_viz_evaluator). Drop all of it so dataloader_idx=1 does not
+        # exist: videos land in the standard videos/ dir and metrics keep the
+        # plain Valid/* names. No-ops for the dw48 runs, which have none.
+        cfg.data.pop("train_viz_datasets", None)
+        cfg.data.pop("train_viz_dataloader_params", None)
+        cfg.pop("train_viz_evaluator", None)
+        cfg.pop("second_val_prefix", None)
 
     # ---- mirror trainHydra.train() (validation-relevant parts) ----
     configure_dataloader_ipc()
@@ -255,6 +391,10 @@ def main() -> None:
     eval_obj.model = model.model
     model.evaluator = eval_obj
 
+    episode_layout = None
+    if args.flush_per_episode:
+        episode_layout = _install_episode_flush(eval_obj, datamodule, cfg)
+
     print(f"[offline_val] loading checkpoint weights (strict=True): {args.ckpt_path}")
     checkpoint = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
     ckpt_epoch = checkpoint.get("epoch")
@@ -291,17 +431,21 @@ def main() -> None:
         os.path.relpath(p, args.out_dir)
         for p in glob.glob(f"{args.out_dir}/videos/**/*.mp4", recursive=True)
     )
-    with open(os.path.join(args.out_dir, "indist_meta.json")) as f:
+    meta_path = args.meta_json or os.path.join(args.out_dir, "indist_meta.json")
+    with open(meta_path) as f:
         meta = json.load(f)
     manifest = {
         "run_tag": args.run_tag,
         "epoch": args.epoch,
         "ckpt_path": args.ckpt_path,
         "ckpt_epoch_counter": ckpt_epoch,
-        "operator": meta["operator"],
+        "operator": meta.get("operator"),
         "episodes": meta["episodes"],
+        "episode_meta": meta.get("episode_meta"),
+        "episode_layout": episode_layout,
         "total_frames": meta["total_frames"],
         "limit_val_batches": args.limit_val_batches,
+        "flush_per_episode": bool(args.flush_per_episode),
         "git_commit": args.git_commit,
         "videos": videos,
         "metrics": metrics,
@@ -325,8 +469,16 @@ def _run_offline_val(
     limit_val_batches: float,
     is_pi: bool,
     out_prefix: str = OUT_PREFIX,
+    run_base: str = RUN_BASE,
+    episode_meta: dict | None = None,
+    flush_per_episode: bool = False,
 ) -> dict:
-    """Container body: clone repo, write + run the runner subprocess, commit."""
+    """Container body: clone repo, write + run the runner subprocess, commit.
+
+    episode_meta: {episode_hash: {"operator": ..., "num_frames": ...}} for the
+    val set; defaults to the dw48 in-distribution 3-episode set. run_base is
+    the volume prefix the run dirs live under (data_div_oss / op_scaling).
+    """
     import shlex
     import subprocess
 
@@ -335,24 +487,38 @@ def _run_offline_val(
     # files, so the runner subprocess resolves them like training's DDP ranks.
     _prepare_repo(git_remote=git_remote, git_commit=git_commit, submodules=submodules)
 
+    if episode_meta is None:
+        episode_meta = {
+            h: {"operator": INDIST_OPERATOR} for h in INDIST_EPISODES
+        }
+    # Hash order == the order episode_table_to_df pins, i.e. the order the
+    # shuffle=False val dataloader walks the episodes in.
+    episodes = sorted(episode_meta)
+    total_frames = (
+        sum(int(m.get("num_frames", 0)) for m in episode_meta.values())
+        or INDIST_TOTAL_FRAMES
+    )
+
     out_dir = f"{CFG.output_mount_path}/{out_prefix}/{run_tag}"
     os.makedirs(out_dir, exist_ok=True)
-    eps_json = f"{out_dir}/offline_val_indist3.json"
+    eps_json = f"{out_dir}/val_episodes.json"
     with open(eps_json, "w") as f:
-        json.dump(INDIST_EPISODES, f)
-    with open(f"{out_dir}/indist_meta.json", "w") as f:
+        json.dump(episodes, f)
+    meta_json = f"{out_dir}/val_meta.json"
+    with open(meta_json, "w") as f:
         json.dump(
             {
-                "operator": INDIST_OPERATOR,
-                "episodes": INDIST_EPISODES,
-                "total_frames": INDIST_TOTAL_FRAMES,
+                "operator": episode_meta[episodes[0]].get("operator"),
+                "episodes": episodes,
+                "episode_meta": episode_meta,
+                "total_frames": total_frames,
             },
             f,
         )
 
-    config_path = f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/.hydra/config.yaml"
+    config_path = f"{CFG.output_mount_path}/{run_base}/{run_tag}/.hydra/config.yaml"
     ckpt_path = (
-        f"{CFG.output_mount_path}/{RUN_BASE}/{run_tag}/checkpoints/"
+        f"{CFG.output_mount_path}/{run_base}/{run_tag}/checkpoints/"
         f"epoch_epoch={epoch}.ckpt"
     )
     for p in (config_path, ckpt_path):
@@ -385,9 +551,12 @@ def _run_offline_val(
         "--ckpt-path", ckpt_path,
         "--out-dir", out_dir,
         "--eps-json", eps_json,
+        "--meta-json", meta_json,
         "--limit-val-batches", str(limit_val_batches),
         "--git-commit", git_commit,
     ]
+    if flush_per_episode:
+        cmd.append("--flush-per-episode")
     print(f"[offline_val] running: {shlex.join(cmd)}")
     proc = subprocess.run(cmd, cwd=CFG.remote_repo_dir, env=env, check=False)
 
@@ -428,6 +597,9 @@ def run_val_oss(
     git_commit: str,
     limit_val_batches: float = 1.0,
     out_prefix: str = OUT_PREFIX,
+    run_base: str = RUN_BASE,
+    episode_meta: dict | None = None,
+    flush_per_episode: bool = False,
 ) -> dict:
     return _run_offline_val(
         run_tag,
@@ -438,6 +610,9 @@ def run_val_oss(
         limit_val_batches=limit_val_batches,
         is_pi=False,
         out_prefix=out_prefix,
+        run_base=run_base,
+        episode_meta=episode_meta,
+        flush_per_episode=flush_per_episode,
     )
 
 
@@ -520,3 +695,83 @@ def run_many(
             print(f"\n=== {tag}: FAILED: {exc!r} ===")
     if failures:
         raise SystemExit(f"failed runs: {failures}")
+
+
+# ---------------------------------------------------------------------------
+# op_scaling entrypoints — TRAIN-SET val over the 8 shared episodes
+# ---------------------------------------------------------------------------
+
+
+def _opscale_episode_meta() -> dict:
+    return {
+        h: {"operator": op, "num_frames": nf}
+        for h, (op, nf) in OPSCALE_TRAINVAL_8.items()
+    }
+
+
+def _opscale_kwargs(limit_val_batches: float, out_prefix: str) -> dict:
+    return dict(
+        limit_val_batches=limit_val_batches,
+        out_prefix=out_prefix,
+        run_base=OPSCALE_RUN_BASE,
+        episode_meta=_opscale_episode_meta(),
+        flush_per_episode=True,
+    )
+
+
+@app.local_entrypoint()
+def run_opscale(
+    run_tag: str = "L1",
+    epoch: int = OPSCALE_COMMON_EPOCH,
+    limit_val_batches: float = 1.0,
+    out_prefix: str = OPSCALE_OUT_PREFIX,
+) -> None:
+    """Train-set offline val for ONE op_scaling level (L1..L4). Blocks."""
+    if run_tag not in OPSCALE_RUNS:
+        raise SystemExit(f"unknown level {run_tag!r}; expected one of {OPSCALE_RUNS}")
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo dirty; the container runs the last pushed commit.")
+    print(
+        f"Submitting op_scaling train-set offline val: {run_tag} @ epoch {epoch} "
+        f"-> {out_prefix}/{run_tag} (commit {git_commit[:12]})"
+    )
+    manifest = run_val_oss.remote(
+        run_tag, epoch, git_remote, git_commit, **_opscale_kwargs(limit_val_batches, out_prefix)
+    )
+    print(json.dumps(manifest, indent=2))
+
+
+@app.local_entrypoint()
+def run_opscale_many(
+    run_tags: str = "L1,L2,L3,L4",
+    epoch: int = OPSCALE_COMMON_EPOCH,
+    limit_val_batches: float = 1.0,
+    out_prefix: str = OPSCALE_OUT_PREFIX,
+) -> None:
+    """Train-set offline val for several op_scaling levels in parallel."""
+    git_remote, git_commit, is_dirty = _resolve_git_state()
+    if is_dirty:
+        print("Warning: local repo dirty; containers run the last pushed commit.")
+    tags = [t.strip() for t in run_tags.split(",") if t.strip()]
+    for tag in tags:
+        if tag not in OPSCALE_RUNS:
+            raise SystemExit(f"unknown level {tag!r}; expected one of {OPSCALE_RUNS}")
+    kwargs = _opscale_kwargs(limit_val_batches, out_prefix)
+    handles = {
+        tag: run_val_oss.spawn(tag, epoch, git_remote, git_commit, **kwargs)
+        for tag in tags
+    }
+    for tag, h in handles.items():
+        print(f"spawned {tag}: {h.object_id}")
+    failures = {}
+    for tag, handle in handles.items():
+        try:
+            manifest = handle.get()
+            print(f"\n=== {tag}: OK, {len(manifest['videos'])} videos ===")
+            print(json.dumps(manifest["metrics"], indent=2))
+        except Exception as exc:
+            failures[tag] = repr(exc)
+            print(f"\n=== {tag}: FAILED: {exc!r} ===")
+    if failures:
+        raise SystemExit(f"failed levels: {failures}")
