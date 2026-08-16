@@ -58,11 +58,67 @@ class ZarrWamDataset(ZarrDataset):
     """ZarrDataset that decodes windowed camera reads into a clip (T, C, H, W)."""
 
     _QUAT_ZERO_EPS = 1e-6
+    # Decode-explosion guards. A corrupt zarr chunk / JPEG header can declare
+    # an absurd decompressed size; the resulting allocation is a HOST-LEVEL
+    # OOM-kill (no Python exception, rank dies silently — observed as the
+    # deterministic wam22_dw48 crash at a fixed shuffle position). Bound what
+    # we are willing to materialize and turn violations into ordinary
+    # exceptions the resample machinery can absorb.
+    _MAX_JPEG_BYTES = 64 * 1024 * 1024  # compressed frame cap (64 MB)
+    # Per-side decoded-dimension cap. Real egoverse camera frames are <=1080p;
+    # 2560 leaves headroom while bounding the worst-case 17-frame float64 clip
+    # at ~2.5 GB (vs ~26 GB at an 8k cap) so a lying SOF header can't OOM the
+    # worker pool even if every frame in a window is corrupt the same way.
+    _MAX_JPEG_DIM = 2560
+    _MIN_JPEG_DIM = 8
+    _MAX_RAW_READ_BYTES = 1024 * 1024 * 1024  # one key's window read cap (1 GB)
 
-    @staticmethod
-    def _decode_one(buf) -> np.ndarray:
+    @classmethod
+    def _decode_one(cls, buf) -> np.ndarray:
+        # Header pre-check BEFORE the pixel allocation: a corrupt SOF segment
+        # claiming e.g. 60000x60000 would otherwise malloc ~10 GB per frame
+        # (x8 more after the float64 /255.0), OOM-killing the worker before
+        # any except-clause can run. Raising here routes into the caller's
+        # "JPEG decode failed" resample path instead.
+        n_bytes = len(buf) if hasattr(buf, "__len__") else 0
+        if n_bytes < 16 or n_bytes > cls._MAX_JPEG_BYTES:
+            raise ValueError(f"implausible JPEG buffer size {n_bytes} bytes")
+        h, w, _, _ = simplejpeg.decode_jpeg_header(buf)
+        if not (
+            cls._MIN_JPEG_DIM <= h <= cls._MAX_JPEG_DIM
+            and cls._MIN_JPEG_DIM <= w <= cls._MAX_JPEG_DIM
+        ):
+            raise ValueError(f"implausible JPEG dims {h}x{w}")
         d = simplejpeg.decode_jpeg(buf, colorspace="RGB")
         return np.transpose(d, (2, 0, 1)) / 255.0  # (C, H, W) in [0,1]
+
+    @classmethod
+    def _oversized_read(cls, arr) -> str | None:
+        """Return a reason string when a just-read window is implausibly large.
+
+        Bounds the bytes we will carry forward into padding / float conversion
+        / stacking (each of which COPIES, multiplying a corrupt decompression
+        by up to 8x via the float64 conversions downstream). Object arrays of
+        JPEG buffers are summed by buffer length.
+        """
+        if arr is None:
+            return None
+        total = 0
+        if isinstance(arr, np.ndarray):
+            if arr.dtype == object:
+                try:
+                    total = sum(
+                        len(b) for b in arr.ravel() if hasattr(b, "__len__")
+                    )
+                except Exception:
+                    return None
+            else:
+                total = int(arr.nbytes)
+        elif hasattr(arr, "__len__") and isinstance(arr, (bytes, bytearray)):
+            total = len(arr)
+        if total > cls._MAX_RAW_READ_BYTES:
+            return f"{total} bytes > cap {cls._MAX_RAW_READ_BYTES}"
+        return None
 
     @classmethod
     def _validate_arrays(cls, data: dict) -> str | None:
@@ -144,7 +200,22 @@ class ZarrWamDataset(ZarrDataset):
                     read_interval = (idx, end_idx)
                 else:
                     read_interval = (idx, None)
-                raw_data = self.episode_reader.read({zarr_key: read_interval})
+                # Guarded zarr read: a corrupt chunk can raise deep inside
+                # numcodecs (or decompress into something enormous). Turn both
+                # into a logged resample instead of a dead dataloader worker.
+                try:
+                    raw_data = self.episode_reader.read({zarr_key: read_interval})
+                except Exception as e:
+                    idx = _next(
+                        f"Zarr read failed ({type(e).__name__}: {e})", key=k
+                    )
+                    retry = True
+                    break
+                over = self._oversized_read(raw_data.get(zarr_key))
+                if over is not None:
+                    idx = _next(f"Oversized zarr read ({over})", key=k)
+                    retry = True
+                    break
                 self._pad_sequences(raw_data, horizon)
                 data[k] = raw_data[zarr_key]
 
