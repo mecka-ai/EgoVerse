@@ -50,14 +50,28 @@ robomimic_model:
     checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
     z_dim: 48
 
+# Published Wan2.2-TI2V-5B fine-tune recipe: AdamW lr 1e-5..2e-5, betas
+# (0.9, 0.999), eps 1e-8, weight_decay 1e-2, linear warmup then cosine annealed
+# to 10% of peak. 2e-5 is the value paired with this full recipe at a batch
+# comparable to ours (effective 4 = 2 per-GPU x 2 accumulate).
 optimizer:
   _target_: torch.optim.AdamW
   _partial_: true
-  lr: 1e-4
-  weight_decay: 1e-6
+  lr: 2e-5
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  weight_decay: 1e-2
 
+# Warmup + monotone cosine decay to 10% of peak. Replaces CosineAnnealingLR,
+# which under scheduler_interval=step ran a 1400-step half-cycle and then
+# annealed the LR back UP — a repeating triangle, never a decay.
+# Horizon: 2000 epochs x 100 batches / accumulate_grad_batches 2 = 100k steps.
 scheduler:
-  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  _target_: transformers.optimization.get_cosine_with_min_lr_schedule_with_warmup
   _partial_: true
-  T_max: 1400
-  eta_min: 1e-5
+  num_warmup_steps: 500
+  num_training_steps: 100000
+  num_cycles: 0.5
+  min_lr: 2e-6
+
+scheduler_interval: step
