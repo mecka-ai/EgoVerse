@@ -33,6 +33,7 @@ from egomimic.rldb.zarr.zarr_dataset_multi import (
     get_fallback_idx,
     logger,
 )
+from egomimic.utils.pose_utils import _matrix_to_xyzwxyz
 
 __all__ = [
     "ZarrWamDataset",
@@ -56,10 +57,103 @@ class WamMultiDataset(MultiDataset):
 class ZarrWamDataset(ZarrDataset):
     """ZarrDataset that decodes windowed camera reads into a clip (T, C, H, W)."""
 
-    @staticmethod
-    def _decode_one(buf) -> np.ndarray:
+    _QUAT_ZERO_EPS = 1e-6
+    # Decode-explosion guards. A corrupt zarr chunk / JPEG header can declare
+    # an absurd decompressed size; the resulting allocation is a HOST-LEVEL
+    # OOM-kill (no Python exception, rank dies silently — observed as the
+    # deterministic wam22_dw48 crash at a fixed shuffle position). Bound what
+    # we are willing to materialize and turn violations into ordinary
+    # exceptions the resample machinery can absorb.
+    _MAX_JPEG_BYTES = 64 * 1024 * 1024  # compressed frame cap (64 MB)
+    # Per-side decoded-dimension cap. Real egoverse camera frames are <=1080p;
+    # 2560 leaves headroom while bounding the worst-case 17-frame float64 clip
+    # at ~2.5 GB (vs ~26 GB at an 8k cap) so a lying SOF header can't OOM the
+    # worker pool even if every frame in a window is corrupt the same way.
+    _MAX_JPEG_DIM = 2560
+    _MIN_JPEG_DIM = 8
+    _MAX_RAW_READ_BYTES = 1024 * 1024 * 1024  # one key's window read cap (1 GB)
+
+    @classmethod
+    def _decode_one(cls, buf) -> np.ndarray:
+        # Header pre-check BEFORE the pixel allocation: a corrupt SOF segment
+        # claiming e.g. 60000x60000 would otherwise malloc ~10 GB per frame
+        # (x8 more after the float64 /255.0), OOM-killing the worker before
+        # any except-clause can run. Raising here routes into the caller's
+        # "JPEG decode failed" resample path instead.
+        n_bytes = len(buf) if hasattr(buf, "__len__") else 0
+        if n_bytes < 16 or n_bytes > cls._MAX_JPEG_BYTES:
+            raise ValueError(f"implausible JPEG buffer size {n_bytes} bytes")
+        h, w, _, _ = simplejpeg.decode_jpeg_header(buf)
+        if not (
+            cls._MIN_JPEG_DIM <= h <= cls._MAX_JPEG_DIM
+            and cls._MIN_JPEG_DIM <= w <= cls._MAX_JPEG_DIM
+        ):
+            raise ValueError(f"implausible JPEG dims {h}x{w}")
         d = simplejpeg.decode_jpeg(buf, colorspace="RGB")
         return np.transpose(d, (2, 0, 1)) / 255.0  # (C, H, W) in [0,1]
+
+    @classmethod
+    def _oversized_read(cls, arr) -> str | None:
+        """Return a reason string when a just-read window is implausibly large.
+
+        Bounds the bytes we will carry forward into padding / float conversion
+        / stacking (each of which COPIES, multiplying a corrupt decompression
+        by up to 8x via the float64 conversions downstream). Object arrays of
+        JPEG buffers are summed by buffer length.
+        """
+        if arr is None:
+            return None
+        total = 0
+        if isinstance(arr, np.ndarray):
+            if arr.dtype == object:
+                try:
+                    total = sum(
+                        len(b) for b in arr.ravel() if hasattr(b, "__len__")
+                    )
+                except Exception:
+                    return None
+            else:
+                total = int(arr.nbytes)
+        elif hasattr(arr, "__len__") and isinstance(arr, (bytes, bytearray)):
+            total = len(arr)
+        if total > cls._MAX_RAW_READ_BYTES:
+            return f"{total} bytes > cap {cls._MAX_RAW_READ_BYTES}"
+        return None
+
+    @classmethod
+    def _validate_arrays(cls, data: dict) -> str | None:
+        """Scan loaded arrays for NaN/Inf and zero-quaternion rows.
+
+        Why: ``WamMultiDataset._check_bounds`` is a no-op for WAM, so the
+        MultiDataset-level NaN/quantile check is skipped. A single bad row —
+        NaN in a state chunk, or an all-zero quaternion in ``obs_head_pose`` /
+        ``{left,right}_extrinsics_pose`` — crashes
+        ``ActionChunkCoordinateFrameTransform`` because
+        ``SE3.from_matrix(_xyzwxyz_to_matrix(...))`` on a degenerate quat
+        yields a NaN matrix whose ``.inverse()`` propagates NaN into every
+        subsequent chunk. In a DDP dataloader worker that failure can wedge
+        the rank silently (worker stalls or spins in a retry loop), dropping
+        GPU util to 0% on that rank while the other ranks time out on the
+        next NCCL collective. Catching these here lets us log the defect and
+        resample a fresh idx cleanly.
+
+        Returns a one-line reason string on the first defect, or None if clean.
+        """
+        for k, v in data.items():
+            if not isinstance(v, np.ndarray):
+                continue
+            if v.dtype.kind not in "fc":
+                continue
+            if not np.all(np.isfinite(v)):
+                return f"NaN/Inf in key={k}"
+            # xyzwxyz layout: last dim 7 means [x, y, z, qw, qx, qy, qz].
+            # All last-dim-7 arrays in the WAM keymap are poses.
+            if v.shape and v.shape[-1] == 7:
+                quat = v[..., 3:7].reshape(-1, 4)
+                norms = np.linalg.norm(quat, axis=-1)
+                if np.any(norms < cls._QUAT_ZERO_EPS):
+                    return f"Zero-quat in key={k} (min |q|={float(norms.min()):.2e})"
+        return None
 
     def __getitem__(self, idx, _fallback_origin=None, _attempts=None):
         # This fork's base ZarrDataset opens the reader lazily and derives
@@ -106,7 +200,22 @@ class ZarrWamDataset(ZarrDataset):
                     read_interval = (idx, end_idx)
                 else:
                     read_interval = (idx, None)
-                raw_data = self.episode_reader.read({zarr_key: read_interval})
+                # Guarded zarr read: a corrupt chunk can raise deep inside
+                # numcodecs (or decompress into something enormous). Turn both
+                # into a logged resample instead of a dead dataloader worker.
+                try:
+                    raw_data = self.episode_reader.read({zarr_key: read_interval})
+                except Exception as e:
+                    idx = _next(
+                        f"Zarr read failed ({type(e).__name__}: {e})", key=k
+                    )
+                    retry = True
+                    break
+                over = self._oversized_read(raw_data.get(zarr_key))
+                if over is not None:
+                    idx = _next(f"Oversized zarr read ({over})", key=k)
+                    retry = True
+                    break
                 self._pad_sequences(raw_data, horizon)
                 data[k] = raw_data[zarr_key]
 
@@ -129,9 +238,42 @@ class ZarrWamDataset(ZarrDataset):
             if retry:
                 continue
 
+            # --- Per-episode camera calibration into the batch (BEFORE
+            # transforms) so downstream steps that operate in camera frame —
+            # e.g. ``Eva.get_wam_transform_list`` — can pull per-episode
+            # ``{left,right}_extrinsics_pose`` (via the transform's
+            # ``extra_batch_key`` setdefault fallback) instead of hardcoding
+            # class-level constants.
+            extr = self.episode_reader.extrinsics
+            if isinstance(extr, dict):
+                for arm_key, se3 in extr.items():
+                    arr = np.asarray(se3, dtype=np.float32)
+                    if arr.shape == (4, 4):
+                        xyzq = _matrix_to_xyzwxyz(arr[None, :])[0].astype(np.float32)
+                        data[f"{arm_key}_extrinsics_pose"] = xyzq
+
+            # Pre-transform validation: catch NaN/Inf and zero-quats before
+            # they blow up the SE3 coord-frame transform (see _validate_arrays).
+            bad = self._validate_arrays(data)
+            if bad is not None:
+                idx = _next(bad)
+                continue
+
             if self.transform:
-                for transform in self.transform or []:
-                    data = transform.transform(data)
+                try:
+                    for transform in self.transform or []:
+                        data = transform.transform(data)
+                except Exception as e:
+                    idx = _next(f"Transform failed ({type(e).__name__}: {e})")
+                    continue
+
+            # Post-transform validation: transforms (interpolation, SE3
+            # inverse, unwrap) can introduce NaN on near-degenerate inputs
+            # that pass the pre-check.
+            bad = self._validate_arrays(data)
+            if bad is not None:
+                idx = _next(f"post-transform: {bad}")
+                continue
 
             for k, v in data.items():
                 if isinstance(v, np.ndarray):
@@ -142,6 +284,25 @@ class ZarrWamDataset(ZarrDataset):
             data["episode_hash"] = (
                 ep_name[:-5] if ep_name.endswith(".zarr") else ep_name
             )
+
+            # Per-episode intrinsics (3x4 K) from zarr metadata so viz /
+            # projection can use per-episode calibration; NaN sentinel when
+            # the episode doesn't persist a K (viz falls back to constants).
+            K = self.episode_reader.intrinsics
+            if isinstance(K, dict):
+                K = next(
+                    (v for k, v in K.items() if "front" in str(k).lower()),
+                    next(iter(K.values()), None) if K else None,
+                )
+            if K is not None:
+                K = np.asarray(K, dtype=np.float32)
+                if K.shape == (3, 3):
+                    K = np.concatenate([K, np.zeros((3, 1), dtype=np.float32)], axis=1)
+                if K.shape != (3, 4):
+                    K = np.full((3, 4), np.nan, dtype=np.float32)
+            else:
+                K = np.full((3, 4), np.nan, dtype=np.float32)
+            data["intrinsics"] = torch.from_numpy(np.ascontiguousarray(K))
             _ = origin
             return data
 

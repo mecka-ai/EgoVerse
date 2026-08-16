@@ -455,6 +455,68 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 f"(missing={len(missing)} keys, unexpected={len(unexpected)} keys)"
             )
             resume_ckpt = None
+        # ``+load_weights_only=true``: resume by pre-loading the model
+        # state_dict from the resolved resume checkpoint (launch ckpt_path OR
+        # the own_last preemption checkpoint), then pass ckpt_path=None to
+        # trainer.fit() so Lightning skips the optimizer/scheduler/epoch-state
+        # restore. Fixes a DDP-wide hang where ``restore_optimizers`` sits on
+        # a size-1 ALLREDUCE that only some ranks post (torch's
+        # ``load_optimizer_state_dict`` traversal diverges on 5B-param ckpts
+        # under find_unused_parameters_true). Trade-off: AdamW moments start
+        # fresh — sub-optimal for a resume, but preserves training continuity
+        # better than a fully-fresh run. Unlike ``finetune_ckpt`` (fresh run,
+        # usually a fresh wandb run), this path CONTINUES the same wandb run:
+        # after skipping Lightning's restore the trainer's global_step counter
+        # restarts at 0, so every WandbLogger.log_metrics is monkey-patched to
+        # add the ckpt's global_step — metrics land at ``ckpt_step +
+        # trainer.global_step``, monotonically increasing, no UI backtracking.
+        if cfg.get("load_weights_only", False) and resume_ckpt:
+            log.info(f"[load_weights_only] Pre-loading state_dict from {resume_ckpt}")
+            _ckpt = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+            _missing, _unexpected = model.load_state_dict(
+                _ckpt["state_dict"], strict=False
+            )
+            _ckpt_global_step = int(_ckpt.get("global_step", 0))
+            _ckpt_epoch = int(_ckpt.get("epoch", 0))
+            log.info(
+                f"[load_weights_only] state_dict loaded: "
+                f"{len(_missing)} missing / {len(_unexpected)} unexpected keys | "
+                f"ckpt.global_step={_ckpt_global_step} ckpt.epoch={_ckpt_epoch}"
+            )
+            del _ckpt
+            import gc as _gc
+
+            _gc.collect()
+            resume_ckpt = None  # skip Lightning's full-ckpt restore
+
+            # Patch WandbLogger(s) so metrics are offset by ckpt_global_step.
+            # Walk both ``logger`` (the instantiated list) and
+            # ``trainer.loggers`` since Lightning may re-wrap them. Also set
+            # WANDB_STEP_OFFSET so code that calls wandb.log directly can pick
+            # it up.
+            os.environ["WANDB_STEP_OFFSET"] = str(_ckpt_global_step)
+            from lightning.pytorch.loggers.wandb import WandbLogger as _WL
+
+            for _lg in list(logger or []) + list(getattr(trainer, "loggers", []) or []):
+                if isinstance(_lg, _WL) and not getattr(
+                    _lg, "_step_offset_patched", False
+                ):
+                    _lg._wandb_step_offset = _ckpt_global_step
+                    _orig_log_metrics = _lg.log_metrics
+
+                    def _offset_log_metrics(
+                        metrics, step=None, _orig=_orig_log_metrics, _lg=_lg
+                    ):
+                        if step is not None:
+                            step = int(step) + int(_lg._wandb_step_offset)
+                        return _orig(metrics, step=step)
+
+                    _lg.log_metrics = _offset_log_metrics
+                    _lg._step_offset_patched = True
+                    log.info(
+                        f"[load_weights_only] Patched WandbLogger with "
+                        f"step_offset={_ckpt_global_step}"
+                    )
         log.info("Starting training!")
         trainer.fit(
             model=model,

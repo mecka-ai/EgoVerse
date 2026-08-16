@@ -2702,6 +2702,42 @@ class ZarrEpisode:
                 pass
             self._store = None
 
+    @property
+    def intrinsics(self) -> dict[str, np.ndarray] | np.ndarray | None:
+        """
+        Camera intrinsics persisted in zarr metadata (``zarr.json`` attrs).
+
+        Returns:
+            - dict[str, np.ndarray] for the multi-camera layout,
+            - np.ndarray if a single K matrix was written,
+            - None if no intrinsics were persisted.
+        """
+        raw = self.metadata.get("intrinsics")
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return {k: np.asarray(v, dtype=np.float32) for k, v in raw.items()}
+        return np.asarray(raw, dtype=np.float32)
+
+    @property
+    def extrinsics(self) -> dict[str, np.ndarray] | np.ndarray | None:
+        """
+        Camera / arm extrinsics persisted in zarr metadata (e.g. eva stores
+        ``{"left": SE3_4x4, "right": SE3_4x4}`` — the per-arm rigid transforms
+        used to bring per-arm command / obs poses into the front-camera frame).
+
+        Returns:
+            - dict[str, np.ndarray] for the multi-key layout (eva),
+            - np.ndarray if a single 4x4 was written,
+            - None if no extrinsics were persisted.
+        """
+        raw = self.metadata.get("extrinsics")
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return {k: np.asarray(v, dtype=np.float32) for k, v in raw.items()}
+        return np.asarray(raw, dtype=np.float32)
+
     def read(
         self, keys_with_ranges: dict[str, tuple[int, int | None]]
     ) -> dict[str, np.ndarray]:

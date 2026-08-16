@@ -431,6 +431,20 @@ class Mecka(Human):
                 "key_type": "proprio_keys",
                 "zarr_key": "obs_head_pose",
             },
+            # Chunked read of the same zarr key so the batch also carries the
+            # per-raw-frame head pose across the whole camera-clip window.
+            # ``key_type=metadata_keys`` keeps it out of the schematic's
+            # proprio registry (so WAM._to_wam_data doesn't append it to
+            # ``data["state"]`` and change model input) and out of norm
+            # inference. Used at viz time (WAMEvalVideo) to re-project each
+            # action into the head pose CURRENT at the displayed pixel —
+            # otherwise the single-pose head reference at frame 0 drifts as
+            # the head moves and the overlay walks off the hand.
+            "obs_head_pose_chunk": {
+                "key_type": "metadata_keys",
+                "zarr_key": "obs_head_pose",
+                "horizon": cam_horizon,
+            },
         }
         if norm_mode:  # norm stats: drop the image clip (camera) key
             for k in [

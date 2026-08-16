@@ -8,6 +8,7 @@ from egomimic.rldb.zarr.action_chunk_transforms import (
     BatchQuaternionPoseToYPR,
     ConcatKeys,
     DeleteKeys,
+    DropGripperDims,
     InterpolateLinear,
     InterpolatePose,
     NumpyToTensor,
@@ -41,6 +42,183 @@ class Eva(Embodiment):
             return _build_eva_bimanual_eef_frame_transform_list(is_quat=False)
         elif mode == "cartesian_wristframe_quat":
             return _build_eva_bimanual_eef_frame_transform_list(is_quat=True)
+
+    # ----------------------------------------------------------------------
+    # WAM (World-Action Model) keymap/transform: a frame CLIP + frame-aligned
+    # action/state ee-pose chunks (base -> camera frame), left-first 12-dim —
+    # the same post-transform interface as ``Mecka.get_wam_keymap`` so a
+    # human-trained or cotrained WAM checkpoint can consume eva batches
+    # directly (cross-embodiment probing / cotrain).
+    # ----------------------------------------------------------------------
+    @classmethod
+    def get_wam_keymap(
+        cls,
+        cam_horizon: int = 17,
+        action_horizon: int = 16,
+        state_horizon: int = 4,
+        norm_mode: bool = False,
+        annotation_key=None,
+    ):
+        """WAM keymap for eva: windowed front-camera clip + per-arm ee pose /
+        gripper action + state chunks. Same shape as ``Mecka.get_wam_keymap``,
+        but reads eva's ``cmd_*``/``obs_*`` fields and includes gripper reads
+        so the transform can drop them later (see ``get_wam_transform_list``).
+        """
+        key_map = {
+            cls.VIZ_IMAGE_KEY: {
+                "key_type": "camera_keys",
+                "zarr_key": "images.front_1",
+                "horizon": cam_horizon,
+            },
+            "right.cmd_ee_pose": {
+                "key_type": "action_keys",
+                "zarr_key": "right.cmd_ee_pose",
+                "horizon": action_horizon,
+            },
+            "left.cmd_ee_pose": {
+                "key_type": "action_keys",
+                "zarr_key": "left.cmd_ee_pose",
+                "horizon": action_horizon,
+            },
+            "right.cmd_gripper": {
+                "key_type": "action_keys",
+                "zarr_key": "right.cmd_gripper",
+                "horizon": action_horizon,
+            },
+            "left.cmd_gripper": {
+                "key_type": "action_keys",
+                "zarr_key": "left.cmd_gripper",
+                "horizon": action_horizon,
+            },
+            "right.obs_ee_pose": {
+                "key_type": "proprio_keys",
+                "zarr_key": "right.obs_ee_pose",
+                "horizon": state_horizon,
+            },
+            "left.obs_ee_pose": {
+                "key_type": "proprio_keys",
+                "zarr_key": "left.obs_ee_pose",
+                "horizon": state_horizon,
+            },
+            "right.obs_gripper": {
+                "key_type": "proprio_keys",
+                "zarr_key": "right.obs_gripper",
+                "horizon": state_horizon,
+            },
+            "left.obs_gripper": {
+                "key_type": "proprio_keys",
+                "zarr_key": "left.obs_gripper",
+                "horizon": state_horizon,
+            },
+        }
+        if norm_mode:
+            # drop camera key so norm-inference doesn't try to decode JPEGs
+            for k in [
+                k for k, v in key_map.items() if v.get("key_type") == "camera_keys"
+            ]:
+                del key_map[k]
+        return key_map
+
+    @classmethod
+    def get_wam_transform_list(cls, extrinsics_key: str = "x5Dec13_2"):
+        """WAM transform for eva: transform per-arm ``cmd_ee_pose`` action
+        chunks AND ``obs_ee_pose`` state chunks into camera frame via
+        extrinsics, convert quat->ypr, concat left/right (including 1D
+        gripper), then drop the two gripper scalars via ``DropGripperDims`` so
+        the resulting ``actions_cartesian`` / ``observations.state.ee_pose``
+        are 12D — matching the mecka WAM interface (``[L xyz ypr, R xyz ypr]``)
+        the model trains on.
+
+        The class-level ``EXTRINSICS[extrinsics_key]`` constants are only a
+        FALLBACK: ``ActionChunkCoordinateFrameTransform`` fills
+        ``{left,right}_extrinsics_pose`` via ``setdefault``, so per-episode
+        extrinsics emitted by ``ZarrWamDataset`` from zarr metadata win when
+        present.
+
+        We do NOT reuse ``_build_eva_bimanual_transform_list`` because that
+        pipeline uses ``PoseCoordinateFrameTransform`` on the (single-pose)
+        state key, which chokes on the (T, 7) chunk WAM's state_horizon reads
+        produce. Instead we use ``ActionChunkCoordinateFrameTransform`` for
+        both action and state — matching the Mecka WAM pattern.
+        """
+        extrinsics = EXTRINSICS[extrinsics_key]
+        left_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["left"][None, :])[0]
+        right_extrinsics_pose = _matrix_to_xyzwxyz(extrinsics["right"][None, :])[0]
+
+        return [
+            # Command poses (chunks): base frame -> camera frame
+            ActionChunkCoordinateFrameTransform(
+                target_world="left_extrinsics_pose",
+                chunk_world="left.cmd_ee_pose",
+                transformed_key_name="left.cmd_ee_pose_camframe",
+                extra_batch_key={"left_extrinsics_pose": left_extrinsics_pose},
+                mode="xyzwxyz",
+            ),
+            ActionChunkCoordinateFrameTransform(
+                target_world="right_extrinsics_pose",
+                chunk_world="right.cmd_ee_pose",
+                transformed_key_name="right.cmd_ee_pose_camframe",
+                extra_batch_key={"right_extrinsics_pose": right_extrinsics_pose},
+                mode="xyzwxyz",
+            ),
+            # Observation poses (chunks): base frame -> camera frame
+            ActionChunkCoordinateFrameTransform(
+                target_world="left_extrinsics_pose",
+                chunk_world="left.obs_ee_pose",
+                transformed_key_name="left.obs_ee_pose_camframe",
+                extra_batch_key={"left_extrinsics_pose": left_extrinsics_pose},
+                mode="xyzwxyz",
+            ),
+            ActionChunkCoordinateFrameTransform(
+                target_world="right_extrinsics_pose",
+                chunk_world="right.obs_ee_pose",
+                transformed_key_name="right.obs_ee_pose_camframe",
+                extra_batch_key={"right_extrinsics_pose": right_extrinsics_pose},
+                mode="xyzwxyz",
+            ),
+            # Quat -> YPR (6D each), in place on the camframe keys.
+            XYZWXYZ_to_XYZYPR(
+                keys=[
+                    "left.cmd_ee_pose_camframe",
+                    "right.cmd_ee_pose_camframe",
+                    "left.obs_ee_pose_camframe",
+                    "right.obs_ee_pose_camframe",
+                ]
+            ),
+            # Concat with gripper (14D each); DropGripperDims strips back to 12D.
+            ConcatKeys(
+                [
+                    "left.cmd_ee_pose_camframe",
+                    "left.cmd_gripper",
+                    "right.cmd_ee_pose_camframe",
+                    "right.cmd_gripper",
+                ],
+                "actions_cartesian",
+                delete_old_keys=True,
+            ),
+            ConcatKeys(
+                [
+                    "left.obs_ee_pose_camframe",
+                    "left.obs_gripper",
+                    "right.obs_ee_pose_camframe",
+                    "right.obs_gripper",
+                ],
+                "observations.state.ee_pose",
+                delete_old_keys=True,
+            ),
+            DeleteKeys(
+                keys_to_delete=[
+                    "left.cmd_ee_pose",
+                    "right.cmd_ee_pose",
+                    "left.obs_ee_pose",
+                    "right.obs_ee_pose",
+                    "left_extrinsics_pose",
+                    "right_extrinsics_pose",
+                ]
+            ),
+            DropGripperDims(keys=["actions_cartesian", "observations.state.ee_pose"]),
+            NumpyToTensor(keys=["actions_cartesian", "observations.state.ee_pose"]),
+        ]
 
     @classmethod
     def _get_keymap(cls, keymap_mode: str, norm_mode: bool = False):

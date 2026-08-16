@@ -1,0 +1,14 @@
+# Cartesian action viz for the WAM eval on eva data (cross-embodiment probing
+# / cotrain prep). Adds an ``eva_bimanual`` entry so ``WAMEvalVideo`` can look
+# up the per-embodiment renderer at eval time. Uses ``Eva.viz_gt_preds``
+# (inherited from the ``Embodiment`` base), which projects the 12D bimanual
+# xyzypr action chunks with the class-level intrinsics.
+#
+# NOTE image_key is the schematic KEY_NAME for the processed batch, matching
+# the mecka convention in wam_cartesian.yaml (front_img_1, not the zarr key).
+eva_bimanual:
+  _target_: egomimic.rldb.embodiment.eva.Eva.viz_gt_preds
+  _partial_: true
+  image_key: front_img_1
+  action_key: actions_cartesian
+  mode: traj
