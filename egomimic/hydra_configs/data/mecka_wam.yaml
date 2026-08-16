@@ -35,12 +35,16 @@ train_datasets:
 valid_datasets:
   mecka_bimanual: ${data.train_datasets.mecka_bimanual}
 
+# persistent_workers: avoid the per-epoch /dev/shm IPC leak from iterator
+# teardown under limit_train_batches (see data_dishwashing_48h_wam.yaml).
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 2
     num_workers: 10
+    persistent_workers: true
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 2
     num_workers: 10
+    persistent_workers: true

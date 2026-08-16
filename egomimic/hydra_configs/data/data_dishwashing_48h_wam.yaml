@@ -42,12 +42,24 @@ valid_datasets:
       eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/dishwashing_val_ophold5.json
     mode: total
 
+# persistent_workers: with ``limit_train_batches`` Lightning drops the loader
+# iterator at every epoch boundary with ~num_workers*prefetch in-flight batches
+# whose /dev/shm IPC segments are never freed (torch worker teardown). WAM's
+# 17-frame clips are ~53MB/sample, so that leaked ~0.9GB per epoch into the
+# FIXED 16GiB /dev/shm of Modal containers -> deterministic worker SIGBUS at
+# epoch ~21 (the wam22_dw48 crash loop; verified with an isolated dataloader
+# probe: non-persistent grows 0.9GB/epoch, persistent stays flat at ~90MB).
+# Persistent workers reuse the pool across epochs, so nothing is torn down
+# mid-flight. Sample order/content are unchanged (the sampler lives in the
+# main process).
 train_dataloader_params:
   mecka_bimanual:
     batch_size: 2
     num_workers: 10
+    persistent_workers: true
 
 valid_dataloader_params:
   mecka_bimanual:
     batch_size: 2
     num_workers: 10
+    persistent_workers: true
