@@ -90,6 +90,7 @@ def _log_dataset_frame_counts(
     train_datasets: dict,
     valid_datasets: dict,
     train_viz_datasets: dict | None = None,
+    extra_val_datasets: dict | None = None,
 ) -> None:
     rows = []
     for name, ds in train_datasets.items():
@@ -112,6 +113,16 @@ def _log_dataset_frame_counts(
                 "TOTAL",
                 "(train_viz)",
                 sum(len(ds) for ds in train_viz_datasets.values()),
+            )
+        )
+    if extra_val_datasets:
+        for name, ds in extra_val_datasets.items():
+            rows.append(("extra_val", name, len(ds)))
+        rows.append(
+            (
+                "TOTAL",
+                "(extra_val)",
+                sum(len(ds) for ds in extra_val_datasets.values()),
             )
         )
     table = tabulate(
@@ -188,15 +199,31 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 continue
             train_viz_datasets[dataset_name] = hydra.utils.instantiate(entry)
 
+    # Optional THIRD val leg (dataloader_idx=2). Gated on the data config
+    # defining `extra_val_datasets`; absent => the kwarg is never passed, so the
+    # datamodule keeps its exact legacy 1-/2-loader val structure.
+    extra_val_datasets = {}
+    extra_val_cfg = OmegaConf.select(cfg, "data.extra_val_datasets", default=None)
+    if extra_val_cfg:
+        for dataset_name in extra_val_cfg:
+            entry = extra_val_cfg[dataset_name]
+            if entry is None:
+                continue
+            extra_val_datasets[dataset_name] = hydra.utils.instantiate(entry)
+
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     assert (
         "MultiDataModuleWrapper" in cfg.data._target_
     ), "cfg.data._target_ must be 'MultiDataModuleWrapper'"
+    _dm_kwargs = {}
+    if extra_val_datasets:
+        _dm_kwargs["extra_val_datasets"] = extra_val_datasets
     datamodule: LightningDataModule = hydra.utils.instantiate(
         cfg.data,
         train_datasets=train_datasets,
         valid_datasets=valid_datasets,
         train_viz_datasets=train_viz_datasets,
+        **_dm_kwargs,
     )
 
     for dataset_name, dataset in datamodule.train_datasets.items():
@@ -278,10 +305,23 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             f"'{model.second_val_metric_prefix}*'"
         )
 
+    # Same for the THIRD val set (dataloader_idx=2, the extra_val slot): losses
+    # logged under `<third_val_prefix>/*` (e.g. Valid_trainviz/*). Gated on the
+    # new top-level `third_val_prefix` key (`+third_val_prefix=Valid_trainviz`);
+    # absent/None = exact legacy behavior.
+    third_val_prefix = OmegaConf.select(cfg, "third_val_prefix", default=None)
+    if third_val_prefix:
+        model.extra_val_metric_prefix = str(third_val_prefix).rstrip("/") + "/"
+        log.info(
+            "third_val_prefix set — dataloader_idx=2 losses will log under "
+            f"'{model.extra_val_metric_prefix}*'"
+        )
+
     _log_dataset_frame_counts(
         datamodule.train_datasets,
         datamodule.valid_datasets,
         getattr(datamodule, "train_viz_datasets", None),
+        getattr(datamodule, "extra_val_datasets", None),
     )
 
     log.info("Instantiating callbacks...")
@@ -301,19 +341,25 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("[VolumeCommit] Callback registered")
 
     _train_viz_ds = getattr(datamodule, "train_viz_datasets", {}) or {}
+    _extra_val_ds = getattr(datamodule, "extra_val_datasets", {}) or {}
     if any(
         hasattr(ds, "prepare_epoch")
         for ds in (
             *datamodule.train_datasets.values(),
             *datamodule.valid_datasets.values(),
             *_train_viz_ds.values(),
+            *_extra_val_ds.values(),
         )
     ):
         from egomimic.modal.callbacks import PrefetchEpochCallback
 
+        _pf_kwargs = {"extra_val_datasets": _extra_val_ds} if _extra_val_ds else {}
         callbacks.append(
             PrefetchEpochCallback(
-                datamodule.train_datasets, datamodule.valid_datasets, _train_viz_ds
+                datamodule.train_datasets,
+                datamodule.valid_datasets,
+                _train_viz_ds,
+                **_pf_kwargs,
             )
         )
         log.info("[PrefetchEpoch] Callback registered (train + valid + train_viz)")
@@ -421,6 +467,12 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 train_viz_eval.model = model.model
                 model.train_viz_evaluator = train_viz_eval
                 log.info("train_viz_evaluator configured — wired to dataloader_idx=1")
+            if OmegaConf.select(cfg, "extra_val_evaluator", default=None) is not None:
+                extra_val_eval: Eval = hydra.utils.instantiate(cfg.extra_val_evaluator)
+                extra_val_eval.trainer = trainer
+                extra_val_eval.model = model.model
+                model.extra_val_evaluator = extra_val_eval
+                log.info("extra_val_evaluator configured — wired to dataloader_idx=2")
         # Finetune: load weights only (strict=False) from a checkpoint and start a
         # FRESH run (new optimizer, epoch 0), as opposed to ckpt_path which
         # full-resumes trainer state. Used to finetune a cotrain checkpoint on a
@@ -533,6 +585,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             train_viz_eval.trainer = trainer
             train_viz_eval.model = model.model
             model.train_viz_evaluator = train_viz_eval
+        if OmegaConf.select(cfg, "extra_val_evaluator", default=None) is not None:
+            extra_val_eval: Eval = hydra.utils.instantiate(cfg.extra_val_evaluator)
+            extra_val_eval.trainer = trainer
+            extra_val_eval.model = model.model
+            model.extra_val_evaluator = extra_val_eval
         # Load checkpoint weights manually so we can reset the epoch counter
         ckpt_path = cfg.get("ckpt_path")
         if ckpt_path:

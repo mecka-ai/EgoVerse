@@ -77,6 +77,13 @@ class ModelWrapper(LightningModule):
         # trainHydra.py from the top-level `second_val_prefix` config key.
         # Default None = legacy behavior (no losses logged for idx=1).
         self.second_val_metric_prefix = None
+        # Optional THIRD evaluator that consumes dataloader_idx=2 (the extra_val
+        # slot), plus its own metric prefix. Wired by trainHydra.py when the data
+        # config populates `extra_val_datasets` and the run sets
+        # `+evaluator@extra_val_evaluator=...` / `+third_val_prefix=...`.
+        # Defaults None/None = exact legacy behavior (no idx=2 loader exists).
+        self.extra_val_evaluator = None
+        self.extra_val_metric_prefix = None
 
     @staticmethod
     def _as_config(cfg):
@@ -209,11 +216,14 @@ class ModelWrapper(LightningModule):
         )
 
     def _evaluator_for(self, dataloader_idx: int):
-        """Route val batches by dataloader_idx: 0 → eval, 1 → train_viz."""
+        """Route val batches by dataloader_idx: 0 → eval, 1 → train_viz,
+        2 → extra_val (only present when the data config defines a third leg)."""
         if dataloader_idx == 0:
             return self.evaluator
         if dataloader_idx == 1:
             return self.train_viz_evaluator
+        if dataloader_idx == 2:
+            return getattr(self, "extra_val_evaluator", None)
         return None
 
     def _rank_barrier(self, tag: str) -> None:
@@ -251,6 +261,8 @@ class ModelWrapper(LightningModule):
         self.evaluator.on_validation_start()
         if self.train_viz_evaluator is not None:
             self.train_viz_evaluator.on_validation_start()
+        if getattr(self, "extra_val_evaluator", None) is not None:
+            self.extra_val_evaluator.on_validation_start()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         evaluator = self._evaluator_for(dataloader_idx)
@@ -280,23 +292,31 @@ class ModelWrapper(LightningModule):
                     sync_dist=True,
                     add_dataloader_idx=False,
                 )
-        elif dataloader_idx == 1 and getattr(self, "second_val_metric_prefix", None):
-            # Second held-out val set (e.g. held-out-operator): log the same
-            # loss family under a separate prefix (e.g. "Valid_oph/"). Only
-            # active when `second_val_prefix` is set in the run config —
-            # legacy runs (prefix None) keep idx=1 as a rollout-only pass.
-            predictions = self.model.forward_training(batch)
-            losses = self.model.compute_losses(predictions, batch)
-            info = {"losses": TensorUtils.detach(losses)}
-            for k, v in self.model.log_info(info).items():
-                self.log(
-                    self.second_val_metric_prefix + k,
-                    v,
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                    add_dataloader_idx=False,
-                )
+        else:
+            # Auxiliary val legs: idx=1 (train_viz slot) and idx=2 (extra_val
+            # slot). Each logs the same loss family under its OWN prefix (e.g.
+            # "Valid_oph/", "Valid_trainviz/") when that prefix is configured.
+            # Only active when `second_val_prefix` / `third_val_prefix` is set in
+            # the run config — legacy runs (prefix None) keep idx=1 as a
+            # rollout-only pass and never have an idx=2 loader at all.
+            aux_prefix = None
+            if dataloader_idx == 1:
+                aux_prefix = getattr(self, "second_val_metric_prefix", None)
+            elif dataloader_idx == 2:
+                aux_prefix = getattr(self, "extra_val_metric_prefix", None)
+            if aux_prefix:
+                predictions = self.model.forward_training(batch)
+                losses = self.model.compute_losses(predictions, batch)
+                info = {"losses": TensorUtils.detach(losses)}
+                for k, v in self.model.log_info(info).items():
+                    self.log(
+                        aux_prefix + k,
+                        v,
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                        add_dataloader_idx=False,
+                    )
 
         print(
             f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}, "
@@ -311,6 +331,8 @@ class ModelWrapper(LightningModule):
             self.evaluator.on_validation_end()
         if self.train_viz_evaluator is not None:
             self.train_viz_evaluator.on_validation_end()
+        if getattr(self, "extra_val_evaluator", None) is not None:
+            self.extra_val_evaluator.on_validation_end()
 
         # Sync after the val loop — mp4 writers on different ranks finish at
         # different times, and without this wait the next train epoch's first

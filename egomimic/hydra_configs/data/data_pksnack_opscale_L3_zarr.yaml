@@ -1,0 +1,106 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# packaging_snacks OPERATOR-SCALING family (pksnack_ops) — level L3. Same Mecka
+# cartesian + pad_gripper recipe as data_opscale_L3_zarr.yaml (the dishwashing
+# op-scaling sweep); only the task, the splits, and the THIRD val leg differ.
+# Fixed 1,080,000-frame (10 h) budget per level; operators ranked by total frames
+# desc, L1=top8 L2=top24 L3=top72 L4=top160 (strict superset chain).
+#
+#   train     -> data_diversity/pksnack_opscale_L3_train.json   (10 h budget)
+#   valid     -> data_diversity/pksnack_opscale_val_indom8.json  (dataloader_idx=0,
+#                Valid/* — 8 eps, one per L1 operator, fixed across levels)
+#   train_viz -> data_diversity/pksnack_val_ophold5.json          (dataloader_idx=1,
+#                Valid_oph/* via evaluator@train_viz_evaluator=train_viz_hpt_oph
+#                + +second_val_prefix=Valid_oph — fully held-out operator)
+#   extra_val -> data_diversity/pksnack_trainviz4.json            (dataloader_idx=2,
+#                Valid_trainviz/* via +evaluator@extra_val_evaluator=train_viz_hpt_trainviz
+#                + +third_val_prefix=Valid_trainviz — 4 TRAINED-ON episodes present
+#                in ALL FOUR levels' train sets, so levels stay comparable)
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_opscale_L3_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_opscale_val_indom8.json
+    mode: total
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_val_ophold5.json
+    mode: total
+
+extra_val_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_trainviz4.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+extra_val_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true

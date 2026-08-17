@@ -5,8 +5,8 @@ operator val videos). This one serves the OFFLINE pass written by
 `egomimic/modal/offline_val.py::run_opscale`, which validates all four
 operator-diversity levels at the SAME checkpoint epoch on the SAME 8 episodes:
 
-    offline_val_opscale/L<n>/videos/epoch_0/MECKA_BIMANUAL/validation_video_<i>.mp4
-    offline_val_opscale/L<n>/manifest.json   (episodes, layout, Valid/* metrics)
+    <prefix>/L<n>/videos/epoch_0/MECKA_BIMANUAL/validation_video_<i>.mp4
+    <prefix>/L<n>/manifest.json   (episodes, layout, Valid/* metrics)
 
 The 8 episodes are TRAIN-SET episodes — one per L1 operator, and each one is in
 the train split of ALL FOUR levels — so every level has seen all 8 and the
@@ -17,14 +17,25 @@ episode i of the val set in episode-hash order (up to batch_size-1 frames of
 spillover at each boundary). That makes column i the same episode/operator in
 every row; the column headers are taken from each level's manifest.json.
 
+Two passes are on the page, switchable with the epoch toggle in the header:
+
+    epoch 1379  offline_val_opscale_e1379/   (current — capped by L2, which is
+                                              the slowest of the four LIVE runs)
+    epoch  779  offline_val_opscale/         (the earlier pass)
+
+All four levels are always snapshotted at the SAME epoch within a pass, which
+is what makes the row-to-row comparison valid.
+
 Deploy:
     MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/opscale_trainval_viewer.py
 
 Routes (single ASGI web function → one URL, relative paths so it works under
 any mount prefix):
     /            HTML viewer page (4 rows = L1..L4, 8 columns = 8 episodes)
-    /api/index   {"rows": [...], "columns": [...], "epoch": N} — cached 60 s
-    /video?path= streams one mp4 (path relative to offline_val_opscale/)
+    /api/index   {"sets": [{"epoch": N, "prefix": P, "rows": [...],
+                 "columns": [...]}], "default_epoch": N} — cached 60 s
+    /video?path= streams one mp4 (path relative to the volume root, restricted
+                 to the prefixes listed in EPOCH_SETS)
 """
 
 import modal
@@ -36,8 +47,17 @@ app = modal.App("opscale-trainval-viewer", image=image)
 outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
 
 MOUNT_PATH = "/data"
-BASE_PREFIX = "offline_val_opscale"
 INDEX_TTL_S = 60
+
+# (checkpoint epoch, volume prefix holding that pass's outputs). Newest first;
+# EPOCH_SETS[0] is what the page opens on. The epoch shown per set is read from
+# that set's manifest.json; the number here is the fallback + the tab label.
+EPOCH_SETS = [
+    (1379, "offline_val_opscale_e1379"),
+    (779, "offline_val_opscale"),
+]
+ALLOWED_PREFIXES = tuple(p for _, p in EPOCH_SETS)
+DEFAULT_EPOCH = EPOCH_SETS[0][0]
 
 # (level dir, number of distinct operators in that level's training mix)
 LEVELS = [
@@ -101,6 +121,9 @@ PAGE_HTML = r"""<!doctype html>
   }
   button:hover, select:hover { border-color: var(--accent); }
   button.on { border-color: var(--accent); color: var(--accent); }
+  #epochtabs { display: flex; align-items: center; gap: 6px; }
+  #epochtabs .lbl { color: var(--dim); font-size: 12px; margin-right: 2px; }
+  #epochtabs button.on { font-weight: 600; }
   #colctl { display: flex; align-items: center; gap: 6px; }
   #colind { color: var(--dim); font-size: 12px; min-width: 104px; text-align: center; }
   details.eps { margin-top: 6px; }
@@ -149,6 +172,7 @@ PAGE_HTML = r"""<!doctype html>
 <header>
   <div class="hrow">
     <h1>op_scaling — train-set offline val</h1>
+    <span id="epochtabs"><span class="lbl">epoch</span></span>
     <button id="playall">Play all</button>
     <button id="pauseall">Pause all</button>
     <button id="colmode" title="load and play one episode column at a time">Column mode</button>
@@ -172,7 +196,9 @@ PAGE_HTML = r"""<!doctype html>
 </main>
 <script>
 (function () {
-  let index = null;      // {epoch, columns:[{i,episode,operator,frames}], rows:[...]}
+  let all = null;        // {sets:[...], default_epoch}
+  let index = null;      // the SELECTED set: {epoch, declared_epoch, prefix,
+                         //   columns:[{i,episode,operator,frames}], rows:[...]}
   let columnMode = false;
   let currentCol = 0;
   let playToken = 0;
@@ -214,14 +240,24 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function renderHeader() {
+    const others = all.sets
+      .filter((s) => s.declared_epoch !== index.declared_epoch)
+      .map((s) => "<b>" + s.epoch + "</b>")
+      .join(", ");
     $("blurb").innerHTML =
       "Offline validation of all four operator-diversity levels at the <b>same " +
-      "checkpoint, epoch " + index.epoch + "</b>, on the <b>same 8 TRAIN-SET " +
+      "checkpoint, epoch " + index.epoch + "</b> (<code>" + index.prefix +
+      "/</code>), on the <b>same 8 TRAIN-SET " +
       "episodes</b> — one per L1 operator, each present in the train split of " +
       "L1, L2, L3 and L4, so every level has seen all 8 (this measures fit on " +
       "seen data, not transfer). Fixed 4.63 h data budget, 300M model; " +
       "L1/L2/L3/L4 spread it over 8/24/72/160 operators. GT is green, " +
-      "prediction red. Column <i>i</i> is the same episode in every row.";
+      "prediction red. Column <i>i</i> is the same episode in every row." +
+      (others ? " Other pass(es) on this page — use the epoch toggle: " +
+        others + "." : "") +
+      (index.declared_epoch === all.newest_epoch
+        ? " This is the newest epoch all four levels share (capped by L2)."
+        : " This is an earlier pass, kept for comparison.");
 
     let h = "<table class='eps'><tr><th>col</th><th>episode</th><th>operator</th>" +
             "<th>frames</th></tr>";
@@ -390,17 +426,48 @@ PAGE_HTML = r"""<!doctype html>
     if (e.key === "ArrowRight") colStep(1);
   });
 
+  // ---- epoch toggle: swap the whole scanned set, keeping the same URL ----
+  function show(declaredEpoch) {
+    const set = all.sets.find((s) => s.declared_epoch === declaredEpoch) || all.sets[0];
+    index = set;
+    document.querySelectorAll("#epochtabs button").forEach((b) => {
+      b.classList.toggle("on", Number(b.dataset.epoch) === set.declared_epoch);
+    });
+    // leave column mode: its cached <video> elements belong to the old set
+    columnMode = false;
+    currentCol = 0;
+    playToken++;
+    colmodeBtn.classList.remove("on");
+    colctl.style.display = "none";
+    scrollers = [];
+    renderHeader();
+    render();
+    const n = index.rows.reduce((s, r) => s + r.n_videos, 0);
+    const done = index.rows.filter((r) => r.n_videos).length;
+    statusEl.textContent =
+      "epoch " + index.epoch + " · " + done + "/" + index.rows.length +
+      " levels · " + n + " videos · index refreshes every 60 s";
+  }
+
+  function renderTabs() {
+    const box = $("epochtabs");
+    for (const s of all.sets) {
+      const b = document.createElement("button");
+      b.dataset.epoch = s.declared_epoch;
+      const n = s.rows.reduce((a, r) => a + r.n_videos, 0);
+      b.textContent = s.epoch + " (" + n + ")";
+      b.title = s.prefix + "/ — " + n + " videos";
+      b.onclick = () => show(s.declared_epoch);
+      box.appendChild(b);
+    }
+  }
+
   fetch("api/index")
     .then((r) => r.json())
     .then((data) => {
-      index = data;
-      renderHeader();
-      render();
-      const n = index.rows.reduce((s, r) => s + r.n_videos, 0);
-      const done = index.rows.filter((r) => r.n_videos).length;
-      statusEl.textContent =
-        done + "/" + index.rows.length + " levels · " + n +
-        " videos · index refreshes every 60 s";
+      all = data;
+      renderTabs();
+      show(all.default_epoch);
     })
     .catch((e) => { statusEl.textContent = "failed to load index: " + e; });
 })();
@@ -428,7 +495,7 @@ def viewer():
     from fastapi.responses import FileResponse, HTMLResponse
 
     api = FastAPI()
-    base_dir = os.path.realpath(os.path.join(MOUNT_PATH, BASE_PREFIX))
+    root_dir = os.path.realpath(MOUNT_PATH)
 
     _cache = {"ts": 0.0, "data": None}
     _lock = threading.Lock()
@@ -437,7 +504,7 @@ def viewer():
         m = re.search(r"validation_video_(\d+)\.mp4$", name)
         return int(m.group(1)) if m else None
 
-    def _read_manifest(level):
+    def _read_manifest(base_dir, level):
         try:
             with open(os.path.join(base_dir, level, "manifest.json")) as f:
                 return json.load(f)
@@ -466,13 +533,14 @@ def viewer():
             for i, (h, op, nf) in enumerate(EPISODES)
         ]
 
-    def _scan():
-        manifests = {level: _read_manifest(level) for level, _ in LEVELS}
+    def _scan_set(declared_epoch, prefix):
+        base_dir = os.path.join(root_dir, prefix)
+        manifests = {level: _read_manifest(base_dir, level) for level, _ in LEVELS}
         columns = _columns(manifests)
         n_cols = len(columns)
         epoch = next(
             (m["epoch"] for m in manifests.values() if m and m.get("epoch") is not None),
-            "?",
+            declared_epoch,
         )
 
         rows = []
@@ -491,7 +559,7 @@ def viewer():
                         for f in sorted(os.listdir(emb_dir)):
                             i = _vid_index(f) if f.endswith(".mp4") else None
                             if i is not None and 0 <= i < n_cols:
-                                videos[i] = f"{level}/videos/{ep_name}/{emb}/{f}"
+                                videos[i] = f"{prefix}/{level}/videos/{ep_name}/{emb}/{f}"
 
             man = manifests[level]
             metrics = (man or {}).get("metrics") or {}
@@ -518,14 +586,27 @@ def viewer():
                 {
                     "level": level,
                     "ops": n_ops,
-                    "dir": f"{BASE_PREFIX}/{level}",
+                    "dir": f"{prefix}/{level}",
                     "videos": videos,
                     "n_videos": sum(1 for v in videos if v),
                     "metrics": metrics,
                     "metrics_summary": summary,
                 }
             )
-        return {"epoch": epoch, "columns": columns, "rows": rows}
+        return {
+            "epoch": epoch,  # from the manifests (falls back to declared_epoch)
+            "declared_epoch": declared_epoch,  # stable key for the epoch toggle
+            "prefix": prefix,
+            "columns": columns,
+            "rows": rows,
+        }
+
+    def _scan():
+        return {
+            "sets": [_scan_set(epoch, prefix) for epoch, prefix in EPOCH_SETS],
+            "default_epoch": DEFAULT_EPOCH,
+            "newest_epoch": max(e for e, _ in EPOCH_SETS),
+        }
 
     def _index():
         with _lock:
@@ -549,11 +630,13 @@ def viewer():
 
     @api.get("/video")
     def video(path: str = Query(...)):
-        # Resolve strictly under offline_val_opscale/ on the volume; reject traversal.
+        # Resolve strictly under one of the EPOCH_SETS prefixes; reject traversal.
         if "\x00" in path or path.startswith(("/", "~")) or ".." in path.split("/"):
             raise HTTPException(status_code=400, detail="bad path")
-        full = os.path.realpath(os.path.join(base_dir, path))
-        if not full.startswith(base_dir + os.sep) or not full.endswith(".mp4"):
+        if path.split("/")[0] not in ALLOWED_PREFIXES:
+            raise HTTPException(status_code=400, detail="bad prefix")
+        full = os.path.realpath(os.path.join(root_dir, path))
+        if not full.startswith(root_dir + os.sep) or not full.endswith(".mp4"):
             raise HTTPException(status_code=400, detail="bad path")
         if not os.path.isfile(full):
             raise HTTPException(status_code=404, detail="video not found")

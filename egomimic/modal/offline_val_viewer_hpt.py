@@ -1,20 +1,27 @@
-"""Web viewer for the SECOND offline in-distribution validation pass — the
-300M / 600M / 1B HPT runs only, at their own (newer) common checkpoint epoch
-(see egomimic/modal/offline_val.py; outputs under offline_val_indist_hpt3/).
+"""Web viewer for the HPT-only offline in-distribution validation passes — the
+300M / 600M / 1B runs at their own (newer) common checkpoint epochs
+(see egomimic/modal/offline_val.py).
 
-The first pass validated all 8 runs at epoch 539 (the largest epoch every run
-had, capped by the 1.5B laggard) — served by the `offline-val-viewer` app.
-This pass skips 1.5B and re-validates 300M/600M/1B at the newest epoch all
-three share (1B's latest checkpoint). Same operator, same 3 seen-in-training
-episodes.
+The all-8 pass is capped by the 1.5B laggard and is served by the
+`offline-val-viewer` app. This page skips 1.5B and validates 300M/600M/1B at
+the newest epoch all three share. Same operator, same 3 seen-in-training
+episodes throughout.
+
+Two passes are on the page, switchable with the epoch toggle in the header:
+
+    epoch 1979  offline_val_indist_hpt_e1979/  (current — all three runs have
+                                                FINISHED, so this is final)
+    epoch 1199  offline_val_indist_hpt3/       (the earlier HPT-only pass)
 
 Deploy:
     MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/offline_val_viewer_hpt.py
 
 Routes (single ASGI web function -> one URL):
     /            HTML viewer page
-    /api/index   {"runs": [...], "meta": {...}} — volume scan, cached 60 s
-    /video?path= streams one mp4 (path relative to offline_val_indist_hpt3/)
+    /api/index   {"sets": [...], "default_epoch": N, "meta": {...}} — volume
+                 scan of every epoch set, cached 60 s
+    /video?path= streams one mp4 (path relative to the volume root, restricted
+                 to the prefixes listed in EPOCH_SETS)
 """
 
 import modal
@@ -28,11 +35,18 @@ app = modal.App("offline-val-viewer-hpt", image=image)
 outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
 
 MOUNT_PATH = "/data"
-BASE_PREFIX = "offline_val_indist_hpt3"
 INDEX_TTL_S = 60
 
-COMMON_EPOCH = 1199  # newest epoch present for all of 300M/600M/1B (verified)
-FIRST_PASS_EPOCH = 539  # all-8 common epoch used by the first pass
+# (checkpoint epoch, volume prefix holding that pass's outputs). Newest first;
+# EPOCH_SETS[0] is what the page opens on. 1979 is the largest epoch all three
+# HPT runs have and they are all finished, so it is their FINAL epoch.
+EPOCH_SETS = [
+    (1979, "offline_val_indist_hpt_e1979"),
+    (1199, "offline_val_indist_hpt3"),
+]
+ALLOWED_PREFIXES = tuple(p for _, p in EPOCH_SETS)
+COMMON_EPOCH = EPOCH_SETS[0][0]  # default / headline epoch
+ALL8_EPOCH = 1499  # all-8 common epoch used by the offline-val-viewer app
 INDIST_OPERATOR = "68b5da0ce7c6a693e3df941c"
 INDIST_EPISODES = [
     ("69b2100ed99f29421f1b4a57", 1825),
@@ -52,7 +66,7 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>offline in-dist val — HPT @ 1199</title>
+<title>offline in-dist val — HPT 300M/600M/1B</title>
 <style>
   :root {
     --bg: #101216; --panel: #181b21; --border: #2a2e37;
@@ -74,6 +88,10 @@ PAGE_HTML = r"""<!doctype html>
     border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
   }
   button:hover { border-color: var(--accent); }
+  button.on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #epochtabs { display: flex; gap: 6px; align-items: center; }
+  #epochtabs .lbl { color: var(--dim); font-size: 12px; margin-right: 2px; }
   .spacer { flex: 1; }
   #status { color: var(--dim); font-size: 12px; }
   #meta {
@@ -103,7 +121,8 @@ PAGE_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>offline in-distribution validation — HPT 300M/600M/1B @ epoch 1199</h1>
+  <h1>offline in-distribution validation — HPT 300M/600M/1B</h1>
+  <span id="epochtabs"><span class="lbl">epoch</span></span>
   <button id="playall">Play all</button>
   <button id="pauseall">Pause all</button>
   <span class="spacer"></span>
@@ -115,6 +134,8 @@ PAGE_HTML = r"""<!doctype html>
 (function () {
   const $ = (id) => document.getElementById(id);
   const grid = $("grid"), statusEl = $("status"), metaEl = $("meta");
+  let index = null;      // {sets:[{epoch,prefix,runs:[...]}], default_epoch, meta}
+  let current = null;    // the selected set
 
   const observer = new IntersectionObserver((entries) => {
     for (const e of entries) {
@@ -126,17 +147,25 @@ PAGE_HTML = r"""<!doctype html>
     }
   }, { rootMargin: "200px" });
 
-  function renderMeta(meta) {
+  function renderMeta(meta, set) {
     const eps = meta.episodes
       .map((e) => "<code>" + e[0] + "</code> (" + e[1] + " frames)")
       .join(" · ");
+    const others = index.sets
+      .filter((s) => s.epoch !== set.epoch)
+      .map((s) => "<code>" + s.epoch + "</code>")
+      .join(", ");
     metaEl.innerHTML =
-      "SECOND pass: 300M / 600M / 1B only (1.5B skipped — it is the laggard " +
-      "that capped the first pass), at checkpoint epoch <code>" + meta.epoch +
-      "</code> — the newest epoch all three share (= 1B's latest checkpoint " +
-      "at selection time). The first, all-8 pass used epoch <code>" +
-      meta.first_pass_epoch + "</code> and is served by the offline-val-viewer " +
-      "app.<br>" +
+      "HPT-only pass: 300M / 600M / 1B (1.5B skipped — it is the laggard that " +
+      "caps the all-8 pass), at checkpoint epoch <code>" + set.epoch +
+      "</code> (<code>" + set.prefix + "/</code>)" +
+      (set.epoch === index.newest_epoch
+        ? " — the newest epoch all three share. All three runs have FINISHED " +
+          "training, so this is their FINAL-epoch number."
+        : " — an earlier HPT-only pass, kept for comparison.") +
+      (others ? " Other pass(es) on this page: " + others + "." : "") +
+      " The all-8 pass now uses epoch <code>" + meta.all8_epoch +
+      "</code> and is served by the offline-val-viewer app.<br>" +
       "In-distribution operator <code>" + meta.operator + "</code> " +
       "(SEEN in training — control vs the held-out-operator val). " +
       "3 episodes, " + meta.total_frames + " frames total: " + eps + "<br>" +
@@ -144,9 +173,9 @@ PAGE_HTML = r"""<!doctype html>
       "over the 3 episodes in hash order.";
   }
 
-  function render(index) {
+  function render(set) {
     grid.innerHTML = "";
-    for (const run of index.runs) {
+    for (const run of set.runs) {
       const row = document.createElement("div");
       row.className = "run-row";
       const head = document.createElement("div");
@@ -160,7 +189,7 @@ PAGE_HTML = r"""<!doctype html>
       }
       head.innerHTML =
         '<span class="run-label">' + run.label + "</span>" +
-        '<span class="run-dir">' + run.dir + " @ epoch " + index.meta.epoch + "</span>" +
+        '<span class="run-dir">' + run.dir + " @ epoch " + set.epoch + "</span>" +
         (metric ? '<span class="run-metric">' + metric + "</span>" : "");
       row.appendChild(head);
 
@@ -169,7 +198,7 @@ PAGE_HTML = r"""<!doctype html>
       if (!run.videos.length) {
         const ph = document.createElement("div");
         ph.className = "placeholder";
-        ph.textContent = "no offline-val videos yet for this run";
+        ph.textContent = "no offline-val videos yet for this run at epoch " + set.epoch;
         body.appendChild(ph);
       } else {
         for (const p of run.videos) {
@@ -198,6 +227,34 @@ PAGE_HTML = r"""<!doctype html>
     }
   }
 
+  function show(epoch) {
+    const set = index.sets.find((s) => s.epoch === epoch) || index.sets[0];
+    current = set;
+    document.querySelectorAll("#epochtabs button").forEach((b) => {
+      b.classList.toggle("on", Number(b.dataset.epoch) === set.epoch);
+    });
+    renderMeta(index.meta, set);
+    render(set);
+    const nvids = set.runs.reduce((s, r) => s + r.videos.length, 0);
+    const nruns = set.runs.filter((r) => r.videos.length).length;
+    statusEl.textContent =
+      "epoch " + set.epoch + " · " + nruns + "/" + set.runs.length + " runs · " +
+      nvids + " videos · index refreshes every 60 s";
+  }
+
+  function renderTabs() {
+    const box = $("epochtabs");
+    for (const s of index.sets) {
+      const b = document.createElement("button");
+      b.dataset.epoch = s.epoch;
+      const n = s.runs.reduce((a, r) => a + r.videos.length, 0);
+      b.textContent = s.epoch + " (" + n + ")";
+      b.title = s.prefix + "/ — " + n + " videos";
+      b.onclick = () => show(s.epoch);
+      box.appendChild(b);
+    }
+  }
+
   $("playall").onclick = () => {
     document.querySelectorAll("video").forEach((v) => {
       if (!v.src && v.dataset.src) v.src = v.dataset.src;
@@ -210,14 +267,10 @@ PAGE_HTML = r"""<!doctype html>
 
   fetch("api/index")
     .then((r) => r.json())
-    .then((index) => {
-      renderMeta(index.meta);
-      render(index);
-      const nvids = index.runs.reduce((s, r) => s + r.videos.length, 0);
-      const nruns = index.runs.filter((r) => r.videos.length).length;
-      statusEl.textContent =
-        nruns + "/" + index.runs.length + " runs · " + nvids +
-        " videos · index refreshes every 60 s";
+    .then((data) => {
+      index = data;
+      renderTabs();
+      show(index.default_epoch);
     })
     .catch((e) => { statusEl.textContent = "failed to load index: " + e; });
 })();
@@ -245,7 +298,7 @@ def viewer():
     from fastapi.responses import FileResponse, HTMLResponse
 
     api = FastAPI()
-    base_dir = os.path.realpath(os.path.join(MOUNT_PATH, BASE_PREFIX))
+    root_dir = os.path.realpath(MOUNT_PATH)
 
     _cache = {"ts": 0.0, "data": None}
     _lock = threading.Lock()
@@ -254,7 +307,10 @@ def viewer():
         m = re.search(r"(\d+)\.mp4$", name)
         return (int(m.group(1)) if m else 1 << 30, name)
 
-    def _scan():
+    def _scan_set(prefix):
+        """One epoch set: per-run video lists (paths relative to the volume
+        root, i.e. prefixed with `prefix/`) plus that run's manifest metrics."""
+        base_dir = os.path.join(root_dir, prefix)
         runs_out = []
         for label, run_dir in RUNS:
             vids = []
@@ -270,7 +326,9 @@ def viewer():
                             continue
                         for f in sorted(os.listdir(emb_dir), key=_vid_sort_key):
                             if f.endswith(".mp4"):
-                                vids.append(f"{run_dir}/videos/{ep_name}/{emb}/{f}")
+                                vids.append(
+                                    f"{prefix}/{run_dir}/videos/{ep_name}/{emb}/{f}"
+                                )
             metrics = None
             manifest_path = os.path.join(base_dir, run_dir, "manifest.json")
             if os.path.isfile(manifest_path):
@@ -282,11 +340,18 @@ def viewer():
             runs_out.append(
                 {"label": label, "dir": run_dir, "videos": vids, "metrics": metrics}
             )
+        return runs_out
+
+    def _scan():
         return {
-            "runs": runs_out,
+            "sets": [
+                {"epoch": epoch, "prefix": prefix, "runs": _scan_set(prefix)}
+                for epoch, prefix in EPOCH_SETS
+            ],
+            "default_epoch": COMMON_EPOCH,
+            "newest_epoch": max(e for e, _ in EPOCH_SETS),
             "meta": {
-                "epoch": COMMON_EPOCH,
-                "first_pass_epoch": FIRST_PASS_EPOCH,
+                "all8_epoch": ALL8_EPOCH,
                 "operator": INDIST_OPERATOR,
                 "episodes": INDIST_EPISODES,
                 "total_frames": sum(n for _, n in INDIST_EPISODES),
@@ -315,11 +380,13 @@ def viewer():
 
     @api.get("/video")
     def video(path: str = Query(...)):
-        # Resolve strictly under offline_val_indist_hpt3/; reject traversal.
+        # Resolve strictly under one of the EPOCH_SETS prefixes; reject traversal.
         if "\x00" in path or path.startswith(("/", "~")) or ".." in path.split("/"):
             raise HTTPException(status_code=400, detail="bad path")
-        full = os.path.realpath(os.path.join(base_dir, path))
-        if not full.startswith(base_dir + os.sep) or not full.endswith(".mp4"):
+        if path.split("/")[0] not in ALLOWED_PREFIXES:
+            raise HTTPException(status_code=400, detail="bad prefix")
+        full = os.path.realpath(os.path.join(root_dir, path))
+        if not full.startswith(root_dir + os.sep) or not full.endswith(".mp4"):
             raise HTTPException(status_code=400, detail="bad path")
         if not os.path.isfile(full):
             raise HTTPException(status_code=404, detail="video not found")

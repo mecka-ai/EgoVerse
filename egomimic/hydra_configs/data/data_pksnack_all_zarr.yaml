@@ -1,0 +1,82 @@
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+# packaging_snacks MODEL-SIZE family (pksnack_size). Same Mecka cartesian +
+# pad_gripper recipe as data_dishwashing_48h_oph_zarr.yaml (the dw48 sweep);
+# only the task and the splits differ, plus a train-viz val leg.
+#
+#   train     -> data_diversity/pksnack_all_train.json          (1968 eps, 47.69 h)
+#   valid     -> data_diversity/pksnack_val_ophold5.json        (dataloader_idx=0,
+#                Valid/* — 5 eps of the fully held-out operator 695cd6a8…)
+#   train_viz -> data_diversity/pksnack_trainviz4.json          (dataloader_idx=1,
+#                Valid_trainviz/* via evaluator@train_viz_evaluator=train_viz_hpt_trainviz
+#                + +second_val_prefix=Valid_trainviz — 4 TRAINED-ON episodes,
+#                in-distribution reference)
+#
+# Two val sets only, so the legacy two-slot structure is sufficient (no
+# extra_val_datasets here).
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_all_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_val_ophold5.json
+    mode: total
+
+train_viz_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_multi.MultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_multi.ModalEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+        pad_gripper: true
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_trainviz4.json
+    mode: total
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true
+
+train_viz_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 12
+    persistent_workers: true

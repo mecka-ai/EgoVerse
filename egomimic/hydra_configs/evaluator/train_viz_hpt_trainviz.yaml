@@ -1,0 +1,21 @@
+# Train-viz val-set evaluator that emits a FULL, separately-named val metric
+# family instead of the legacy additive `train_viz/Valid/*` keys.
+#
+# Same TrainVizEvalVideo wrapper as train_viz_hpt_oph.yaml, just a different
+# (prefix, video dir) pair: the canonical `Valid/*` family produced by
+# HPTEvalVideo is rewritten onto `Valid_trainviz/*` and videos are written to
+# <run>/videos_trainviz/.
+#
+# Usable in either aux slot:
+#   dataloader_idx=1 -> `evaluator@train_viz_evaluator=train_viz_hpt_trainviz`
+#                       + `+second_val_prefix=Valid_trainviz`
+#   dataloader_idx=2 -> `+evaluator@extra_val_evaluator=train_viz_hpt_trainviz`
+#                       + `+third_val_prefix=Valid_trainviz`
+# The paired prefix key is what adds `Valid_trainviz/Loss` etc. (the losses);
+# this config supplies the rollout metric family (paired_mse_avg, final_mse,
+# frechet, reverse_kl) and the videos.
+_target_: egomimic.eval.train_viz_eval_video.TrainVizEvalVideo
+base:
+  _target_: egomimic.eval.eval_hpt.HPTEvalVideo
+metric_prefix: Valid_trainviz
+video_dirname: videos_trainviz

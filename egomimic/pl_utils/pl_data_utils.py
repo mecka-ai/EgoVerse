@@ -64,6 +64,8 @@ class MultiDataModuleWrapper(LightningDataModule):
         valid_dataloader_params: dict,
         train_viz_datasets: dict | None = None,
         train_viz_dataloader_params: dict | None = None,
+        extra_val_datasets: dict | None = None,
+        extra_val_dataloader_params: dict | None = None,
         collate_max_length=128,
         model_name="google/paligemma-3b-mix-224",
         sampling_mode: Literal["first", "random"] = "random",
@@ -82,6 +84,12 @@ class MultiDataModuleWrapper(LightningDataModule):
             valid_datasets: dictionary of valid datasets
             train_dataloader_params: dictionary of train dataloader parameters
             valid_dataloader_params: dictionary of valid dataloader parameters
+            train_viz_datasets: optional SECOND val leg (dataloader_idx=1).
+            train_viz_dataloader_params: dataloader params for that leg.
+            extra_val_datasets: optional THIRD val leg (dataloader_idx=2). Only
+                usable together with ``train_viz_datasets`` so the index of the
+                second leg never shifts. Absent/empty = exact legacy behavior.
+            extra_val_dataloader_params: dataloader params for the third leg.
             model_name: name of the model to use for the tokenizer
             sampling_mode: "first" to sample the first prompt from the list of prompts, "random" to sample a random prompt from the list of prompts
             annotation_key: key of the annotation to use for the collate function
@@ -127,6 +135,23 @@ class MultiDataModuleWrapper(LightningDataModule):
             k: v for k, v in (train_viz_datasets or {}).items() if v is not None
         }
         self.train_viz_dataloader_params = train_viz_dataloader_params or {}
+        # Optional THIRD leg of the val loop (dataloader_idx=2). Used when a run
+        # needs three distinct val sets (e.g. in-domain-operator holdout at idx=0,
+        # fully held-out operator at idx=1, trained-on train-viz episodes at
+        # idx=2). Empty unless the data config defines extra_val_datasets +
+        # extra_val_dataloader_params — so every legacy config keeps exactly the
+        # 1- or 2-loader val structure it had before.
+        self.extra_val_datasets = {
+            k: v for k, v in (extra_val_datasets or {}).items() if v is not None
+        }
+        self.extra_val_dataloader_params = extra_val_dataloader_params or {}
+        if self.extra_val_datasets and not self.train_viz_datasets:
+            raise ValueError(
+                "extra_val_datasets (dataloader_idx=2) requires train_viz_datasets "
+                "(dataloader_idx=1) to be defined as well — otherwise the extra val "
+                "loader would silently land on dataloader_idx=1 and be logged with "
+                "the second val set's prefix/evaluator."
+            )
         if use_tokenizer:
             self.collate_fn = build_tokenized_collate(
                 max_length=collate_max_length,
@@ -191,21 +216,39 @@ class MultiDataModuleWrapper(LightningDataModule):
         eval_loader = CombinedLoader(iterables, "max_size_cycle")
         if not self.train_viz_datasets:
             return eval_loader
-        # [eval, train_viz] → Lightning iterates each with a distinct
-        # dataloader_idx: 0 = held-out eval, 1 = in-distribution train-viz.
-        # pl_model._evaluator_for routes idx=1 to the train_viz_evaluator.
-        return [eval_loader, self._build_train_viz_loader()]
+        # [eval, train_viz(, extra_val)] → Lightning iterates each with a distinct
+        # dataloader_idx: 0 = held-out eval, 1 = in-distribution train-viz (or a
+        # second held-out val set), 2 = optional third val set.
+        # pl_model._evaluator_for routes idx=1 to the train_viz_evaluator and
+        # idx=2 to the extra_val_evaluator.
+        loaders = [
+            eval_loader,
+            self._build_aux_val_loader(
+                self.train_viz_datasets,
+                self.train_viz_dataloader_params,
+                "train_viz",
+            ),
+        ]
+        if self.extra_val_datasets:
+            loaders.append(
+                self._build_aux_val_loader(
+                    self.extra_val_datasets,
+                    self.extra_val_dataloader_params,
+                    "extra_val",
+                )
+            )
+        return loaders
 
-    def _build_train_viz_loader(self):
-        """Non-shuffled loader over train_viz datasets (shuffle forced off so
-        the same in-distribution episodes appear each epoch — comparable videos)."""
+    def _build_aux_val_loader(self, datasets, dataloader_params, slot):
+        """Non-shuffled loader over an auxiliary val leg's datasets (shuffle
+        forced off so the same episodes appear each epoch — comparable videos)."""
         iterables = dict()
-        for dataset_name, dataset in self.train_viz_datasets.items():
-            dataset_params = self.train_viz_dataloader_params.get(dataset_name)
+        for dataset_name, dataset in datasets.items():
+            dataset_params = dataloader_params.get(dataset_name)
             if dataset_params is None or len(dataset_params) == 0:
                 raise ValueError(
-                    f"No dataloader params found for train_viz dataset {dataset_name}. "
-                    f"Please add {dataset_name} into your data config train_viz_dataloader_params."
+                    f"No dataloader params found for {slot} dataset {dataset_name}. "
+                    f"Please add {dataset_name} into your data config {slot}_dataloader_params."
                 )
             dataset_params = dict(dataset_params)
             dataset_params.pop("shuffle", None)
@@ -216,6 +259,12 @@ class MultiDataModuleWrapper(LightningDataModule):
                 **apply_ipc_dataloader_params(dataset_params),
             )
         return CombinedLoader(iterables, "max_size_cycle")
+
+    def _build_train_viz_loader(self):
+        """Back-compat alias for the dataloader_idx=1 leg."""
+        return self._build_aux_val_loader(
+            self.train_viz_datasets, self.train_viz_dataloader_params, "train_viz"
+        )
 
 
 class DualDataModuleWrapper(LightningDataModule):
