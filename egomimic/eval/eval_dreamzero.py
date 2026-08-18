@@ -1,30 +1,32 @@
 """Offline evaluation for the DreamZero WAM model (Modal fork port).
 
-Loads a hydra config (defaults to ``train_zarr_human_wam_wan22_5b``), restricts
-the valid split to N episodes (one full-clip window each), loads a checkpoint,
-and runs a single Lightning ``trainer.validate`` pass through ``WAMEvalVideo``
-— emitting one ``predicted_video_*.mp4`` + one ``validation_video_*.mp4`` per
-episode plus the Valid/* metrics.
+Loads a hydra config (defaults to ``train_zarr_human_wam_wan22_5b``), plans a
+FULL-EPISODE walk over the first N episodes of the valid split, loads a
+checkpoint, and runs a single Lightning ``trainer.validate`` pass through
+``WAMEvalVideo`` — emitting one ``predicted_video_<i>.mp4`` + one
+``validation_video_<i>.mp4`` per episode, each spanning that whole episode, plus
+the ``Valid/*`` metrics (optionally dumped as JSON for the sweep aggregator).
 
-Two important differences vs ``trainHydra.py``:
+Differences vs ``trainHydra.py``:
 
-  1. **Selectable rolling mode**: ``algo.val_rollout`` / ``forward_eval`` are
-     monkey-patched with EITHER
-       - ``_sample_rolling_ar`` — fully-autoregressive causal rolling: history
-         slides only on the model's own K new predictions each step; only the
-         initial anchor is GT. Right for open-loop generation quality (drift
-         accumulates, seams are genuine divergence), OR
-       - ``_sample_rolling_tf`` — dreamzero Fig-14a GT teacher-forced rolling:
-         history refills with GT latents every K predicted latents. Right for
-         short-horizon forecasting quality (drift can't accumulate).
-     Which one is picked comes from the evaluator yaml
-     (``evaluator=eval_dreamzero_ar`` vs ``eval_dreamzero_tf`` — both are
-     ``WAMEvalVideo`` with a ``teacher_force_rolling`` flag).
+  1. **Full-episode val split**: ``egomimic.eval.wam_episode.plan_full_episode_walk``
+     keeps the first ``+num_val_episodes`` episodes (sorted) and tiles each into
+     ``cam_horizon``-length windows at stride ``cam_horizon - 1``, in order.
+     ``limit_val_batches`` is auto-set to the resulting window count and the
+     valid dataloader batch size is forced to 1, so the val loop walks episode 0
+     start-to-finish, then episode 1, ... A mecka dishwashing episode is ~2100
+     frames, which is why the episode is streamed as windows rather than handed
+     over as one sample; ``wam_rollout.EpisodeRoller`` carries the
+     teacher-forcing context across the window seams so the rollout is
+     continuous over the episode.
 
-  2. **Per-episode limit**: ``num_val_episodes`` restricts the valid split to
-     its first N (sorted) episodes with exactly ONE window each; the trainer's
-     ``limit_val_batches`` is auto-set to match and the valid dataloader batch
-     size is forced to 1 so each episode gets its own mp4 pair.
+  2. **Selectable rolling mode**: the evaluator yaml picks GT teacher-forced
+     (``evaluator=eval_dreamzero_tf``, dreamzero Fig-14a — each chunk conditions
+     on GT, drift cannot accumulate) or fully autoregressive
+     (``evaluator=eval_dreamzero_ar`` — only the episode anchor is GT). Both go
+     through the SAME shared rollout (``egomimic.eval.wam_rollout``) that the
+     training-time val loop uses; ``_select_rolling_mode`` just flips a flag.
+     There is no longer a monkey-patched second copy of the rolling loop.
 
 By default the config's OWN valid split is evaluated (e.g. the dw48 held-out-
 operator json in ``data_dishwashing_48h_wam``). For configs whose valid split
@@ -32,7 +34,14 @@ aliases the train set (``mode: total`` + interpolation, e.g. ``mecka_wam``),
 pass ``+force_ood_split=true`` to rewrite train/valid into the seed-split
 (``valid_mode=valid|train|total`` picks the side).
 
-Run (repo root; on Modal use egomimic/modal/offline_val_wam.py):
+Extra keys this script understands (all optional, pass with ``+``):
+  ``num_val_episodes``         how many episodes to walk (default 3)
+  ``max_windows_per_episode``  truncate each episode's walk (smoke tests only)
+  ``metrics_out``              path to write the flat metrics JSON
+  ``force_ood_split`` / ``valid_ratio`` / ``valid_mode``  seed-split rewrite
+
+Run (repo root; on Modal use egomimic/modal/offline_val_wam.py or
+egomimic/modal/wam_val_sweep.py):
 
     python -m egomimic.eval.eval_dreamzero \
         --config-name=train_zarr_human_wam_wan22_5b \
@@ -46,7 +55,6 @@ from __future__ import annotations
 
 import copy
 import os
-from collections import OrderedDict
 
 import hydra
 import lightning as L
@@ -57,356 +65,54 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 # Importing trainHydra registers the eval/multiply OmegaConf resolvers and
 # applies the DataLoader shm/tmpdir setup — same import environment as training.
 import egomimic.trainHydra as th
+from egomimic.eval.wam_episode import plan_full_episode_walk
+from egomimic.eval.wam_rollout import WAM_VIDEO_FPS
 from egomimic.pl_utils.pl_model import ModelWrapper
-from egomimic.rldb.embodiment.embodiment import get_embodiment
 from egomimic.rldb.zarr.utils import DataSchematic, set_global_seed
-from egomimic.rldb.zarr.zarr_dataset_multi import MultiDataset
 from egomimic.utils.aws.aws_data_utils import load_env
 from egomimic.utils.pylogger import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def _restrict_to_first_n_episodes(mds: MultiDataset, n: int) -> list[str]:
-    """Keep only the first ``n`` (sorted) episodes on a MultiDataset and expose
-    each as exactly one sample window (local_idx=0 — the first cam_horizon-
-    length window of the episode). Rebuilds the flat sample index in place.
-    Returns the kept episode names."""
-    all_names = sorted(mds.datasets.keys())
-    if len(all_names) < n:
-        log.warning(
-            f"[eval_dreamzero] valid split has {len(all_names)} episodes < "
-            f"requested {n}; using all of them."
-        )
-    kept = all_names[:n]
-    mds.datasets = {name: mds.datasets[name] for name in kept}
-    mds.index_map = []
-    mds._global_indices_by_dataset = {name: [] for name in kept}
-    for name in kept:
-        mds.index_map.append((name, 0))
-        mds._global_indices_by_dataset[name].append(0)
-    log.info(
-        f"[eval_dreamzero] restricted valid dataset to {len(kept)} episodes "
-        f"(1 window each): {kept}"
-    )
-    return kept
+def _select_rolling_mode(algo, teacher_force: bool) -> None:
+    """Point the loaded algo's val loop at TF or AR rolling.
 
-
-def _rolling_denoise_step(
-    model,
-    sched,
-    video,
-    action,
-    history,
-    n_hist,
-    F_total,
-    seq_len,
-    context,
-    state,
-    emb,
-):
-    """One rolling step's denoising loop — shared by AR + TF variants. Runs the
-    flow-match scheduler over all timesteps, updating ``video[:, :, n_hist:]``
-    (the K noisy positions) while pinning ``video[:, :, :n_hist]`` to
-    ``history`` (clean past) each step. Returns (new_latents, new_actions).
+    This used to be a ~250-line monkey-patch that re-implemented the rolling
+    loop (``_sample_rolling_tf`` / ``_sample_rolling_ar``) and rebound
+    ``val_rollout`` + ``forward_eval`` on the algo, precisely so that
+    ``wam.py`` could be left alone. That is what let the offline and
+    training-time paths diverge: two copies of the same index arithmetic, only
+    one of which ever got fixed. Both paths now share
+    ``egomimic.eval.wam_rollout`` (via ``WAM.val_rollout`` ->
+    ``EpisodeRoller``), so selecting the mode is a single flag and the offline
+    eval measures exactly what training-time validation measures.
     """
-    for t in sched.timesteps:
-        ts_v = torch.zeros(video.shape[0], F_total, device=video.device)
-        ts_v[:, n_hist:] = t
-        ts_a = t.to(video.device).expand(video.shape[0], action.shape[1])
-        clean_x = torch.cat([history, video[:, :, n_hist:]], dim=2)
-        v_vel, a_vel = model.dit(
-            video,
-            ts_v,
-            ts_a,
-            context,
-            seq_len,
-            action=action,
-            state=state,
-            embodiment_id=emb,
-            clean_x=clean_x,
-        )
-        video = sched.step(v_vel, t, video)
-        video[:, :, :n_hist] = history
-        action = sched.step(a_vel, t, action)
-    new_latents = video[:, :, n_hist:]  # (B, Cz, K, h, w)
-    return new_latents, action
-
-
-def _rolling_setup(model, step_data, num_steps):
-    """Common setup for both rolling variants — encodes the GT clip, builds
-    the scheduler, primes history/state/context, and returns everything the
-    per-step loop needs plus (K, F_gt, num_steps, num_action_per_block)."""
-    from egomimic.models.wam_nets import FlowMatchScheduler
-
-    sched = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
-    sched.set_timesteps(model.num_inference_steps, training=False)
-
-    K = getattr(model.dit, "num_frame_per_block", 1)
-    F_total = model.num_video_frames
-    n_hist = F_total - K
-
-    gt_latents = model._encode(step_data["video"])  # (B, Cz, F_gt, h, w)
-    B, Cz, F_gt, h, w = gt_latents.shape
-    device, dtype = gt_latents.device, gt_latents.dtype
-
-    max_steps_by_gt = max(1, (F_gt - 1) // K)
-    num_steps = (
-        max_steps_by_gt if num_steps is None else min(num_steps, max_steps_by_gt)
-    )
-
-    seq_len = F_total * (h // 2) * (w // 2)
-    history = gt_latents[:, :, :1].repeat(1, 1, n_hist, 1, 1)
-
-    state, _ = model._prep_state_action(step_data)
-    context = model._zero_context(B, device, dtype)
-    # DiT embodiment-embedding slot: the DOMAIN INDEX the batch was trained
-    # with (see WAMModel._emb_ids) — 0 for single-domain runs, one slot per
-    # domain for cotrain. NOT the raw registry embodiment id.
-    eid = int(step_data.get("embodiment_id", 0))
-    emb = torch.full((B,), eid, dtype=torch.long, device=device)
-
-    num_action_per_block = getattr(
-        model.dit,
-        "num_action_per_block",
-        model.action_horizon // max(1, (F_total - 1) // K),
-    )
-
-    return {
-        "sched": sched,
-        "K": K,
-        "F_total": F_total,
-        "F_gt": F_gt,
-        "n_hist": n_hist,
-        "seq_len": seq_len,
-        "history": history,
-        "gt_latents": gt_latents,
-        "state": state,
-        "context": context,
-        "emb": emb,
-        "num_steps": num_steps,
-        "num_action_per_block": num_action_per_block,
-        "B": B,
-        "Cz": Cz,
-        "h": h,
-        "w": w,
-        "device": device,
-        "dtype": dtype,
-    }
-
-
-@torch.no_grad()
-def _sample_rolling_ar(model, step_data, num_steps=None):
-    """Fully-autoregressive rolling: history slides ONLY on the model's own K
-    new latents each step. Only the initial anchor (``gt_latents[:, :, :1]``)
-    is GT — every subsequent frame is generated. Right for measuring what the
-    model can produce open-loop; drift accumulates step-to-step.
-    """
-    ctx = _rolling_setup(model, step_data, num_steps)
-    sched, K, F_total, n_hist = ctx["sched"], ctx["K"], ctx["F_total"], ctx["n_hist"]
-    seq_len, history, gt_latents = ctx["seq_len"], ctx["history"], ctx["gt_latents"]
-    state, context, emb = ctx["state"], ctx["context"], ctx["emb"]
-    num_steps, num_action_per_block = ctx["num_steps"], ctx["num_action_per_block"]
-    B, Cz, h, w, device, dtype = (
-        ctx["B"],
-        ctx["Cz"],
-        ctx["h"],
-        ctx["w"],
-        ctx["device"],
-        ctx["dtype"],
-    )
-
-    pred_latents = []
-    pred_actions_chunks = []
-    for _step in range(num_steps):
-        video = torch.randn(B, Cz, F_total, h, w, device=device, dtype=dtype)
-        video[:, :, :n_hist] = history
-        action = torch.randn(
-            B, model.action_horizon, model.action_dim, device=device, dtype=dtype
-        )
-
-        new_latents, new_action = _rolling_denoise_step(
-            model,
-            sched,
-            video,
-            action,
-            history,
-            n_hist,
-            F_total,
-            seq_len,
-            context,
-            state,
-            emb,
-        )
-        pred_latents.append(new_latents)
-        pred_actions_chunks.append(new_action[:, -num_action_per_block:])
-
-        # AR: history slides on the model's own K new latents (no GT peek).
-        history = torch.cat([history[:, :, K:], new_latents], dim=2)
-
-    pred_actions = torch.cat(pred_actions_chunks, dim=1)
-    all_latents = torch.cat([gt_latents[:, :, :1]] + pred_latents, dim=2)
-    frames = model.vae.decode(all_latents)
-    return pred_actions, frames
-
-
-@torch.no_grad()
-def _sample_rolling_tf(model, step_data, num_steps=None):
-    """GT teacher-forced rolling (dreamzero Fig-14a): history slides with
-    ``gt_latents[:, :, step*K+1 : step*K+K+1]`` each step, so chunk k
-    conditions on GT for the previous chunk's K positions instead of the
-    model's own predictions. Right for short-horizon / one-chunk-ahead
-    forecasting quality since drift can't accumulate. If we run off the end
-    of the encoded clip we fall back to the model's own predictions (matches
-    ``WAMModel.sample_rolling`` semantics).
-    """
-    ctx = _rolling_setup(model, step_data, num_steps)
-    sched, K, F_total, F_gt, n_hist = (
-        ctx["sched"],
-        ctx["K"],
-        ctx["F_total"],
-        ctx["F_gt"],
-        ctx["n_hist"],
-    )
-    seq_len, history, gt_latents = ctx["seq_len"], ctx["history"], ctx["gt_latents"]
-    state, context, emb = ctx["state"], ctx["context"], ctx["emb"]
-    num_steps, num_action_per_block = ctx["num_steps"], ctx["num_action_per_block"]
-    B, Cz, h, w, device, dtype = (
-        ctx["B"],
-        ctx["Cz"],
-        ctx["h"],
-        ctx["w"],
-        ctx["device"],
-        ctx["dtype"],
-    )
-
-    pred_latents = []
-    pred_actions_chunks = []
-    for step in range(num_steps):
-        video = torch.randn(B, Cz, F_total, h, w, device=device, dtype=dtype)
-        video[:, :, :n_hist] = history
-        action = torch.randn(
-            B, model.action_horizon, model.action_dim, device=device, dtype=dtype
-        )
-
-        new_latents, new_action = _rolling_denoise_step(
-            model,
-            sched,
-            video,
-            action,
-            history,
-            n_hist,
-            F_total,
-            seq_len,
-            context,
-            state,
-            emb,
-        )
-        pred_latents.append(new_latents)
-        pred_actions_chunks.append(new_action[:, -num_action_per_block:])
-
-        # TF: history slides with GT latents from the input clip; if we've
-        # exhausted GT, tail with the model's own predictions.
-        next_gt_start = step * K + 1
-        next_gt_end = next_gt_start + K
-        if next_gt_end <= F_gt:
-            newest = gt_latents[:, :, next_gt_start:next_gt_end]
-        elif next_gt_start < F_gt:
-            newest_gt = gt_latents[:, :, next_gt_start:F_gt]
-            fill = K - (F_gt - next_gt_start)
-            newest = torch.cat([newest_gt, new_latents[:, :, -fill:]], dim=2)
-        else:
-            newest = new_latents
-        history = torch.cat([history[:, :, K:], newest], dim=2)
-
-    pred_actions = torch.cat(pred_actions_chunks, dim=1)
-    all_latents = torch.cat([gt_latents[:, :, :1]] + pred_latents, dim=2)
-    frames = model.vae.decode(all_latents)
-    return pred_actions, frames
-
-
-def _patch_algo_use_sample_rolling(algo, teacher_force: bool = False) -> None:
-    """Replace ``WAM.val_rollout`` (and ``forward_eval``) on the loaded algo
-    with EITHER ``_sample_rolling_ar`` (fully autoregressive, no GT
-    reconditioning after the anchor) OR ``_sample_rolling_tf`` (dreamzero
-    Fig-14a GT teacher-forced, recondition every K latents).
-
-    Which of the two is used depends on ``teacher_force``, which the offline
-    eval reads off the evaluator yaml (``evaluator=eval_dreamzero_ar`` vs
-    ``eval_dreamzero_tf``).
-
-    Why not modify ``WAMModel.sample_rolling`` directly: we keep ``wam.py``
-    untouched to preserve training-time val behavior. Rebinding bound methods
-    on the loaded algo instead of subclassing means trainer / evaluator see
-    the patched behavior without any Hydra-side plumbing changes.
-    """
-    _rolling_fn = _sample_rolling_tf if teacher_force else _sample_rolling_ar
-
-    def val_rollout(eid, batch):
-        model = algo.nets["policy"]
-
-        video_clip = None
-        for key in algo.camera_keys[eid]:
-            if key in batch:
-                video_clip = batch[key]
-                break
-
-        states = []
-        for key in algo.proprio_keys[eid]:
-            if key in batch:
-                s = batch[key]
-                states.append(s.unsqueeze(1) if s.dim() == 2 else s)
-        full_state = torch.cat(states, dim=-1) if states else None
-
-        step_data = {
-            "video": video_clip,
-            "state": full_state,
-            "action": batch[algo.ac_keys[eid]],
-            # domain index for the DiT emb table (0 for single-domain runs)
-            "embodiment_id": getattr(algo, "_dit_emb_index", {}).get(eid, 0),
-        }
-        pred_actions, pred_frames = _rolling_fn(model, step_data)
-        viz_video = pred_frames[:, :, 1:]  # drop the VAE recon of the anchor
-        return pred_actions, viz_video
-
-    def forward_eval(batch):
-        # Same structure as WAM.forward_eval but routed through the patched
-        # val_rollout above. Preserves the {name}_loss, {name}_action_loss,
-        # {name}_world_loss, {name}_{ac_key} keys the evaluator reads.
-        unnorm_preds = {}
-        algo._eval_frames = {}
-        for eid, _batch in batch.items():
-            name = get_embodiment(eid).lower()
-            ac_key = algo.ac_keys[eid]
-            data = algo._to_wam_data(eid, _batch)
-            loss, parts = algo.nets["policy"].compute_loss(
-                {"domain": name, "data": data}
-            )
-            unnorm_preds[f"{name}_loss"] = loss
-            for pk, pv in parts.items():
-                unnorm_preds[f"{name}_{pk}"] = pv
-            pred_actions, viz_video = val_rollout(eid, _batch)
-            algo._eval_frames[eid] = viz_video
-            ref = _batch[ac_key]
-            _, _, D = ref.shape
-            # Keep the FULL rolled prediction so viz can draw arrows past GT's
-            # dataset horizon; MSE slices inside compute_metrics_and_viz.
-            preds = OrderedDict({ac_key: pred_actions[:, :, :D]})
-            for key, val in algo.data_schematic.unnormalize_data(preds, eid).items():
-                unnorm_preds[f"{name}_{key}"] = val
-        return unnorm_preds
-
-    algo.val_rollout = val_rollout
-    algo.forward_eval = forward_eval
-    mode_str = (
+    algo.val_teacher_force = bool(teacher_force)
+    if hasattr(algo, "_episode_rollers"):
+        algo._episode_rollers = {}  # rebuild with the new mode
+    mode = (
         "GT teacher-forced (recondition every K latents)"
         if teacher_force
-        else "fully-autoregressive (no GT reconditioning after anchor)"
+        else "fully-autoregressive (no GT reconditioning after the anchor)"
     )
-    log.info(
-        f"[eval_dreamzero] algo.val_rollout / forward_eval patched — "
-        f"rolling mode: {mode_str}"
-    )
+    log.info(f"[eval_dreamzero] rolling mode: {mode}")
+
+
+def _dump_metrics(trainer, out_path: str) -> None:
+    """Write the val metrics as a flat JSON dict for the sweep aggregator."""
+    import json
+
+    metrics = {}
+    for k, v in trainer.callback_metrics.items():
+        try:
+            metrics[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
+    log.info(f"[eval_dreamzero] wrote {len(metrics)} metrics -> {out_path}")
 
 
 def _force_ood_split(
@@ -523,16 +229,27 @@ def main(cfg: DictConfig) -> None:
             f"valid episodes (valid_mode={valid_mode}, overlap={len(overlap)})"
         )
 
-    # Restrict valid to the first N episodes (sorted for determinism), one
-    # window each. limit_val_batches equals the resulting window count (with
-    # batch_size forced to 1 the val loop is exactly one pass per episode).
+    # Plan a FULL-EPISODE walk: keep the first N episodes (sorted for
+    # determinism) and tile each into cam_horizon-length windows at stride
+    # cam_horizon-1, in order. With batch_size forced to 1 the val loop then
+    # walks episode 0 end-to-end, then episode 1, ... and the evaluator emits
+    # ONE mp4 pair per episode covering the whole episode.
     total_windows = 0
+    all_plans = []
     for name, mds in valid_datasets.items():
-        _restrict_to_first_n_episodes(mds, num_val_episodes)
+        plans = plan_full_episode_walk(
+            mds,
+            num_val_episodes,
+            max_windows_per_episode=cfg.get("max_windows_per_episode"),
+            log=log,
+        )
+        all_plans.extend(plans)
         total_windows += len(mds)
     log.info(
-        f"[eval_dreamzero] Sweeping {total_windows} total val windows "
-        f"(one window x {num_val_episodes} episodes per dataset)."
+        f"[eval_dreamzero] {len(all_plans)} episodes / {total_windows} val "
+        f"windows; expected video length "
+        f"{[p.pred_pixel_frames for p in all_plans]} frames "
+        f"({[round(p.duration_s, 1) for p in all_plans]} s at {WAM_VIDEO_FPS} fps)"
     )
 
     assert (
@@ -612,7 +329,7 @@ def main(cfg: DictConfig) -> None:
     # Route eval through the selected rolling sampler — must happen AFTER
     # load_state_dict since we rebind bound methods on the loaded algo.
     teacher_force_rolling = bool(getattr(eval_obj, "teacher_force_rolling", False))
-    _patch_algo_use_sample_rolling(model.model, teacher_force=teacher_force_rolling)
+    _select_rolling_mode(model.model, teacher_force=teacher_force_rolling)
 
     log.info("[eval_dreamzero] Starting evaluation!")
     trainer.validate(model=model, datamodule=datamodule)
@@ -624,6 +341,14 @@ def main(cfg: DictConfig) -> None:
             log.info(f"[eval_dreamzero] metric {k} = {float(v):.6f}")
         except (TypeError, ValueError):
             pass
+
+    # Per-episode roller stats: how much of each episode the rollout covered.
+    for eid, roller in getattr(model.model, "_episode_rollers", {}).items():
+        log.info(f"[eval_dreamzero] roller[{eid}] final stats: {roller.stats()}")
+
+    metrics_out = cfg.get("metrics_out")
+    if metrics_out:
+        _dump_metrics(trainer, str(metrics_out))
 
 
 if __name__ == "__main__":

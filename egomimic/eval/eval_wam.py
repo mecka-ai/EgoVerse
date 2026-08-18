@@ -7,6 +7,7 @@ import torchvision.io as tvio
 from torchmetrics import MeanSquaredError
 
 from egomimic.eval.eval_video import EvalVideo
+from egomimic.eval.wam_rollout import WAM_VIDEO_FPS
 from egomimic.rldb.embodiment.embodiment import get_embodiment
 
 
@@ -20,7 +21,10 @@ def _is_rank0() -> bool:
 
 class WAMEvalVideo(EvalVideo):
     """Evaluator for WAM (World-Action Model). Per embodiment it writes TWO
-    separate validation videos per val sample:
+    separate validation videos per val sample — and when the val split is built
+    with one full-episode window per episode (``egomimic.eval.wam_episode``,
+    used by both the training-time evaluator and the offline driver) "per val
+    sample" means **per episode**, so each mp4 spans a whole episode:
 
       1. ``validation_video_*.mp4`` — animated predicted vs GT **action**
          overlay drawn on the GT observation clip (via ``viz_func``); BC loss
@@ -39,14 +43,20 @@ class WAMEvalVideo(EvalVideo):
       Within each DiT action-chunk window (``num_action_per_block`` actions)
       the arrow trail shrinks by one action per output frame and resets to
       full length at every chunk boundary.
+
+    Both mp4s of a given episode are written with the SAME frame count and the
+    SAME fps (``wam_rollout.WAM_VIDEO_FPS``), so an episode of N predicted
+    frames yields two N-frame clips of N / fps seconds that play in lockstep.
     """
 
-    # Playback rate for both mp4s. Our mecka WAM clips are short (16 predicted
-    # frames per sample at FR=1), so play at 10 fps (~1.6 s/sample; real-time
-    # source rate would be 30). Both videos have the same frame count per
-    # sample so they stay in sync side-by-side.
-    VAL_FPS = 10
-    PREDICTED_FPS = 10
+    # Playback rate for BOTH mp4s — see ``wam_rollout.WAM_VIDEO_FPS`` (the
+    # single source of truth). Both videos are written with the same frame
+    # count per episode so they stay frame-synchronised side by side, and both
+    # use the same rate so an N-frame clip always lasts N / fps seconds. Do not
+    # reintroduce separate VAL_FPS / PREDICTED_FPS constants: two rates for two
+    # videos of the same episode is what made the pair play at different speeds.
+    VAL_FPS = WAM_VIDEO_FPS
+    PREDICTED_FPS = WAM_VIDEO_FPS
 
     def __init__(
         self,
@@ -165,6 +175,16 @@ class WAMEvalVideo(EvalVideo):
         FR = max(1, int(round(n_gt / max(1, T_pix - 1))))
         total_out_frames = (T_pix - 1) * FR
 
+        # Keep validation_video and predicted_video the SAME length so the pair
+        # is frame-synchronised and both mp4s report the same duration at
+        # WAM_VIDEO_FPS. The rolling rollout emits K*num_chunks latents ->
+        # 4*K*num_chunks pixel frames, which is <= (T_pix - 1) whenever the
+        # episode length is not exactly 1 (mod 4*K); trim the GT-overlay
+        # timeline to match rather than letting the two videos drift apart.
+        pred_video_probe = getattr(self.model, "_eval_frames", {}).get(embodiment_id)
+        if pred_video_probe is not None:
+            total_out_frames = min(total_out_frames, pred_video_probe.shape[2] * FR)
+
         # Per-raw-frame head-pose chunk (see Mecka.get_wam_keymap ->
         # ``obs_head_pose_chunk``). Shape (B, cam_horizon, 7) xyzwxyz; row 0 ==
         # the pose the data-pipeline transform used as target (H_0), row k ==
@@ -262,11 +282,14 @@ class WAMEvalVideo(EvalVideo):
         # other ranks fall back to the raw (non-overlay) VAE decode in
         # ``on_validation_step`` and clear their buffers in
         # ``on_validation_end``.
-        pred_video_t = getattr(self.model, "_eval_frames", {}).get(embodiment_id)
+        pred_video_t = pred_video_probe
         if _is_rank0() and pred_video_t is not None:
             image_key = some_ck
             ref_H = clip_by_cam[image_key].shape[-2]
             ref_W = clip_by_cam[image_key].shape[-1]
+            # Trim to the same length the GT-overlay timeline was trimmed to, so
+            # the two mp4s of this episode have identical frame counts.
+            pred_video_t = pred_video_t[:, :, : total_out_frames // FR]
             Bp, Cp, T_pred, _, _ = pred_video_t.shape
             pv = F.interpolate(
                 pred_video_t.permute(0, 2, 1, 3, 4).reshape(
@@ -329,6 +352,69 @@ class WAMEvalVideo(EvalVideo):
             self._pred_buffer = {}
             self._pred_step_count = {}
             self._val_step_count = {}
+        if not hasattr(self, "_ep_open"):
+            # ONE open clip per (video kind, embodiment): [episode_hash, frames].
+            # The val split walks each episode start-to-finish (see
+            # egomimic.eval.wam_episode), so frames arrive grouped by episode and
+            # a clip can be written the moment the episode_hash changes. Writing
+            # eagerly matters: a 1936-frame episode of 360x640 RGB is ~1.3 GB per
+            # video kind, so holding all 5 val episodes until on_validation_end
+            # would need ~13 GB of frame buffers.
+            #
+            # This replaces the old "split the flat buffer into n_samples equal
+            # slices" scheme, which assumed one mp4 per val STEP and cannot
+            # express episodes with differing window counts.
+            self._ep_open: dict[tuple[str, int], list] = {}
+            self._ep_ordinal: dict[tuple[str, int], int] = {}
+
+    @staticmethod
+    def _episode_key(_batch) -> str:
+        """Stable per-episode identity for grouping frames into one mp4."""
+        ep = _batch.get("episode_hash") if isinstance(_batch, dict) else None
+        if isinstance(ep, (list, tuple)):
+            return str(ep[0]) if len(ep) else "episode_0"
+        return "episode_0" if ep is None else str(ep)
+
+    def _append_episode_frames(self, stem: str, eid, episode: str, frames) -> None:
+        """Buffer ``frames`` into the open clip, flushing on episode change."""
+        key = (stem, eid)
+        cur = self._ep_open.get(key)
+        if cur is not None and cur[0] != episode:
+            self._flush_episode(stem, eid)
+            cur = None
+        if cur is None:
+            cur = [episode, []]
+            self._ep_open[key] = cur
+        cur[1].extend(torch.from_numpy(frames))
+
+    def _flush_episode(self, stem: str, eid) -> None:
+        """Write the open ``<stem>`` clip for ``eid`` and free its frames."""
+        key = (stem, eid)
+        cur = self._ep_open.pop(key, None)
+        if cur is None or not cur[1]:
+            return
+        episode, frames = cur
+        # Ordinal is per (kind, embodiment) and both kinds are appended in the
+        # same step order, so predicted_video_<s> and validation_video_<s> are
+        # always the same episode.
+        s = self._ep_ordinal.get(key, 0)
+        self._ep_ordinal[key] = s + 1
+        out_dir = os.path.join(
+            self.video_dir(),
+            f"epoch_{self.trainer.current_epoch}",
+            str(get_embodiment(eid)),
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"{stem}_{s}.mp4")
+        stacked = torch.stack(frames)
+        frames.clear()
+        tvio.write_video(path, stacked, fps=WAM_VIDEO_FPS, video_codec="h264")
+        print(
+            f"[WAMEvalVideo] {stem}_{s}.mp4: episode {episode} "
+            f"{stacked.shape[0]} frames @ {WAM_VIDEO_FPS} fps = "
+            f"{stacked.shape[0] / WAM_VIDEO_FPS:.2f}s -> {path}",
+            flush=True,
+        )
 
     def on_validation_step(self, batch, batch_idx, dataloader_idx=0):
         # Reimplements the base's metric-log + frame-buffer WITHOUT its
@@ -345,11 +431,16 @@ class WAMEvalVideo(EvalVideo):
             for k, v in metrics.items()
         }
 
+        # RANK-GUARD: only rank 0 buffers/writes mp4s (h264 encode + shared-FS
+        # writes on every rank caused per-rank divergence and NCCL watchdog
+        # timeouts). Other ranks still log metrics below.
+        rank0 = _is_rank0()
+
         for key, images in images_dict.items():
-            if key not in self.val_image_buffer or self.val_image_buffer[key] is None:
-                self.val_image_buffer[key] = []
-                self.val_counter[key] = 0
-            self.val_image_buffer[key].extend(torch.from_numpy(images))
+            if rank0:
+                self._append_episode_frames(
+                    "validation_video", key, self._episode_key(batch.get(key)), images
+                )
             self._val_step_count[key] = self._val_step_count.get(key, 0) + 1
 
         for eid, video in getattr(self.model, "_eval_frames", {}).items():
@@ -359,11 +450,14 @@ class WAMEvalVideo(EvalVideo):
             # compute_metrics_and_viz. Fall back to raw upscaled pred frames
             # if the overlay cache is missing (non-rank0, or no clip batch).
             overlay = getattr(self, "_pred_overlay_cache", {}).pop(eid, None)
-            if overlay is not None:
-                frames = overlay
-            else:
-                frames = self._predicted_frames_all(video)  # (B*T, Hd, Wd, 3)
-            self._pred_buffer.setdefault(eid, []).extend(torch.from_numpy(frames))
+            if rank0:
+                if overlay is not None:
+                    frames = overlay
+                else:
+                    frames = self._predicted_frames_all(video)  # (B*T, Hd, Wd, 3)
+                self._append_episode_frames(
+                    "predicted_video", eid, self._episode_key(batch.get(eid)), frames
+                )
             self._pred_step_count[eid] = self._pred_step_count.get(eid, 0) + 1
 
         # add_dataloader_idx=False: keep canonical Valid/ chart names (see the
@@ -379,74 +473,23 @@ class WAMEvalVideo(EvalVideo):
         # frames from its OWN shard of val samples (DistributedSampler), so
         # rank-0-only writes lose the other shards' videos — fine for
         # training-time eyeballing; offline eval runs single-rank anyway.
-        if not _is_rank0():
-            self._pred_buffer = {}
-            self._pred_step_count = {}
-            for key in list(self.val_image_buffer.keys()):
-                self.val_image_buffer[key] = []
-                self.val_counter[key] = 0
-            self._val_step_count = {}
-            return
+        # Flush whatever episode was still open when the val loop ended (the
+        # per-episode writes themselves already happened in on_validation_step
+        # as each episode finished).
+        if _is_rank0():
+            for stem, eid in list(self._ep_open.keys()):
+                self._flush_episode(stem, eid)
+        self._reset_buffers()
 
-        # PREDICTED: one mp4 per val step (per-eid sizes inferred from the
-        # buffer length / step count).
-        for eid, buf in self._pred_buffer.items():
-            if not buf:
-                continue
-            n_samples = self._pred_step_count.get(eid, 0)
-            if n_samples <= 0:
-                continue
-            frames_per_sample = len(buf) // n_samples
-            if frames_per_sample <= 0:
-                continue
-            out_dir = os.path.join(
-                self.video_dir(),
-                f"epoch_{self.trainer.current_epoch}",
-                str(get_embodiment(eid)),
-            )
-            os.makedirs(out_dir, exist_ok=True)
-            for s in range(n_samples):
-                frames = torch.stack(
-                    buf[s * frames_per_sample : (s + 1) * frames_per_sample]
-                )
-                tvio.write_video(
-                    os.path.join(out_dir, f"predicted_video_{s}.mp4"),
-                    frames,
-                    fps=self.PREDICTED_FPS,
-                    video_codec="h264",
-                )
+    def _reset_buffers(self) -> None:
+        self._ep_open = {}
+        self._ep_ordinal = {}
         self._pred_buffer = {}
         self._pred_step_count = {}
-
-        # VAL OVERLAY: one mp4 per val step, similarly inferred.
-        for key, buffer in self.val_image_buffer.items():
-            if not buffer:
-                continue
-            n_samples = self._val_step_count.get(key, 0)
-            if n_samples <= 0:
-                continue
-            frames_per_sample = len(buffer) // n_samples
-            if frames_per_sample <= 0:
-                continue
-            out_dir = os.path.join(
-                self.video_dir(),
-                f"epoch_{self.trainer.current_epoch}",
-                str(get_embodiment(key)),
-            )
-            os.makedirs(out_dir, exist_ok=True)
-            for s in range(n_samples):
-                frames = torch.stack(
-                    buffer[s * frames_per_sample : (s + 1) * frames_per_sample]
-                )
-                tvio.write_video(
-                    os.path.join(out_dir, f"validation_video_{s}.mp4"),
-                    frames,
-                    fps=self.VAL_FPS,
-                    video_codec="h264",
-                )
-            self.val_counter[key] = 0
-            self.val_image_buffer[key] = []
         self._val_step_count = {}
+        for key in list(self.val_image_buffer.keys()):
+            self.val_image_buffer[key] = []
+            self.val_counter[key] = 0
 
     # ------------------------------------------------------------------
     # Helpers

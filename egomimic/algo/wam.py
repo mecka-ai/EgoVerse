@@ -208,131 +208,48 @@ class WAMModel(nn.Module):
         return loss, {"action_loss": action_loss, "world_loss": world_loss}
 
     # --- inference: rolling-window video prediction -------------------------
-    @torch.no_grad()
-    def sample_rolling(self, data, num_steps=None):
-        """DreamZero-style sliding-window inference. K-generic: predicts K
-        latent frames per DiT forward (K = num_frame_per_block), slides the
-        history window by K each step. Past-context slots use GT observations
-        from the val clip; when GT runs out we fall back to the model's own
-        last predictions.
+    def sample_rolling(
+        self,
+        data,
+        num_steps=None,
+        teacher_force: bool = True,
+        log=None,
+        return_geometry: bool = False,
+    ):
+        """DreamZero-style rolling inference over the WHOLE clip in ``data``.
 
-        Layout per DiT forward (num_video_frames = F_total, K = num_frame_per_block):
-            video   = [past_0..past_{n_hist-1}, noisy_0..noisy_{K-1}]  # (F_total frames)
-            clean_x = [past_0..past_{n_hist-1}, video_last_K]          # tf-prefix
-            ts_v    = [  0    ...     0        ,    t    ...   t   ]
-        with n_hist = F_total - K.
+        Thin wrapper around ``egomimic.eval.wam_rollout.rollout_episode`` — the
+        ONE implementation shared with the offline eval driver
+        (``egomimic.eval.eval_dreamzero``). ``data["video"]`` may be a single
+        training window or an entire episode; it is encoded into one continuous
+        latent timeline and every chunk's conditioning context is gathered from
+        that timeline by absolute latent index, so the teacher-forcing boundary
+        (``ctx_end == chunk_start``) holds for every chunk of the episode. See
+        ``wam_rollout`` for the index arithmetic and the invariants it asserts.
+
+        Args:
+            data: ``{"video", "state", "action", "embodiment_id"}``.
+            num_steps: cap on rolling chunks (``None`` = as many as the clip
+                supports).
+            teacher_force: True (default, dreamzero Fig-14a) conditions each
+                chunk on GT latents; False rolls fully autoregressively on the
+                model's own predictions.
 
         Returns:
-          actions (B, num_steps*num_action_per_block, action_dim) — assembled
-                  across rolling steps (num_action_per_block per step from the
-                  last DiT block)
-          frames  (B, C, T_pix, H, W) in [-1, 1] — VAE decode of
-                  [GT_cond_0] + [K * num_steps predicted latents]
+            actions (B, num_chunks*num_action_per_block, action_dim)
+            frames  (B, C, T_pix, H, W) in [-1, 1] — VAE decode of
+                    [GT anchor] + [K * num_chunks predicted latents]
         """
-        sched = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
-        sched.set_timesteps(self.num_inference_steps, training=False)
+        from egomimic.eval.wam_rollout import rollout_episode
 
-        # K = num predicted latents per DiT forward (chunk size).
-        K = getattr(self.dit, "num_frame_per_block", 1)
-        F_total = self.num_video_frames  # e.g. 5 (wan22_5b mecka: 1 cond + 4 pred)
-        n_hist = F_total - K
-
-        # Encode ALL available GT frames from the clip -> GT latent trajectory.
-        gt_latents = self._encode(data["video"])  # (B, Cz, F_gt, h, w)
-        B, Cz, F_gt, h, w = gt_latents.shape
-        device = gt_latents.device
-        dtype = gt_latents.dtype
-
-        # Dynamic step count: roll as long as the next slide can still pull in
-        # a full K-latent chunk from GT. Stops when GT context is exhausted.
-        # Bootstrap step 0 always happens; each subsequent step needs the next
-        # gt[step*K + 1 : step*K + K + 1] slice to exist inside F_gt.
-        max_steps_by_gt = max(1, (F_gt - 1) // K)
-        if num_steps is None:
-            num_steps = max_steps_by_gt
-        else:
-            num_steps = min(num_steps, max_steps_by_gt)
-
-        seq_len = F_total * (h // 2) * (w // 2)
-
-        # Bootstrap history: n_hist copies of g0.
-        history = gt_latents[:, :, :1].repeat(1, 1, n_hist, 1, 1)
-
-        state, _ = self._prep_state_action(data)
-        context = self._zero_context(B, device, dtype)
-        # Cross-embodiment conditioning: use the domain index the batch was
-        # trained with (see ``_emb_ids``) so val hits the same embedding slot
-        # as training. Single-domain runs -> slot 0 (unchanged behavior).
-        emb = self._emb_ids(data, B, device)
-
-        # num_action_per_block = actions the DiT allocates to one block. Per
-        # rolling step we take the actions from the LAST block (aligned with
-        # the currently-predicted chunk of K latents).
-        num_action_per_block = getattr(
-            self.dit,
-            "num_action_per_block",
-            self.action_horizon // ((F_total - 1) // K),
+        return rollout_episode(
+            self,
+            data,
+            teacher_force=teacher_force,
+            num_chunks=num_steps,
+            log=log,
+            return_geometry=return_geometry,
         )
-
-        pred_latents = []
-        pred_actions_chunks = []
-        for step in range(num_steps):
-            # Build the F_total-frame video: n_hist clean history + K noise slots.
-            video = torch.randn(B, Cz, F_total, h, w, device=device, dtype=dtype)
-            video[:, :, :n_hist] = history
-            action = torch.randn(
-                B, self.action_horizon, self.action_dim, device=device, dtype=dtype
-            )
-
-            for t in sched.timesteps:
-                ts_v = torch.zeros(B, F_total, device=device)
-                ts_v[:, n_hist:] = t  # last K frames noisy
-                ts_a = t.to(device).expand(B, self.action_horizon)
-                clean_x = torch.cat([history, video[:, :, n_hist:]], dim=2)
-
-                v_vel, a_vel = self.dit(
-                    video,
-                    ts_v,
-                    ts_a,
-                    context,
-                    seq_len,
-                    action=action,
-                    state=state,
-                    embodiment_id=emb,
-                    clean_x=clean_x,
-                )
-                video = sched.step(v_vel, t, video)
-                video[:, :, :n_hist] = history  # keep past clean
-                action = sched.step(a_vel, t, action)
-
-            new_latents = video[:, :, n_hist:]  # (B, Cz, K, h, w)
-            pred_latents.append(new_latents)
-            pred_actions_chunks.append(action[:, -num_action_per_block:])
-
-            # Slide window by K: drop oldest K, add newest K.
-            # Chunk k semantically represents latents at times (k*K+1, ..., k*K+K)
-            # (starting after the initial g0 anchor at time 0). Teacher-forcing
-            # replaces those predicted positions with their GT counterparts.
-            next_gt_start = step * K + 1
-            next_gt_end = next_gt_start + K
-            if next_gt_end <= F_gt:
-                newest = gt_latents[:, :, next_gt_start:next_gt_end]
-            elif next_gt_start < F_gt:
-                # Partial GT + fall back to prediction for the tail.
-                newest_gt = gt_latents[:, :, next_gt_start:F_gt]
-                fill = K - (F_gt - next_gt_start)
-                newest = torch.cat([newest_gt, new_latents[:, :, -fill:]], dim=2)
-            else:
-                newest = new_latents  # fully autoregressive tail
-            history = torch.cat([history[:, :, K:], newest], dim=2)
-
-        pred_actions = torch.cat(
-            pred_actions_chunks, dim=1
-        )  # (B, num_steps*num_action_per_block, action_dim)
-        # Decode: initial GT cond + all predicted latents (in time order).
-        all_latents = torch.cat([gt_latents[:, :, :1]] + pred_latents, dim=2)
-        frames = self.vae.decode(all_latents)
-        return pred_actions, frames
 
     # --- inference: jointly sample action chunk + future frame --------------
     @torch.no_grad()
@@ -406,6 +323,10 @@ class WAM(Algo):
         world_loss_weight: float = 1.0,
         num_inference_steps: int = 16,
         val_rollout_chunks: int = None,  # override for sample_rolling num_steps
+        # Rolling mode for the val loop. True (default) = dreamzero Fig-14a GT
+        # teacher forcing; False = fully autoregressive. The offline driver flips
+        # it from the evaluator yaml (eval_dreamzero_tf vs eval_dreamzero_ar).
+        val_teacher_force: bool = True,
         domains: list = None,
         ac_keys: dict = None,
         **kwargs,
@@ -416,6 +337,7 @@ class WAM(Algo):
         self.viz_func = viz_func
         self.camera_transforms = camera_transforms
         self.val_rollout_chunks = val_rollout_chunks
+        self.val_teacher_force = bool(val_teacher_force)
         self.domains = domains.copy()
         self.ac_keys = ac_keys or {}
         self.device = kwargs.get(
@@ -478,9 +400,7 @@ class WAM(Algo):
                 # the others, and viz-time extras (per-frame head pose chunk,
                 # per-episode intrinsics) never reach the evaluator. Mirrors
                 # the upstream hpt.py fix (commit 532e288d).
-                key_name = (
-                    self.data_schematic.zarr_key_to_keyname(key, eid) or key
-                )
+                key_name = self.data_schematic.zarr_key_to_keyname(key, eid) or key
                 processed[eid][key_name] = value
             ac_key = self.ac_keys[eid]
             B, S, _ = processed[eid][ac_key].shape
@@ -552,8 +472,6 @@ class WAM(Algo):
           viz_video    (B, C, T_pred, H, W) — predicted future pixel frames
                        (VAE recon of the GT anchor at idx 0 dropped).
         """
-        model = self.nets["policy"]
-
         video_clip = None
         for key in self.camera_keys[eid]:
             if key in batch:
@@ -568,17 +486,47 @@ class WAM(Algo):
         full_state = torch.cat(states, dim=-1) if states else None
 
         step_data = {
-            "video": video_clip,  # FULL clip -> sample_rolling encodes all frames
+            "video": video_clip,  # FULL clip -> the roller encodes all frames
             "state": full_state,
             "action": batch[self.ac_keys[eid]],
             # domain index for the DiT emb table (0 for single-domain runs)
             "embodiment_id": self._dit_emb_index.get(eid, 0),
         }
-        pred_actions, pred_frames = model.sample_rolling(
-            step_data, num_steps=self.val_rollout_chunks
-        )
-        viz_video = pred_frames[:, :, 1:]  # drop VAE recon of the GT anchor at idx 0
-        return pred_actions, viz_video
+
+        # Continuous full-episode rolling. The val split tiles each episode into
+        # cam_horizon-length windows (see egomimic.eval.wam_episode), so one call
+        # here handles ONE window while the roller carries the teacher-forcing
+        # context across window seams on the episode's latent timeline. Restart
+        # the context only when the episode itself changes — rebuilding it per
+        # window is the bug where conditioning snaps back to an earlier window.
+        roller = self._episode_roller(eid)
+        episode = self._episode_key(batch)
+        if roller.episode_key != episode:
+            roller.begin_episode(episode)
+        # roll_window already drops the VAE recon of the window's GT anchor, so
+        # the per-window results concatenate into one seam-free episode clip.
+        return roller.roll_window(step_data)
+
+    def _episode_roller(self, eid):
+        """Lazily-created per-embodiment ``EpisodeRoller`` (see wam_rollout)."""
+        from egomimic.eval.wam_rollout import EpisodeRoller
+
+        if not hasattr(self, "_episode_rollers"):
+            self._episode_rollers = {}
+        if eid not in self._episode_rollers:
+            self._episode_rollers[eid] = EpisodeRoller(
+                self.nets["policy"],
+                teacher_force=self.val_teacher_force,
+            )
+        return self._episode_rollers[eid]
+
+    @staticmethod
+    def _episode_key(batch) -> str:
+        """Episode identity of a val batch, used to detect episode boundaries."""
+        ep = batch.get("episode_hash")
+        if isinstance(ep, (list, tuple)):
+            return str(ep[0]) if len(ep) else "episode_0"
+        return "episode_0" if ep is None else str(ep)
 
     @override
     def forward_eval(self, batch):
