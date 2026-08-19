@@ -83,12 +83,41 @@ import torch
 # --------------------------------------------------------------------------
 # Playback rate for BOTH `predicted_video_*.mp4` and `validation_video_*.mp4`.
 # The two videos are written with the same frame count per episode so they stay
-# frame-synchronised side by side, and both are written at this rate so a clip
-# of N frames always lasts N / WAM_VIDEO_FPS seconds.
+# frame-synchronised side by side, and both are written at this rate. Frames are
+# SUBSAMPLED from the native prediction rate to reach it (see
+# ``video_frame_stride``) so playback is real time, never slow motion.
 WAM_VIDEO_FPS = 5
 
 # Pixel frames represented by one non-anchor latent frame (Wan VAE 4x temporal).
 LATENT_PIXEL_STRIDE = 4
+
+# Frame rate of the SOURCE frames the rollout predicts at. This is NOT a display
+# choice: ``VideoVAE38_.encode`` consumes ``x[:, :, 1+4*(i-1) : 1+4*i]`` per
+# latent and ``decode`` emits 4 DISTINCT pixel frames per latent, at whatever
+# temporal spacing the frames were fed in with. This fork's WAM keymap reads
+# ``cam_horizon`` CONSECUTIVE frames from a 30 fps mecka zarr (upstream's
+# ``video_stride=6``, which pre-subsampled 30 -> 5 fps before the VAE, is not
+# ported), so the model's native prediction granularity is one frame per 30 fps
+# source frame. Overridden per-episode from the zarr metadata where available.
+DEFAULT_SOURCE_FPS = 30.0
+
+
+def video_frame_stride(source_fps: float = DEFAULT_SOURCE_FPS) -> int:
+    """Keep every Nth predicted frame so the mp4 plays back in REAL TIME.
+
+    The model predicts at ``source_fps`` granularity (see ``DEFAULT_SOURCE_FPS``)
+    but the mp4s are written at ``WAM_VIDEO_FPS``. Writing every predicted frame
+    into a 5 fps container turns 64.8 s of episode into 387 s of video — a 6x
+    slowdown. Subsampling the ASSEMBLED frames by this stride gives real-time
+    playback instead.
+
+    This is deliberately a video-assembly concern only: the rollout, the
+    teacher-forcing conditioning, the chunk/latent geometry and the per-frame
+    action predictions all stay at native ``source_fps`` granularity, and the
+    metrics are computed over ALL predicted frames. Only which frames get
+    encoded into the container changes.
+    """
+    return max(1, int(round(float(source_fps) / float(WAM_VIDEO_FPS))))
 
 
 def latents_to_pixels(num_latents: int) -> int:
@@ -203,17 +232,26 @@ class RollingGeometry:
         """Pixel frames in the emitted video (anchor recon dropped)."""
         return latents_to_pixels(1 + self.pred_latents) - 1
 
-    @property
-    def duration_s(self) -> float:
-        return self.pred_pixel_frames / WAM_VIDEO_FPS
+    def video_frames(self, source_fps: float = DEFAULT_SOURCE_FPS) -> int:
+        """Frames actually written to the mp4 after real-time subsampling."""
+        stride = video_frame_stride(source_fps)
+        return (self.pred_pixel_frames + stride - 1) // stride
 
-    def summary(self) -> str:
+    def duration_s(self, source_fps: float = DEFAULT_SOURCE_FPS) -> float:
+        """Playback length of the mp4. Equals the real elapsed time of the
+        predicted span (``pred_pixel_frames / source_fps``) up to one frame."""
+        return self.video_frames(source_fps) / WAM_VIDEO_FPS
+
+    def summary(self, source_fps: float = DEFAULT_SOURCE_FPS) -> str:
         return (
             f"K={self.K} F_total={self.F_total} n_hist={self.n_hist} "
             f"F_gt={self.F_gt} chunks={self.num_chunks} "
             f"pred_latents={self.pred_latents} "
-            f"pred_frames={self.pred_pixel_frames} "
-            f"fps={WAM_VIDEO_FPS} duration={self.duration_s:.2f}s"
+            f"pred_frames={self.pred_pixel_frames} @ {source_fps:g} fps native "
+            f"-> stride {video_frame_stride(source_fps)} -> "
+            f"{self.video_frames(source_fps)} frames @ {WAM_VIDEO_FPS} fps = "
+            f"{self.duration_s(source_fps):.2f}s "
+            f"(real time {self.pred_pixel_frames / source_fps:.2f}s)"
         )
 
 

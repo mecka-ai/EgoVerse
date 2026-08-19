@@ -246,11 +246,20 @@ def main(cfg: DictConfig) -> None:
         all_plans.extend(plans)
         total_windows += len(mds)
     log.info(
-        f"[eval_dreamzero] {len(all_plans)} episodes / {total_windows} val "
-        f"windows; expected video length "
-        f"{[p.pred_pixel_frames for p in all_plans]} frames "
-        f"({[round(p.duration_s, 1) for p in all_plans]} s at {WAM_VIDEO_FPS} fps)"
+        f"[eval_dreamzero] {len(all_plans)} episodes / {total_windows} val windows"
     )
+    for p in all_plans:
+        # The self-check that catches "5 fps by slowing down": the mp4's playback
+        # length must equal the REAL elapsed time of the span it covers.
+        log.info(
+            f"[eval_dreamzero] {p.episode}: {p.video_frames} frames @ "
+            f"{WAM_VIDEO_FPS} fps = {p.duration_s:.1f}s "
+            f"(episode {p.total_frames} frames @ {p.source_fps:g} fps = "
+            f"{p.episode_duration_s:.1f}s real; predicted span "
+            f"{p.pred_pixel_frames} frames = {p.predicted_span_s:.1f}s real; "
+            f"video subsample x{p.frame_stride})"
+        )
+        p.assert_realtime()
 
     assert (
         "MultiDataModuleWrapper" in cfg.data._target_
@@ -311,6 +320,23 @@ def main(cfg: DictConfig) -> None:
     eval_obj.trainer = trainer
     eval_obj.model = model.model
     model.evaluator = eval_obj
+
+    # Drive the video subsample off the DATA's frame rate (read from the episode
+    # zarr metadata) rather than the class default, so playback is real time for
+    # any capture rate. All planned episodes come from the same capture pipeline;
+    # assert that rather than silently picking one.
+    if all_plans:
+        rates = {p.source_fps for p in all_plans}
+        assert len(rates) == 1, (
+            f"val episodes have mixed source frame rates {sorted(rates)}; one "
+            "video subsample stride cannot be real-time for all of them."
+        )
+        eval_obj.set_source_fps(all_plans[0].source_fps)
+        log.info(
+            f"[eval_dreamzero] evaluator source_fps={eval_obj.source_fps:g}, "
+            f"video subsample stride={eval_obj.frame_stride} "
+            f"-> {WAM_VIDEO_FPS} fps real-time playback"
+        )
 
     log.info(f"[eval_dreamzero] Loading checkpoint {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)

@@ -7,7 +7,11 @@ import torchvision.io as tvio
 from torchmetrics import MeanSquaredError
 
 from egomimic.eval.eval_video import EvalVideo
-from egomimic.eval.wam_rollout import WAM_VIDEO_FPS
+from egomimic.eval.wam_rollout import (
+    DEFAULT_SOURCE_FPS,
+    WAM_VIDEO_FPS,
+    video_frame_stride,
+)
 from egomimic.rldb.embodiment.embodiment import get_embodiment
 
 
@@ -63,15 +67,27 @@ class WAMEvalVideo(EvalVideo):
         viz_func=None,
         limit_val_batches: int = 400,
         teacher_force_rolling: bool = False,
+        source_fps: float = DEFAULT_SOURCE_FPS,
     ):
         # This fork's EvalVideo takes only limit_val_batches; the per-embodiment
         # action-overlay viz callables come in via viz_func (evaluator/viz config).
         # ``teacher_force_rolling`` is metadata read by the offline eval driver
-        # (``eval_dreamzero._patch_algo_use_sample_rolling``) to pick fully-AR
-        # vs dreamzero Fig-14a TF rolling. Ignored inside this class.
+        # (``eval_dreamzero._select_rolling_mode``) to pick fully-AR vs dreamzero
+        # Fig-14a TF rolling. Ignored inside this class.
         super().__init__(limit_val_batches=limit_val_batches)
         self.viz_func = viz_func
         self.teacher_force_rolling = bool(teacher_force_rolling)
+        self.set_source_fps(source_fps)
+
+    def set_source_fps(self, source_fps: float) -> None:
+        """Set the NATIVE prediction frame rate and derive the video subsample.
+
+        The offline driver calls this with the rate read from the episode's zarr
+        metadata (``wam_episode._source_fps``) so playback speed follows the data
+        rather than a constant.
+        """
+        self.source_fps = float(source_fps)
+        self.frame_stride = video_frame_stride(self.source_fps)
 
     def compute_metrics_and_viz(self, batch):
         algo = self.model
@@ -185,6 +201,39 @@ class WAMEvalVideo(EvalVideo):
         if pred_video_probe is not None:
             total_out_frames = min(total_out_frames, pred_video_probe.shape[2] * FR)
 
+        # REAL-TIME SUBSAMPLE. The rollout predicts one frame per source frame
+        # (30 fps for mecka), so writing every predicted frame into a
+        # WAM_VIDEO_FPS container would play back source_fps/WAM_VIDEO_FPS times
+        # too slow (6x). Keep every ``frame_stride``-th predicted instant instead.
+        #
+        # This changes ONLY which instants get rendered into the mp4. The
+        # rollout, the teacher-forcing conditioning, the chunk/latent geometry and
+        # the action chunks drawn at each kept instant are all still at native
+        # granularity, and the metrics above are computed over the FULL action
+        # tensors, not this subset.
+        #
+        # Both videos are driven off the SAME index grid — predicted frame ``p``
+        # pairs with GT-overlay output frame ``p * FR`` — so index i is the same
+        # instant in both files and the two clips have identical lengths.
+        # The subsample PHASE is global across the episode, not per window. This
+        # method runs once per val step and an episode is walked as many windows
+        # (16 native frames each here), so restarting the phase at 0 every window
+        # would keep global indices {16j, 16j+6, 16j+12} — not multiples of 6,
+        # because the window length is not a multiple of the stride. Playback
+        # would jitter and the episode would end up with 363 frames instead of
+        # 323. Carrying a per-episode native-frame offset keeps every kept frame
+        # on the same uniform global grid.
+        stride = max(1, int(getattr(self, "frame_stride", 1)))
+        n_pred_frames = total_out_frames // FR
+        if not hasattr(self, "_native_offset"):
+            self._native_offset = {}
+        okey = (embodiment_id, self._episode_key(_batch))
+        offset = self._native_offset.get(okey, 0)
+        first = (-offset) % stride
+        keep_p = list(range(first, n_pred_frames, stride))
+        keep_f = [p * FR for p in keep_p]
+        self._native_offset[okey] = offset + n_pred_frames
+
         # Per-raw-frame head-pose chunk (see Mecka.get_wam_keymap ->
         # ``obs_head_pose_chunk``). Shape (B, cam_horizon, 7) xyzwxyz; row 0 ==
         # the pose the data-pipeline transform used as target (H_0), row k ==
@@ -247,7 +296,7 @@ class WAMEvalVideo(EvalVideo):
         # (also +FR-shifted). At each chunk boundary the trail resets to full
         # length, then shrinks H_actions -> 1 as ``start`` advances.
         per_frame_ims = []
-        for f in range(total_out_frames):
+        for f in keep_f:
             pixel_idx = 1 + f // FR  # skip frame 0 = anchor
             start = f + FR
             chunk_bucket = f // H_actions
@@ -287,9 +336,13 @@ class WAMEvalVideo(EvalVideo):
             image_key = some_ck
             ref_H = clip_by_cam[image_key].shape[-2]
             ref_W = clip_by_cam[image_key].shape[-1]
-            # Trim to the same length the GT-overlay timeline was trimmed to, so
-            # the two mp4s of this episode have identical frame counts.
-            pred_video_t = pred_video_t[:, :, : total_out_frames // FR]
+            # Select exactly the instants the GT-overlay timeline kept (same
+            # index grid, see keep_p/keep_f above), so the two mp4s have
+            # identical frame counts and index i is the same instant in both.
+            # Selecting before the upscale also skips 5/6 of the interpolate.
+            pred_video_t = pred_video_t.index_select(
+                2, torch.tensor(keep_p, device=pred_video_t.device)
+            )
             Bp, Cp, T_pred, _, _ = pred_video_t.shape
             pv = F.interpolate(
                 pred_video_t.permute(0, 2, 1, 3, 4).reshape(
@@ -306,7 +359,10 @@ class WAMEvalVideo(EvalVideo):
             # ``clip_by_cam``, which the data pipeline provides in [0, 1]).
             pv = (pv.clamp(-1, 1) + 1.0) * 0.5
             pred_overlay_frames = []
-            for p in range(T_pred):
+            # ``i`` indexes the SELECTED frames in pv; ``p`` is the frame's index
+            # on the native prediction timeline, which is what the action-overlay
+            # arithmetic below must use so the arrows keep native granularity.
+            for i, p in enumerate(keep_p):
                 # ``_eval_frames`` already dropped the anchor frame
                 # (WAM.val_rollout: viz_video = pred_frames[:, :, 1:]), so p=0
                 # corresponds to pixel_idx=1 (first predicted frame).
@@ -319,7 +375,7 @@ class WAMEvalVideo(EvalVideo):
                 gt_slice, pred_slice = _slices_for(start, end)
                 gt_slice, pred_slice = _reproject(gt_slice, pred_slice, pixel_idx)
                 _batch_p = dict(_batch)
-                _batch_p[image_key] = pv[:, p]  # (B, C, H, W)
+                _batch_p[image_key] = pv[:, i]  # (B, C, H, W)
                 preds_p, _batch_p = _frame_dicts(gt_slice, pred_slice, _batch_p)
                 pred_overlay_frames.append(self._visualize_preds(preds_p, _batch_p))
 
@@ -366,6 +422,10 @@ class WAMEvalVideo(EvalVideo):
             # express episodes with differing window counts.
             self._ep_open: dict[tuple[str, int], list] = {}
             self._ep_ordinal: dict[tuple[str, int], int] = {}
+            # {(eid, episode): native frames emitted so far} -> keeps the
+            # real-time subsample on one uniform grid across the episode's
+            # windows (see _animate_overlays).
+            self._native_offset: dict[tuple[int, str], int] = {}
 
     @staticmethod
     def _episode_key(_batch) -> str:
@@ -454,7 +514,10 @@ class WAMEvalVideo(EvalVideo):
                 if overlay is not None:
                     frames = overlay
                 else:
-                    frames = self._predicted_frames_all(video)  # (B*T, Hd, Wd, 3)
+                    # Same real-time subsample as the overlay path.
+                    frames = self._predicted_frames_all(
+                        video, stride=max(1, int(getattr(self, "frame_stride", 1)))
+                    )  # (B*T, Hd, Wd, 3)
                 self._append_episode_frames(
                     "predicted_video", eid, self._episode_key(batch.get(eid)), frames
                 )
@@ -484,6 +547,7 @@ class WAMEvalVideo(EvalVideo):
     def _reset_buffers(self) -> None:
         self._ep_open = {}
         self._ep_ordinal = {}
+        self._native_offset = {}
         self._pred_buffer = {}
         self._pred_step_count = {}
         self._val_step_count = {}
@@ -557,10 +621,15 @@ class WAMEvalVideo(EvalVideo):
         return result
 
     @staticmethod
-    def _predicted_frames_all(video: torch.Tensor, hw=(360, 640)) -> np.ndarray:
+    def _predicted_frames_all(
+        video: torch.Tensor, hw=(360, 640), stride: int = 1
+    ) -> np.ndarray:
         """(B, C, T, H, W) in [-1, 1] -> (B*T, Hd, Wd, 3) uint8, resized to the
         GT display resolution so the aspect ratio matches a real frame (the
-        world model runs at 160x320)."""
+        world model runs at 160x320). ``stride`` applies the same real-time
+        subsample the overlay path uses (see ``video_frame_stride``)."""
+        if stride > 1:
+            video = video[:, :, ::stride]
         B, C, T, H, W = video.shape
         v = video.clamp(-1, 1).permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
         v = F.interpolate(v, size=tuple(hw), mode="bilinear", align_corners=False)
