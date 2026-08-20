@@ -10,36 +10,42 @@ matched pair per sample:
     validation_video_<i>.mp4  the GROUND-TRUTH clip for the same window, same
                               overlay — the reference to compare the dream to
 
-THERE ARE TWO GENERATIONS OF VIDEO ON THE VOLUME and they must not be mixed
-silently. Measured (not assumed — every number below was read out of the actual
-mp4 moov atoms, cross-checked against ffprobe):
+FOUR GENERATIONS of video exist on the volume and must never be read as
+like-for-like. Every number below was measured from the actual mp4 atoms by
+``_probe`` (cross-checked against ffprobe), not assumed:
 
-    post-fix   1936 frames @ 5 fps = 387.2 s   ~50 MB   one FULL episode
-    pre-fix      32 frames @ 10 fps =  3.2 s   ~0.4 MB  one chunk, misaligned TF
+    real-time     ~323 f @ 5 fps =  64.6 s   ~8.4 MB   full episode, subsampled
+                  x6 from the 30 fps source — CORRECT (post-d272d135)
+    6x slow       1936 f @ 5 fps = 387.2 s  ~50   MB   full episode, but 30 fps
+                  frames written into a 5 fps container -> plays 6x too slow
+    debug-capped    96 f @ 5 fps =  19.2 s   ~2.5 MB   right fps, length-capped
+    chunk           32 f @ 10 fps =  3.2 s   ~0.4 MB   pre-fix: one chunk,
+                  10 fps, misaligned teacher forcing
 
-Sources surfaced, in order of trustworthiness:
+Sources surfaced:
 
-  1. FIXED offline pass — wam_gateA/fixcheck_*/videos/epoch_0/MECKA_BIMANUAL/
-     The reference-quality pair: full episode (69b22fc5f4f4e149281a6635),
-     teacher-forced rolling, latest checkpoint, verified 1936 f @ 5 fps.
-  2. Offline sweep (fixed) — wam_val_sweep/ (a per-checkpoint 4xH200 sweep).
-     Not present at build time; the scanner picks it up automatically the
-     moment it appears (its prefix is already allow-listed), no redeploy.
-  3. Live training-time val — data_div_oss/wam22_dw48_v2/videos/epoch_<N>/
-     45 epochs (29 -> 1349) x ~100 pairs, ALL pre-fix at build time: the live
-     run only picks up the fix on a future resubmit. Capped to the first
-     TRAINING_CAP pairs per epoch to keep the page light.
-
-Generation is detected PER EPOCH from the real file (frame count + fps parsed
-from the mp4 header/trailer, no ffmpeg), so when the live run does cut over the
-badge flips on its own instead of lying.
+  1. REFERENCE — wam_gate_a2/e989_realtime_*/ (featured). Full episode
+     69b22fc5f4f4e149281a6635 at checkpoint epoch 989, teacher-forced rolling,
+     real time. This is the pair to trust.
+  2. SWEEP — wam_val_sweep/<sweep_id>/epoch_<N>_<ts>/videos/... , one offline
+     pass per checkpoint (45 checkpoints, 4x H200). Sweep ids are DISCOVERED
+     (never hardcoded), newest preferred, several tolerated. Per-epoch metrics
+     come from metrics/epoch_<N>.json when written, else are parsed out of that
+     epoch's eval_dreamzero.log so numbers show up while the sweep is still
+     running.
+  3. LIVE training-time val — data_div_oss/wam22_dw48_v2/videos/epoch_<N>/,
+     ~100 pairs per epoch, capped to TRAINING_CAP. Still "chunk" generation at
+     build time; the run picks up both fixes on its next resubmit, at which
+     point the per-file probe relabels new epochs "real-time" on its own.
+  4. COMPARISON passes — wam_gateA (6x slow, superseded) and wam_gateC
+     (debug-capped), kept unfeatured so the reference can't be confused.
 
 Deploy:
     MODAL_ENVIRONMENT=robotics modal deploy egomimic/modal/wam_viewer.py
 
 Routes (single ASGI web function -> one URL, relative paths):
     /            HTML viewer page
-    /api/index   {"fixed":…, "sweep":…, "training":…} — volume scan, cached 60 s
+    /api/index   {"passes":…, "sweeps":…, "training":…} — volume scan, cached 60 s
     /video?path= streams one mp4, restricted to the WAM prefixes only
 """
 
@@ -57,31 +63,53 @@ INDEX_TTL_S = 60
 WAM_RUN_LABEL = "data_div_oss_wam22_dw48_v2"
 WAM_RUN_DIR = "data_div_oss/wam22_dw48_v2"
 TRAINING_CAP = 8  # pairs shown per epoch (each epoch really has ~100)
+SWEEP_CAP = 4  # pairs shown per sweep checkpoint
 
-# Offline single-checkpoint passes: (key, volume prefix, label, note).
+# Offline single-checkpoint passes, in display order.
+# (key, prefix, title, note, featured)
 OFFLINE_PASSES = [
+    (
+        "gate_a2",
+        "wam_gate_a2",
+        "Reference pass",
+        "fixed · full episode · real-time 5 fps (subsampled ×6)",
+        True,
+    ),
     (
         "gateA",
         "wam_gateA",
-        "Fixed offline pass",
-        "fixed pipeline · full episode · 5 fps · TF rolling",
+        "Superseded pass",
+        "superseded · full episode but 6× slow — 30 fps frames in a 5 fps container",
+        False,
+    ),
+    (
+        "gateC",
+        "wam_gateC",
+        "Debug train-path check",
+        "debug-capped · correct 5 fps, length-capped by the debug config",
+        False,
     ),
 ]
 
-# Per-checkpoint sweep prefixes — scanned if/when they show up on the volume.
-SWEEP_PREFIXES = [("wam_val_sweep", "Offline sweep (fixed)")]
+SWEEP_PREFIX = "wam_val_sweep"
+SWEEP_LABEL = "Offline sweep (fixed) — one pass per checkpoint"
 
 # /video may only serve paths under these prefixes. Anything else on the volume
-# (op_scaling/, pksnack_*/, other data_div_oss/ runs, ...) is rejected. Note the
-# training entry is scoped to the WAM run's videos/ subtree, NOT all of
-# data_div_oss/, so sibling runs stay unreachable.
-ALLOWED_PATH_PREFIXES = tuple(f"{p}/" for _, p, _, _ in OFFLINE_PASSES) + tuple(
-    f"{p}/" for p, _ in SWEEP_PREFIXES
-) + (f"{WAM_RUN_DIR}/videos/",)
+# (op_scaling/, pksnack_*/, other data_div_oss/ runs, checkpoints, ...) is
+# rejected. The training entry is scoped to the WAM run's videos/ subtree, NOT
+# all of data_div_oss/, so sibling runs stay unreachable.
+ALLOWED_PATH_PREFIXES = tuple(f"{p}/" for _, p, _, _, _ in OFFLINE_PASSES) + (
+    f"{SWEEP_PREFIX}/",
+    f"{WAM_RUN_DIR}/videos/",
+)
 
-# Generation thresholds (frames, fps) measured from the files themselves.
-FULL_EPISODE_MIN_FRAMES = 500
-PREFIX_FPS = 10  # the pre-fix writer used 10 fps; the fix writes 5
+# Generation classification thresholds, applied to (frames, fps) measured from
+# the file. The frames split between "6x slow" and "real-time" assumes episodes
+# of at most a few minutes: at real-time 5 fps a 3-minute episode is 900 frames,
+# while the 6x-slow generation of a 1-minute episode is already ~1936.
+CHUNK_FPS_MIN = 8  # the pre-fix writer used 10 fps; every fixed one uses 5
+SLOW_MIN_FRAMES = 1000
+REALTIME_MIN_FRAMES = 200
 
 PAGE_HTML = r"""<!doctype html>
 <html lang="en">
@@ -93,7 +121,8 @@ PAGE_HTML = r"""<!doctype html>
   :root {
     --bg: #101216; --panel: #181b21; --border: #2a2e37;
     --text: #e6e8ec; --dim: #8b919d; --accent: #6ea8fe;
-    --good: #7fd1a4; --warn: #e0a04d; --pred: #e08a8a; --gt: #7fb3d1;
+    --good: #7fd1a4; --warn: #e0a04d; --bad: #d98b8b; --neutral: #9aa3b2;
+    --pred: #e08a8a; --gt: #7fb3d1;
   }
   * { box-sizing: border-box; }
   body {
@@ -108,7 +137,7 @@ PAGE_HTML = r"""<!doctype html>
   header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
   .blurb { color: var(--dim); font-size: 12px; margin-top: 7px; line-height: 1.65; }
   .blurb b { color: #b9c0cc; font-weight: 600; }
-  .blurb code {
+  code {
     color: var(--text); background: var(--panel); padding: 1px 5px; border-radius: 4px;
   }
   select, button {
@@ -126,17 +155,22 @@ PAGE_HTML = r"""<!doctype html>
     margin-bottom: 16px; padding: 10px 12px 6px; background: #14171c;
   }
   section.featured { border-color: var(--good); background: #141a17; }
+  section.muted { opacity: .92; background: #131519; }
   .sec-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .sec-title { font-size: 14px; font-weight: 600; }
   section.featured .sec-title { color: var(--good); }
+  section.muted .sec-title { color: var(--neutral); }
   .sec-note { color: var(--dim); font-size: 12px; }
-  .sec-sub { color: var(--dim); font-size: 12px; margin: 4px 0 8px; }
+  .sec-sub { color: var(--dim); font-size: 12px; margin: 4px 0 8px; line-height: 1.6; }
+  .metrics { color: var(--accent); font-size: 12px; }
   .badge {
     font-size: 11px; padding: 2px 7px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
   }
-  .badge.post { border-color: var(--good); color: var(--good); }
-  .badge.pre { border-color: var(--warn); color: var(--warn); }
+  .badge.gen-realtime { border-color: var(--good); color: var(--good); }
+  .badge.gen-slow { border-color: var(--bad); color: var(--bad); }
+  .badge.gen-chunk { border-color: var(--warn); color: var(--warn); }
+  .badge.gen-capped { border-color: var(--neutral); color: var(--neutral); }
   .row {
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
     margin-bottom: 8px; padding: 8px 10px; border-left: 3px solid var(--border);
@@ -173,7 +207,7 @@ PAGE_HTML = r"""<!doctype html>
     <button id="colmode" title="load and play one video column at a time">Column mode</button>
     <span id="colctl" style="display:none">
       <button id="colprev">&#9664; col</button>
-      <span class="lbl" id="colind" style="color:var(--dim);font-size:12px">Column 1</span>
+      <span id="colind" style="color:var(--dim);font-size:12px">Column 1</span>
       <button id="colnext">col &#9654;</button>
     </span>
     <span class="spacer"></span>
@@ -187,8 +221,9 @@ PAGE_HTML = r"""<!doctype html>
   const $ = (id) => document.getElementById(id);
   const mainEl = $("main"), statusEl = $("status");
   let index = null;
-  let trainEpoch = null, sweepEpoch = null;
+  let trainEpoch = null, sweepEpoch = null, sweepId = null;
   let columnMode = false, currentCol = 0, playToken = 0;
+  const SWEEP_TITLE = "Offline sweep (fixed)";
 
   const observer = new IntersectionObserver((entries) => {
     for (const e of entries) {
@@ -202,16 +237,30 @@ PAGE_HTML = r"""<!doctype html>
 
   function fmtProbe(pr) {
     if (!pr || !pr.frames) return "";
-    const d = pr.duration ? pr.duration.toFixed(1) + " s" : "?";
-    return pr.frames + " f @ " + (pr.fps || "?") + " fps · " + d;
+    const d = pr.duration != null ? pr.duration.toFixed(1) + " s" : "?";
+    return pr.frames + " f @ " + (pr.fps != null ? pr.fps : "?") + " fps · " + d;
   }
 
   function badge(pr) {
     if (!pr || !pr.generation) return "";
-    const cls = pr.generation === "post-fix" ? "post"
-              : pr.generation === "pre-fix" ? "pre" : "";
-    const txt = pr.generation + (fmtProbe(pr) ? " · " + fmtProbe(pr) : "");
-    return '<span class="badge ' + cls + '">' + txt + "</span>";
+    const g = pr.generation;
+    const cls = g === "real-time" ? "gen-realtime"
+              : g === "6× slow" ? "gen-slow"
+              : g === "chunk (pre-fix)" ? "gen-chunk"
+              : g === "debug-capped" ? "gen-capped" : "";
+    const p = fmtProbe(pr);
+    return '<span class="badge ' + cls + '">' + g + (p ? " · " + p : "") + "</span>";
+  }
+
+  function fmtMetrics(m) {
+    if (!m) return "";
+    const order = Object.keys(m).sort((a, b) => {
+      const rank = (k) => (/paired_mse/.test(k) ? 0 : /Loss$/.test(k) ? 1 : 2);
+      return rank(a) - rank(b) || a.localeCompare(b);
+    });
+    return order.slice(0, 3)
+      .map((k) => k.replace(/^Valid\//, "") + " = " + Number(m[k]).toFixed(4))
+      .join("   ");
   }
 
   function vidCard(p, wide) {
@@ -231,7 +280,6 @@ PAGE_HTML = r"""<!doctype html>
     return card;
   }
 
-  // kind: "pred" | "val"
   function makeRow(kind, sub, videos, emptyMsg, note, wide) {
     const row = document.createElement("div");
     row.className = "row " + kind;
@@ -266,6 +314,7 @@ PAGE_HTML = r"""<!doctype html>
   function section(opts) {
     const sec = document.createElement("section");
     if (opts.featured) sec.className = "featured";
+    else if (opts.muted) sec.className = "muted";
     const head = document.createElement("div");
     head.className = "sec-head";
     head.innerHTML =
@@ -280,11 +329,11 @@ PAGE_HTML = r"""<!doctype html>
       s.innerHTML = opts.sub;
       sec.appendChild(s);
     }
-    for (const r of opts.rows) sec.appendChild(r);
+    for (const r of opts.rows || []) sec.appendChild(r);
     return sec;
   }
 
-  function epochCtl(label, epochs, value, onChange) {
+  function selector(label, values, value, fmt, onChange) {
     const box = document.createElement("span");
     box.className = "epctl";
     const lbl = document.createElement("span");
@@ -292,87 +341,104 @@ PAGE_HTML = r"""<!doctype html>
     const prev = document.createElement("button"); prev.textContent = "◀";
     const sel = document.createElement("select");
     const next = document.createElement("button"); next.textContent = "▶";
-    for (const e of epochs) {
+    for (const v of values) {
       const o = document.createElement("option");
-      o.value = e; o.textContent = "epoch " + e;
+      o.value = v; o.textContent = fmt ? fmt(v) : v;
       sel.appendChild(o);
     }
     sel.value = value;
-    sel.onchange = () => onChange(Number(sel.value));
+    sel.onchange = () => onChange(sel.value);
     const step = (d) => {
-      const i = epochs.indexOf(value) + d;
-      if (i >= 0 && i < epochs.length) onChange(epochs[i]);
+      const i = values.indexOf(value) + d;
+      if (i >= 0 && i < values.length) onChange(values[i]);
     };
     prev.onclick = () => step(-1);
     next.onclick = () => step(1);
-    prev.disabled = epochs.indexOf(value) <= 0;
-    next.disabled = epochs.indexOf(value) >= epochs.length - 1;
+    prev.disabled = values.indexOf(value) <= 0;
+    next.disabled = values.indexOf(value) >= values.length - 1;
     box.append(lbl, prev, sel, next);
     return box;
   }
 
-  function render() {
-    mainEl.innerHTML = "";
-    const d = index;
+  function renderPass(p) {
+    const wide = !!p.featured;
+    const sub =
+      "<code>" + p.prefix + "/" + (p.sub || "") + "</code>" +
+      (p.episode ? " · episode <code>" + p.episode + "</code>" : "") +
+      " · " + (p.featured
+        ? "teacher-forced rolling over one full episode at real speed — compare the " +
+          "dream against the ground truth over the whole " +
+          (p.probe && p.probe.duration ? p.probe.duration.toFixed(1) + " s" : "clip") + "."
+        : "kept for comparison only — <b>not</b> the reference.");
+    return section({
+      featured: p.featured, muted: !p.featured,
+      title: p.title, note: p.note, badge: badge(p.probe), sub,
+      rows: [
+        makeRow("pred", p.epoch_label || "epoch_0", p.predicted,
+                "no predicted video in this pass", fmtProbe(p.probe), wide),
+        makeRow("val", p.epoch_label || "epoch_0", p.validation,
+                "no validation video in this pass", fmtProbe(p.probe), wide),
+      ],
+    });
+  }
 
-    // ---- 1. featured fixed offline pass(es) ----
-    for (const p of d.fixed.passes) {
-      const sub =
-        "<code>" + p.prefix + "/" + (p.sub || "") + "</code>" +
-        (p.episode ? " · episode <code>" + p.episode + "</code>" : "") +
-        " · teacher-forced rolling · one full episode, compare the dream (top) " +
-        "against the ground truth (bottom) over the whole 387 s.";
-      const rows = [
-        makeRow("pred", "epoch_0", p.predicted,
-                "no predicted video in this pass", fmtProbe(p.probe), true),
-        makeRow("val", "epoch_0", p.validation,
-                "no validation video in this pass", fmtProbe(p.probe), true),
-      ];
-      mainEl.appendChild(section({
-        featured: true, title: p.label, note: p.note,
-        badge: badge(p.probe), sub, rows,
-      }));
+  function renderSweep() {
+    const sweeps = index.sweeps;
+    if (!sweeps.length) {
+      return section({
+        title: "Offline sweep (fixed)", note: "per-checkpoint sweep",
+        sub: "<code>" + index.sweep_prefix + "/</code> has no sweep dirs yet — this " +
+             "section fills in automatically as the sweep writes them (no redeploy).",
+      });
     }
-    if (!d.fixed.passes.length) {
-      mainEl.appendChild(section({
-        featured: true, title: "Fixed offline pass", note: "",
-        sub: "not found on the volume", rows: [],
-      }));
+    if (sweepId === null || !sweeps.some((s) => s.id === sweepId)) {
+      sweepId = sweeps[0].id;  // newest first
     }
+    const sw = sweeps.find((s) => s.id === sweepId);
+    const eps = sw.epochs;
+    if (sweepEpoch === null || !eps.includes(sweepEpoch)) {
+      sweepEpoch = eps.length ? eps[eps.length - 1] : null;
+    }
+    const cur = (sw.byEpoch || {})[String(sweepEpoch)] || {};
+    const pr = (sw.probe || {})[String(sweepEpoch)];
+    const met = (sw.metrics || {})[String(sweepEpoch)];
+    const ctlWrap = document.createElement("span");
+    ctlWrap.className = "epctl";
+    if (sweeps.length > 1) {
+      ctlWrap.appendChild(selector("sweep", sweeps.map((s) => s.id), sweepId, null,
+        (v) => { sweepId = v; sweepEpoch = null; render(); }));
+    }
+    if (eps.length) {
+      ctlWrap.appendChild(selector("ckpt", eps, sweepEpoch,
+        (e) => "epoch " + e + ((sw.metrics || {})[String(e)] ? " ✓" : ""),
+        (v) => { sweepEpoch = Number(v); render(); }));
+    }
+    const done = Object.keys(sw.byEpoch || {}).length;
+    let sub =
+      "<code>" + index.sweep_prefix + "/" + sw.id + "/</code> — " + done +
+      " of " + sw.n_dirs + " checkpoint dirs have videos" +
+      (sw.n_expected ? " (sweep covers ~" + sw.n_expected + " checkpoints)" : "") +
+      ". Real-time generation (post-fix). Videos capped to " + sw.cap + " pairs.";
+    if (met) sub += '<br><span class="metrics">' + fmtMetrics(met) + "</span>";
+    else if (eps.length) sub += "<br>no metrics for this checkpoint yet.";
+    return section({
+      title: SWEEP_TITLE, note: eps.length + " checkpoints with video",
+      badge: badge(pr), sub, ctl: ctlWrap,
+      rows: [
+        makeRow("pred", "epoch " + sweepEpoch, cur.predicted,
+                eps.length ? "no predicted videos at this checkpoint"
+                           : "sweep is running — no videos committed yet",
+                fmtProbe(pr)),
+        makeRow("val", "epoch " + sweepEpoch, cur.validation,
+                eps.length ? "no validation videos at this checkpoint"
+                           : "sweep is running — no videos committed yet",
+                fmtProbe(pr)),
+      ],
+    });
+  }
 
-    // ---- 2. offline sweep (fixed), if it exists yet ----
-    for (const sw of d.sweep) {
-      if (!sw.found) {
-        mainEl.appendChild(section({
-          title: sw.label,
-          note: "per-checkpoint sweep",
-          sub: "<code>" + sw.prefix + "/</code> is not on the volume yet — this " +
-               "section fills in automatically once the sweep runs (no redeploy).",
-          rows: [],
-        }));
-        continue;
-      }
-      const eps = sw.epochs;
-      if (sweepEpoch === null || !eps.includes(sweepEpoch)) {
-        sweepEpoch = eps.length ? eps[eps.length - 1] : null;
-      }
-      const cur = (sw.byEpoch || {})[String(sweepEpoch)] || {};
-      const pr = (sw.probe || {})[String(sweepEpoch)];
-      mainEl.appendChild(section({
-        title: sw.label, note: eps.length + " checkpoints",
-        badge: badge(pr),
-        sub: "<code>" + sw.prefix + "/</code> — one pass per checkpoint.",
-        ctl: eps.length ? epochCtl("ckpt", eps, sweepEpoch,
-              (e) => { sweepEpoch = e; render(); }) : null,
-        rows: [
-          makeRow("pred", "epoch " + sweepEpoch, cur.predicted, "no predicted videos", ""),
-          makeRow("val", "epoch " + sweepEpoch, cur.validation, "no validation videos", ""),
-        ],
-      }));
-    }
-
-    // ---- 3. live training-time val ----
-    const tr = d.training;
+  function renderTraining() {
+    const tr = index.training;
     const eps = tr.epochs;
     if (trainEpoch === null || !eps.includes(trainEpoch)) {
       trainEpoch = eps.length ? eps[eps.length - 1] : null;
@@ -380,21 +446,30 @@ PAGE_HTML = r"""<!doctype html>
     const cur = (tr.byEpoch || {})[String(trainEpoch)] || {};
     const tot = (tr.totals || {})[String(trainEpoch)] || {};
     const pr = (tr.probe || {})[String(trainEpoch)];
-    const genNote = pr && pr.generation === "pre-fix"
-      ? " <b>Pre-fix output</b>: one ~3.2 s chunk at 10 fps with misaligned teacher " +
-        "forcing — NOT comparable to the fixed pass above. The live run picks up " +
-        "the fix only on a future resubmit."
-      : pr && pr.generation === "post-fix"
-        ? " <b>Post-fix output</b> — full-episode 5 fps, comparable to the fixed pass above."
-        : "";
-    mainEl.appendChild(section({
+    let genNote = "";
+    if (pr && pr.generation === "chunk (pre-fix)") {
+      genNote = " <b>Pre-fix output</b>: one ~3.2 s chunk at 10 fps with misaligned " +
+        "teacher forcing — NOT comparable to the reference above. The live run picks " +
+        "up both fixes only on its next resubmit.";
+    } else if (pr && pr.generation === "real-time") {
+      genNote = " <b>Post-fix output</b> — full-episode real-time 5 fps, comparable " +
+        "to the reference above.";
+    } else if (pr && pr.generation === "6× slow") {
+      genNote = " <b>6× slow output</b> — full episode but played 6× too slow.";
+    }
+    const genCounts = tr.gen_counts || {};
+    const mix = Object.keys(genCounts).length > 1
+      ? "<br>Epoch mix on the volume: " +
+        Object.entries(genCounts).map(([g, n]) => n + " × " + g).join(", ") + "."
+      : "";
+    return section({
       title: "Live training-time val",
       note: "held-out operator · " + eps.length + " epochs",
       badge: badge(pr),
-      sub: "<code>" + tr.run_dir + "/videos/epoch_" + trainEpoch + "/</code> — " +
-           "first " + tr.cap + " of ~" + (tot.validation || "100") + " pairs." + genNote,
-      ctl: eps.length ? epochCtl("epoch", eps, trainEpoch,
-            (e) => { trainEpoch = e; render(); }) : null,
+      sub: "<code>" + tr.run_dir + "/videos/epoch_" + trainEpoch + "/</code> — first " +
+           tr.cap + " of ~" + (tot.validation || "100") + " pairs." + genNote + mix,
+      ctl: eps.length ? selector("epoch", eps, trainEpoch, (e) => "epoch " + e,
+            (v) => { trainEpoch = Number(v); render(); }) : null,
       rows: [
         makeRow("pred", "epoch " + trainEpoch, cur.predicted,
                 "no predicted videos at this epoch",
@@ -403,8 +478,18 @@ PAGE_HTML = r"""<!doctype html>
                 "no validation videos at this epoch",
                 (cur.validation || []).length + " of " + (tot.validation || "?")),
       ],
-    }));
+    });
+  }
 
+  function render() {
+    mainEl.innerHTML = "";
+    for (const p of index.passes.filter((x) => x.featured)) {
+      mainEl.appendChild(renderPass(p));
+    }
+    mainEl.appendChild(renderSweep());
+    mainEl.appendChild(renderTraining());
+    const others = index.passes.filter((x) => !x.featured);
+    for (const p of others) mainEl.appendChild(renderPass(p));
     if (columnMode) applyColumn();
   }
 
@@ -510,29 +595,33 @@ PAGE_HTML = r"""<!doctype html>
   });
 
   function setBlurb() {
-    const f = index.fixed.passes[0];
-    const fp = f ? fmtProbe(f.probe) : "n/a";
-    const tp = index.training.probe[String(index.training.epochs[index.training.epochs.length - 1])];
+    const ref = index.passes.find((p) => p.featured);
+    const slow = index.passes.find((p) => p.key === "gateA");
+    const tp = index.training.probe[
+      String(index.training.epochs[index.training.epochs.length - 1])];
     $("blurb").innerHTML =
       "Run <code>" + index.run + "</code> — <b>Wan2.2-TI2V-5B world-action model</b>, " +
       "dishwashing 48 h pool, validating on the <b>held-out operator</b> split. " +
       "<b>predicted</b> = the model's imagined future frames (its dream); " +
       "<b>validation</b> = the ground-truth clip for the same window. Both carry " +
-      "action-trail overlays, so a good model matches the GT both in pixels and in " +
-      "the drawn trajectory.<br>" +
-      "Two generations of video exist on the volume and are labelled per section " +
-      "from the actual files: <b>post-fix</b> = " + fp + " (one full episode, " +
-      "aligned teacher forcing) vs <b>pre-fix</b> = " +
+      "action-trail overlays, so a good model matches the GT in pixels and in the " +
+      "drawn trajectory.<br>" +
+      "Four generations of video exist on the volume; every section is labelled from " +
+      "its actual files. <b>real-time</b> = " +
+      (ref && ref.probe ? fmtProbe(ref.probe) : "~323 f @ 5 fps · 64.6 s") +
+      " (full episode, subsampled ×6 — correct) · <b>6× slow</b> = " +
+      (slow && slow.probe ? fmtProbe(slow.probe) : "1936 f @ 5 fps · 387.2 s") +
+      " (30 fps frames in a 5 fps container) · <b>chunk (pre-fix)</b> = " +
       (tp ? fmtProbe(tp) : "32 f @ 10 fps · 3.2 s") +
-      " (one chunk, 10 fps, misaligned TF). Never read across the two as a " +
-      "like-for-like comparison.";
+      " (one chunk, misaligned TF) · <b>debug-capped</b> = right fps, capped length. " +
+      "Never read across generations as a like-for-like comparison.";
   }
 
   function signature(d) {
     return JSON.stringify([
-      d.fixed.passes.map((p) => [p.sub, p.predicted.length, p.validation.length]),
-      d.sweep.map((s) => [s.found, s.epochs]),
-      d.training.epochs,
+      d.passes.map((p) => [p.key, p.sub, p.predicted.length, p.validation.length]),
+      d.sweeps.map((s) => [s.id, s.epochs, Object.keys(s.metrics || {}).length]),
+      d.training.epochs, d.training.gen_counts,
     ]);
   }
 
@@ -546,15 +635,16 @@ PAGE_HTML = r"""<!doctype html>
         index = data; lastSig = sig;
         setBlurb();
         render();
-        const nTr = data.training.epochs.length;
+        const sw = data.sweeps[0];
         statusEl.textContent =
-          data.fixed.passes.length + " fixed pass · " + nTr +
-          " training epochs · index refreshes every 60 s";
+          data.passes.length + " offline passes · sweep " +
+          (sw ? Object.keys(sw.byEpoch || {}).length + "/" + (sw.n_expected || sw.n_dirs) : "none") +
+          " · " + data.training.epochs.length + " training epochs · refreshes every 60 s";
       })
       .catch((e) => { statusEl.textContent = "failed to load index: " + e; });
   }
   load();
-  setInterval(load, 60000);  // the run is live; new val epochs land every 30
+  setInterval(load, 60000);  // sweep is running; live run commits every 30 epochs
 })();
 </script>
 </body>
@@ -570,6 +660,7 @@ PAGE_HTML = r"""<!doctype html>
 @modal.concurrent(max_inputs=50)
 @modal.asgi_app(label="wam-viewer")
 def viewer():
+    import json
     import os
     import re
     import struct
@@ -584,20 +675,33 @@ def viewer():
 
     _cache = {"ts": 0.0, "data": None}
     _lock = threading.Lock()
-    # A given mp4 never changes once written, so probe results are cached
-    # permanently keyed by (path, size) — only NEW epochs cost a read.
+    # An mp4/log/metrics file never changes once written, so results are cached
+    # permanently keyed by (path, size) — only NEW files ever cost a read.
     _probe_cache = {}
+    _metrics_cache = {}
 
     def _vid_sort_key(name):
         m = re.search(r"(\d+)\.mp4$", name)
         return (int(m.group(1)) if m else 1 << 30, name)
 
+    def _classify(frames, fps):
+        """Generation vocabulary: real-time / 6x slow / debug-capped / chunk."""
+        if not frames or not fps:
+            return "unknown"
+        if fps >= CHUNK_FPS_MIN:
+            return "chunk (pre-fix)"
+        if frames >= SLOW_MIN_FRAMES:
+            return "6× slow"
+        if frames >= REALTIME_MIN_FRAMES:
+            return "real-time"
+        return "debug-capped"
+
     def _probe(path, window=131072):
-        """(duration_s, frames, fps) from the mp4 mvhd+stsz atoms.
+        """(duration, frames, fps, generation) from the mp4 mvhd+stsz atoms.
 
         Reads only the first and last `window` bytes: torchvision/pyav writes
         moov at the END, other writers at the start, so both are searched.
-        Verified against ffprobe on all three generations present.
+        Verified against ffprobe on every generation present on the volume.
         """
         try:
             size = os.path.getsize(path)
@@ -609,11 +713,10 @@ def viewer():
         try:
             with open(path, "rb") as fh:
                 head = fh.read(window)
+                tail = b""
                 if size > window:
                     fh.seek(max(0, size - window))
                     tail = fh.read(window)
-                else:
-                    tail = b""
         except OSError:
             return None
 
@@ -646,23 +749,15 @@ def viewer():
                     except struct.error:
                         pass
 
-        fps = round(frames / dur, 3) if (frames and dur) else None
+        fps = round(frames / dur, 2) if (frames and dur) else None
         if fps is not None and abs(fps - round(fps)) < 0.05:
             fps = int(round(fps))
-        if frames is None:
-            generation = "unknown"
-        elif frames >= FULL_EPISODE_MIN_FRAMES and fps and fps < PREFIX_FPS:
-            generation = "post-fix"
-        elif fps == PREFIX_FPS:
-            generation = "pre-fix"
-        else:
-            generation = "partial"
         out = {
             "duration": round(dur, 2) if dur else None,
             "frames": frames,
             "fps": fps,
             "size_mb": round(size / 1e6, 2),
-            "generation": generation,
+            "generation": _classify(frames, fps),
         }
         _probe_cache[key] = out
         return out
@@ -686,18 +781,119 @@ def viewer():
             val, pred = val[:cap], pred[:cap]
         return val, pred, n_val, n_pred
 
-    def _epoch_dirs(videos_dir):
-        """{epoch_int: dirname} for epoch_<N> and ckpt_epoch_<N> layouts."""
+    def _collect_videos(videos_dir, rel_videos, cap=None):
+        """Walk a `videos/` tree (videos/<epoch>/<EMB>/) collecting both families."""
+        val, pred, n_val, n_pred, probe = [], [], 0, 0, None
+        if not os.path.isdir(videos_dir):
+            return val, pred, n_val, n_pred, probe, None
+        ep_label = None
+        try:
+            ep_names = sorted(os.listdir(videos_dir))
+        except OSError:
+            return val, pred, n_val, n_pred, probe, None
+        for ep_name in ep_names:
+            ep_dir = os.path.join(videos_dir, ep_name)
+            if not os.path.isdir(ep_dir):
+                continue
+            ep_label = ep_label or ep_name
+            try:
+                embs = sorted(os.listdir(ep_dir))
+            except OSError:
+                continue
+            for emb in embs:
+                emb_dir = os.path.join(ep_dir, emb)
+                if not os.path.isdir(emb_dir):
+                    continue
+                v, p, nv, np_ = _split_families(
+                    emb_dir, f"{rel_videos}/{ep_name}/{emb}", cap=cap
+                )
+                val += v
+                pred += p
+                n_val += nv
+                n_pred += np_
+                if probe is None and (v or p):
+                    probe = _probe(
+                        os.path.join(emb_dir, os.path.basename((v or p)[0]))
+                    )
+        if cap is not None:
+            val, pred = val[:cap], pred[:cap]
+        return val, pred, n_val, n_pred, probe, ep_label
+
+    _METRIC_RE = re.compile(r"\[eval_dreamzero\] metric (\S+) = ([-\d.eE+]+)")
+
+    def _metrics_from_log(run_dir):
+        """Valid/* metrics parsed from an eval_dreamzero.log."""
         out = {}
         try:
-            names = os.listdir(videos_dir)
+            names = [f for f in os.listdir(run_dir) if f.endswith(".log")]
         except OSError:
             return out
         for name in names:
-            m = re.match(r"(?:ckpt_)?epoch_(\d+)$", name)
-            if m and os.path.isdir(os.path.join(videos_dir, name)):
-                out[int(m.group(1))] = name
+            path = os.path.join(run_dir, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            key = ("log", path, size)
+            if key in _metrics_cache:
+                out.update(_metrics_cache[key])
+                continue
+            found = {}
+            try:
+                with open(path, errors="replace") as fh:
+                    for line in fh:
+                        m = _METRIC_RE.search(line)
+                        if m:
+                            try:
+                                found[m.group(1)] = float(m.group(2))
+                            except ValueError:
+                                pass
+            except OSError:
+                continue
+            _metrics_cache[key] = found
+            out.update(found)
         return out
+
+    def _flatten_metrics(obj):
+        """Pull scalar Valid/* style metrics out of a (possibly nested) json."""
+        out = {}
+        if not isinstance(obj, dict):
+            return out
+        for k, v in obj.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[k] = float(v)
+            elif isinstance(v, dict):
+                for k2, v2 in v.items():
+                    if isinstance(v2, (int, float)) and not isinstance(v2, bool):
+                        out[k2 if k in ("metrics", "callback_metrics") else f"{k}/{k2}"] = float(v2)
+        return out
+
+    def _metrics_from_json(path):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return {}
+        key = ("json", path, size)
+        if key in _metrics_cache:
+            return _metrics_cache[key]
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        out = _flatten_metrics(data)
+        _metrics_cache[key] = out
+        return out
+
+    def _pick_metrics(m):
+        """Keep the headline keys: paired_mse_avg first, then Valid/Loss."""
+        if not m:
+            return None
+        keep = {
+            k: v for k, v in m.items()
+            if re.search(r"paired_mse|_loss$|Loss$", k, re.I)
+        }
+        return keep or dict(list(m.items())[:3])
 
     def _episode_from_log(run_dir):
         """The episode hash an offline pass evaluated (from its eval log)."""
@@ -705,7 +901,9 @@ def viewer():
             names = [f for f in os.listdir(run_dir) if f.endswith(".log")]
         except OSError:
             return None
-        pat = re.compile(r"restricted valid dataset to \d+ episodes[^\[]*\['([0-9a-f]{24})'")
+        pat = re.compile(
+            r"restricted valid dataset to \d+ episodes[^\[]*\['([0-9a-f]{24})'"
+        )
         for name in names:
             try:
                 with open(os.path.join(run_dir, name), errors="replace") as fh:
@@ -720,93 +918,135 @@ def viewer():
                 return m2.group(1)
         return None
 
-    def _scan_offline_pass(key, prefix, label, note):
-        """One-shot offline passes: <prefix>/<sub>/videos/epoch_*/EMB/*.mp4."""
+    def _scan_offline_pass(key, prefix, title, note, featured):
         base = os.path.join(root_dir, prefix)
         out = []
         if not os.path.isdir(base):
             return out
         for sub in sorted(os.listdir(base)):
-            videos_dir = os.path.join(base, sub, "videos")
-            if not os.path.isdir(videos_dir):
+            run_dir = os.path.join(base, sub)
+            if not os.path.isdir(run_dir):
                 continue
-            val, pred, probe = [], [], None
-            for ep, ep_name in sorted(_epoch_dirs(videos_dir).items()):
-                ep_dir = os.path.join(videos_dir, ep_name)
-                for emb in sorted(os.listdir(ep_dir)):
-                    emb_dir = os.path.join(ep_dir, emb)
-                    if not os.path.isdir(emb_dir):
-                        continue
-                    v, p, _, _ = _split_families(
-                        emb_dir, f"{prefix}/{sub}/videos/{ep_name}/{emb}"
-                    )
-                    val += v
-                    pred += p
-                    if probe is None and (v or p):
-                        probe = _probe(os.path.join(emb_dir, os.path.basename((v or p)[0])))
-            if val or pred:
-                out.append({
-                    "key": key,
-                    "prefix": prefix,
-                    "sub": sub,
-                    "label": label,
-                    "note": note,
-                    "validation": val,
-                    "predicted": pred,
-                    "probe": probe,
-                    "episode": _episode_from_log(os.path.join(base, sub)),
-                })
+            val, pred, _, _, probe, ep_label = _collect_videos(
+                os.path.join(run_dir, "videos"), f"{prefix}/{sub}/videos"
+            )
+            if not (val or pred):
+                continue
+            out.append({
+                "key": key,
+                "prefix": prefix,
+                "sub": sub,
+                "title": title,
+                "note": note,
+                "featured": featured,
+                "validation": val,
+                "predicted": pred,
+                "probe": probe,
+                "epoch_label": ep_label,
+                "episode": _episode_from_log(run_dir),
+            })
         return out
 
-    def _scan_sweep(prefix, label):
-        """Per-checkpoint sweep: <prefix>/<sub>/videos/(ckpt_)?epoch_<N>/EMB/."""
-        base = os.path.join(root_dir, prefix)
-        result = {
-            "prefix": prefix, "label": label, "found": False,
-            "epochs": [], "byEpoch": {}, "probe": {},
-        }
+    _SWEEP_EP_RE = re.compile(r"^(?:ckpt_)?epoch_(\d+)(?:_.*)?$")
+
+    def _scan_sweeps():
+        """Discover sweep ids under SWEEP_PREFIX; newest (name-sorted) first."""
+        base = os.path.join(root_dir, SWEEP_PREFIX)
+        sweeps = []
         if not os.path.isdir(base):
-            return result
-        by_epoch, probes = {}, {}
-        for sub in sorted(os.listdir(base)):
-            videos_dir = os.path.join(base, sub, "videos")
-            if not os.path.isdir(videos_dir):
+            return sweeps
+        for sweep_id in sorted(os.listdir(base), reverse=True):
+            sweep_dir = os.path.join(base, sweep_id)
+            if not os.path.isdir(sweep_dir):
                 continue
-            for ep, ep_name in sorted(_epoch_dirs(videos_dir).items()):
-                ep_dir = os.path.join(videos_dir, ep_name)
-                val, pred = [], []
-                for emb in sorted(os.listdir(ep_dir)):
-                    emb_dir = os.path.join(ep_dir, emb)
-                    if not os.path.isdir(emb_dir):
-                        continue
-                    v, p, _, _ = _split_families(
-                        emb_dir, f"{prefix}/{sub}/videos/{ep_name}/{emb}",
-                        cap=TRAINING_CAP,
-                    )
-                    val += v
-                    pred += p
-                    if ep not in probes and (v or p):
-                        probes[ep] = _probe(
-                            os.path.join(emb_dir, os.path.basename((v or p)[0]))
+            try:
+                entries = sorted(os.listdir(sweep_dir))
+            except OSError:
+                continue
+
+            # metrics/epoch_<N>.json written by the sweep driver
+            metrics_by_ep = {}
+            metrics_dir = os.path.join(sweep_dir, "metrics")
+            if os.path.isdir(metrics_dir):
+                for name in os.listdir(metrics_dir):
+                    m = re.match(r"epoch_(\d+)\.json$", name)
+                    if m:
+                        got = _pick_metrics(
+                            _metrics_from_json(os.path.join(metrics_dir, name))
                         )
+                        if got:
+                            metrics_by_ep[int(m.group(1))] = got
+
+            summary = None
+            summary_path = os.path.join(sweep_dir, "summary.json")
+            if os.path.isfile(summary_path):
+                try:
+                    with open(summary_path) as fh:
+                        summary = json.load(fh)
+                except (OSError, ValueError):
+                    summary = None
+
+            by_epoch, probes, ep_dirs = {}, {}, {}
+            for entry in entries:
+                m = _SWEEP_EP_RE.match(entry)
+                if not m:
+                    continue
+                ep = int(m.group(1))
+                run_dir = os.path.join(sweep_dir, entry)
+                if not os.path.isdir(run_dir):
+                    continue
+                ep_dirs[ep] = entry
+                val, pred, _, _, probe, _ = _collect_videos(
+                    os.path.join(run_dir, "videos"),
+                    f"{SWEEP_PREFIX}/{sweep_id}/{entry}/videos",
+                    cap=SWEEP_CAP,
+                )
                 if val or pred:
                     by_epoch[ep] = {"validation": val, "predicted": pred}
-        if by_epoch:
+                    probes[ep] = probe
+                # metrics/ may lag the videos — fall back to the epoch's own log
+                # so numbers appear while the sweep is still running.
+                if ep not in metrics_by_ep:
+                    got = _pick_metrics(_metrics_from_log(run_dir))
+                    if got:
+                        metrics_by_ep[ep] = got
+
             eps = sorted(by_epoch)
-            result.update({
-                "found": True,
+            n_expected = None
+            if isinstance(summary, dict):
+                for k in ("n_checkpoints", "num_checkpoints", "total"):
+                    if isinstance(summary.get(k), int):
+                        n_expected = summary[k]
+                        break
+            sweeps.append({
+                "id": sweep_id,
                 "epochs": eps,
                 "byEpoch": {str(e): by_epoch[e] for e in eps},
                 "probe": {str(e): probes.get(e) for e in eps},
+                "metrics": {str(e): metrics_by_ep[e] for e in sorted(metrics_by_ep)},
+                "n_dirs": len(ep_dirs),
+                "n_expected": n_expected,
+                "has_summary": summary is not None,
+                "cap": SWEEP_CAP,
             })
-        return result
+        return sweeps
 
     def _scan_training():
         videos_dir = os.path.join(root_dir, WAM_RUN_DIR, "videos")
         by_epoch, totals, probes = {}, {}, {}
-        for ep, ep_name in sorted(_epoch_dirs(videos_dir).items()):
-            ep_dir = os.path.join(videos_dir, ep_name)
-            val, pred, n_val, n_pred = [], [], 0, 0
+        try:
+            names = os.listdir(videos_dir)
+        except OSError:
+            names = []
+        for name in names:
+            m = re.match(r"^epoch_(\d+)$", name)
+            if not m:
+                continue
+            ep = int(m.group(1))
+            ep_dir = os.path.join(videos_dir, name)
+            if not os.path.isdir(ep_dir):
+                continue
+            val, pred, n_val, n_pred, probe = [], [], 0, 0, None
             try:
                 embodiments = sorted(os.listdir(ep_dir))
             except OSError:
@@ -815,14 +1055,14 @@ def viewer():
                 emb_dir = os.path.join(ep_dir, emb)
                 if not os.path.isdir(emb_dir):
                     continue
-                rel = f"{WAM_RUN_DIR}/videos/{ep_name}/{emb}"
+                rel = f"{WAM_RUN_DIR}/videos/{name}/{emb}"
                 v, p, nv, np_ = _split_families(emb_dir, rel, cap=TRAINING_CAP)
                 val += v
                 pred += p
                 n_val += nv
                 n_pred += np_
-                if ep not in probes and (v or p):
-                    probes[ep] = _probe(
+                if probe is None and (v or p):
+                    probe = _probe(
                         os.path.join(emb_dir, os.path.basename((v or p)[0]))
                     )
             if val or pred:
@@ -831,24 +1071,31 @@ def viewer():
                     "predicted": pred[:TRAINING_CAP],
                 }
                 totals[ep] = {"validation": n_val, "predicted": n_pred}
+                probes[ep] = probe
         eps = sorted(by_epoch)
+        gen_counts = {}
+        for e in eps:
+            g = (probes.get(e) or {}).get("generation", "unknown")
+            gen_counts[g] = gen_counts.get(g, 0) + 1
         return {
             "run_dir": WAM_RUN_DIR,
             "epochs": eps,
             "byEpoch": {str(e): by_epoch[e] for e in eps},
             "totals": {str(e): totals[e] for e in eps},
             "probe": {str(e): probes.get(e) for e in eps},
+            "gen_counts": gen_counts,
             "cap": TRAINING_CAP,
         }
 
     def _scan():
         passes = []
-        for key, prefix, label, note in OFFLINE_PASSES:
-            passes += _scan_offline_pass(key, prefix, label, note)
+        for key, prefix, title, note, featured in OFFLINE_PASSES:
+            passes += _scan_offline_pass(key, prefix, title, note, featured)
         return {
             "run": WAM_RUN_LABEL,
-            "fixed": {"passes": passes},
-            "sweep": [_scan_sweep(p, lbl) for p, lbl in SWEEP_PREFIXES],
+            "sweep_prefix": SWEEP_PREFIX,
+            "passes": passes,
+            "sweeps": _scan_sweeps(),
             "training": _scan_training(),
         }
 
@@ -876,7 +1123,7 @@ def viewer():
     def video(path: str = Query(...)):
         # Resolve strictly under one of the WAM prefixes; reject traversal. The
         # allowlist is on the full path prefix (not the first segment) so the
-        # training entry cannot reach sibling runs under data_div_oss/.
+        # training entry cannot reach sibling runs or checkpoints.
         if "\x00" in path or path.startswith(("/", "~")) or ".." in path.split("/"):
             raise HTTPException(status_code=400, detail="bad path")
         if not path.startswith(ALLOWED_PATH_PREFIXES):
