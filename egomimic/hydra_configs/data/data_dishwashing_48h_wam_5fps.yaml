@@ -1,4 +1,6 @@
-# 5 fps EVAL-ONLY variant of data_dishwashing_48h_wam.yaml (frame_stride=6).
+# 5 fps variant of data_dishwashing_48h_wam.yaml — for TRAINING and eval.
+# camera strides x6 (17 frames = 3.4 s @ 5 fps); ACTIONS DO NOT stride and keep
+# the raw 30 Hz rate, so action_horizon 96 = 3.2 s covers the whole window.
 # SEPARATE FILE ON PURPOSE: the live k2 training run resubmits with
 # data=data_dishwashing_48h_wam, so putting frame_stride there would switch a
 # 30fps-trained run to 5fps clips mid-flight on resume. Use this only for
