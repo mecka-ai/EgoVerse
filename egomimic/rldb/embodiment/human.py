@@ -398,6 +398,7 @@ class Mecka(Human):
         state_horizon: int = 4,
         norm_mode: bool = False,
         annotation_key=None,
+        frame_stride: int = 1,
     ):
         key_map = {
             cls.VIZ_IMAGE_KEY: {
@@ -451,6 +452,18 @@ class Mecka(Human):
                 k for k, v in key_map.items() if v.get("key_type") == "camera_keys"
             ]:
                 del key_map[k]
+        # Resample EVERY horizoned read at the same rate so the video clip, the
+        # action chunk, the state chunk and the per-frame head poses stay
+        # frame-aligned. frame_stride=6 turns the 30 fps source into a 5 fps
+        # clip: cam_horizon 17 then spans 97 raw frames (3.4 s) instead of 17
+        # (0.567 s). The 0.567 s clip is why rollouts looked frozen — 16
+        # predicted frames covered half a second of near-static content, and an
+        # episode became 121 of those bursts stitched together.
+        # frame_stride=1 leaves every entry exactly as before.
+        if frame_stride and int(frame_stride) > 1:
+            for spec in key_map.values():
+                if spec.get("horizon"):
+                    spec["stride"] = int(frame_stride)
         return key_map
 
     @classmethod

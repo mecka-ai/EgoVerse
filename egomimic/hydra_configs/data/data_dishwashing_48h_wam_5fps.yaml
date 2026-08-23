@@ -1,0 +1,71 @@
+# 5 fps EVAL-ONLY variant of data_dishwashing_48h_wam.yaml (frame_stride=6).
+# SEPARATE FILE ON PURPOSE: the live k2 training run resubmits with
+# data=data_dishwashing_48h_wam, so putting frame_stride there would switch a
+# 30fps-trained run to 5fps clips mid-flight on resume. Use this only for
+# offline eval of existing checkpoints, and for FRESH 5fps training runs.
+# data_dishwashing_48h_oph_zarr.yaml (the data_div_oss dw48 experiment), same
+# WAM clip/action/state pipeline as mecka_wam.yaml:
+#   - Train = ~48h (1710 eps) of dishwashing -> data_diversity/dishwashing_48h_train.json
+#   - Val   = 5 eps of the held-out operator -> data_diversity/dishwashing_val_ophold5.json
+# ModalWamEpisodeResolver inherits eps_to_use from ModalEpisodeResolver (SQL
+# filter + /mnt/zarr-data volume), so the jsons plug in directly — no
+# filter_lambdas needed. Keymap/transform/dataloader params are WAM's own
+# (see mecka_wam.yaml header for the horizon alignment).
+# Pair with model=wam_bc_human_wan22_5b evaluator=eval_wam.
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_wam.WamMultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_wam.ModalWamEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
+        cam_horizon: 17
+        frame_stride: 6
+        action_horizon: 16
+        state_horizon: 4
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/dishwashing_48h_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_wam.WamMultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_wam.ModalWamEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
+        cam_horizon: 17
+        frame_stride: 6
+        action_horizon: 16
+        state_horizon: 4
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/dishwashing_val_ophold5.json
+    mode: total
+
+# persistent_workers: with ``limit_train_batches`` Lightning drops the loader
+# iterator at every epoch boundary with ~num_workers*prefetch in-flight batches
+# whose /dev/shm IPC segments are never freed (torch worker teardown). WAM's
+# 17-frame clips are ~53MB/sample, so that leaked ~0.9GB per epoch into the
+# FIXED 16GiB /dev/shm of Modal containers -> deterministic worker SIGBUS at
+# epoch ~21 (the wam22_dw48 crash loop; verified with an isolated dataloader
+# probe: non-persistent grows 0.9GB/epoch, persistent stays flat at ~90MB).
+# Persistent workers reuse the pool across epochs, so nothing is torn down
+# mid-flight. Sample order/content are unchanged (the sampler lives in the
+# main process).
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 2
+    num_workers: 10
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 2
+    num_workers: 10
+    persistent_workers: true

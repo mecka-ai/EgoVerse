@@ -50,6 +50,8 @@ class EpisodePlan:
     cam_horizon: int
     stride: int
     source_fps: float = DEFAULT_SOURCE_FPS
+    # Stride the data pipeline already applied (6 => the clip is 5 fps).
+    data_frame_stride: int = 1
     anchors: list[int] = field(default_factory=list)
 
     @property
@@ -59,7 +61,7 @@ class EpisodePlan:
     @property
     def frame_stride(self) -> int:
         """Video-assembly subsample stride for real-time playback at 5 fps."""
-        return video_frame_stride(self.source_fps)
+        return video_frame_stride(self.source_fps, self.data_frame_stride)
 
     @property
     def covered_frames(self) -> int:
@@ -145,6 +147,20 @@ def _camera_horizon(dataset) -> int:
     )
 
 
+def _data_frame_stride(dataset) -> int:
+    """Stride the DATA pipeline applies to the camera clip (1 if none).
+
+    ``Mecka.get_wam_keymap(frame_stride=6)`` stamps ``stride`` onto every
+    horizoned key, so the clip is a 5 fps resample of a 30 fps source. The
+    window tiling must then advance in RAW frames per SAMPLED frame, and the
+    playback subsample must not decimate a second time.
+    """
+    for spec in (dataset.key_map or {}).values():
+        if spec.get("key_type") == "camera_keys" and spec.get("horizon"):
+            return max(1, int(spec.get("stride") or 1))
+    return 1
+
+
 def _source_fps(dataset, log=None) -> float:
     """Frame rate of the episode's raw camera stream, from its zarr metadata.
 
@@ -212,12 +228,19 @@ def plan_full_episode_walk(
             ds._ensure_episode_reader()
         total = int(ds.total_frames)
         cam_h = _camera_horizon(ds)
-        stride = cam_h - 1
+        # With a data stride the clip is a resample, so one window SPANS
+        # (cam_h - 1) * dstride + 1 raw frames while still yielding cam_h
+        # samples. Anchors must therefore advance in RAW frames by
+        # (cam_h - 1) * dstride to keep window j's frame 0 on window j-1's last
+        # SAMPLED frame — stepping by cam_h - 1 would overlap windows ~6x and
+        # re-emit the same content over and over.
+        dstride = _data_frame_stride(ds)
+        stride = (cam_h - 1) * dstride
         if stride < 1:
             raise ValueError(f"cam_horizon must be > 1 (got {cam_h})")
         # Only whole windows: a window that overruns the episode would be
         # tail-padded with copies of the final frame.
-        last_anchor = total - cam_h
+        last_anchor = total - ((cam_h - 1) * dstride + 1)
         if last_anchor < 0:
             if log is not None:
                 log.warning(
@@ -233,6 +256,7 @@ def plan_full_episode_walk(
             total_frames=total,
             cam_horizon=cam_h,
             stride=stride,
+            data_frame_stride=dstride,
             source_fps=_source_fps(ds, log=log),
             anchors=anchors,
         )

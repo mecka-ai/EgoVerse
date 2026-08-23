@@ -102,7 +102,9 @@ LATENT_PIXEL_STRIDE = 4
 DEFAULT_SOURCE_FPS = 30.0
 
 
-def video_frame_stride(source_fps: float = DEFAULT_SOURCE_FPS) -> int:
+def video_frame_stride(
+    source_fps: float = DEFAULT_SOURCE_FPS, data_frame_stride: int = 1
+) -> int:
     """Keep every Nth predicted frame so the mp4 plays back in REAL TIME.
 
     The model predicts at ``source_fps`` granularity (see ``DEFAULT_SOURCE_FPS``)
@@ -113,11 +115,20 @@ def video_frame_stride(source_fps: float = DEFAULT_SOURCE_FPS) -> int:
 
     This is deliberately a video-assembly concern only: the rollout, the
     teacher-forcing conditioning, the chunk/latent geometry and the per-frame
-    action predictions all stay at native ``source_fps`` granularity, and the
-    metrics are computed over ALL predicted frames. Only which frames get
-    encoded into the container changes.
+    action predictions all stay at the prediction granularity, and the metrics
+    are computed over ALL predicted frames. Only which frames get encoded into
+    the container changes.
+
+    ``data_frame_stride`` is the stride the DATA pipeline already applied to the
+    source (``Mecka.get_wam_keymap(frame_stride=...)``). The model predicts at
+    ``source_fps / data_frame_stride``, NOT at ``source_fps``, so that is the
+    rate to compare against the container. With the 5 fps WAM pipeline
+    (source 30, data stride 6) the prediction rate is already 5 fps and the
+    correct answer is 1 — subsampling again would drop 5 of every 6 predicted
+    frames and play the episode back 6x too FAST off a 30x-decimated clip.
     """
-    return max(1, int(round(float(source_fps) / float(WAM_VIDEO_FPS))))
+    pred_fps = float(source_fps) / max(1, int(data_frame_stride))
+    return max(1, int(round(pred_fps / float(WAM_VIDEO_FPS))))
 
 
 def latents_to_pixels(num_latents: int) -> int:
