@@ -10,33 +10,60 @@ matched pair per sample:
     validation_video_<i>.mp4  the GROUND-TRUTH clip for the same window, same
                               overlay — the reference to compare the dream to
 
-FOUR GENERATIONS of video exist on the volume and must never be read as
+FIVE GENERATIONS of video exist on the volume and must never be read as
 like-for-like. Every number below was measured from the actual mp4 atoms by
 ``_probe`` (cross-checked against ffprobe), not assumed:
 
-    real-time     ~323 f @ 5 fps =  64.6 s   ~8.4 MB   full episode, subsampled
-                  x6 from the 30 fps source — CORRECT (post-d272d135)
+    5 fps source  ~320-352 f @ 5 fps = 64-72 s        TRUE 5 fps clips: the data
+                  pipeline itself strides x6 (cam_horizon=17 now spans 3.2 s of
+                  real time, not 0.567 s) and episode tiling steps 96 raw frames
+                  so windows no longer overlap ~6x. Playback subsample x1.
+                  Fixed in c1c4ff00 — the cure for the "repeating segments".
+    real-time     ~323-326 f @ 5 fps = 64-65 s        full episode at the right
+                  (30 fps       speed, but built from 17 CONSECUTIVE 30 fps frames
+                  decimated)    (a 0.567 s burst per window) then decimated x6 at
+                                write time (d272d135). Right duration, still the
+                                repeating-burst content.
     6x slow       1936 f @ 5 fps = 387.2 s  ~50   MB   full episode, but 30 fps
                   frames written into a 5 fps container -> plays 6x too slow
     debug-capped    96 f @ 5 fps =  19.2 s   ~2.5 MB   right fps, length-capped
     chunk           32 f @ 10 fps =  3.2 s   ~0.4 MB   pre-fix: one chunk,
                   10 fps, misaligned teacher forcing
 
+"5 fps source" and "real-time (30 fps decimated)" are INDISTINGUISHABLE from the
+mp4 alone — both are ~320 frames at 5 fps. They are told apart by PATH PREFIX:
+anything under ``wam_offline_5fps/`` came from the c1c4ff00 pipeline and is true
+5 fps source; everything else with those dimensions is x6-decimated. That is why
+``_classify`` takes a ``source_5fps`` flag instead of guessing from the file.
+
 Sources surfaced:
 
-  1. REFERENCE — wam_gate_a2/e989_realtime_*/ (featured). Full episode
+  0. 5 FPS OFFLINE EVAL — wam_offline_5fps/<run>_<ts>/ (featured, first). Four
+     logical runs, all at k2 checkpoint epoch 1019 over the 3 held-out-operator
+     episodes: {tf,ar} x {vids,metrics}. The point of these four is the
+     TF-vs-AR comparison, so the section renders GT / TF-predicted /
+     AR-predicted side by side for one selected episode, with each mode's
+     metrics. Run dirs are TIMESTAMPED and each logical run may have several
+     attempts (the 03-50/03-51 launches crashed on the new real-time assertion
+     and wrote no videos); the scanner groups by logical name, prefers the
+     newest attempt that actually has videos, and reports crashed/running
+     status from the attempt's log.
+  1. PREVIOUS REFERENCE — wam_gate_a2/e989_realtime_*/. Full episode
      69b22fc5f4f4e149281a6635 at checkpoint epoch 989, teacher-forced rolling,
-     real time. This is the pair to trust.
+     right duration but x6-decimated content.
   2. SWEEP — wam_val_sweep/<sweep_id>/epoch_<N>_<ts>/videos/... , one offline
      pass per checkpoint (45 checkpoints, 4x H200). Sweep ids are DISCOVERED
      (never hardcoded), newest preferred, several tolerated. Per-epoch metrics
      come from metrics/epoch_<N>.json when written, else are parsed out of that
      epoch's eval_dreamzero.log so numbers show up while the sweep is still
      running.
-  3. LIVE training-time val — data_div_oss/wam22_dw48_v2/videos/epoch_<N>/,
-     ~100 pairs per epoch, capped to TRAINING_CAP. Still "chunk" generation at
-     build time; the run picks up both fixes on its next resubmit, at which
-     point the per-file probe relabels new epochs "real-time" on its own.
+  3. LIVE training-time val — data_div_oss/wam22_dw48_{v2,k2}/videos/epoch_<N>/,
+     selectable per run, capped to TRAINING_CAP pairs. v2 is still "chunk"
+     generation (32 f @ 10 fps); k2 is uniformly "real-time (30 fps decimated)"
+     (326 f @ 5 fps) across every epoch 29..1079 — its .hydra config carries the
+     same cam_horizon=17 with no stride, so it predates c1c4ff00 and is NOT
+     5 fps source. Both relabel themselves per epoch if a resubmit changes the
+     output.
   4. COMPARISON passes — wam_gateA (6x slow, superseded) and wam_gateC
      (debug-capped), kept unfeatured so the reference can't be confused.
 
@@ -60,10 +87,24 @@ outputs_volume = modal.Volume.from_name("egoverse-training-outputs")
 MOUNT_PATH = "/data"
 INDEX_TTL_S = 60
 
-WAM_RUN_LABEL = "data_div_oss_wam22_dw48_v2"
-WAM_RUN_DIR = "data_div_oss/wam22_dw48_v2"
+WAM_RUN_LABEL = "data_div_oss_wam22_dw48_v2 / _k2"
 TRAINING_CAP = 8  # pairs shown per epoch (each epoch really has ~100)
 SWEEP_CAP = 4  # pairs shown per sweep checkpoint
+
+# Live training runs, selectable in the training section. (key, volume dir)
+TRAINING_RUNS = [
+    ("v2", "data_div_oss/wam22_dw48_v2"),
+    ("k2", "data_div_oss/wam22_dw48_k2"),
+]
+
+# The c1c4ff00 pipeline: TRUE 5 fps source clips. Indistinguishable from the
+# x6-decimated generation by file inspection alone (both ~320 f @ 5 fps), so
+# membership is decided by this path prefix and nothing else.
+FIVE_FPS_PREFIX = "wam_offline_5fps"
+FIVE_FPS_LABEL = "5 fps offline eval (fixed pipeline)"
+# Expected final length, from the verified plan line: 1945 frames @ 30 fps ->
+# 20 windows x 17 (stride 96) -> 320 frames @ 5 fps, subsampled x1.
+FIVE_FPS_EXPECTED_FRAMES = 320
 
 # Offline single-checkpoint passes, in display order.
 # (key, prefix, title, note, featured)
@@ -98,9 +139,10 @@ SWEEP_LABEL = "Offline sweep (fixed) — one pass per checkpoint"
 # (op_scaling/, pksnack_*/, other data_div_oss/ runs, checkpoints, ...) is
 # rejected. The training entry is scoped to the WAM run's videos/ subtree, NOT
 # all of data_div_oss/, so sibling runs stay unreachable.
-ALLOWED_PATH_PREFIXES = tuple(f"{p}/" for _, p, _, _, _ in OFFLINE_PASSES) + (
-    f"{SWEEP_PREFIX}/",
-    f"{WAM_RUN_DIR}/videos/",
+ALLOWED_PATH_PREFIXES = (
+    tuple(f"{p}/" for _, p, _, _, _ in OFFLINE_PASSES)
+    + (f"{SWEEP_PREFIX}/", f"{FIVE_FPS_PREFIX}/")
+    + tuple(f"{d}/videos/" for _, d in TRAINING_RUNS)
 )
 
 # Generation classification thresholds, applied to (frames, fps) measured from
@@ -167,7 +209,29 @@ PAGE_HTML = r"""<!doctype html>
     font-size: 11px; padding: 2px 7px; border-radius: 999px;
     border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
   }
+  .badge.gen-5fps { border-color: #6ee7d0; color: #6ee7d0; }
   .badge.gen-realtime { border-color: var(--good); color: var(--good); }
+  .badge.status-crashed { border-color: var(--bad); color: var(--bad); }
+  .badge.status-running { border-color: var(--warn); color: var(--warn); }
+  .badge.status-done { border-color: var(--good); color: var(--good); }
+  .cmp { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 4px; }
+  .cmp-col { flex: 0 0 auto; width: 400px; }
+  .cmp-col h4 {
+    margin: 0 0 5px; font-size: 12px; font-weight: 600; display: flex;
+    align-items: baseline; gap: 6px;
+  }
+  .cmp-col.gt h4 { color: var(--gt); }
+  .cmp-col.tf h4 { color: #a9d97f; }
+  .cmp-col.ar h4 { color: var(--pred); }
+  .cmp-col .met { color: var(--accent); font-size: 11px; font-weight: 400; }
+  .cmp-col video { width: 100%; border-radius: 6px; background: #000; display: block; }
+  .cmp-col .cap { color: var(--dim); font-size: 11px; margin-top: 3px; text-align: center; }
+  .runtable { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 6px; }
+  .runtable th, .runtable td {
+    text-align: left; padding: 3px 8px 3px 0; color: var(--dim);
+    border-bottom: 1px solid #21252c; white-space: nowrap;
+  }
+  .runtable th { color: #9aa3b2; font-weight: 600; }
   .badge.gen-slow { border-color: var(--bad); color: var(--bad); }
   .badge.gen-chunk { border-color: var(--warn); color: var(--warn); }
   .badge.gen-capped { border-color: var(--neutral); color: var(--neutral); }
@@ -222,8 +286,10 @@ PAGE_HTML = r"""<!doctype html>
   const mainEl = $("main"), statusEl = $("status");
   let index = null;
   let trainEpoch = null, sweepEpoch = null, sweepId = null;
+  let trainRun = null, fiveEp = null;
   let columnMode = false, currentCol = 0, playToken = 0;
   const SWEEP_TITLE = "Offline sweep (fixed)";
+  const FIVE_FPS_TITLE = "5 fps offline eval (fixed pipeline)";
 
   const observer = new IntersectionObserver((entries) => {
     for (const e of entries) {
@@ -241,15 +307,25 @@ PAGE_HTML = r"""<!doctype html>
     return pr.frames + " f @ " + (pr.fps != null ? pr.fps : "?") + " fps · " + d;
   }
 
+  const GEN_CLASS = {
+    "5 fps source": "gen-5fps",
+    "real-time (30 fps decimated)": "gen-realtime",
+    "6× slow": "gen-slow",
+    "chunk (pre-fix)": "gen-chunk",
+    "debug-capped": "gen-capped",
+  };
+
   function badge(pr) {
     if (!pr || !pr.generation) return "";
     const g = pr.generation;
-    const cls = g === "real-time" ? "gen-realtime"
-              : g === "6× slow" ? "gen-slow"
-              : g === "chunk (pre-fix)" ? "gen-chunk"
-              : g === "debug-capped" ? "gen-capped" : "";
     const p = fmtProbe(pr);
-    return '<span class="badge ' + cls + '">' + g + (p ? " · " + p : "") + "</span>";
+    return '<span class="badge ' + (GEN_CLASS[g] || "") + '">' + g +
+           (p ? " · " + p : "") + "</span>";
+  }
+
+  function statusBadge(st) {
+    if (!st) return "";
+    return '<span class="badge status-' + st + '">' + st + "</span>";
   }
 
   function fmtMetrics(m) {
@@ -382,6 +458,138 @@ PAGE_HTML = r"""<!doctype html>
     });
   }
 
+  // ---- 5 fps offline eval: TF vs AR side by side, one episode at a time ----
+  function pickRun(runs, mode) {
+    // prefer the *_vids variant, fall back to *_metrics; prefer one with videos
+    const cands = runs.filter((r) => r.mode === mode);
+    const withVids = cands.filter((r) => (r.predicted || []).length);
+    const pool = withVids.length ? withVids : cands;
+    return pool.find((r) => r.variant === "vids") || pool[0] || null;
+  }
+
+  function cmpCol(kind, title, path, met, epLabel) {
+    const col = document.createElement("div");
+    col.className = "cmp-col " + kind;
+    const h = document.createElement("h4");
+    h.innerHTML = title + (met ? '<span class="met">' + met + "</span>" : "");
+    col.appendChild(h);
+    if (path) {
+      const v = document.createElement("video");
+      v.controls = true; v.muted = true; v.loop = true;
+      v.playsInline = true; v.preload = "none";
+      v.dataset.src = "video?path=" + encodeURIComponent(path);
+      v.title = path;
+      if (!columnMode) observer.observe(v);
+      col.appendChild(v);
+      const cap = document.createElement("div");
+      cap.className = "cap";
+      cap.textContent = path.split("/").pop() + " · " + epLabel;
+      col.appendChild(cap);
+    } else {
+      const ph = document.createElement("div");
+      ph.className = "placeholder";
+      ph.textContent = "still running — no video for this episode yet";
+      col.appendChild(ph);
+    }
+    return col;
+  }
+
+  function renderFiveFps() {
+    const f = index.five_fps;
+    if (!f || !f.runs.length) {
+      return section({
+        featured: true, title: FIVE_FPS_TITLE,
+        sub: "<code>" + (f ? f.prefix : "wam_offline_5fps") + "/</code> is not on " +
+             "the volume yet — this section fills in automatically (no redeploy).",
+      });
+    }
+    const tf = pickRun(f.runs, "tf"), ar = pickRun(f.runs, "ar");
+    const nEps = Math.max(
+      tf ? (tf.predicted || []).length : 0, ar ? (ar.predicted || []).length : 0,
+      tf ? (tf.validation || []).length : 0, ar ? (ar.validation || []).length : 0);
+    const epList = [];
+    for (let i = 0; i < Math.max(nEps, 1); i++) epList.push(i);
+    if (fiveEp === null || !epList.includes(fiveEp)) fiveEp = 0;
+
+    const hashes = (tf && tf.episodes.length ? tf.episodes
+                 : (ar && ar.episodes) || []);
+    const epLabel = (i) => "episode " + i + (hashes[i] ? " · " + hashes[i].slice(0, 8) : "");
+
+    const cmp = document.createElement("div");
+    cmp.className = "cmp";
+    const gtPath = (tf && (tf.validation || [])[fiveEp]) ||
+                   (ar && (ar.validation || [])[fiveEp]) || null;
+    cmp.appendChild(cmpCol("gt", "validation — ground truth", gtPath, "", epLabel(fiveEp)));
+    cmp.appendChild(cmpCol("tf", "predicted — teacher-forced (TF)",
+      tf ? (tf.predicted || [])[fiveEp] : null,
+      tf ? fmtMetrics(tf.metrics) : "", epLabel(fiveEp)));
+    cmp.appendChild(cmpCol("ar", "predicted — autoregressive (AR)",
+      ar ? (ar.predicted || [])[fiveEp] : null,
+      ar ? fmtMetrics(ar.metrics) : "", epLabel(fiveEp)));
+
+    // status table over all four logical runs
+    const table = document.createElement("table");
+    table.className = "runtable";
+    table.innerHTML =
+      "<tr><th>run</th><th>mode</th><th>status</th><th>pairs</th>" +
+      "<th>video</th><th>metrics</th><th>attempts</th></tr>" +
+      f.runs.map((r) => {
+        const pr = r.probe;
+        return "<tr><td>" + r.logical + "</td><td>" + r.mode.toUpperCase() +
+          "</td><td>" + r.status + "</td><td>" +
+          Math.min((r.predicted || []).length, (r.validation || []).length) +
+          "</td><td>" + (pr ? fmtProbe(pr) : "—") + "</td><td>" +
+          (r.metrics ? fmtMetrics(r.metrics) : "—") + "</td><td>" +
+          r.n_attempts + (r.crashed_attempts.length
+            ? " (" + r.crashed_attempts.length + " crashed)" : "") +
+          "</td></tr>";
+      }).join("");
+
+    const probe = (tf && tf.probe) || (ar && ar.probe);
+    const short = probe && probe.frames && probe.frames < f.expected_frames * 0.8;
+    const allDone = f.runs.every((r) => r.status === "done");
+    let sub =
+      "<code>" + f.prefix + "/</code> · k2 checkpoint <b>epoch 1019</b>, 3 held-out-" +
+      "operator episodes. <b>TRUE 5 fps clips</b>: the data pipeline strides ×6 so " +
+      "cam_horizon=17 spans 3.2 s of real time instead of a 0.567 s burst, and " +
+      "episode tiling steps 96 raw frames so windows no longer overlap ~6× — this is " +
+      "the fix for the repeating segments. Compare the same episode across " +
+      "<b>teacher-forced</b> (re-anchored to GT every chunk) and " +
+      "<b>autoregressive</b> (free-running, drift accumulates).";
+    if (short && allDone) {
+      sub += "<br><b>Length caveat:</b> these passes report <i>done</i>, yet each " +
+        "episode video is only " + probe.frames + " f (" +
+        probe.duration.toFixed(1) + " s) against the ~" + f.expected_frames +
+        " f (~64–72 s) the plan predicts — so the full-episode tiling is not " +
+        "landing in the mp4s even though the fps is right. Treat the clips as a " +
+        "short excerpt per episode, not a whole episode.";
+    } else if (short) {
+      sub += "<br><b>Still running</b> — expected ~" + f.expected_frames +
+        " frames (~64–72 s) per episode, currently " + probe.frames + " f (" +
+        probe.duration.toFixed(1) + " s), so lengths and metrics are provisional.";
+    }
+    if (!f.runs.some((r) => r.metrics)) {
+      sub += "<br>No <code>metrics.json</code> written yet and the eval logs have not " +
+        "flushed their metric lines, so no numbers are available for either mode yet.";
+    } else {
+      sub += "<br>Metrics are parsed from each pass's <code>eval_dreamzero.log</code> " +
+        "(no <code>metrics.json</code> was written). Only " +
+        "<code>paired_mse_avg</code> separates the two modes — the Valid/*_loss " +
+        "figures are computed teacher-forced in both and come out identical.";
+    }
+
+    return section({
+      featured: true, title: FIVE_FPS_TITLE,
+      note: "TF vs AR · " + f.runs.length + " runs",
+      badge: badge(probe) + (tf ? statusBadge(tf.status) : ""),
+      sub,
+      ctl: epList.length > 1
+        ? selector("episode", epList, fiveEp, epLabel, (v) => { fiveEp = Number(v); render(); })
+        : null,
+      rows: [cmp, table],
+    });
+  }
+
   function renderSweep() {
     const sweeps = index.sweeps;
     if (!sweeps.length) {
@@ -438,7 +646,14 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function renderTraining() {
-    const tr = index.training;
+    const runs = index.training_runs;
+    if (trainRun === null || !runs.some((r) => r.key === trainRun)) {
+      // default to the run with the most recent epoch
+      trainRun = runs.slice().sort((a, b) =>
+        (a.epochs[a.epochs.length - 1] || 0) - (b.epochs[b.epochs.length - 1] || 0)
+      ).pop().key;
+    }
+    const tr = runs.find((r) => r.key === trainRun);
     const eps = tr.epochs;
     if (trainEpoch === null || !eps.includes(trainEpoch)) {
       trainEpoch = eps.length ? eps[eps.length - 1] : null;
@@ -451,9 +666,13 @@ PAGE_HTML = r"""<!doctype html>
       genNote = " <b>Pre-fix output</b>: one ~3.2 s chunk at 10 fps with misaligned " +
         "teacher forcing — NOT comparable to the reference above. The live run picks " +
         "up both fixes only on its next resubmit.";
-    } else if (pr && pr.generation === "real-time") {
-      genNote = " <b>Post-fix output</b> — full-episode real-time 5 fps, comparable " +
-        "to the reference above.";
+    } else if (pr && pr.generation === "real-time (30 fps decimated)") {
+      genNote = " <b>Right duration, decimated content</b> — full episode at real " +
+        "speed, but each window is still 17 consecutive 30 fps frames decimated ×6, " +
+        "so it shows the repeating-burst behaviour rather than true 5 fps clips. " +
+        "Not the same generation as the 5 fps section at the top.";
+    } else if (pr && pr.generation === "5 fps source") {
+      genNote = " <b>True 5 fps source</b> — comparable to the 5 fps section above.";
     } else if (pr && pr.generation === "6× slow") {
       genNote = " <b>6× slow output</b> — full episode but played 6× too slow.";
     }
@@ -462,14 +681,24 @@ PAGE_HTML = r"""<!doctype html>
       ? "<br>Epoch mix on the volume: " +
         Object.entries(genCounts).map(([g, n]) => n + " × " + g).join(", ") + "."
       : "";
+    const ctlWrap = document.createElement("span");
+    ctlWrap.className = "epctl";
+    if (runs.length > 1) {
+      ctlWrap.appendChild(selector("run", runs.map((r) => r.key), trainRun,
+        (k) => k + " (" + (runs.find((r) => r.key === k).epochs.length) + " ep)",
+        (v) => { trainRun = v; trainEpoch = null; render(); }));
+    }
+    if (eps.length) {
+      ctlWrap.appendChild(selector("epoch", eps, trainEpoch, (e) => "epoch " + e,
+        (v) => { trainEpoch = Number(v); render(); }));
+    }
     return section({
       title: "Live training-time val",
-      note: "held-out operator · " + eps.length + " epochs",
+      note: "held-out operator · " + tr.key + " · " + eps.length + " epochs",
       badge: badge(pr),
       sub: "<code>" + tr.run_dir + "/videos/epoch_" + trainEpoch + "/</code> — first " +
            tr.cap + " of ~" + (tot.validation || "100") + " pairs." + genNote + mix,
-      ctl: eps.length ? selector("epoch", eps, trainEpoch, (e) => "epoch " + e,
-            (v) => { trainEpoch = Number(v); render(); }) : null,
+      ctl: ctlWrap,
       rows: [
         makeRow("pred", "epoch " + trainEpoch, cur.predicted,
                 "no predicted videos at this epoch",
@@ -483,6 +712,7 @@ PAGE_HTML = r"""<!doctype html>
 
   function render() {
     mainEl.innerHTML = "";
+    mainEl.appendChild(renderFiveFps());
     for (const p of index.passes.filter((x) => x.featured)) {
       mainEl.appendChild(renderPass(p));
     }
@@ -589,16 +819,19 @@ PAGE_HTML = r"""<!doctype html>
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     const d = e.key === "ArrowLeft" ? -1 : 1;
     if (columnMode) { colStep(d); return; }
-    const eps = index ? index.training.epochs : [];
+    const run = index && index.training_runs.find((r) => r.key === trainRun);
+    const eps = run ? run.epochs : [];
     const i = eps.indexOf(trainEpoch) + d;
     if (i >= 0 && i < eps.length) { trainEpoch = eps[i]; render(); }
   });
 
   function setBlurb() {
-    const ref = index.passes.find((p) => p.featured);
+    const ref = index.passes.find((p) => p.key === "gate_a2");
     const slow = index.passes.find((p) => p.key === "gateA");
-    const tp = index.training.probe[
-      String(index.training.epochs[index.training.epochs.length - 1])];
+    const v2 = index.training_runs.find((r) => r.key === "v2");
+    const tp = v2 && v2.epochs.length
+      ? v2.probe[String(v2.epochs[v2.epochs.length - 1])] : null;
+    const f5 = index.five_fps.runs.map((r) => r.probe).find((p) => p);
     $("blurb").innerHTML =
       "Run <code>" + index.run + "</code> — <b>Wan2.2-TI2V-5B world-action model</b>, " +
       "dishwashing 48 h pool, validating on the <b>held-out operator</b> split. " +
@@ -606,22 +839,31 @@ PAGE_HTML = r"""<!doctype html>
       "<b>validation</b> = the ground-truth clip for the same window. Both carry " +
       "action-trail overlays, so a good model matches the GT in pixels and in the " +
       "drawn trajectory.<br>" +
-      "Four generations of video exist on the volume; every section is labelled from " +
-      "its actual files. <b>real-time</b> = " +
+      "<b>Five generations</b> exist on the volume; each section is labelled from its " +
+      "own files. <b>5 fps source</b> = " +
+      (f5 ? fmtProbe(f5) : "~320 f @ 5 fps · ~64 s") +
+      " — true 5 fps clips (pipeline strides ×6; the repeating-segments fix) · " +
+      "<b>real-time (30 fps decimated)</b> = " +
       (ref && ref.probe ? fmtProbe(ref.probe) : "~323 f @ 5 fps · 64.6 s") +
-      " (full episode, subsampled ×6 — correct) · <b>6× slow</b> = " +
+      " — right duration, but 0.567 s bursts decimated ×6 · <b>6× slow</b> = " +
       (slow && slow.probe ? fmtProbe(slow.probe) : "1936 f @ 5 fps · 387.2 s") +
-      " (30 fps frames in a 5 fps container) · <b>chunk (pre-fix)</b> = " +
+      " · <b>chunk (pre-fix)</b> = " +
       (tp ? fmtProbe(tp) : "32 f @ 10 fps · 3.2 s") +
-      " (one chunk, misaligned TF) · <b>debug-capped</b> = right fps, capped length. " +
-      "Never read across generations as a like-for-like comparison.";
+      " · <b>debug-capped</b> = right fps, capped length. The first two are " +
+      "byte-identical in shape and are told apart only by path prefix " +
+      "(<code>wam_offline_5fps/</code>), never by the file. Never read across " +
+      "generations as like-for-like.";
   }
 
   function signature(d) {
     return JSON.stringify([
       d.passes.map((p) => [p.key, p.sub, p.predicted.length, p.validation.length]),
       d.sweeps.map((s) => [s.id, s.epochs, Object.keys(s.metrics || {}).length]),
-      d.training.epochs, d.training.gen_counts,
+      d.training_runs.map((r) => [r.key, r.epochs, r.gen_counts]),
+      d.five_fps.runs.map((r) => [
+        r.logical, r.dir, r.status, r.predicted.length, r.validation.length,
+        r.probe ? r.probe.frames : null, r.metrics ? Object.keys(r.metrics).length : 0,
+      ]),
     ]);
   }
 
@@ -636,10 +878,14 @@ PAGE_HTML = r"""<!doctype html>
         setBlurb();
         render();
         const sw = data.sweeps[0];
+        const f5 = data.five_fps.runs;
+        const f5live = f5.filter((r) => (r.predicted || []).length).length;
         statusEl.textContent =
-          data.passes.length + " offline passes · sweep " +
+          "5 fps: " + f5live + "/" + f5.length + " runs with video · sweep " +
           (sw ? Object.keys(sw.byEpoch || {}).length + "/" + (sw.n_expected || sw.n_dirs) : "none") +
-          " · " + data.training.epochs.length + " training epochs · refreshes every 60 s";
+          " · training " +
+          data.training_runs.map((r) => r.key + ":" + r.epochs.length).join(" ") +
+          " · refreshes every 60 s";
       })
       .catch((e) => { statusEl.textContent = "failed to load index: " + e; });
   }
@@ -684,19 +930,29 @@ def viewer():
         m = re.search(r"(\d+)\.mp4$", name)
         return (int(m.group(1)) if m else 1 << 30, name)
 
-    def _classify(frames, fps):
-        """Generation vocabulary: real-time / 6x slow / debug-capped / chunk."""
+    def _classify(frames, fps, source_5fps=False):
+        """Generation vocabulary.
+
+        5 fps source / real-time (30 fps decimated) / 6x slow / debug-capped /
+        chunk (pre-fix). ``source_5fps`` comes from the PATH (the
+        wam_offline_5fps/ prefix) because a true-5 fps clip and an x6-decimated
+        one are byte-indistinguishable at ~320 f @ 5 fps.
+        """
         if not frames or not fps:
             return "unknown"
         if fps >= CHUNK_FPS_MIN:
             return "chunk (pre-fix)"
+        if source_5fps:
+            # Length is not a reliability signal here: these passes write one
+            # episode at a time while running, so short is "still going".
+            return "5 fps source"
         if frames >= SLOW_MIN_FRAMES:
             return "6× slow"
         if frames >= REALTIME_MIN_FRAMES:
-            return "real-time"
+            return "real-time (30 fps decimated)"
         return "debug-capped"
 
-    def _probe(path, window=131072):
+    def _probe(path, window=131072, source_5fps=False):
         """(duration, frames, fps, generation) from the mp4 mvhd+stsz atoms.
 
         Reads only the first and last `window` bytes: torchvision/pyav writes
@@ -707,7 +963,7 @@ def viewer():
             size = os.path.getsize(path)
         except OSError:
             return None
-        key = (path, size)
+        key = (path, size, source_5fps)
         if key in _probe_cache:
             return _probe_cache[key]
         try:
@@ -757,7 +1013,7 @@ def viewer():
             "frames": frames,
             "fps": fps,
             "size_mb": round(size / 1e6, 2),
-            "generation": _classify(frames, fps),
+            "generation": _classify(frames, fps, source_5fps),
         }
         _probe_cache[key] = out
         return out
@@ -781,7 +1037,7 @@ def viewer():
             val, pred = val[:cap], pred[:cap]
         return val, pred, n_val, n_pred
 
-    def _collect_videos(videos_dir, rel_videos, cap=None):
+    def _collect_videos(videos_dir, rel_videos, cap=None, source_5fps=False):
         """Walk a `videos/` tree (videos/<epoch>/<EMB>/) collecting both families."""
         val, pred, n_val, n_pred, probe = [], [], 0, 0, None
         if not os.path.isdir(videos_dir):
@@ -813,7 +1069,8 @@ def viewer():
                 n_pred += np_
                 if probe is None and (v or p):
                     probe = _probe(
-                        os.path.join(emb_dir, os.path.basename((v or p)[0]))
+                        os.path.join(emb_dir, os.path.basename((v or p)[0])),
+                        source_5fps=source_5fps,
                     )
         if cap is not None:
             val, pred = val[:cap], pred[:cap]
@@ -865,7 +1122,9 @@ def viewer():
             elif isinstance(v, dict):
                 for k2, v2 in v.items():
                     if isinstance(v2, (int, float)) and not isinstance(v2, bool):
-                        out[k2 if k in ("metrics", "callback_metrics") else f"{k}/{k2}"] = float(v2)
+                        out[
+                            k2 if k in ("metrics", "callback_metrics") else f"{k}/{k2}"
+                        ] = float(v2)
         return out
 
     def _metrics_from_json(path):
@@ -890,8 +1149,7 @@ def viewer():
         if not m:
             return None
         keep = {
-            k: v for k, v in m.items()
-            if re.search(r"paired_mse|_loss$|Loss$", k, re.I)
+            k: v for k, v in m.items() if re.search(r"paired_mse|_loss$|Loss$", k, re.I)
         }
         return keep or dict(list(m.items())[:3])
 
@@ -918,6 +1176,125 @@ def viewer():
                 return m2.group(1)
         return None
 
+    _TS_SUFFIX_RE = re.compile(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+    def _episodes_from_log(run_dir):
+        """Ordered episode hashes the pass was restricted to."""
+        try:
+            names = [f for f in os.listdir(run_dir) if f.endswith(".log")]
+        except OSError:
+            return []
+        pat = re.compile(r"restricted valid dataset to \d+ episodes[^\[]*\[([^\]]*)\]")
+        for name in names:
+            try:
+                with open(os.path.join(run_dir, name), errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            m = pat.search(text)
+            if m:
+                return re.findall(r"[0-9a-f]{24}", m.group(1))
+        return []
+
+    def _run_status(run_dir):
+        """(status, detail) for an offline attempt, read from its log."""
+        log = None
+        try:
+            for f in os.listdir(run_dir):
+                if f.endswith(".log"):
+                    log = os.path.join(run_dir, f)
+                    break
+        except OSError:
+            return "unknown", None
+        if log is None:
+            return "unknown", None
+        try:
+            with open(log, errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            return "unknown", None
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if "[eval_dreamzero] Done." in text:
+            return "done", None
+        if "Traceback (most recent call last)" in text or "AssertionError" in text:
+            # Surface the assertion message — that is what killed the attempt.
+            detail = None
+            for ln in reversed(lines):
+                if len(ln) > 40 and "Traceback" not in ln:
+                    detail = ln.strip()[:300]
+                    break
+            return "crashed", detail
+        return "running", (lines[-1][:200] if lines else None)
+
+    def _scan_5fps():
+        """The c1c4ff00 5 fps-source offline evals, grouped TF vs AR.
+
+        Run dirs are ``<logical>_<YYYY-MM-DD_HH-MM-SS>`` and a logical run may
+        have several attempts; prefer the newest attempt that actually produced
+        videos, else the newest overall (so a crash is still reported).
+        """
+        base = os.path.join(root_dir, FIVE_FPS_PREFIX)
+        out = {
+            "prefix": FIVE_FPS_PREFIX,
+            "label": FIVE_FPS_LABEL,
+            "runs": [],
+            "expected_frames": FIVE_FPS_EXPECTED_FRAMES,
+        }
+        if not os.path.isdir(base):
+            return out
+
+        attempts = {}
+        for entry in sorted(os.listdir(base)):
+            run_dir = os.path.join(base, entry)
+            if not os.path.isdir(run_dir):
+                continue
+            logical = _TS_SUFFIX_RE.sub("", entry)
+            val, pred, _, _, probe, _ = _collect_videos(
+                os.path.join(run_dir, "videos"),
+                f"{FIVE_FPS_PREFIX}/{entry}/videos",
+                source_5fps=True,
+            )
+            status, detail = _run_status(run_dir)
+            metrics = _pick_metrics(
+                _metrics_from_json(os.path.join(run_dir, "metrics.json"))
+                or _metrics_from_log(run_dir)
+            )
+            attempts.setdefault(logical, []).append(
+                {
+                    "dir": entry,
+                    "validation": val,
+                    "predicted": pred,
+                    "probe": probe,
+                    "status": status,
+                    "detail": detail,
+                    "metrics": metrics,
+                    "episodes": _episodes_from_log(run_dir),
+                }
+            )
+
+        for logical in sorted(attempts):
+            tries = attempts[logical]
+            # newest-first; a try with videos wins over a bare crash
+            tries.sort(
+                key=lambda a: (bool(a["validation"] or a["predicted"]), a["dir"])
+            )
+            best = tries[-1]
+            mode = "ar" if re.search(r"(^|_)ar(_|$)", logical) else "tf"
+            variant = "metrics" if logical.endswith("metrics") else "vids"
+            out["runs"].append(
+                {
+                    "logical": logical,
+                    "mode": mode,
+                    "variant": variant,
+                    "n_attempts": len(tries),
+                    "crashed_attempts": [
+                        t["dir"] for t in tries if t["status"] == "crashed"
+                    ],
+                    **best,
+                }
+            )
+        return out
+
     def _scan_offline_pass(key, prefix, title, note, featured):
         base = os.path.join(root_dir, prefix)
         out = []
@@ -932,19 +1309,21 @@ def viewer():
             )
             if not (val or pred):
                 continue
-            out.append({
-                "key": key,
-                "prefix": prefix,
-                "sub": sub,
-                "title": title,
-                "note": note,
-                "featured": featured,
-                "validation": val,
-                "predicted": pred,
-                "probe": probe,
-                "epoch_label": ep_label,
-                "episode": _episode_from_log(run_dir),
-            })
+            out.append(
+                {
+                    "key": key,
+                    "prefix": prefix,
+                    "sub": sub,
+                    "title": title,
+                    "note": note,
+                    "featured": featured,
+                    "validation": val,
+                    "predicted": pred,
+                    "probe": probe,
+                    "epoch_label": ep_label,
+                    "episode": _episode_from_log(run_dir),
+                }
+            )
         return out
 
     _SWEEP_EP_RE = re.compile(r"^(?:ckpt_)?epoch_(\d+)(?:_.*)?$")
@@ -1018,21 +1397,25 @@ def viewer():
                     if isinstance(summary.get(k), int):
                         n_expected = summary[k]
                         break
-            sweeps.append({
-                "id": sweep_id,
-                "epochs": eps,
-                "byEpoch": {str(e): by_epoch[e] for e in eps},
-                "probe": {str(e): probes.get(e) for e in eps},
-                "metrics": {str(e): metrics_by_ep[e] for e in sorted(metrics_by_ep)},
-                "n_dirs": len(ep_dirs),
-                "n_expected": n_expected,
-                "has_summary": summary is not None,
-                "cap": SWEEP_CAP,
-            })
+            sweeps.append(
+                {
+                    "id": sweep_id,
+                    "epochs": eps,
+                    "byEpoch": {str(e): by_epoch[e] for e in eps},
+                    "probe": {str(e): probes.get(e) for e in eps},
+                    "metrics": {
+                        str(e): metrics_by_ep[e] for e in sorted(metrics_by_ep)
+                    },
+                    "n_dirs": len(ep_dirs),
+                    "n_expected": n_expected,
+                    "has_summary": summary is not None,
+                    "cap": SWEEP_CAP,
+                }
+            )
         return sweeps
 
-    def _scan_training():
-        videos_dir = os.path.join(root_dir, WAM_RUN_DIR, "videos")
+    def _scan_training_run(run_key, run_dir):
+        videos_dir = os.path.join(root_dir, run_dir, "videos")
         by_epoch, totals, probes = {}, {}, {}
         try:
             names = os.listdir(videos_dir)
@@ -1055,16 +1438,14 @@ def viewer():
                 emb_dir = os.path.join(ep_dir, emb)
                 if not os.path.isdir(emb_dir):
                     continue
-                rel = f"{WAM_RUN_DIR}/videos/{name}/{emb}"
+                rel = f"{run_dir}/videos/{name}/{emb}"
                 v, p, nv, np_ = _split_families(emb_dir, rel, cap=TRAINING_CAP)
                 val += v
                 pred += p
                 n_val += nv
                 n_pred += np_
                 if probe is None and (v or p):
-                    probe = _probe(
-                        os.path.join(emb_dir, os.path.basename((v or p)[0]))
-                    )
+                    probe = _probe(os.path.join(emb_dir, os.path.basename((v or p)[0])))
             if val or pred:
                 by_epoch[ep] = {
                     "validation": val[:TRAINING_CAP],
@@ -1078,7 +1459,8 @@ def viewer():
             g = (probes.get(e) or {}).get("generation", "unknown")
             gen_counts[g] = gen_counts.get(g, 0) + 1
         return {
-            "run_dir": WAM_RUN_DIR,
+            "key": run_key,
+            "run_dir": run_dir,
             "epochs": eps,
             "byEpoch": {str(e): by_epoch[e] for e in eps},
             "totals": {str(e): totals[e] for e in eps},
@@ -1094,9 +1476,10 @@ def viewer():
         return {
             "run": WAM_RUN_LABEL,
             "sweep_prefix": SWEEP_PREFIX,
+            "five_fps": _scan_5fps(),
             "passes": passes,
             "sweeps": _scan_sweeps(),
-            "training": _scan_training(),
+            "training_runs": [_scan_training_run(k, d) for k, d in TRAINING_RUNS],
         }
 
     def _index():

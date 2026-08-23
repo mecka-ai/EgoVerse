@@ -79,7 +79,7 @@ class WAMEvalVideo(EvalVideo):
         self.teacher_force_rolling = bool(teacher_force_rolling)
         self.set_source_fps(source_fps)
 
-    def set_source_fps(self, source_fps: float) -> None:
+    def set_source_fps(self, source_fps: float, data_frame_stride: int = 1) -> None:
         """Set the NATIVE prediction frame rate and derive the video subsample.
 
         The offline driver calls this with the rate read from the episode's zarr
@@ -87,7 +87,14 @@ class WAMEvalVideo(EvalVideo):
         rather than a constant.
         """
         self.source_fps = float(source_fps)
-        self.frame_stride = video_frame_stride(self.source_fps)
+        # MUST pass the data stride. The rollout predicts at
+        # source_fps / data_frame_stride, so on the 5 fps pipeline the correct
+        # playback stride is 1. Calling this with source_fps alone returned 6 and
+        # decimated an already-5 fps clip a second time: a 320-frame full-episode
+        # rollout landed in the mp4 as ceil(320/6) = 54 frames (10.8 s instead of
+        # 64 s), which looked like the episode tiling had failed.
+        self.data_frame_stride = max(1, int(data_frame_stride))
+        self.frame_stride = video_frame_stride(self.source_fps, self.data_frame_stride)
 
     def compute_metrics_and_viz(self, batch):
         algo = self.model

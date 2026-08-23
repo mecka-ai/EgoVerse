@@ -331,7 +331,7 @@ def main(cfg: DictConfig) -> None:
             f"val episodes have mixed source frame rates {sorted(rates)}; one "
             "video subsample stride cannot be real-time for all of them."
         )
-        eval_obj.set_source_fps(all_plans[0].source_fps)
+        eval_obj.set_source_fps(all_plans[0].source_fps, all_plans[0].data_frame_stride)
         log.info(
             f"[eval_dreamzero] evaluator source_fps={eval_obj.source_fps:g}, "
             f"video subsample stride={eval_obj.frame_stride} "
