@@ -24,7 +24,7 @@ train_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
         cam_horizon: 17
         frame_stride: 6
-        action_horizon: 16
+        action_horizon: 96
         state_horizon: 4
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list
@@ -41,7 +41,7 @@ valid_datasets:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
         cam_horizon: 17
         frame_stride: 6
-        action_horizon: 16
+        action_horizon: 96
         state_horizon: 4
       transform_list:
         _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list

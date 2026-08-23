@@ -1,0 +1,104 @@
+# 5 fps K=2 config: 30 Hz actions over a 5 fps video clip.
+# SEPARATE from wam_bc_human_wan22_5b_k2.yaml on purpose — that one is loaded by
+# the LIVE wam22_dw48_k2 run, and changing its register widths would break the
+# architecture on resume. Pair with data=data_dishwashing_48h_wam_5fps.
+#
+# Video strides x6 (5 fps) but ACTIONS DO NOT: a K=2 chunk is 8 displayed frames
+# = 1.6 s, which at the raw 30 Hz action rate is 48 actions; a window is 16
+# frames = 3.2 s = 96 actions. Register invariant: actions/(F-1) == n_action//K
+# -> 96/4 == 48//2 == 24. State is unchanged (4/4 == 2//2 == 1).
+# Original K=2 twin header follows.
+# the rolling chunk size: the DiT predicts K=2 latent frames per forward instead
+# of K=1, so teacher forcing in the val rollout reconditions every 2 latents
+# (= 8 source frames) instead of every 1 latent (= 4 source frames).
+#
+# K is NOT independently tunable — ``compute_loss`` asserts two register-length
+# invariants (wan_flow_matching_action_tf.py:954-962) that couple it to the
+# action/state block widths:
+#
+#   actions / (F_total - 1)      == num_action_per_block // num_frame_per_block
+#   (F_total - 1) / state_horizon == num_frame_per_block // num_state_per_block
+#
+# With F_total = num_video_frames = 5, action_horizon = 96, state_horizon = 4:
+#   96 / 4 == n_action // K  -> 24 == n_action // 2  ->  num_action_per_block = 48
+#    4 / 4 == K // n_state   ->  1 == 2 // n_state   ->  num_state_per_block  = 2
+#
+# At 5 fps video with 30 Hz actions, K=2 -> (48, 2). Changing K alone fails
+# the first assert on the very first training batch.
+#
+# 5B geometry (Wan2.2 VAE38 = 16x spatial, 4x temporal; DiT patch (1,2,2)):
+#   frame 160x320 -> latent 10x20 -> DiT patch -> 5x10 = 50 tokens/frame
+#   cam clip 17 frames -> 5 latent frames (1 cond + 4 predicted)
+#   action_horizon=96  (num_action_per_block=48 x 2 blocks) = 3.2 s @ 30 Hz
+#   state_horizon=4    (num_state_per_block=2 x 2 blocks)
+#   => num_image_blocks == num_action_blocks == num_state_blocks == 2
+#   n_hist = num_video_frames - num_frame_per_block = 3
+#
+# NOTE: the block partition (2 blocks vs the K=1 config's 4) changes the DiT's
+# causal attention structure, so this is NOT weight-compatible with the K=1
+# ``wam22_dw48_v2`` checkpoints. Train from scratch (pretrained video DiT +
+# fresh registers), never from a K=1 last.ckpt.
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+robomimic_model:
+  _target_: egomimic.algo.wam.WAM
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  action_dim: 12
+  action_horizon: 96
+  state_dim: 12
+  target_h: 160            # Wan2.2 5B input resolution (non-square)
+  target_w: 320
+  # Latent frames per DiT forward: cam clip 17 -> 5 latents (1 cond + 4
+  # predicted). Also the rolling-window size F_total in sample_rolling
+  # (n_hist = num_video_frames - num_frame_per_block = 3 here).
+  num_video_frames: 5
+  world_loss_weight: 1.0
+  num_inference_steps: 16
+
+  # --- CausalWanModel DiT (Wan2.2 TI2V-5B, joint video+action) ------------
+  dit:
+    _target_: egomimic.models.wam_nets.build_wam_dit
+    arch: wan22_5b
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/diffusion_pytorch_model.safetensors.index.json
+    action_dim: 12
+    max_state_dim: 12
+    # K=2. Reaches CausalWanModel via build_wam_dit's **overrides (it is a
+    # preset key, defaulted to 1 in WAM_DIT_5B).
+    num_frame_per_block: 2
+    num_action_per_block: 48    # 48 actions per K=2 block (1.6 s @ 30 Hz) x2 = 96
+    num_state_per_block: 2      # 2 state obs per K=2 block (x2 = state_horizon 4)
+    frame_seqlen: 50            # (160/16/2) * (320/16/2) = 5*10
+    freeze_video: true          # train state/action/decoder; freeze pretrained blocks
+    lora: true                  # dreamzero-style LoRA adapters on the DiT blocks
+
+  # --- Wan2.2 VAE38 (frozen, z_dim=48): frame <-> latent ------------------
+  vae:
+    _target_: egomimic.models.wam_nets.build_wan_vae
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+    z_dim: 48
+
+# Published Wan2.2-TI2V-5B fine-tune recipe: AdamW lr 1e-5..2e-5, betas
+# (0.9, 0.999), eps 1e-8, weight_decay 1e-2, linear warmup then cosine annealed
+# to 10% of peak. Identical to the K=1 config so the two runs differ ONLY in K.
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 2e-5
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  weight_decay: 1e-2
+
+# Warmup + monotone cosine decay to 10% of peak.
+# Horizon: 2000 epochs x 100 batches / accumulate_grad_batches 2 = 100k steps.
+scheduler:
+  _target_: transformers.optimization.get_cosine_with_min_lr_schedule_with_warmup
+  _partial_: true
+  num_warmup_steps: 500
+  num_training_steps: 100000
+  num_cycles: 0.5
+  min_lr: 2e-6
+
+scheduler_interval: step

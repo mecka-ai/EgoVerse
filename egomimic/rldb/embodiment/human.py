@@ -452,17 +452,34 @@ class Mecka(Human):
                 k for k, v in key_map.items() if v.get("key_type") == "camera_keys"
             ]:
                 del key_map[k]
-        # Resample EVERY horizoned read at the same rate so the video clip, the
-        # action chunk, the state chunk and the per-frame head poses stay
-        # frame-aligned. frame_stride=6 turns the 30 fps source into a 5 fps
-        # clip: cam_horizon 17 then spans 97 raw frames (3.4 s) instead of 17
-        # (0.567 s). The 0.567 s clip is why rollouts looked frozen — 16
-        # predicted frames covered half a second of near-static content, and an
-        # episode became 121 of those bursts stitched together.
-        # frame_stride=1 leaves every entry exactly as before.
+        # Resample only the VIDEO-RATE reads. frame_stride=6 turns the 30 fps
+        # source into a 5 fps clip: cam_horizon 17 then spans 97 raw frames
+        # (3.4 s) instead of 17 (0.567 s). The 0.567 s clip is why rollouts
+        # looked frozen — 16 predicted frames covered half a second of
+        # near-static content, and an episode became 121 such bursts.
+        #
+        # ACTIONS MUST NOT BE STRIDED. They are the model's output and stay at
+        # the raw 30 Hz rate, so a K=2 chunk (8 displayed frames = 1.6 s) covers
+        # 1.6 * 30 = 48 actions and a window covers 96 — hence action_horizon 96
+        # with num_action_per_block 48. Striding them too (an earlier version of
+        # this function did) silently dropped the action rate to 5 Hz: 200 ms
+        # between waypoints instead of 33 ms, 6x coarser than the data, and far
+        # too coarse to drive a robot.
+        #
+        # The head-pose chunk IS strided: it is indexed per DISPLAYED frame by
+        # the overlay's per-frame reprojection, so it must match the camera.
+        # State is left alone — it is one observation per predicted latent, and
+        # its own register assertion ((F-1)/state_horizon == K//n_state) does
+        # not involve the frame rate.
+        _VIDEO_RATE_KEYS = {"camera_keys"}
         if frame_stride and int(frame_stride) > 1:
-            for spec in key_map.values():
-                if spec.get("horizon"):
+            for name, spec in key_map.items():
+                if not spec.get("horizon"):
+                    continue
+                if (
+                    spec.get("key_type") in _VIDEO_RATE_KEYS
+                    or name == "obs_head_pose_chunk"
+                ):
                     spec["stride"] = int(frame_stride)
         return key_map
 

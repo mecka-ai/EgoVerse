@@ -102,9 +102,27 @@ TRAINING_RUNS = [
 # membership is decided by this path prefix and nothing else.
 FIVE_FPS_PREFIX = "wam_offline_5fps"
 FIVE_FPS_LABEL = "5 fps offline eval (fixed pipeline)"
-# Expected final length, from the verified plan line: 1945 frames @ 30 fps ->
-# 20 windows x 17 (stride 96) -> 320 frames @ 5 fps, subsampled x1.
+# Expected final length, from the verified plan lines: the 3 val episodes tile to
+# 20/21/22 windows x 17 (stride 96) -> 320/336/352 frames @ 5 fps, subsampled x1.
 FIVE_FPS_EXPECTED_FRAMES = 320
+# Below this a wam_offline_5fps/ video is the cf217330 bug: set_source_fps called
+# video_frame_stride() without the data stride, so it defaulted to 1, returned 6
+# and decimated an ALREADY-5fps clip a second time -> ceil(320/6) = 54 frames.
+# The episode tiling was always right; only the assembly threw frames away.
+FIVE_FPS_FULL_MIN_FRAMES = 200
+
+# Generation preference, best first — drives every "default to the newest correct
+# output" decision on the page (which pass is featured, which training run/epoch
+# and which sweep checkpoint open by default).
+GENERATION_RANK = [
+    "5 fps source",
+    "real-time (30 fps decimated)",
+    "truncated (double-subsampled)",
+    "debug-capped",
+    "6× slow",
+    "chunk (pre-fix)",
+    "unknown",
+]
 
 # Offline single-checkpoint passes, in display order.
 # (key, prefix, title, note, featured)
@@ -112,9 +130,10 @@ OFFLINE_PASSES = [
     (
         "gate_a2",
         "wam_gate_a2",
-        "Reference pass",
-        "fixed · full episode · real-time 5 fps (subsampled ×6)",
-        True,
+        "Previous reference pass",
+        "superseded by the 5 fps section · full episode, real-time speed, but ×6-"
+        "decimated 0.567 s bursts",
+        False,
     ),
     (
         "gateA",
@@ -210,6 +229,10 @@ PAGE_HTML = r"""<!doctype html>
     border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
   }
   .badge.gen-5fps { border-color: #6ee7d0; color: #6ee7d0; }
+  .badge.gen-trunc { border-color: #c98fd6; color: #c98fd6; }
+  .warn-note {
+    color: var(--warn); font-size: 12px; margin: 6px 0 2px; line-height: 1.55;
+  }
   .badge.gen-realtime { border-color: var(--good); color: var(--good); }
   .badge.status-crashed { border-color: var(--bad); color: var(--bad); }
   .badge.status-running { border-color: var(--warn); color: var(--warn); }
@@ -286,7 +309,7 @@ PAGE_HTML = r"""<!doctype html>
   const mainEl = $("main"), statusEl = $("status");
   let index = null;
   let trainEpoch = null, sweepEpoch = null, sweepId = null;
-  let trainRun = null, fiveEp = null;
+  let trainRun = null, fiveEp = null, fiveFamily = null;
   let columnMode = false, currentCol = 0, playToken = 0;
   const SWEEP_TITLE = "Offline sweep (fixed)";
   const FIVE_FPS_TITLE = "5 fps offline eval (fixed pipeline)";
@@ -310,10 +333,34 @@ PAGE_HTML = r"""<!doctype html>
   const GEN_CLASS = {
     "5 fps source": "gen-5fps",
     "real-time (30 fps decimated)": "gen-realtime",
+    "truncated (double-subsampled)": "gen-trunc",
     "6× slow": "gen-slow",
     "chunk (pre-fix)": "gen-chunk",
     "debug-capped": "gen-capped",
   };
+  // Best first — every "default to the newest correct output" choice uses this.
+  const GEN_RANK = [
+    "5 fps source", "real-time (30 fps decimated)",
+    "truncated (double-subsampled)", "debug-capped", "6× slow",
+    "chunk (pre-fix)", "unknown",
+  ];
+  const genRank = (g) => {
+    const i = GEN_RANK.indexOf(g);
+    return i < 0 ? GEN_RANK.length : i;
+  };
+  // newest epoch of the best generation present (not merely the newest epoch)
+  function bestEpoch(epochs, probeByEpoch) {
+    let best = null, bestKey = null;
+    for (const e of epochs) {
+      const pr = probeByEpoch[String(e)];
+      const key = [genRank(pr && pr.generation), -e];
+      if (bestKey === null || key[0] < bestKey[0] ||
+          (key[0] === bestKey[0] && key[1] < bestKey[1])) {
+        bestKey = key; best = e;
+      }
+    }
+    return best;
+  }
 
   function badge(pr) {
     if (!pr || !pr.generation) return "";
@@ -459,12 +506,34 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   // ---- 5 fps offline eval: TF vs AR side by side, one episode at a time ----
-  function pickRun(runs, mode) {
-    // prefer the *_vids variant, fall back to *_metrics; prefer one with videos
-    const cands = runs.filter((r) => r.mode === mode);
-    const withVids = cands.filter((r) => (r.predicted || []).length);
+  // Ranking (best last): has videos, full-episode length, longest, newest dir.
+  // Server computes best_by_mode with the identical rule; family === "auto"
+  // follows it, otherwise we stay inside the family the user pinned.
+  function rankRun(r) {
+    return [
+      (r.predicted || []).length || (r.validation || []).length ? 1 : 0,
+      r.is_full ? 1 : 0, r.frames || 0, r.dir,
+    ];
+  }
+
+  function pickRun(runs, mode, family) {
+    let cands = runs.filter((r) => r.mode === mode);
+    if (family && family !== "auto") {
+      const inFam = cands.filter((r) => r.variant === family);
+      if (inFam.length) cands = inFam;
+    }
+    const withVids = cands.filter(
+      (r) => (r.predicted || []).length || (r.validation || []).length);
     const pool = withVids.length ? withVids : cands;
-    return pool.find((r) => r.variant === "vids") || pool[0] || null;
+    if (!pool.length) return null;
+    return pool.slice().sort((a, b) => {
+      const ka = rankRun(a), kb = rankRun(b);
+      for (let i = 0; i < ka.length; i++) {
+        if (ka[i] < kb[i]) return -1;
+        if (ka[i] > kb[i]) return 1;
+      }
+      return 0;
+    }).pop();
   }
 
   function cmpCol(kind, title, path, met, epLabel) {
@@ -503,7 +572,9 @@ PAGE_HTML = r"""<!doctype html>
              "the volume yet — this section fills in automatically (no redeploy).",
       });
     }
-    const tf = pickRun(f.runs, "tf"), ar = pickRun(f.runs, "ar");
+    if (fiveFamily === null) fiveFamily = "auto";
+    const tf = pickRun(f.runs, "tf", fiveFamily),
+          ar = pickRun(f.runs, "ar", fiveFamily);
     const nEps = Math.max(
       tf ? (tf.predicted || []).length : 0, ar ? (ar.predicted || []).length : 0,
       tf ? (tf.validation || []).length : 0, ar ? (ar.validation || []).length : 0);
@@ -527,27 +598,36 @@ PAGE_HTML = r"""<!doctype html>
       ar ? (ar.predicted || [])[fiveEp] : null,
       ar ? fmtMetrics(ar.metrics) : "", epLabel(fiveEp)));
 
-    // status table over all four logical runs
+    // status table over every logical run — the superseded truncated families
+    // stay visible and reachable here even when the full ones are featured.
+    const shown = new Set([tf && tf.logical, ar && ar.logical]);
     const table = document.createElement("table");
     table.className = "runtable";
     table.innerHTML =
-      "<tr><th>run</th><th>mode</th><th>status</th><th>pairs</th>" +
-      "<th>video</th><th>metrics</th><th>attempts</th></tr>" +
-      f.runs.map((r) => {
+      "<tr><th>run</th><th>mode</th><th>generation</th><th>status</th><th>pairs</th>" +
+      "<th>video</th><th>paired_mse / Loss</th><th>attempts</th><th></th></tr>" +
+      f.runs.slice().sort((a, b) => a.logical.localeCompare(b.logical)).map((r) => {
         const pr = r.probe;
         return "<tr><td>" + r.logical + "</td><td>" + r.mode.toUpperCase() +
+          "</td><td>" + (pr ? pr.generation : "—") +
           "</td><td>" + r.status + "</td><td>" +
           Math.min((r.predicted || []).length, (r.validation || []).length) +
           "</td><td>" + (pr ? fmtProbe(pr) : "—") + "</td><td>" +
           (r.metrics ? fmtMetrics(r.metrics) : "—") + "</td><td>" +
           r.n_attempts + (r.crashed_attempts.length
             ? " (" + r.crashed_attempts.length + " crashed)" : "") +
-          "</td></tr>";
+          "</td><td>" + (shown.has(r.logical) ? "◀ shown" : "") + "</td></tr>";
       }).join("");
 
     const probe = (tf && tf.probe) || (ar && ar.probe);
     const short = probe && probe.frames && probe.frames < f.expected_frames * 0.8;
     const allDone = f.runs.every((r) => r.status === "done");
+    // The two columns can legitimately come from different generations while a
+    // relaunch is mid-flight (TF full has landed, AR full has not). Say so
+    // loudly rather than letting them read as a fair comparison.
+    const tfGen = tf && tf.probe ? tf.probe.generation : null;
+    const arGen = ar && ar.probe ? ar.probe.generation : null;
+    const mismatch = tfGen && arGen && tfGen !== arGen;
     let sub =
       "<code>" + f.prefix + "/</code> · k2 checkpoint <b>epoch 1019</b>, 3 held-out-" +
       "operator episodes. <b>TRUE 5 fps clips</b>: the data pipeline strides ×6 so " +
@@ -557,12 +637,13 @@ PAGE_HTML = r"""<!doctype html>
       "<b>teacher-forced</b> (re-anchored to GT every chunk) and " +
       "<b>autoregressive</b> (free-running, drift accumulates).";
     if (short && allDone) {
-      sub += "<br><b>Length caveat:</b> these passes report <i>done</i>, yet each " +
-        "episode video is only " + probe.frames + " f (" +
-        probe.duration.toFixed(1) + " s) against the ~" + f.expected_frames +
-        " f (~64–72 s) the plan predicts — so the full-episode tiling is not " +
-        "landing in the mp4s even though the fps is right. Treat the clips as a " +
-        "short excerpt per episode, not a whole episode.";
+      sub += "<br><b>Truncated by the double-subsample bug (cf217330):</b> " +
+        "<code>set_source_fps</code> called <code>video_frame_stride()</code> " +
+        "without the data stride, so it defaulted to 1, returned 6 and decimated " +
+        "an already-5 fps clip a second time — ceil(320/6) = 54 frames. The " +
+        "episode tiling (20×17, stride 96) was always correct; only the assembly " +
+        "threw frames away. This family shows " + probe.frames + " f (" +
+        probe.duration.toFixed(1) + " s) instead of ~" + f.expected_frames + " f.";
     } else if (short) {
       sub += "<br><b>Still running</b> — expected ~" + f.expected_frames +
         " frames (~64–72 s) per episode, currently " + probe.frames + " f (" +
@@ -578,15 +659,39 @@ PAGE_HTML = r"""<!doctype html>
         "figures are computed teacher-forced in both and come out identical.";
     }
 
+    const ctlWrap = document.createElement("span");
+    ctlWrap.className = "epctl";
+    const fams = ["auto"].concat(f.variants || []);
+    if (fams.length > 1) {
+      ctlWrap.appendChild(selector("family", fams, fiveFamily,
+        (v) => v === "auto" ? "auto (best)" : v,
+        (v) => { fiveFamily = v; fiveEp = null; render(); }));
+    }
+    if (epList.length > 1) {
+      ctlWrap.appendChild(selector("episode", epList, fiveEp, epLabel,
+        (v) => { fiveEp = Number(v); render(); }));
+    }
+
+    const rows = [];
+    if (mismatch) {
+      const w = document.createElement("div");
+      w.className = "warn-note";
+      w.innerHTML =
+        "⚠ The two prediction columns are <b>different generations</b> right now — " +
+        "TF is <b>" + tfGen + "</b> (" + tf.logical + ") and AR is <b>" + arGen +
+        "</b> (" + ar.logical + "), because the newest relaunch has landed for one " +
+        "mode but not the other. Not a fair TF-vs-AR comparison until both are the " +
+        "same generation; pin <code>family</code> to compare like with like.";
+      rows.push(w);
+    }
+    rows.push(cmp, table);
+
     return section({
       featured: true, title: FIVE_FPS_TITLE,
-      note: "TF vs AR · " + f.runs.length + " runs",
+      note: "TF vs AR · " + f.runs.length + " runs · showing " +
+            (fiveFamily === "auto" ? "best available" : fiveFamily),
       badge: badge(probe) + (tf ? statusBadge(tf.status) : ""),
-      sub,
-      ctl: epList.length > 1
-        ? selector("episode", epList, fiveEp, epLabel, (v) => { fiveEp = Number(v); render(); })
-        : null,
-      rows: [cmp, table],
+      sub, ctl: ctlWrap, rows,
     });
   }
 
@@ -605,7 +710,8 @@ PAGE_HTML = r"""<!doctype html>
     const sw = sweeps.find((s) => s.id === sweepId);
     const eps = sw.epochs;
     if (sweepEpoch === null || !eps.includes(sweepEpoch)) {
-      sweepEpoch = eps.length ? eps[eps.length - 1] : null;
+      // newest checkpoint of the best generation present in this sweep
+      sweepEpoch = eps.length ? bestEpoch(eps, sw.probe) : null;
     }
     const cur = (sw.byEpoch || {})[String(sweepEpoch)] || {};
     const pr = (sw.probe || {})[String(sweepEpoch)];
@@ -648,15 +754,22 @@ PAGE_HTML = r"""<!doctype html>
   function renderTraining() {
     const runs = index.training_runs;
     if (trainRun === null || !runs.some((r) => r.key === trainRun)) {
-      // default to the run with the most recent epoch
-      trainRun = runs.slice().sort((a, b) =>
-        (a.epochs[a.epochs.length - 1] || 0) - (b.epochs[b.epochs.length - 1] || 0)
-      ).pop().key;
+      // Default to the run whose BEST generation ranks highest (newest correct
+      // output wins), tie-broken by the most recent epoch — not just max epoch.
+      trainRun = runs.slice().sort((a, b) => {
+        const ga = Math.min(...a.epochs.map((e) =>
+          genRank((a.probe[String(e)] || {}).generation)), GEN_RANK.length);
+        const gb = Math.min(...b.epochs.map((e) =>
+          genRank((b.probe[String(e)] || {}).generation)), GEN_RANK.length);
+        if (ga !== gb) return gb - ga;  // lower rank = better = sorts last
+        return (a.epochs[a.epochs.length - 1] || 0) - (b.epochs[b.epochs.length - 1] || 0);
+      }).pop().key;
     }
     const tr = runs.find((r) => r.key === trainRun);
     const eps = tr.epochs;
     if (trainEpoch === null || !eps.includes(trainEpoch)) {
-      trainEpoch = eps.length ? eps[eps.length - 1] : null;
+      // newest epoch of the best generation this run has (v2 is mid-cutover)
+      trainEpoch = eps.length ? bestEpoch(eps, tr.probe) : null;
     }
     const cur = (tr.byEpoch || {})[String(trainEpoch)] || {};
     const tot = (tr.totals || {})[String(trainEpoch)] || {};
@@ -943,8 +1056,10 @@ def viewer():
         if fps >= CHUNK_FPS_MIN:
             return "chunk (pre-fix)"
         if source_5fps:
-            # Length is not a reliability signal here: these passes write one
-            # episode at a time while running, so short is "still going".
+            # True 5 fps clips either way; length tells the two apart. Short ones
+            # are the pre-cf217330 double-subsample (54 f from 320).
+            if frames < FIVE_FPS_FULL_MIN_FRAMES:
+                return "truncated (double-subsampled)"
             return "5 fps source"
         if frames >= SLOW_MIN_FRAMES:
             return "6× slow"
@@ -1272,27 +1387,80 @@ def viewer():
                 }
             )
 
+        def _frames(a):
+            return (a["probe"] or {}).get("frames") or 0
+
         for logical in sorted(attempts):
             tries = attempts[logical]
-            # newest-first; a try with videos wins over a bare crash
+            # Ranking, worst -> best (take the last): has videos, then
+            # full-episode length, then longest, then newest timestamp. A
+            # freshly-landed full run therefore outranks an older truncated one
+            # with nobody editing a path.
             tries.sort(
-                key=lambda a: (bool(a["validation"] or a["predicted"]), a["dir"])
+                key=lambda a: (
+                    bool(a["validation"] or a["predicted"]),
+                    _frames(a) >= FIVE_FPS_FULL_MIN_FRAMES,
+                    _frames(a),
+                    a["dir"],
+                )
             )
             best = tries[-1]
+            # metrics.json can live in a bare sibling dir (the +metrics_out=
+            # flag wrote e.g. k2_e1019_tf_vids/metrics.json with no videos), so
+            # fall back to any attempt of this logical run that has numbers.
+            metrics = best["metrics"] or next(
+                (t["metrics"] for t in reversed(tries) if t["metrics"]), None
+            )
+            episodes = best["episodes"] or next(
+                (t["episodes"] for t in reversed(tries) if t["episodes"]), []
+            )
             mode = "ar" if re.search(r"(^|_)ar(_|$)", logical) else "tf"
-            variant = "metrics" if logical.endswith("metrics") else "vids"
-            out["runs"].append(
+            if logical.endswith("full"):
+                variant = "full"
+            elif logical.endswith("metrics"):
+                variant = "metrics"
+            else:
+                variant = "vids"
+            entry = dict(best)
+            entry.update(
                 {
                     "logical": logical,
                     "mode": mode,
                     "variant": variant,
+                    "metrics": metrics,
+                    "episodes": episodes,
+                    "is_full": _frames(best) >= FIVE_FPS_FULL_MIN_FRAMES,
+                    "frames": _frames(best) or None,
                     "n_attempts": len(tries),
                     "crashed_attempts": [
                         t["dir"] for t in tries if t["status"] == "crashed"
                     ],
-                    **best,
                 }
             )
+            out["runs"].append(entry)
+
+        # Best run per mode under the same ranking, plus the variant families
+        # that actually have videos (best first) for the opt-in selector.
+        def _rank(r):
+            return (
+                bool(r["predicted"] or r["validation"]),
+                r["is_full"],
+                r["frames"] or 0,
+                r["dir"],
+            )
+
+        with_vids = [r for r in out["runs"] if r["predicted"] or r["validation"]]
+        out["best_by_mode"] = {}
+        for mode in ("tf", "ar"):
+            cands = [r for r in with_vids if r["mode"] == mode]
+            out["best_by_mode"][mode] = (
+                max(cands, key=_rank)["logical"] if cands else None
+            )
+        variants = []
+        for r in sorted(with_vids, key=_rank, reverse=True):
+            if r["variant"] not in variants:
+                variants.append(r["variant"])
+        out["variants"] = variants
         return out
 
     def _scan_offline_pass(key, prefix, title, note, featured):
