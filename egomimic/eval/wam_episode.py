@@ -92,9 +92,21 @@ class EpisodePlan:
         return self.video_frames / WAM_VIDEO_FPS
 
     @property
+    def pred_fps(self) -> float:
+        """Rate the rollout PREDICTS at.
+
+        ``pred_pixel_frames`` counts SAMPLED frames, so with a data stride the
+        rollout emits source_fps / data_frame_stride frames per real second
+        (5 fps for the 30 fps source at stride 6) — not source_fps. Dividing
+        sampled frames by source_fps understates the span 6x and trips
+        ``assert_realtime`` against a correctly-built 5 fps video.
+        """
+        return float(self.source_fps) / max(1, int(self.data_frame_stride))
+
+    @property
     def predicted_span_s(self) -> float:
         """REAL elapsed time of the span the rollout covered."""
-        return self.pred_pixel_frames / self.source_fps
+        return self.pred_pixel_frames / self.pred_fps
 
     @property
     def episode_duration_s(self) -> float:
@@ -108,7 +120,7 @@ class EpisodePlan:
             f"x {self.cam_horizon} (stride {self.stride}), covering "
             f"{self.covered_frames}/{self.total_frames} frames "
             f"({100.0 * self.covered_frames / max(1, self.total_frames):.1f}%); "
-            f"predicts {self.pred_pixel_frames} frames @ {self.source_fps:g} fps, "
+            f"predicts {self.pred_pixel_frames} frames @ {self.pred_fps:g} fps, "
             f"subsampled x{self.frame_stride} -> video {self.video_frames} frames "
             f"@ {WAM_VIDEO_FPS} fps = {self.duration_s:.1f}s "
             f"(predicted span {self.predicted_span_s:.1f}s real)"
