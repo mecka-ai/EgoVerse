@@ -1,0 +1,83 @@
+# WAM (World-Action Model) on the Wan2.2 TI2V-5B backbone, mecka_bimanual.
+# ONE joint DiT forward over [video latent | action | state] predicts video +
+# action velocities (rectified flow). The pretrained video DiT is frozen and
+# LoRA-adapted; the state/action/decoder register modules train.
+# Pair with data=data_dishwashing_48h_wam_5fps evaluator=eval_wam.
+#
+# RATES (the thing that matters):
+#   video   30 fps source, data stride 6 -> 5 fps clip. cam_horizon 17 spans
+#           97 raw frames = 3.2 s.
+#   actions raw 30 Hz, NOT strided. action_horizon 96 = 3.2 s, so the action
+#           chunk covers the same span as the video at 6x the resolution.
+#   K = 2   latents per DiT forward -> a chunk is 8 displayed frames = 1.6 s
+#           = 48 actions at 30 Hz. Teacher forcing reconditions every 1.6 s.
+#
+# The three block widths are NOT independent — compute_loss asserts
+# (wan_flow_matching_action_tf.py:954-962):
+#     actions / (F_total - 1)       == num_action_per_block // num_frame_per_block
+#     (F_total - 1) / state_horizon == num_frame_per_block // num_state_per_block
+# With F_total=5, action_horizon=96, state_horizon=4:
+#     96/4 == n_action//2 -> num_action_per_block = 48
+#      4/4 == 2//n_state  -> num_state_per_block  = 2
+# Changing K alone fails the first assert on the first training batch.
+#
+# 5B geometry (VAE38: 16x spatial, 4x temporal; DiT patch (1,2,2)):
+#   frame 160x320 -> latent 10x20 -> patch -> 5x10 = 50 tokens/frame
+#   cam clip 17 frames -> 5 latents (1 cond + 4 predicted), n_hist = 5 - K = 3
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+robomimic_model:
+  _target_: egomimic.algo.wam.WAM
+
+  domains: ["mecka_bimanual"]
+  ac_keys:
+    mecka_bimanual: "actions_cartesian"
+
+  action_dim: 12
+  action_horizon: 96       # 3.2 s at raw 30 Hz
+  state_dim: 12
+  target_h: 160
+  target_w: 320
+  num_video_frames: 5      # F_total; also the rolling window in sample_rolling
+  world_loss_weight: 1.0
+  num_inference_steps: 16
+
+  dit:
+    _target_: egomimic.models.wam_nets.build_wam_dit
+    arch: wan22_5b
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/diffusion_pytorch_model.safetensors.index.json
+    action_dim: 12
+    max_state_dim: 12
+    num_frame_per_block: 2      # K
+    num_action_per_block: 48    # 48 actions per K=2 block (1.6 s @ 30 Hz) x2 = 96
+    num_state_per_block: 2      # x2 blocks = state_horizon 4
+    frame_seqlen: 50            # (160/16/2) * (320/16/2)
+    freeze_video: true
+    lora: true
+
+  vae:
+    _target_: egomimic.models.wam_nets.build_wan_vae
+    checkpoint_path: /mnt/wan-ckpts/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+    z_dim: 48
+
+# Published Wan2.2-TI2V-5B fine-tune recipe: AdamW 1e-5..2e-5, betas
+# (0.9, 0.999), eps 1e-8, wd 1e-2, warmup then cosine to 10% of peak.
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 2e-5
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  weight_decay: 1e-2
+
+# Monotone cosine decay. Replaces CosineAnnealingLR, which under
+# scheduler_interval=step ran a 1400-step half-cycle then annealed back UP.
+# Horizon: 2000 epochs x 100 batches / accumulate_grad_batches 2 = 100k steps.
+scheduler:
+  _target_: transformers.optimization.get_cosine_with_min_lr_schedule_with_warmup
+  _partial_: true
+  num_warmup_steps: 500
+  num_training_steps: 100000
+  num_cycles: 0.5
+  min_lr: 2e-6
+
+scheduler_interval: step
