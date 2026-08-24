@@ -36,7 +36,13 @@ Routes (single ASGI web function -> one URL, relative paths):
 
 import modal
 
-image = modal.Image.debian_slim(python_version="3.11").pip_install("fastapi[standard]")
+# ffmpeg + numpy are here only for the TEMPORARY debug section's temporal
+# uniformity profile (see DEBUG_SECTION); drop them when that section goes.
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg")
+    .pip_install("fastapi[standard]", "numpy")
+)
 
 app = modal.App("wam-viewer", image=image)
 
@@ -54,36 +60,80 @@ EXPECTED_MIN_FRAMES = 300
 
 # ---------------------------------------------------------------------------
 # TEMPORARY DEBUG SECTION -- rip-out instructions:
-#   delete (a) this DEBUG_SECTION block, (b) the DEBUG_SECTION entry in
-#   ALLOWED_PATH_PREFIXES, (c) _scan_debug() and its "debug" key in _scan(),
-#   (d) renderDebug() and its one call at the end of render(), and (e) the
-#   #debugsec CSS rules. Nothing else references it -- it is deliberately kept
-#   out of the epoch/default-selection logic so removal cannot break the main
-#   view.
+#   delete (a) this DEBUG_SECTION block, (b) the DEBUG_SECTION entries in
+#   ALLOWED_PATH_PREFIXES, (c) _profile() / _scan_debug() and the "debug" key in
+#   _scan(), (d) renderDebug() and its calls at the end of render() plus the
+#   d.debug term in signature(), (e) the #debugsec CSS rules, and (f) the
+#   apt_install("ffmpeg") / "numpy" additions to `image`. Nothing else refers to
+#   it -- it is deliberately kept out of the epoch/default-selection logic.
 # ---------------------------------------------------------------------------
 DEBUG_SECTION = {
-    "dir": "pksnack_wam_debug/stridecheck",
-    "title": "Temporary validation run — stridecheck",
+    "root": "pksnack_wam_debug",
+    "title": "Temporary validation runs — read-stride before/after",
     "caveat": (
-        "<b>Not a model to judge.</b> 4-epoch throwaway "
+        "<b>Not models to judge.</b> Four 4-epoch throwaways "
         "(<code>trainer=debug_modal</code>, <code>num_val_episodes=1</code>, 2% norm "
-        "stats, packaging_snacks) that exists only to confirm a stride fix."
+        "stats, packaging_snacks) kept only to demonstrate one bug and its fix."
     ),
-    "expected_frames": 336,
-    "expected_duration_s": 67.2,
-    "expected_note": "21 tiled windows × 16 displayed frames",
-    # The specific regression under test: a x6 decimation applied one time too
-    # many. The sibling walkcheck run produced exactly 56 f / 11.2 s.
-    "regression_frames": 56,
-    "regression_duration_s": 11.2,
-    "regression_max_frames": 100,
+    "bug": (
+        "The frame stride reached the keymap and the episode tiler (window anchors "
+        "stepping 96 raw frames) but <b>not the actual zarr read</b>, because "
+        "<code>ZarrWamDataset</code> implements its own <code>__getitem__</code>. So "
+        "each clip stayed <b>17 consecutive 30 fps frames (0.567 s)</b> while the "
+        "windows sat 96 frames apart: 16 output frames each advancing 1 source frame, "
+        "then a <b>6× jump at the seam</b>. Intended and now fixed: take the 30 fps "
+        "source, keep every 6th frame, display at 5 fps — so the 5 fps video spans the "
+        "<b>same real time</b> as the 30 fps original."
+    ),
+    # Rendered in this order.
+    "runs": [
+        {
+            "name": "stridefix",
+            "label": "THE FIX — current / correct",
+            "note": "read stride applied in ZarrWamDataset.__getitem__ too",
+            "expected_frames": 336,
+            "expected_duration_s": 67.2,
+            "expect_uniform": True,
+        },
+        {
+            "name": "stridecheck",
+            "label": "correct duration, pre-read-fix CONTENT",
+            "note": "336 f / 67.2 s, but each window holds 30 fps frames — the seam "
+            "jump is the tell; geometry alone cannot separate it from the fix",
+            "expected_frames": 336,
+            "expected_duration_s": 67.2,
+            "expect_uniform": False,
+        },
+        {
+            "name": "walkcheck",
+            "label": "×6-decimated assembly bug",
+            "note": "56 f / 11.2 s — decimation applied one time too many",
+            "expected_frames": 56,
+            "expected_duration_s": 11.2,
+            "expect_uniform": False,
+        },
+        {
+            "name": "cfgcheck",
+            "label": "original short-clip geometry",
+            "note": "16 f / 3.2 s — one window only",
+            "expected_frames": 16,
+            "expected_duration_s": 3.2,
+            "expect_uniform": False,
+        },
+    ],
+    # Temporal-uniformity profile: mean abs inter-frame difference, averaged per
+    # phase mod PHASE_PERIOD, reported as max/min ratio.
+    "phase_period": 16,
+    "uniform_max_ratio": 2.0,
+    "seam_min_ratio": 2.5,
+    "profile_size": [160, 90],
 }
+DEBUG_PROFILE_BUDGET = 8  # videos profiled per index scan; rest fill in on refresh
 
-# The only servable prefix. Everything else on the volume — including this run's
-# own checkpoints/ and logs — is rejected.
-ALLOWED_PATH_PREFIXES = (
-    f"{RUN_DIR}/videos/",
-    f"{DEBUG_SECTION['dir']}/videos/",  # TEMPORARY -- see DEBUG_SECTION
+ALLOWED_PATH_PREFIXES = (f"{RUN_DIR}/videos/",) + tuple(
+    # TEMPORARY -- see DEBUG_SECTION
+    f"{DEBUG_SECTION['root']}/{r['name']}/videos/"
+    for r in DEBUG_SECTION["runs"]
 )
 
 PAGE_HTML = r"""<!doctype html>
@@ -171,6 +221,20 @@ PAGE_HTML = r"""<!doctype html>
   #debugsec .big.ok { color: var(--good); border-color: var(--good); }
   #debugsec .big.bad { color: var(--warn); border-color: var(--warn); }
   #debugsec .verdict { margin: 6px 0 2px; font-size: 12.5px; }
+  #debugsec .bug { color: var(--dim); font-size: 11.5px; line-height: 1.7; margin: 6px 0 2px; }
+  #debugsec .run {
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px 4px;
+    margin: 10px 0; background: #14140f;
+  }
+  #debugsec .run.fix { border-color: var(--good); background: #121710; }
+  #debugsec .run h3 { margin: 0 0 3px; font-size: 12.5px; font-weight: 600; }
+  #debugsec .run.fix h3 { color: var(--good); }
+  #debugsec .run .rnote { color: var(--dim); font-size: 11px; line-height: 1.55; }
+  #debugsec .phases {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px;
+    color: var(--dim); margin-top: 3px; word-break: break-all;
+  }
+  #debugsec .phases b { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -286,101 +350,125 @@ PAGE_HTML = r"""<!doctype html>
     sec.id = "debugsec";
 
     const h = document.createElement("h2");
-    h.textContent = "⚠ " + d.title + " — secondary, temporary";
+    h.textContent = "\u26a0 " + d.title + " — secondary, temporary";
     sec.appendChild(h);
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.innerHTML = d.caveat + "<br><code>" + d.dir + "/videos/</code> · expected " +
-      "<b>" + d.expected_frames + " f @ " + index.expected_fps + " fps = " +
-      d.expected_duration_s + " s</b> (" + d.expected_note + "). Regression under " +
-      "test: <b>" + d.regression_frames + " f / " + d.regression_duration_s +
-      " s</b> — a ×6 decimation applied one time too many.";
+    meta.innerHTML = d.caveat;
     sec.appendChild(meta);
 
-    if (!d.epochs.length) {
-      const ph = document.createElement("div");
-      ph.className = "placeholder";
-      ph.style.marginTop = "10px";
-      ph.textContent = d.present
-        ? "still running — no videos written yet (this section fills in on the next 60 s refresh)"
-        : "run directory not on the volume yet";
-      sec.appendChild(ph);
-      mainEl.appendChild(sec);
-      return;
-    }
+    const bug = document.createElement("div");
+    bug.className = "bug";
+    bug.innerHTML = "<b>The bug:</b> " + d.bug +
+      "<br><b>Uniformity profile:</b> mean absolute inter-frame difference, averaged " +
+      "per phase mod " + d.phase_period + ". Ratio (max/min) &lt; " +
+      d.uniform_max_ratio + " = <b>uniform advance</b> (correct); \u2265 " +
+      d.seam_min_ratio + " = <b>seam jump</b> (30 fps content inside the window). " +
+      "Geometry alone cannot tell the fix from stridecheck — this readout can. " +
+      "The <i>validation</i> clip is the clean diagnostic; predicted clips carry the " +
+      "model's own frame-to-frame noise on top.";
+    sec.appendChild(bug);
 
-    // Prominent per-video geometry: this is the whole point of the section.
-    const judge = (pr) => {
+    const geom = (pr, spec) => {
       if (!pr || !pr.frames) return { cls: "bad", txt: "no measurement" };
       const g = pr.frames + " f @ " + pr.fps + " fps = " +
         (pr.duration != null ? pr.duration.toFixed(1) + " s" : "?");
-      if (pr.frames >= d.expected_frames) return { cls: "ok", txt: g + "  ✓ expected" };
-      if (pr.frames <= d.regression_max_frames) {
-        return { cls: "bad", txt: g + "  ✗ REGRESSION (×6 decimation applied twice)" };
-      }
-      return { cls: "bad", txt: g + "  ✗ unexpected (want " + d.expected_frames + " f)" };
+      const ok = pr.frames === spec.expected_frames;
+      return { cls: ok ? "ok" : "bad",
+               txt: g + (ok ? "  \u2713" : "  \u2717 want " + spec.expected_frames + " f") };
     };
 
-    for (const ep of d.epochs) {
-      const lbl = document.createElement("div");
-      lbl.className = "ep";
-      lbl.textContent = "epoch " + ep;
-      sec.appendChild(lbl);
-      for (const p of d.byEpoch[String(ep)]) {
-        const row = document.createElement("div");
-        row.className = "pair";
-        for (const [kind, title] of [["pred", "predicted"], ["val", "validation"]]) {
-          const item = p[kind === "pred" ? "predicted" : "validation"];
-          const col = document.createElement("div");
-          col.className = "col " + kind;
-          const t = document.createElement("h3");
-          t.textContent = title;
-          col.appendChild(t);
-          if (!item || !item.path) {
-            const ph = document.createElement("div");
-            ph.className = "placeholder";
-            ph.textContent = "no " + title + " video";
-            col.appendChild(ph);
-          } else {
-            const v = document.createElement("video");
-            v.controls = true; v.muted = true; v.loop = true;
-            v.playsInline = true; v.preload = "none";
-            v.dataset.src = "video?path=" + encodeURIComponent(item.path);
-            v.title = item.path;
-            observer.observe(v);
-            col.appendChild(v);
-            const j = judge(item.probe);
-            const r = document.createElement("div");
-            r.className = "readout";
-            r.innerHTML = '<span class="big ' + j.cls + '">' + j.txt + "</span>" +
-              "<span>" + (item.probe ? item.probe.size_mb + " MB" : "") + "</span>" +
-              '<span class="fn">' + item.path.split("/").pop() + "</span>";
-            col.appendChild(r);
-          }
-          row.appendChild(col);
-        }
-        sec.appendChild(row);
-      }
-    }
+    for (const run of d.runs) {
+      const box = document.createElement("div");
+      box.className = "run" + (run.expect_uniform ? " fix" : "");
+      const t = document.createElement("h3");
+      t.textContent = run.name + " — " + run.label;
+      box.appendChild(t);
+      const rn = document.createElement("div");
+      rn.className = "rnote";
+      rn.innerHTML = run.note + " · <code>" + run.dir + "/videos/</code> · expected <b>" +
+        run.expected_frames + " f @ 5 fps = " + run.expected_duration_s + " s</b>";
+      box.appendChild(rn);
 
-    const allFrames = d.epochs.flatMap((ep) => d.byEpoch[String(ep)].flatMap(
-      (p) => ["predicted", "validation"].map((k) => p[k] && p[k].probe && p[k].probe.frames)
-    )).filter((x) => x);
-    if (allFrames.length) {
-      const good = allFrames.every((n) => n >= d.expected_frames);
-      const regressed = allFrames.some((n) => n <= d.regression_max_frames);
-      const vd = document.createElement("div");
-      vd.className = "verdict";
-      vd.innerHTML = good
-        ? '<span class="big ok">FIX CONFIRMED — all ' + allFrames.length +
-          " videos at " + d.expected_frames + "+ frames</span>"
-        : regressed
-          ? '<span class="big bad">REGRESSION PRESENT — ' +
-            allFrames.filter((n) => n <= d.regression_max_frames).length + " of " +
-            allFrames.length + " videos truncated</span>"
-          : '<span class="big bad">unexpected geometry — see per-video readouts</span>';
-      sec.appendChild(vd);
+      if (!run.epochs.length) {
+        const ph = document.createElement("div");
+        ph.className = "placeholder";
+        ph.style.marginTop = "8px";
+        ph.textContent = run.present
+          ? "still running — no videos written yet (fills in on the next 60 s refresh)"
+          : "run directory not on the volume";
+        box.appendChild(ph);
+        sec.appendChild(box);
+        continue;
+      }
+
+      for (const ep of run.epochs) {
+        const lbl = document.createElement("div");
+        lbl.className = "ep";
+        lbl.textContent = "epoch " + ep;
+        box.appendChild(lbl);
+        for (const p of run.byEpoch[String(ep)]) {
+          const row = document.createElement("div");
+          row.className = "pair";
+          for (const [kind, title, key] of [
+            ["pred", "predicted", "predicted"], ["val", "validation", "validation"]]) {
+            const item = p[key];
+            const col = document.createElement("div");
+            col.className = "col " + kind;
+            const ct = document.createElement("h3");
+            ct.textContent = title + (kind === "val" ? "  (diagnostic)" : "");
+            col.appendChild(ct);
+            if (!item || !item.path) {
+              const ph = document.createElement("div");
+              ph.className = "placeholder";
+              ph.textContent = "no " + title + " video";
+              col.appendChild(ph);
+            } else {
+              const v = document.createElement("video");
+              v.controls = true; v.muted = true; v.loop = true;
+              v.playsInline = true; v.preload = "none";
+              v.dataset.src = "video?path=" + encodeURIComponent(item.path);
+              v.title = item.path;
+              observer.observe(v);
+              col.appendChild(v);
+
+              const g = geom(item.probe, run);
+              const r = document.createElement("div");
+              r.className = "readout";
+              r.innerHTML = '<span class="big ' + g.cls + '">' + g.txt + "</span>" +
+                '<span class="fn">' + item.path.split("/").pop() + "</span>";
+              col.appendChild(r);
+
+              const pf = item.profile;
+              const u = document.createElement("div");
+              u.className = "readout";
+              if (!pf) {
+                u.innerHTML = "<span>uniformity: not profiled yet (computed a few " +
+                  "per refresh)</span>";
+              } else if (pf.error) {
+                u.innerHTML = "<span>uniformity: " + pf.error + "</span>";
+              } else {
+                const bad = pf.verdict === "seam jump";
+                u.innerHTML = '<span class="big ' + (bad ? "bad" : "ok") +
+                  '">ratio ' + pf.ratio + " — " + pf.verdict + "</span>";
+              }
+              col.appendChild(u);
+              if (pf && pf.phases) {
+                const ps = document.createElement("div");
+                ps.className = "phases";
+                ps.innerHTML = "phases " + pf.phases.map((x, i) =>
+                  i === pf.peak_phase ? "<b>" + x.toFixed(1) + "</b>" : x.toFixed(1)
+                ).join(" ");
+                col.appendChild(ps);
+              }
+            }
+            row.appendChild(col);
+          }
+          box.appendChild(row);
+        }
+      }
+      sec.appendChild(box);
     }
     mainEl.appendChild(sec);
   }
@@ -451,7 +539,9 @@ PAGE_HTML = r"""<!doctype html>
       "verified-correct workflow, so it is all this page serves. " +
       "<b>predicted</b> = the model's imagined future frames; " +
       "<b>validation</b> = the ground-truth clip for the same window; both carry " +
-      "action-trail overlays.<br>" +
+      "action-trail overlays. <b>Note:</b> this run predates the read-stride fix, so " +
+      "its clips show the same within-window artifact the debug section below " +
+      "demonstrates.<br>" +
       "<b>video</b>: cam_horizon " + w.cam_horizon + ", stride " + w.video_stride +
       " → " + w.display_hz + " Hz display, spanning " + w.video_raw_frames +
       " raw frames = " + w.video_span_s + " s (30 fps base strided ×" +
@@ -687,56 +777,157 @@ def viewer():
             "debug": _scan_debug(),  # TEMPORARY -- see DEBUG_SECTION
         }
 
-    def _scan_debug():
-        """TEMPORARY: the stridecheck validation run (see DEBUG_SECTION)."""
-        videos_dir = os.path.join(root_dir, DEBUG_SECTION["dir"], "videos")
-        by_epoch = {}
+    _profile_cache = {}
+
+    def _profile(path, budget):
+        """Temporal-uniformity profile (TEMPORARY -- see DEBUG_SECTION).
+
+        Decodes to small greyscale frames, takes the mean absolute inter-frame
+        difference, then averages those per phase mod PHASE_PERIOD. Uniform
+        stepping gives a flat profile; 30 fps content inside each window gives a
+        big spike at the last phase (the seam). Returns None when the budget for
+        this scan is used up, so a cold scan stays fast and later refreshes fill
+        the rest in.
+        """
         try:
-            names = os.listdir(videos_dir)
+            size = os.path.getsize(path)
         except OSError:
-            names = []
-        for name in names:
-            m = re.match(r"^epoch_(\d+)$", name)
-            if not m:
-                continue
-            ep_dir = os.path.join(videos_dir, name)
-            if not os.path.isdir(ep_dir):
-                continue
-            pred, val = [], []
+            return None, budget
+        key = (path, size)
+        if key in _profile_cache:
+            return _profile_cache[key], budget
+        if budget <= 0:
+            return None, budget
+
+        import subprocess
+
+        period = DEBUG_SECTION["phase_period"]
+        w, h = DEBUG_SECTION["profile_size"]
+        out = None
+        try:
+            import numpy as np
+
+            r = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-i",
+                    path,
+                    "-vf",
+                    f"scale={w}:{h},format=gray",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                capture_output=True,
+                timeout=180,
+            )
+            fsz = w * h
+            n = len(r.stdout) // fsz
+            if n < period + 2:
+                out = {
+                    "error": f"too short to profile ({n} frames vs {period}-frame period)"
+                }
+            else:
+                arr = (
+                    np.frombuffer(r.stdout[: n * fsz], dtype=np.uint8)
+                    .reshape(n, fsz)
+                    .astype(np.int16)
+                )
+                dif = np.abs(np.diff(arr, axis=0)).mean(axis=1)
+                phases = [float(dif[i::period].mean()) for i in range(period)]
+                lo, hi = min(phases), max(phases)
+                ratio = (hi / lo) if lo > 0 else None
+                if ratio is None:
+                    verdict = "inconclusive"
+                elif ratio < DEBUG_SECTION["uniform_max_ratio"]:
+                    verdict = "uniform advance"
+                elif ratio >= DEBUG_SECTION["seam_min_ratio"]:
+                    verdict = "seam jump"
+                else:
+                    verdict = "inconclusive"
+                out = {
+                    "frames": n,
+                    "phases": [round(x, 2) for x in phases],
+                    "peak_phase": int(max(range(period), key=lambda i: phases[i])),
+                    "ratio": round(ratio, 2) if ratio else None,
+                    "verdict": verdict,
+                }
+        except Exception as exc:  # decoder missing, timeout, malformed file
+            out = {"error": f"{type(exc).__name__}: {exc}"[:160]}
+        _profile_cache[key] = out
+        return out, budget - 1
+
+    def _scan_debug():
+        """TEMPORARY: the four read-stride debug runs (see DEBUG_SECTION)."""
+        root = DEBUG_SECTION["root"]
+        budget = DEBUG_PROFILE_BUDGET
+        runs_out = []
+        for spec in DEBUG_SECTION["runs"]:
+            run_dir = os.path.join(root_dir, root, spec["name"])
+            videos_dir = os.path.join(run_dir, "videos")
+            by_epoch = {}
             try:
-                embodiments = sorted(os.listdir(ep_dir))
+                names = os.listdir(videos_dir)
             except OSError:
-                continue
-            for emb in embodiments:
-                emb_dir = os.path.join(ep_dir, emb)
-                if not os.path.isdir(emb_dir):
+                names = []
+            for name in names:
+                m = re.match(r"^epoch_(\d+)$", name)
+                if not m:
                     continue
-                rel_dir = f"{DEBUG_SECTION['dir']}/videos/{name}/{emb}"
+                ep_dir = os.path.join(videos_dir, name)
+                if not os.path.isdir(ep_dir):
+                    continue
+                pred, val = [], []
                 try:
-                    files = sorted(os.listdir(emb_dir), key=_vid_sort_key)
+                    embodiments = sorted(os.listdir(ep_dir))
                 except OSError:
                     continue
-                for fn in files:
-                    if not fn.endswith(".mp4"):
+                for emb in embodiments:
+                    emb_dir = os.path.join(ep_dir, emb)
+                    if not os.path.isdir(emb_dir):
                         continue
-                    if fn.startswith("predicted_video"):
-                        pred.append(_item(emb_dir, rel_dir, fn))
-                    elif fn.startswith("validation_video"):
-                        val.append(_item(emb_dir, rel_dir, fn))
-            if pred or val:
-                by_epoch[int(m.group(1))] = [
-                    {
-                        "predicted": pred[i] if i < len(pred) else None,
-                        "validation": val[i] if i < len(val) else None,
-                    }
-                    for i in range(max(len(pred), len(val)))
-                ]
-        epochs = sorted(by_epoch)
-        out = dict(DEBUG_SECTION)
-        out["epochs"] = epochs
-        out["byEpoch"] = {str(e): by_epoch[e] for e in epochs}
-        out["present"] = os.path.isdir(os.path.join(root_dir, DEBUG_SECTION["dir"]))
-        return out
+                    rel_dir = f"{root}/{spec['name']}/videos/{name}/{emb}"
+                    try:
+                        files = sorted(os.listdir(emb_dir), key=_vid_sort_key)
+                    except OSError:
+                        continue
+                    for fn in files:
+                        if not fn.endswith(".mp4"):
+                            continue
+                        item = _item(emb_dir, rel_dir, fn)
+                        prof, budget = _profile(os.path.join(emb_dir, fn), budget)
+                        item["profile"] = prof
+                        (pred if fn.startswith("predicted_video") else val).append(item)
+                if pred or val:
+                    by_epoch[int(m.group(1))] = [
+                        {
+                            "predicted": pred[i] if i < len(pred) else None,
+                            "validation": val[i] if i < len(val) else None,
+                        }
+                        for i in range(max(len(pred), len(val)))
+                    ]
+            epochs = sorted(by_epoch)
+            entry = dict(spec)
+            entry.update(
+                {
+                    "dir": f"{root}/{spec['name']}",
+                    "present": os.path.isdir(run_dir),
+                    "epochs": epochs,
+                    "byEpoch": {str(e): by_epoch[e] for e in epochs},
+                }
+            )
+            runs_out.append(entry)
+        return {
+            "title": DEBUG_SECTION["title"],
+            "caveat": DEBUG_SECTION["caveat"],
+            "bug": DEBUG_SECTION["bug"],
+            "phase_period": DEBUG_SECTION["phase_period"],
+            "uniform_max_ratio": DEBUG_SECTION["uniform_max_ratio"],
+            "seam_min_ratio": DEBUG_SECTION["seam_min_ratio"],
+            "runs": runs_out,
+        }
 
     def _index():
         with _lock:
