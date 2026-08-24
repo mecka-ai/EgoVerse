@@ -18,12 +18,12 @@ the repo, and the volume is mounted at ``<repo>/logs``):
 Usage (offline eval of one checkpoint, TF rolling, 3 held-out episodes):
     MODAL_ENVIRONMENT=robotics modal run --detach \
         egomimic/modal/offline_val_wam.py::run --hydra-args "\
-        data=data_dishwashing_48h_wam evaluator=eval_dreamzero_tf \
+        data=data_dishwashing_48h_wam evaluator=eval_wam_video evaluator.rolling_mode=tf \
         data_schematic.norm_mode=minmax reject_outliers=false \
         ckpt_path=data_div_oss/wam22_dw48/checkpoints/last.ckpt \
         +num_val_episodes=3 name=wam_offline_eval description=wam22_dw48_tf"
 
-    (evaluator=eval_dreamzero_ar for fully-autoregressive rolling; relative
+    (evaluator=eval_wam_video evaluator.rolling_mode=ar for fully-autoregressive rolling; relative
     ckpt_path / checkpoints_dir / norm paths resolve against the outputs
     volume mount.)
 
@@ -146,7 +146,10 @@ def run_eval_dreamzero(
     wandb_api_key: str = "",
 ) -> None:
     _run_module(
-        "egomimic.eval.eval_dreamzero", hydra_args, git_remote, git_commit,
+        "egomimic.eval.eval_dreamzero",
+        hydra_args,
+        git_remote,
+        git_commit,
         wandb_api_key=wandb_api_key,
     )
 
@@ -159,7 +162,10 @@ def run_val_sweep(
     wandb_api_key: str = "",
 ) -> None:
     _run_module(
-        "egomimic.eval.val_sweep", hydra_args, git_remote, git_commit,
+        "egomimic.eval.val_sweep",
+        hydra_args,
+        git_remote,
+        git_commit,
         wandb_api_key=wandb_api_key,
     )
 
@@ -171,7 +177,7 @@ def _split_args(hydra_args: str) -> list[str]:
     if not args:
         raise SystemExit(
             "--hydra-args is required, e.g. --hydra-args "
-            "'data=data_dishwashing_48h_wam evaluator=eval_dreamzero_tf "
+            "'data=data_dishwashing_48h_wam evaluator=eval_wam_video evaluator.rolling_mode=tf "
             "ckpt_path=data_div_oss/wam22_dw48/checkpoints/last.ckpt'"
         )
     return args

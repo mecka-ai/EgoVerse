@@ -2,7 +2,7 @@
 # ONE joint DiT forward over [video latent | action | state] predicts video +
 # action velocities (rectified flow). The pretrained video DiT is frozen and
 # LoRA-adapted; the state/action/decoder register modules train.
-# Pair with data=data_dishwashing_48h_wam_5fps evaluator=eval_wam.
+# Pair with data=data_dishwashing_48h_wam_5fps evaluator=eval_wam_video_metrics.
 #
 # RATES (the thing that matters):
 #   video   30 fps source, data stride 6 -> 5 fps clip. cam_horizon 17 spans

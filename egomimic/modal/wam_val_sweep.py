@@ -44,7 +44,7 @@ Launch (Modal turns local-entrypoint params into ``--kebab-case`` CLI flags)
     # extra/overriding hydra args (appended to the fixed set, later wins):
     MODAL_ENVIRONMENT=robotics modal run --detach \
         egomimic/modal/wam_val_sweep.py::sweep \
-        --hydra-args "evaluator=eval_dreamzero_ar seed=7"
+        --hydra-args "evaluator=eval_wam_video evaluator.rolling_mode=ar seed=7"
 
     # just print the checkpoint snapshot:
     MODAL_ENVIRONMENT=robotics modal run \
@@ -127,7 +127,7 @@ DEFAULT_WANDB_RUN_NAME = "wam22_dw48_v2_valsweep"
 _BASE_HYDRA_ARGS: tuple[str, ...] = (
     "--config-name=train_zarr_human_wam_wan22_5b",
     "data=data_dishwashing_48h_wam",
-    "evaluator=eval_dreamzero_tf",
+    "evaluator=eval_wam_video evaluator.rolling_mode=tf",
     "data_schematic.norm_mode=minmax",
     "reject_outliers=false",
     f"norm_stats.precomputed_norm_path={SOURCE_RUN}/norm_stats/norm_stats.json",

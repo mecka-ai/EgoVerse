@@ -21,9 +21,9 @@ Differences vs ``trainHydra.py``:
      continuous over the episode.
 
   2. **Selectable rolling mode**: the evaluator yaml picks GT teacher-forced
-     (``evaluator=eval_dreamzero_tf``, dreamzero Fig-14a — each chunk conditions
+     (``evaluator=eval_wam_video_metrics evaluator.rolling_mode=tf``, dreamzero Fig-14a — each chunk conditions
      on GT, drift cannot accumulate) or fully autoregressive
-     (``evaluator=eval_dreamzero_ar`` — only the episode anchor is GT). Both go
+     (``evaluator=eval_wam_video_metrics evaluator.rolling_mode=ar`` — only the episode anchor is GT). Both go
      through the SAME shared rollout (``egomimic.eval.wam_rollout``) that the
      training-time val loop uses; ``_select_rolling_mode`` just flips a flag.
      There is no longer a monkey-patched second copy of the rolling loop.
@@ -45,7 +45,7 @@ egomimic/modal/wam_val_sweep.py):
 
     python -m egomimic.eval.eval_dreamzero \
         --config-name=train_zarr_human_wam_wan22_5b \
-        data=data_dishwashing_48h_wam evaluator=eval_dreamzero_tf \
+        data=data_dishwashing_48h_wam evaluator=eval_wam_video_metrics evaluator.rolling_mode=tf \
         ckpt_path=/path/to/checkpoints/last.ckpt \
         +num_val_episodes=3 \
         <training-time overrides...>
@@ -354,8 +354,11 @@ def main(cfg: DictConfig) -> None:
 
     # Route eval through the selected rolling sampler — must happen AFTER
     # load_state_dict since we rebind bound methods on the loaded algo.
-    teacher_force_rolling = bool(getattr(eval_obj, "teacher_force_rolling", False))
-    _select_rolling_mode(model.model, teacher_force=teacher_force_rolling)
+    # rolling_mode ("tf" | "ar") lives on the evaluator config; the old
+    # teacher_force_rolling bool is kept as a property for this call site.
+    rolling_mode = str(getattr(eval_obj, "rolling_mode", "tf")).lower()
+    _select_rolling_mode(model.model, teacher_force=(rolling_mode == "tf"))
+    log.info(f"[eval_dreamzero] rolling_mode={rolling_mode}")
 
     log.info("[eval_dreamzero] Starting evaluation!")
     trainer.validate(model=model, datamodule=datamodule)

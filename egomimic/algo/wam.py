@@ -325,7 +325,7 @@ class WAM(Algo):
         val_rollout_chunks: int = None,  # override for sample_rolling num_steps
         # Rolling mode for the val loop. True (default) = dreamzero Fig-14a GT
         # teacher forcing; False = fully autoregressive. The offline driver flips
-        # it from the evaluator yaml (eval_dreamzero_tf vs eval_dreamzero_ar).
+        # it from the evaluator yaml (evaluator.rolling_mode=tf vs ar).
         val_teacher_force: bool = True,
         domains: list = None,
         ac_keys: dict = None,

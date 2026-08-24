@@ -8,6 +8,6 @@ defaults:
   - train_zarr_cartesian
   - override model: wam_bc_human_wan22_5b
   - override data: mecka_wam           # WAM frame-clip + aligned action/state pipeline
-  - override evaluator: eval_wam
+  - override evaluator: eval_wam_video_metrics
   - override evaluator@train_viz_evaluator: null
   - _self_

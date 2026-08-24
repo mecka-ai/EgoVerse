@@ -1,0 +1,29 @@
+# WAM validation loop. Rates are the contract:
+#   video   30 fps source strided x6 by the data pipeline -> the model consumes a
+#           5 fps clip, and the mp4 is written at 5 fps so it plays in real time
+#           and lasts as long as the episode.
+#   actions raw 30 Hz, never strided. A K=2 chunk is 8 displayed frames = 1.6 s
+#           = 48 actions.
+#
+# Action overlay (both videos, GT green + predicted red): at displayed frame d
+# within a chunk we draw actions [6d : 48] of that chunk, so frame 0 shows the
+# whole 48-action chunk and each later frame drops 6 (one 5 fps frame = 6 actions
+# at 30 Hz). The last frame shows the final 6 and the count reaches zero exactly
+# at the chunk boundary, where the next 48 appear. All 8 frames and all 48
+# actions are therefore visible across the chunk.
+#
+# rolling_mode:
+#   tf  recondition the sliding history on GT latents after EVERY chunk. Short-
+#       horizon forecast quality; drift cannot accumulate, but chunk seams show
+#       wherever the prediction differed from GT.
+#   ar  condition chunk 0 on the first GT frame only, then on the model own
+#       predictions forever. Open-loop quality; any seam is real divergence.
+# Override per run with evaluator.rolling_mode=ar .
+defaults:
+  - viz@viz_func: cartesian_wam
+  - _self_
+
+_target_: egomimic.eval.eval_wam.WAMEvalVideo
+rolling_mode: tf
+emit_video: true
+emit_metrics: true

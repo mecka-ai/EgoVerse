@@ -13,7 +13,7 @@
 # filter + /mnt/zarr-data volume), so the jsons plug in directly — no
 # filter_lambdas needed. Keymap/transform/dataloader params are WAM's own
 # (see mecka_wam.yaml header for the horizon alignment).
-# Pair with model=wam_bc_human_wan22_5b evaluator=eval_wam.
+# Pair with model=wam_bc_human_wan22_5b evaluator=eval_wam_video_metrics.
 _target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
 
 train_datasets:
