@@ -1,0 +1,70 @@
+# packaging_snacks on the WAM 5 fps pipeline.
+#   Train = pksnack_all_train.json (1968 eps)
+#   Val   = pksnack_val_ophold5.json (5 held-out-operator eps)
+# Same episode selection as the HPT pksnack_size / pksnack_ops sweeps, but the
+# WAM clip/action/state pipeline: WamMultiDataset + get_wam_keymap, camera
+# strided x6 (17 frames = 3.2 s @ 5 fps) and actions UNSTRIDED at raw 30 Hz
+# (action_horizon 96 = 3.2 s). Pair with model=wam_bc_human_wan22_5b and
+# evaluator=eval_wam_video_metrics.
+#
+# NOTE the HPT pksnack runs' precomputed norm stats
+# (data_div_smoke/D1_.../norm_stats) are for the 16-step cartesian pipeline and
+# are NOT loadable here -- unnormalize_data would hit a 96-vs-16 shape mismatch.
+# Let this run infer its own at norm_stats.sample_frac=0.20.
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_wam.WamMultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_wam.ModalWamEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
+        cam_horizon: 17
+        frame_stride: 6
+        action_horizon: 96
+        state_horizon: 4
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_all_train.json
+    mode: total
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.zarr_dataset_wam.WamMultiDataset._from_resolver
+    resolver:
+      _target_: egomimic.rldb.zarr.zarr_dataset_wam.ModalWamEpisodeResolver
+      folder_path: /mnt/zarr-data
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_keymap
+        cam_horizon: 17
+        frame_stride: 6
+        action_horizon: 96
+        state_horizon: 4
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_wam_transform_list
+      eps_to_use: egomimic/hydra_configs/data/extra/data_diversity/pksnack_val_ophold5.json
+    mode: total
+
+# persistent_workers: with ``limit_train_batches`` Lightning drops the loader
+# iterator at every epoch boundary with ~num_workers*prefetch in-flight batches
+# whose /dev/shm IPC segments are never freed (torch worker teardown). WAM's
+# 17-frame clips are ~53MB/sample, so that leaked ~0.9GB per epoch into the
+# FIXED 16GiB /dev/shm of Modal containers -> deterministic worker SIGBUS at
+# epoch ~21 (the wam22_dw48 crash loop; verified with an isolated dataloader
+# probe: non-persistent grows 0.9GB/epoch, persistent stays flat at ~90MB).
+# Persistent workers reuse the pool across epochs, so nothing is torn down
+# mid-flight. Sample order/content are unchanged (the sampler lives in the
+# main process).
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 2
+    num_workers: 10
+    persistent_workers: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 2
+    num_workers: 10
+    persistent_workers: true
