@@ -48,13 +48,43 @@ INDEX_TTL_S = 60
 RUN_LABEL = "data_div_oss_wam22_dw48_k2_5fps"
 RUN_DIR = "data_div_oss/wam22_dw48_k2_5fps"
 
-# The only servable prefix. Everything else on the volume — including this run's
-# own checkpoints/ and logs — is rejected.
-ALLOWED_PATH_PREFIXES = (f"{RUN_DIR}/videos/",)
-
 # Expected shape of a correct video, used only to flag a deviating readout.
 EXPECTED_FPS = 5
 EXPECTED_MIN_FRAMES = 300
+
+# ---------------------------------------------------------------------------
+# TEMPORARY DEBUG SECTION -- rip-out instructions:
+#   delete (a) this DEBUG_SECTION block, (b) the DEBUG_SECTION entry in
+#   ALLOWED_PATH_PREFIXES, (c) _scan_debug() and its "debug" key in _scan(),
+#   (d) renderDebug() and its one call at the end of render(), and (e) the
+#   #debugsec CSS rules. Nothing else references it -- it is deliberately kept
+#   out of the epoch/default-selection logic so removal cannot break the main
+#   view.
+# ---------------------------------------------------------------------------
+DEBUG_SECTION = {
+    "dir": "pksnack_wam_debug/stridecheck",
+    "title": "Temporary validation run — stridecheck",
+    "caveat": (
+        "<b>Not a model to judge.</b> 4-epoch throwaway "
+        "(<code>trainer=debug_modal</code>, <code>num_val_episodes=1</code>, 2% norm "
+        "stats, packaging_snacks) that exists only to confirm a stride fix."
+    ),
+    "expected_frames": 336,
+    "expected_duration_s": 67.2,
+    "expected_note": "21 tiled windows × 16 displayed frames",
+    # The specific regression under test: a x6 decimation applied one time too
+    # many. The sibling walkcheck run produced exactly 56 f / 11.2 s.
+    "regression_frames": 56,
+    "regression_duration_s": 11.2,
+    "regression_max_frames": 100,
+}
+
+# The only servable prefix. Everything else on the volume — including this run's
+# own checkpoints/ and logs — is rejected.
+ALLOWED_PATH_PREFIXES = (
+    f"{RUN_DIR}/videos/",
+    f"{DEBUG_SECTION['dir']}/videos/",  # TEMPORARY -- see DEBUG_SECTION
+)
 
 PAGE_HTML = r"""<!doctype html>
 <html lang="en">
@@ -123,6 +153,24 @@ PAGE_HTML = r"""<!doctype html>
     color: var(--dim); border: 1px dashed var(--border); border-radius: 8px;
     padding: 40px 16px; text-align: center; font-size: 13px;
   }
+  /* TEMPORARY debug section -- delete with the DEBUG_SECTION block */
+  #debugsec {
+    margin-top: 30px; border: 1px dashed #4a4433; border-radius: 10px;
+    padding: 10px 12px 4px; background: #16150f;
+  }
+  #debugsec h2 { font-size: 13px; margin: 0 0 4px; color: var(--warn); }
+  #debugsec .meta { color: var(--dim); font-size: 11.5px; line-height: 1.65; }
+  #debugsec .col h3 { margin: 0 0 5px; font-size: 12px; font-weight: 600; }
+  #debugsec .col.pred h3 { color: var(--pred); }
+  #debugsec .col.val h3 { color: var(--gt); }
+  #debugsec .ep { color: #9aa3b2; font-size: 12px; margin: 10px 0 4px; font-weight: 600; }
+  #debugsec .big {
+    font-size: 12.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  #debugsec .big.ok { color: var(--good); border-color: var(--good); }
+  #debugsec .big.bad { color: var(--warn); border-color: var(--warn); }
+  #debugsec .verdict { margin: 6px 0 2px; font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -213,6 +261,7 @@ PAGE_HTML = r"""<!doctype html>
         ? "no videos at epoch " + epoch
         : "no validation videos on the volume yet for this run";
       mainEl.appendChild(ph);
+      renderDebug();  // TEMPORARY -- see DEBUG_SECTION
       return;
     }
     for (const p of pairs) {
@@ -222,6 +271,118 @@ PAGE_HTML = r"""<!doctype html>
       row.appendChild(column("val", "validation — ground-truth clip", p.validation));
       mainEl.appendChild(row);
     }
+    renderDebug();  // TEMPORARY -- see DEBUG_SECTION
+  }
+
+  // ---------------------------------------------------------------------
+  // TEMPORARY debug section. Self-contained: its own readout + flagging, no
+  // shared state, not part of epoch/default selection. Delete this function
+  // and its single call at the end of render() to remove.
+  // ---------------------------------------------------------------------
+  function renderDebug() {
+    const d = index.debug;
+    if (!d) return;
+    const sec = document.createElement("section");
+    sec.id = "debugsec";
+
+    const h = document.createElement("h2");
+    h.textContent = "⚠ " + d.title + " — secondary, temporary";
+    sec.appendChild(h);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.innerHTML = d.caveat + "<br><code>" + d.dir + "/videos/</code> · expected " +
+      "<b>" + d.expected_frames + " f @ " + index.expected_fps + " fps = " +
+      d.expected_duration_s + " s</b> (" + d.expected_note + "). Regression under " +
+      "test: <b>" + d.regression_frames + " f / " + d.regression_duration_s +
+      " s</b> — a ×6 decimation applied one time too many.";
+    sec.appendChild(meta);
+
+    if (!d.epochs.length) {
+      const ph = document.createElement("div");
+      ph.className = "placeholder";
+      ph.style.marginTop = "10px";
+      ph.textContent = d.present
+        ? "still running — no videos written yet (this section fills in on the next 60 s refresh)"
+        : "run directory not on the volume yet";
+      sec.appendChild(ph);
+      mainEl.appendChild(sec);
+      return;
+    }
+
+    // Prominent per-video geometry: this is the whole point of the section.
+    const judge = (pr) => {
+      if (!pr || !pr.frames) return { cls: "bad", txt: "no measurement" };
+      const g = pr.frames + " f @ " + pr.fps + " fps = " +
+        (pr.duration != null ? pr.duration.toFixed(1) + " s" : "?");
+      if (pr.frames >= d.expected_frames) return { cls: "ok", txt: g + "  ✓ expected" };
+      if (pr.frames <= d.regression_max_frames) {
+        return { cls: "bad", txt: g + "  ✗ REGRESSION (×6 decimation applied twice)" };
+      }
+      return { cls: "bad", txt: g + "  ✗ unexpected (want " + d.expected_frames + " f)" };
+    };
+
+    for (const ep of d.epochs) {
+      const lbl = document.createElement("div");
+      lbl.className = "ep";
+      lbl.textContent = "epoch " + ep;
+      sec.appendChild(lbl);
+      for (const p of d.byEpoch[String(ep)]) {
+        const row = document.createElement("div");
+        row.className = "pair";
+        for (const [kind, title] of [["pred", "predicted"], ["val", "validation"]]) {
+          const item = p[kind === "pred" ? "predicted" : "validation"];
+          const col = document.createElement("div");
+          col.className = "col " + kind;
+          const t = document.createElement("h3");
+          t.textContent = title;
+          col.appendChild(t);
+          if (!item || !item.path) {
+            const ph = document.createElement("div");
+            ph.className = "placeholder";
+            ph.textContent = "no " + title + " video";
+            col.appendChild(ph);
+          } else {
+            const v = document.createElement("video");
+            v.controls = true; v.muted = true; v.loop = true;
+            v.playsInline = true; v.preload = "none";
+            v.dataset.src = "video?path=" + encodeURIComponent(item.path);
+            v.title = item.path;
+            observer.observe(v);
+            col.appendChild(v);
+            const j = judge(item.probe);
+            const r = document.createElement("div");
+            r.className = "readout";
+            r.innerHTML = '<span class="big ' + j.cls + '">' + j.txt + "</span>" +
+              "<span>" + (item.probe ? item.probe.size_mb + " MB" : "") + "</span>" +
+              '<span class="fn">' + item.path.split("/").pop() + "</span>";
+            col.appendChild(r);
+          }
+          row.appendChild(col);
+        }
+        sec.appendChild(row);
+      }
+    }
+
+    const allFrames = d.epochs.flatMap((ep) => d.byEpoch[String(ep)].flatMap(
+      (p) => ["predicted", "validation"].map((k) => p[k] && p[k].probe && p[k].probe.frames)
+    )).filter((x) => x);
+    if (allFrames.length) {
+      const good = allFrames.every((n) => n >= d.expected_frames);
+      const regressed = allFrames.some((n) => n <= d.regression_max_frames);
+      const vd = document.createElement("div");
+      vd.className = "verdict";
+      vd.innerHTML = good
+        ? '<span class="big ok">FIX CONFIRMED — all ' + allFrames.length +
+          " videos at " + d.expected_frames + "+ frames</span>"
+        : regressed
+          ? '<span class="big bad">REGRESSION PRESENT — ' +
+            allFrames.filter((n) => n <= d.regression_max_frames).length + " of " +
+            allFrames.length + " videos truncated</span>"
+          : '<span class="big bad">unexpected geometry — see per-video readouts</span>';
+      sec.appendChild(vd);
+    }
+    mainEl.appendChild(sec);
   }
 
   function setEpoch(e) {
@@ -305,7 +466,10 @@ PAGE_HTML = r"""<!doctype html>
   }
 
   function signature(d) {
-    return JSON.stringify([d.epochs, Object.keys(d.byEpoch || {}).length]);
+    return JSON.stringify([
+      d.epochs, Object.keys(d.byEpoch || {}).length,
+      d.debug ? d.debug.epochs : null,  // TEMPORARY -- see DEBUG_SECTION
+    ]);
   }
 
   let lastSig = null;
@@ -520,7 +684,59 @@ def viewer():
                 "expected_frames": 326,
                 "expected_duration_s": 65.2,
             },
+            "debug": _scan_debug(),  # TEMPORARY -- see DEBUG_SECTION
         }
+
+    def _scan_debug():
+        """TEMPORARY: the stridecheck validation run (see DEBUG_SECTION)."""
+        videos_dir = os.path.join(root_dir, DEBUG_SECTION["dir"], "videos")
+        by_epoch = {}
+        try:
+            names = os.listdir(videos_dir)
+        except OSError:
+            names = []
+        for name in names:
+            m = re.match(r"^epoch_(\d+)$", name)
+            if not m:
+                continue
+            ep_dir = os.path.join(videos_dir, name)
+            if not os.path.isdir(ep_dir):
+                continue
+            pred, val = [], []
+            try:
+                embodiments = sorted(os.listdir(ep_dir))
+            except OSError:
+                continue
+            for emb in embodiments:
+                emb_dir = os.path.join(ep_dir, emb)
+                if not os.path.isdir(emb_dir):
+                    continue
+                rel_dir = f"{DEBUG_SECTION['dir']}/videos/{name}/{emb}"
+                try:
+                    files = sorted(os.listdir(emb_dir), key=_vid_sort_key)
+                except OSError:
+                    continue
+                for fn in files:
+                    if not fn.endswith(".mp4"):
+                        continue
+                    if fn.startswith("predicted_video"):
+                        pred.append(_item(emb_dir, rel_dir, fn))
+                    elif fn.startswith("validation_video"):
+                        val.append(_item(emb_dir, rel_dir, fn))
+            if pred or val:
+                by_epoch[int(m.group(1))] = [
+                    {
+                        "predicted": pred[i] if i < len(pred) else None,
+                        "validation": val[i] if i < len(val) else None,
+                    }
+                    for i in range(max(len(pred), len(val)))
+                ]
+        epochs = sorted(by_epoch)
+        out = dict(DEBUG_SECTION)
+        out["epochs"] = epochs
+        out["byEpoch"] = {str(e): by_epoch[e] for e in epochs}
+        out["present"] = os.path.isdir(os.path.join(root_dir, DEBUG_SECTION["dir"]))
+        return out
 
     def _index():
         with _lock:

@@ -1765,23 +1765,8 @@ class ZarrDataset(torch.utils.data.Dataset):
         # anchor so the largest horizoned window fits entirely in real frames
         # (frames in the last max_horizon-1 snap back to the last full chunk).
         self.snap_horizon_to_end = bool(snap_horizon_to_end)
-        # A key may carry ``stride`` to sample its horizon every Nth raw frame
-        # (WAM: stride 6 turns 30 fps source into a 5 fps clip). The window then
-        # SPANS (horizon - 1) * stride + 1 raw frames even though it yields
-        # ``horizon`` samples, and it is the span — not the sample count — that
-        # the end-of-episode anchor clamp must reserve. Absent/1 stride keeps
-        # the span equal to the horizon, i.e. byte-identical legacy behavior.
-        self._max_horizon = (
-            max(
-                (
-                    ((int(v.get("horizon")) - 1) * int(v.get("stride") or 1) + 1)
-                    if v.get("horizon")
-                    else 0
-                )
-                for v in (key_map or {}).values()
-            )
-            if key_map
-            else 0
+        self._max_horizon = max(
+            (v.get("horizon") or 0 for v in (key_map or {}).values()), default=0
         )
         self.keep_indices: np.ndarray | None = None
         self._raw_total_frames: int | None = None
@@ -2521,25 +2506,13 @@ class ZarrDataset(torch.utils.data.Dataset):
                 data[k] = self._annotation_text_for_frame(real_idx)
                 continue
 
-            # ``stride`` samples the horizon every Nth frame instead of taking it
-            # contiguously, so a 30 fps source can be read as a 5 fps clip
-            # (stride 6) without a 6x-larger read. stride 1 keeps both branches
-            # on their original contiguous paths.
-            stride = int(self.key_map[k].get("stride") or 1)
-
             if horizon is not None:
                 if self.keep_indices is not None:
                     # Fully-filtered chunk: take H consecutive *filtered* frames
                     # by fancy-indexing keep_indices, so paused raw frames are
                     # skipped inside the chunk too (not just at the anchor).
-                    end_filtered = min(idx + horizon * stride, len(self.keep_indices))
-                    read_interval = self.keep_indices[idx:end_filtered:stride]
-                elif stride > 1:
-                    # Explicit index list: the reader's (start, end) form cannot
-                    # express a step, so hand it the exact frames. Clipped to the
-                    # episode; _pad_sequences repeat-last fills any short tail.
-                    stop = min(real_idx + (horizon - 1) * stride + 1, self.total_frames)
-                    read_interval = np.arange(real_idx, stop, stride)
+                    end_filtered = min(idx + horizon, len(self.keep_indices))
+                    read_interval = self.keep_indices[idx:end_filtered]
                 else:
                     end_idx = self._chunk_end_idx(real_idx, horizon, key_type)
                     read_interval = (real_idx, end_idx)

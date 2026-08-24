@@ -107,9 +107,7 @@ class ZarrWamDataset(ZarrDataset):
         if isinstance(arr, np.ndarray):
             if arr.dtype == object:
                 try:
-                    total = sum(
-                        len(b) for b in arr.ravel() if hasattr(b, "__len__")
-                    )
+                    total = sum(len(b) for b in arr.ravel() if hasattr(b, "__len__"))
                 except Exception:
                     return None
             else:
@@ -195,20 +193,51 @@ class ZarrWamDataset(ZarrDataset):
                     data[k] = self._annotation_text_for_frame(idx)
                     continue
 
+                # ``stride`` samples this key's horizon every Nth RAW frame, so
+                # a 30 fps source is read as a 5 fps clip (stride 6). WAM-only,
+                # and it lives HERE because this class implements its own
+                # __getitem__ and so inherits nothing from ZarrDataset's read.
+                #
+                # The bug this fixes: the stride reached get_wam_keymap and the
+                # episode tiler (anchors stepping (cam_horizon-1)*stride = 96)
+                # but NOT the frame read, so clips stayed 17 CONSECUTIVE frames
+                # (0.567 s) while windows sat 96 raw frames apart -- 16 output
+                # frames advancing 1 raw frame each, then a 6x jump at the seam.
+                # Exactly "30 fps content emitted as 5 fps inside the chunk".
+                stride = int(self.key_map[k].get("stride") or 1)
+                strided = None
                 if horizon is not None:
-                    end_idx = self._chunk_end_idx(idx, horizon, key_type)
-                    read_interval = (idx, end_idx)
+                    if stride > 1:
+                        # The reader takes {key: (start, end)} and UNPACKS the
+                        # value as a 2-tuple, so it cannot express a step and an
+                        # index array would raise. Reading the contiguous span
+                        # and slicing would pull (horizon-1)*stride+1 frames to
+                        # keep horizon -- 97 instead of 17 for a 5 fps clip,
+                        # ~6x the bytes on 360x640 frames and a /dev/shm hazard
+                        # at 10 workers. One single-frame read per wanted index
+                        # keeps only what we use.
+                        stop = min(idx + (horizon - 1) * stride + 1, self.total_frames)
+                        strided = list(range(idx, stop, stride))
+                        read_interval = None
+                    else:
+                        end_idx = self._chunk_end_idx(idx, horizon, key_type)
+                        read_interval = (idx, end_idx)
                 else:
                     read_interval = (idx, None)
                 # Guarded zarr read: a corrupt chunk can raise deep inside
                 # numcodecs (or decompress into something enormous). Turn both
                 # into a logged resample instead of a dead dataloader worker.
                 try:
-                    raw_data = self.episode_reader.read({zarr_key: read_interval})
+                    if strided is not None:
+                        parts = [
+                            self.episode_reader.read({zarr_key: (i, i + 1)})[zarr_key]
+                            for i in strided
+                        ]
+                        raw_data = {zarr_key: np.concatenate(parts, axis=0)}
+                    else:
+                        raw_data = self.episode_reader.read({zarr_key: read_interval})
                 except Exception as e:
-                    idx = _next(
-                        f"Zarr read failed ({type(e).__name__}: {e})", key=k
-                    )
+                    idx = _next(f"Zarr read failed ({type(e).__name__}: {e})", key=k)
                     retry = True
                     break
                 over = self._oversized_read(raw_data.get(zarr_key))
