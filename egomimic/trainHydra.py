@@ -190,6 +190,43 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
             cfg.data.valid_datasets[dataset_name]
         )
 
+    # WAM: walk WHOLE episodes at val time, exactly ``num_val_episodes`` of them
+    # (default 3 -> 6 mp4s, one predicted + one validation per episode).
+    #
+    # Without this the val loader draws whatever windows the sampler hands it and
+    # limit_val_batches decides how much of the split is touched, so an mp4 could
+    # cover a partial episode or stop mid-episode. plan_full_episode_walk rewrites
+    # the val index into the tiled window anchors of the first N episodes in
+    # order, and limit_val_batches is then DERIVED from the plan -- a hardcoded
+    # value cannot express "3 episodes" because episodes differ in length
+    # (dishwashing: 20/21/22 windows).
+    #
+    # Val batch_size is forced to 1: WAMEvalVideo groups frames into one mp4 per
+    # episode_hash and reads that hash from sample 0 of the batch, so a batch
+    # straddling an episode boundary would file the next episode's frames under
+    # the previous episode's mp4.
+    #
+    # Gated on the WAM evaluator so every other model keeps its exact legacy val
+    # behavior. Single-rank only: a DistributedSampler shards the windows across
+    # ranks and destroys the sequential episode walk.
+    _eval_target = str(OmegaConf.select(cfg, "evaluator._target_", default="") or "")
+    if valid_datasets and "WAMEvalVideo" in _eval_target:
+        from egomimic.eval.wam_episode import plan_full_episode_walk
+
+        n_val_eps = int(cfg.get("num_val_episodes", 3))
+        total_windows = 0
+        for _name, _mds in valid_datasets.items():
+            plan_full_episode_walk(_mds, n_val_eps, log=log)
+            total_windows += len(_mds)
+        with open_dict(cfg):
+            cfg.trainer.limit_val_batches = total_windows
+            for _name in cfg.data.valid_dataloader_params:
+                cfg.data.valid_dataloader_params[_name].batch_size = 1
+        log.info(
+            f"[wam] full-episode val: {n_val_eps} episodes -> {total_windows} "
+            f"windows; limit_val_batches={total_windows}, val batch_size=1"
+        )
+
     train_viz_datasets = {}
     train_viz_cfg = OmegaConf.select(cfg, "data.train_viz_datasets", default=None)
     if train_viz_cfg:
