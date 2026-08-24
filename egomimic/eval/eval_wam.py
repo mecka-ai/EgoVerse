@@ -74,6 +74,7 @@ class WAMEvalVideo(EvalVideo):
         emit_video: bool = True,
         emit_metrics: bool = True,
         source_fps: float = DEFAULT_SOURCE_FPS,
+        data_frame_stride: int = 1,
     ):
         """``rolling_mode`` is "tf" (recondition the sliding history on GT after
         every chunk) or "ar" (condition chunk 0 on the first GT frame, then on
@@ -98,7 +99,11 @@ class WAMEvalVideo(EvalVideo):
                 "emit_video and emit_metrics are both False -- this evaluator "
                 "would do a full rollout and throw everything away."
             )
-        self.set_source_fps(source_fps)
+        # data_frame_stride MUST reflect the stride the data pipeline applied,
+        # or video_frame_stride() decimates an already-5 fps clip a second time.
+        # The offline driver calls set_source_fps() with the plan's value; the
+        # training path passes it here (trainHydra sets it from the same plan).
+        self.set_source_fps(source_fps, data_frame_stride)
 
     @property
     def teacher_force_rolling(self) -> bool:

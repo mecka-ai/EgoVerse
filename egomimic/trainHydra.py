@@ -215,16 +215,27 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
 
         n_val_eps = int(cfg.get("num_val_episodes", 3))
         total_windows = 0
+        _plans = []
         for _name, _mds in valid_datasets.items():
-            plan_full_episode_walk(_mds, n_val_eps, log=log)
+            _plans.extend(plan_full_episode_walk(_mds, n_val_eps, log=log))
             total_windows += len(_mds)
         with open_dict(cfg):
             cfg.trainer.limit_val_batches = total_windows
             for _name in cfg.data.valid_dataloader_params:
                 cfg.data.valid_dataloader_params[_name].batch_size = 1
+            # Hand the evaluator the rates the plan just measured. Without the
+            # data stride it defaults to 1, and video_frame_stride() then
+            # decimates an ALREADY-5 fps clip a second time -- 21 windows
+            # (336 displayed frames) landed in the mp4 as 56 frames / 11.2 s
+            # instead of 336 / 67.2 s.
+            if _plans:
+                cfg.evaluator.source_fps = float(_plans[0].source_fps)
+                cfg.evaluator.data_frame_stride = int(_plans[0].data_frame_stride)
         log.info(
             f"[wam] full-episode val: {n_val_eps} episodes -> {total_windows} "
-            f"windows; limit_val_batches={total_windows}, val batch_size=1"
+            f"windows; limit_val_batches={total_windows}, val batch_size=1, "
+            f"source_fps={_plans[0].source_fps if _plans else '?'}, "
+            f"data_frame_stride={_plans[0].data_frame_stride if _plans else '?'}"
         )
 
     train_viz_datasets = {}
