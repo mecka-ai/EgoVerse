@@ -274,10 +274,20 @@ class WAMEvalVideo(EvalVideo):
         self._native_offset[okey] = offset + n_disp
 
         def _action_window(j):
-            """(start, end) into the FULL action tensor for displayed frame j."""
-            c, d = divmod(int(j), chunk_disp)
-            base = c * H_actions
-            return base + d * actions_per_disp, base + H_actions
+            """(start, end) into the FULL action tensor for displayed frame j.
+
+            Both ends are LEAD-shifted by one displayed frame
+            (``actions_per_disp`` = 6 actions @ 30 Hz). Displayed frame j shows
+            raw frame 6*(j+1) -- clip index 0 is the anchor, which is never
+            drawn -- so the first arrow must be action 6*(j+1), not 6*j.
+            Without the shift every overlay trailed the video by exactly one
+            displayed frame (0.2 s), which is visible as arrows lagging the
+            palm. The end shifts with it so the count still runs
+            48,42,...,6 and resets to 48 at the chunk boundary.
+            """
+            c = int(j) // chunk_disp
+            lead = actions_per_disp
+            return (int(j) + 1) * lead, (c + 1) * H_actions + lead
 
         # Per-raw-frame head-pose chunk (see Mecka.get_wam_keymap ->
         # ``obs_head_pose_chunk``). Shape (B, cam_horizon, 7) xyzwxyz; row 0 ==

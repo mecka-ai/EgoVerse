@@ -20,13 +20,26 @@ Prints one line per video frame (`video[k] -> source[i]  delta`) plus a verdict.
 Exits non-zero if the sequence is not monotonic or the stride is wrong.
 """
 
-from egomimic.modal.modal_config import (
+import sys
+from pathlib import Path
+
+import modal
+
+# modal_setup.py sits next to this file locally (egomimic/modal/) and is baked
+# into the image at /root/, so it imports before the repo is cloned. The package
+# path egomimic.modal.* is NOT importable under `modal run`.
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from modal_setup import (  # noqa: E402
     CFG,
-    app,
     image,
     training_outputs_volume,
     zarr_volume,
 )
+
+app = modal.App("egomimic-verify-video-alignment", image=image)
 
 
 @app.function(
@@ -73,7 +86,10 @@ def _verify(mp4_rel: str, episode: str, stride: int, max_src: int, tol: float):
     )
     arr = store[key]
     n_src = min(int(arr.shape[0]), max_src)
-    src = np.stack([thumb_from_jpeg(arr[i]) for i in range(n_src)])
+    # arr[i] on a VariableLengthBytes array yields a 0-d wrapper that
+    # simplejpeg cannot parse ("could not determine subsampling level"); the
+    # reader itself documents arr[i:i+1][0] as the workaround.
+    src = np.stack([thumb_from_jpeg(arr[i : i + 1][0]) for i in range(n_src)])
     print(f"[align] source: {episode} -> {n_src} raw frames fingerprinted", flush=True)
 
     # ---- video fingerprints --------------------------------------------------
