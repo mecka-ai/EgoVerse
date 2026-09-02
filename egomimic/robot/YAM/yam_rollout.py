@@ -210,19 +210,22 @@ TEMP_DIR = "/home/robot/temp_dir"
 
 
 def _build_robot_interface(
-    arms_list, robot="eva", offline_debug=False, offline_episode_path=None, yam_channels=None
+    arms_list, robot="eva", offline_debug=False, offline_episode_path=None,
+    yam_channels=None, camera_names=None,
 ):
     if robot == "yam":
         if offline_debug:
             raise ValueError("--offline-debug is not supported for --robot yam")
-        # YAMInterface is a sibling module (this file lives in egomimic/robot/YAM/);
-        # YAM/ is already on sys.path (see the path setup at the top of this file).
         from yam_interface import YAMInterface
+        from yam_cameras import DEFAULT_CAMERA_NAMES, parse_camera_names
 
-        # YAMInterface always opens its cameras, so get_obs() includes
-        # front_img_1 / left_wrist_img / right_wrist_img — the keys the obs
-        # pipeline consumes (and it raises if no cameras are available).
-        return YAMInterface(arms=arms_list, channels=yam_channels)
+        # Start from the hardcoded per-machine aliases, then apply any CLI overrides.
+        serial_to_name = dict(DEFAULT_CAMERA_NAMES)
+        if camera_names:
+            serial_to_name.update(camera_names)
+
+        return YAMInterface(arms=arms_list, channels=yam_channels,
+                            camera_names=serial_to_name)
 
     if offline_debug:
         from robot_interface import OfflineARXInterface
