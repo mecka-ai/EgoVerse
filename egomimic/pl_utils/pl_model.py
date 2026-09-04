@@ -302,7 +302,9 @@ class ModelWrapper(LightningModule):
             else:
                 scheduler = None
         else:
-            optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+            optimizer = self.hparams.optimizer(
+                params=list(self.trainer.model.parameters())
+            )
             scheduler = (
                 self.hparams.scheduler(optimizer=optimizer)
                 if self.hparams.scheduler is not None
