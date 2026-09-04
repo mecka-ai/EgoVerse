@@ -7,6 +7,62 @@ from typing import Any, Dict, List, Optional, Tuple
 import hydra
 import lightning as L
 import torch
+
+# --- TEMPORARY DIAGNOSTIC: locate the unpicklable generator in the checkpoint
+# object graph on the next torch.save failure, then print its exact attribute
+# path and exit, instead of a bare "cannot pickle 'generator' object" error
+# with no indication of where. Revert once the real culprit is found and fixed
+# in the actual attribute that holds it.
+import types as _types
+
+
+def _find_generators(obj, path="checkpoint", seen=None, out=None):
+    if out is None:
+        out = []
+    if seen is None:
+        seen = set()
+    oid = id(obj)
+    if oid in seen:
+        return out
+    seen.add(oid)
+    if isinstance(obj, _types.GeneratorType):
+        out.append(path)
+        return out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _find_generators(v, f"{path}[{k!r}]", seen, out)
+    elif isinstance(obj, (list, tuple, set)):
+        for i, v in enumerate(obj):
+            _find_generators(v, f"{path}[{i}]", seen, out)
+    elif hasattr(obj, "__dict__") and not isinstance(
+        obj, (torch.Tensor, type, int, float, str, bytes, bool)
+    ):
+        for k, v in vars(obj).items():
+            _find_generators(v, f"{path}.{k}", seen, out)
+    return out
+
+
+_orig_torch_save = torch.save
+
+
+def _diagnostic_torch_save(obj, *args, **kwargs):
+    try:
+        return _orig_torch_save(obj, *args, **kwargs)
+    except TypeError as e:
+        if "pickle" in str(e) and "generator" in str(e):
+            paths = _find_generators(obj)
+            print("=" * 70, flush=True)
+            print("DIAGNOSTIC: unpicklable generator(s) found at:", flush=True)
+            for p in paths:
+                print(f"  {p}", flush=True)
+            if not paths:
+                print("  (none found via __dict__ walk -- check __slots__ / C-level state)", flush=True)
+            print("=" * 70, flush=True)
+        raise
+
+
+torch.save = _diagnostic_torch_save
+# --- END TEMPORARY DIAGNOSTIC
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
