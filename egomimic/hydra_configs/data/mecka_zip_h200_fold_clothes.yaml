@@ -1,0 +1,99 @@
+# 4×H200 — fold-clothes subset, STAGE-ALL-FIRST from the `robotics` R2 bucket.
+#
+# Lineage of this data (produced OUTSIDE this repo -- see
+# ~/mecka/robotics_pipeline/, which uses its own `mecka-r2` Modal secret
+# built from mecka/.env, never EgoVerse's egoverse-r2/egoverse-mongodb):
+#   Mongo `delivered` (delivered_to=nvidia, task_id=folding_clothes)
+#     -> quality/diversity selection             -> 40,355 eps / 1,150 h
+#     -> robotics_pipeline/convert_to_volume.py   -> volume mecka_data_zip_fold_clothes (this file's data=)
+#     -> robotics_pipeline/sync_volume_to_r2.py   -> r2://robotics/fold_clothes_1150h/<hash>.tar  (durable backup)
+#
+# Subset staged here: the top 17,000 episodes by quality score = 456 h.
+# Sized against Modal's 3 TiB ephemeral hard cap using a MEASURED 5.49 GB/h
+# (400 episodes of the 260814 conversion, cross-checked against the whole
+# 481 GB output dir):
+#
+#   17,000 eps ≈ 456 h ≈ 2,504 GB   → 81% of cap, ~570 GB headroom   [this file]
+#   20,000 eps ≈ 539 h ≈ 2,960 GB   → 96% of cap — too tight
+#
+# Note these episodes are LARGER than the ones mecka_zip_h200_20k_staged.yaml
+# was tuned for (~155 MB vs ~131 MB each), which is why the episode count is
+# lower here for a similar disk footprint. Re-check if you change the subset.
+#
+# The staged catalog contains exactly the 17k chosen episodes, so there is
+# deliberately NO `debug:` cap below — `debug` slices the catalog in
+# episode-hash order and would silently discard the quality ranking.
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_zip_h200_fold_clothes trainer=ddp_modal logger=wandb \
+#     model=hpt_bc_flow_mecka_300m name=<run> description=<desc> \
+#     '~evaluator@train_viz_evaluator' \
+#     trainer.check_val_every_n_epoch=5 trainer.limit_val_batches=10 \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_volume=mecka_data_zip_fold_clothes +modal_ephemeral_disk_gb=3000 \
+#     norm_stats.precomputed_norm_path=precomputed_norm_stats/mecka_all_zarr \
+#     init_submodules=false
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      min_frames: null
+      valid_ratio: 0.1
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    episodes_per_epoch: 17000   # >= the ~15.3k train split → prepare_epoch(0) stages all
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 2400          # holds the whole ~2.26 TB train split, no eviction
+    lookahead_epochs: 1.0       # filler stages once up front, then idles
+    n_copy_threads: 48
+    prepare_timeout_s: 21600    # 6h. Initial stage is ~2.3 TB off a ~150 MB/s volume
+                                # (~4.3h); the 1h default would abort mid-stage.
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZipEpisodeResolver
+      zip_dir: /mnt/zarr-zip
+      min_frames: null
+      valid_ratio: 0.1
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    episodes_per_epoch: 1700    # == full valid split
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 300
+    lookahead_epochs: 1.0
+    n_copy_threads: 16
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128          # per rank; global = 128 × 4 = 512
+    num_workers: 12          # × 4 ranks = 48 (Modal cpu cap is 64)
+    persistent_workers: false
+    prefetch_factor: 6
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: false
+    prefetch_factor: 2
+    shuffle: false
