@@ -43,7 +43,7 @@ class ModelWrapper(LightningModule):
             model (PolicyAlgo): robomimic model to wrap.
         """
         super().__init__()
-        self.save_hyperparameters(ignore=["robomimic_model", "viz_func"])
+        self.save_hyperparameters(ignore=["robomimic_model", "viz_func", "evaluator"])
 
         if config_tree is not None:
             self.model = self._instantiate_model(
