@@ -1,0 +1,88 @@
+# fold-clothes, R2-DIRECT variant -- reads zarr straight from R2, no tar,
+# no Modal Volume, no per-epoch stage-and-wait.
+#
+# This is the NEW path (see egomimic/rldb/zarr/remote_store.py and
+# egomimic/rldb/zarr/prefetch/remote_dataset.py), replacing the
+# mecka_zip_h200_fold_clothes.yaml pattern's tar-on-a-Volume design. It has
+# NOT yet been run against a live training job -- smoke-test before trusting
+# it for a real run:
+#   1. python -c "from egomimic.rldb.zarr.remote_store import verify_remote_zarr as v; \
+#                  print(v('r2://robotics/fold_clothes_zarr/<some_hash>.zarr'))"
+#   2. A few hundred steps with num_workers=0, then with num_workers>0.
+#
+# Lineage: same source data as mecka_zip_h200_fold_clothes.yaml, but written
+# by ~/mecka/robotics_pipeline/convert_to_r2_zarr.py directly to
+#   r2://robotics/fold_clothes_zarr/<episode_hash>.zarr/...   (raw zarr tree)
+#   r2://robotics/fold_clothes_zarr/catalog.json               (manifest)
+# instead of tar+Modal-Volume. Requires the mecka-r2 Modal secret attached
+# (pass +modal_use_mecka_r2=true when launching -- see trainModal.py's
+# _MODAL_KEY_MAP and modal_setup.py's _Config.secret_names for why this
+# secret is opt-in rather than always-attached).
+#
+# Launch:
+#   python egomimic/modal/trainModal.py \
+#     data=mecka_r2_direct_fold_clothes model=pi0.5_bc_mecka trainer=ddp_modal \
+#     logger=wandb name=<run> description=<desc> \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_use_mecka_r2=true
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch.remote_dataset.RemoteZarrMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch.catalog.R2ZarrEpisodeResolver
+      bucket: robotics
+      key_prefix: fold_clothes_zarr
+      catalog_path: null  # set to a local path if you've pre-fetched catalog.json; else read from R2 directly
+      min_frames: null
+      valid_ratio: 0.1
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: train
+    cache_warm_ahead_episodes: 200   # how many upcoming episodes the background warmer keeps primed
+    cache_warm_threads: 16
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch.remote_dataset.RemoteZarrMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch.catalog.R2ZarrEpisodeResolver
+      bucket: robotics
+      key_prefix: fold_clothes_zarr
+      catalog_path: null
+      min_frames: null
+      valid_ratio: 0.1
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian
+    mode: valid
+    cache_warm_ahead_episodes: 0     # validation runs rarely; no need to warm ahead
+    cache_warm_threads: 4
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    # Start at 0 to isolate correctness from the fork-safety of the cached
+    # async R2 filesystem (see remote_store.py's per-(cache_dir,pid) keying)
+    # before trying num_workers>0 on a real run.
+    num_workers: 0
+    persistent_workers: false
+    prefetch_factor: null
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 64
+    num_workers: 0
+    persistent_workers: false
+    prefetch_factor: null
+    shuffle: false

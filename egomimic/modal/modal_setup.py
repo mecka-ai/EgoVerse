@@ -108,6 +108,18 @@ class _Config:
             #   modal secret create egoverse-hf HF_TOKEN=<token>
             # (token must have accepted google/paligemma-3b-mix-224's license).
             "egoverse-hf",
+            # R2_ENDPOINT/R2_ACCESS_KEY/R2_SECRET_KEY for RemoteZarrMapDataset /
+            # egomimic.rldb.zarr.remote_store (direct R2 zarr reads, no
+            # tar-extract). NOT the same credentials as egoverse-r2 -- that
+            # key cannot reach the `robotics` bucket. Built by
+            # ~/mecka/robotics_pipeline/setup_secret.sh. Opt-in only (pass
+            # +modal_use_mecka_r2=true) -- unlike the secrets above, this one
+            # does NOT exist in every Modal environment this repo runs
+            # training in, so it must never be attached unconditionally:
+            # modal.Secret.from_name() resolves eagerly at container-build
+            # time and would break every launch in an environment lacking it,
+            # not just ones that actually use the new R2-direct path.
+            *(["mecka-r2"] if os.environ.get("MODAL_USE_MECKA_R2") else []),
         ]
     )
 
@@ -256,6 +268,15 @@ image = (
         "pyzmq",
         "torchvision==0.21.0",
         "s5cmd",
+        # s3fs: direct zarr reads from R2 (RemoteZarrMapDataset /
+        # remote_store.py), replacing the tar-extract-to-local-disk path for
+        # new data configs. fsspec is already a transitive dep here
+        # (datasets/huggingface-hub/pyarrow) -- left unpinned so pip's
+        # resolver picks a version compatible with those, not forced to an
+        # exact one; remote_store.py only needs fsspec>=2024.12.0 (verified
+        # locally against zarr==3.1.5 + fsspec==2026.4.0, its minimum
+        # requirement for the sync->async filesystem wrap it relies on).
+        "s3fs",
     )
     # openpi import deps (for egomimic.algo.pi → PI / pi0.5 models). openpi is
     # JAX-first: even its pytorch model path imports jax/flax at module load

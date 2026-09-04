@@ -2388,10 +2388,21 @@ class ZarrEpisode:
         """
         Initialize ZarrEpisode wrapper.
         Args:
-            path: Path to the .zarr episode directory
+            path: Path to the .zarr episode directory, or an ``r2://bucket/key``
+                URL to read directly off R2 (no local tar-extract step -- see
+                ``egomimic.rldb.zarr.remote_store``). A bare ``Path(...)`` on a
+                URL string would mangle the "://" double-slash, so URLs are
+                routed around the local-path branch entirely.
         """
-        self._path = Path(path)
-        self._store = zarr.open_group(str(self._path), mode="r")
+        if isinstance(path, str) and path.startswith("r2://"):
+            from egomimic.rldb.zarr.remote_store import open_remote_zarr_group
+
+            self._path = path
+            cache_dir = os.environ.get("R2_ZARR_CACHE_DIR", "/cache/r2_zarr_chunks")
+            self._store = open_remote_zarr_group(path, cache_dir, mode="r")
+        else:
+            self._path = Path(path)
+            self._store = zarr.open_group(str(self._path), mode="r")
         self.metadata = dict(self._store.attrs)
         self.keys = self.metadata["features"]
 

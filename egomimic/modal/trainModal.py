@@ -443,6 +443,10 @@ if __name__ == "__main__":
         "modal_ephemeral_disk_gb": "MODAL_EPHEMERAL_DISK_GB",
         "modal_timeout_seconds": "MODAL_TIMEOUT_SECONDS",
         "modal_restart_margin_sec": "MODAL_RESTART_MARGIN_SEC",
+        # Opt-in: attaches the mecka-r2 secret for RemoteZarrMapDataset /
+        # egomimic.rldb.zarr.remote_store (direct R2 zarr reads). See
+        # modal_setup.py::_Config.secret_names for why this must stay opt-in.
+        "modal_use_mecka_r2": "MODAL_USE_MECKA_R2",
     }
 
     modal_env = os.environ.copy()
