@@ -373,7 +373,9 @@ class MeckaExtractor:
                         f"Could not find video in {local_data_dir}; expected one of {[str(p) for p in candidate_videos]}"
                     )
 
-                for p in [hands_path, egomotion_path, frames_path, annotations_path]:
+                # annotations.csv is best-effort upstream (not every episode has
+                # labels), so it's excluded from the required-file check below.
+                for p in [hands_path, egomotion_path, frames_path]:
                     if not p.exists():
                         raise FileNotFoundError(
                             f"Missing required file for local load: {p}"
@@ -383,7 +385,11 @@ class MeckaExtractor:
             hands_df = pd.read_csv(hands_path)
             egomotion = np.loadtxt(egomotion_path)
             frames_df = pd.read_csv(frames_path)
-            annotations_df = pd.read_csv(annotations_path)
+            if Path(annotations_path).exists():
+                annotations_df = pd.read_csv(annotations_path)
+            else:
+                logger.info("No annotations.csv found; treating episode as unlabeled")
+                annotations_df = pd.DataFrame(columns=["label", "start_time", "end_time"])
 
             # Per-frame camera poses (world-to-camera) for hand transform
             camera_transforms = MeckaExtractor._extract_camera_transforms(egomotion)
@@ -520,6 +526,17 @@ class MeckaExtractor:
                 f"frames.csv has {len(frames_df)} frames but egomotion has only "
                 f"{len(camera_transforms)}; truncating hand data to {num_frames}"
             )
+
+        # hands.csv columns were renamed at some point; world_x/y/z and
+        # robotics_x/y/z hold the same quantity under different names.
+        hands_cols = set(hands_df.columns)
+        if {"world_x", "world_y", "world_z"}.issubset(hands_cols):
+            xyz_cols = ["world_x", "world_y", "world_z"]
+        elif {"robotics_x", "robotics_y", "robotics_z"}.issubset(hands_cols):
+            xyz_cols = ["robotics_x", "robotics_y", "robotics_z"]
+        else:
+            raise ValueError(f"hands.csv missing world_x/y/z or robotics_x/y/z columns: {sorted(hands_cols)}")
+
         hand_poses = np.zeros((num_frames, 14))
         hand_keypoints = np.zeros((num_frames, 2, 21, 3))
         wrist_poses = np.zeros((num_frames, 14))
@@ -532,9 +549,7 @@ class MeckaExtractor:
                 ].sort_values("landmark_index")
 
                 if len(hand_data) == 21:
-                    kp = hand_data[
-                        ["world_x", "world_y", "world_z"]
-                    ].values  # (21, 3) in camera frame
+                    kp = hand_data[xyz_cols].values  # (21, 3) in camera frame
                     wTc = camera_transforms[frame_idx]
 
                     # Transform keypoints from camera frame to world frame (same as hand poses)
