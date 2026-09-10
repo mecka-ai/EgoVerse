@@ -421,7 +421,9 @@ class MeckaExtractor:
             hand_poses_world = hand_poses_world[:num_frames]
             wrist_poses_world = wrist_poses_world[:num_frames]
             hand_keypoints_world = hand_keypoints_world[:num_frames]
-            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(egomotion)
+            actions_head_cartesian_world = MeckaExtractor._extract_head_poses(egomotion)[
+                :num_frames
+            ]
             # Flatten 21×3 keypoints to 63 per hand for Zarr schema
             # hand_index 0=left, 1=right
             right_keypoints = hand_keypoints_world[:, 1, :, :].reshape(num_frames, 63)
@@ -512,7 +514,12 @@ class MeckaExtractor:
                 - hand_poses_world: (T, 14) [left_7dof, right_7dof] xyz+quat(WXYZ) in world frame.
                 - hand_keypoints_world: (T, 2, 21, 3) [left_21kp, right_21kp] in world.
         """
-        num_frames = len(frames_df)
+        num_frames = min(len(frames_df), len(camera_transforms))
+        if num_frames < len(frames_df):
+            logger.warning(
+                f"frames.csv has {len(frames_df)} frames but egomotion has only "
+                f"{len(camera_transforms)}; truncating hand data to {num_frames}"
+            )
         hand_poses = np.zeros((num_frames, 14))
         hand_keypoints = np.zeros((num_frames, 2, 21, 3))
         wrist_poses = np.zeros((num_frames, 14))
