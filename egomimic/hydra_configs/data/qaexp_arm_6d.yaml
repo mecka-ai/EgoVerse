@@ -44,14 +44,18 @@ train_datasets:
     mode: train
     # An arm is ~2,300 episodes, so the whole arm stages before step 1 and the
     # filler then idles — no train-vs-filler CPU contention for the rest of the
-    # run. At ~48MB/episode that is ~110GB and roughly 30 minutes.
+    # run. At ~41MB/episode that is ~86GB; measured ~92 min with 9 runs sharing
+    # the volume (~14 MB/s each), ~50 min for a run with the volume to itself.
     episodes_per_epoch: 2400
     epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
     cache_dir: /cache/zarr_cache
     pool_size_gb: 400
     lookahead_epochs: 1.0
     n_copy_threads: 48
-    prepare_timeout_s: 7200
+    # 9 concurrent runs share one volume: staging measured 25 MB/s alone but
+    # 14 MB/s with all 9 in flight, i.e. ~92 min for a ~2,100-episode arm.
+    # 2h left almost no margin, so allow 6h rather than lose a run at 119 min.
+    prepare_timeout_s: 21600
 
 valid_datasets:
   mecka_bimanual:
