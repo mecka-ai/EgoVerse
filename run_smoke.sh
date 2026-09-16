@@ -19,7 +19,7 @@ python egomimic/modal/trainModal.py \
   logger=wandb \
   model=pi0.5_bc_mecka \
   name=smoke-cleaning-top \
-  description="smoke: pi0.5 6D + zarr staging, 1 arm, few steps" \
+  description=smoke-pi05-6d-zarr-staging \
   '~evaluator@train_viz_evaluator' \
   '+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/cleaning-sanitation__top.json' \
   '+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/cleaning-sanitation__top.json' \
