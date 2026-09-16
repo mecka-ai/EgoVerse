@@ -326,12 +326,16 @@ class ModelWrapper(LightningModule):
             f"dropped {len(dropped)}: {'; '.join(dropped[:10]) or 'none'}"
         )
 
-        # If it still will not pickle, the offender is in a skipped key -- say
-        # which one rather than letting torch.save raise a bare TypeError.
-        for key in self._CKPT_SKIP_PROBE:
-            if key in checkpoint and not ok(checkpoint[key]):
-                print(f"[checkpoint] WARNING: {key!r} is itself unpicklable")
-                checkpoint[key] = fix(checkpoint[key], f"checkpoint[{key!r}]")
+        # optimizer_states splits into 'state' (tensors, always picklable and
+        # gigabytes) and 'param_groups' (small, and where a stray parameter
+        # generator ends up). Probe only param_groups: pickling the tensors on
+        # every save just to find this would cost more than the bug did.
+        for i, opt in enumerate(checkpoint.get("optimizer_states") or []):
+            if isinstance(opt, dict) and "param_groups" in opt:
+                opt["param_groups"] = fix(
+                    opt["param_groups"],
+                    f"checkpoint['optimizer_states'][{i}]['param_groups']",
+                )
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
@@ -345,9 +349,12 @@ class ModelWrapper(LightningModule):
         config_tree = getattr(self.hparams, "config_tree", None)
         if config_tree is not None:
             cfg = self._as_config(config_tree)
+            # list(), not the generator: a bare generator here leaks into
+            # the optimizer's param_groups and makes optimizer_states
+            # unpicklable, which kills every checkpoint save.
             optimizer = hydra.utils.instantiate(
                 cfg.model.optimizer,
-                params=self.trainer.model.parameters(),
+                params=list(self.trainer.model.parameters()),
             )
             if callable(optimizer):
                 optimizer = optimizer()
@@ -362,7 +369,9 @@ class ModelWrapper(LightningModule):
             else:
                 scheduler = None
         else:
-            optimizer = self.hparams.optimizer(params=self.trainer.model.parameters())
+            optimizer = self.hparams.optimizer(
+                params=list(self.trainer.model.parameters())
+            )
             scheduler = (
                 self.hparams.scheduler(optimizer=optimizer)
                 if self.hparams.scheduler is not None
