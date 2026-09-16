@@ -273,8 +273,10 @@ class ModelWrapper(LightningModule):
             flush=True,
         )
 
-    # Tensor payloads; always picklable and far too big to probe by trial.
-    _CKPT_SKIP_PROBE = ("state_dict", "optimizer_states", "lr_schedulers")
+    # Tensor payloads: far too big to probe by trial, and they hold plain
+    # tensors. Everything else is probed -- including lr_schedulers, which is
+    # small and is exactly the kind of place a generator hides.
+    _CKPT_SKIP_PROBE = ("state_dict", "optimizer_states")
 
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """Drop unpicklable values so ``torch.save`` can write the checkpoint.
@@ -316,11 +318,20 @@ class ModelWrapper(LightningModule):
                 continue
             checkpoint[key] = fix(checkpoint[key], f"checkpoint[{key!r}]")
 
-        if dropped:
-            print(
-                f"[checkpoint] dropped {len(dropped)} unpicklable value(s): "
-                + "; ".join(dropped[:10])
-            )
+        # Report unconditionally: a silent hook that finds nothing looks
+        # identical to a hook that never ran, and that cost a full debug cycle.
+        probed = [k for k in checkpoint if k not in self._CKPT_SKIP_PROBE]
+        print(
+            f"[checkpoint] probed {len(probed)} keys {probed}, "
+            f"dropped {len(dropped)}: {'; '.join(dropped[:10]) or 'none'}"
+        )
+
+        # If it still will not pickle, the offender is in a skipped key -- say
+        # which one rather than letting torch.save raise a bare TypeError.
+        for key in self._CKPT_SKIP_PROBE:
+            if key in checkpoint and not ok(checkpoint[key]):
+                print(f"[checkpoint] WARNING: {key!r} is itself unpicklable")
+                checkpoint[key] = fix(checkpoint[key], f"checkpoint[{key!r}]")
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
