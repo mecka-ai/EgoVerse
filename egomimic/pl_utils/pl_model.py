@@ -273,6 +273,40 @@ class ModelWrapper(LightningModule):
             flush=True,
         )
 
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Strip generators so ``torch.save`` can pickle the checkpoint.
+
+        A single generator anywhere in the checkpoint dict aborts the whole
+        save with ``TypeError: cannot pickle 'generator' object`` -- after a
+        full epoch of training has already been paid for. A generator carries
+        no restorable state, so replacing it with None loses nothing, and the
+        warning names the exact path so the real source can be fixed.
+        """
+        import types
+
+        dropped: list[str] = []
+
+        def scrub(obj, path):
+            if isinstance(obj, types.GeneratorType):
+                dropped.append(path)
+                return None
+            if isinstance(obj, dict):
+                return {k: scrub(v, f"{path}[{k!r}]") for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [scrub(v, f"{path}[{i}]") for i, v in enumerate(obj)]
+            if isinstance(obj, tuple):
+                return tuple(scrub(v, f"{path}[{i}]") for i, v in enumerate(obj))
+            return obj
+
+        for key in list(checkpoint.keys()):
+            checkpoint[key] = scrub(checkpoint[key], f"checkpoint[{key!r}]")
+
+        if dropped:
+            print(
+                f"[checkpoint] dropped {len(dropped)} unpicklable generator(s): "
+                + ", ".join(dropped[:10])
+            )
+
     def configure_optimizers(self) -> Dict[str, Any]:
         """Choose what optimizers and learning-rate schedulers to use in your optimization.
         Normally you'd need one. But in the case of GANs or similar you might have multiple.
