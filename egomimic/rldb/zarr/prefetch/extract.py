@@ -40,35 +40,48 @@ def _extract_tar_to_dir(source: Path, dest: Path) -> int:
     return sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
 
 
-# A zarr episode is thousands of tiny chunk files, and on a FUSE volume the
-# per-file round trip -- not bandwidth -- dominates. shutil.copytree is
-# sequential and adds a stat+copystat per file, which measured 6 MB/s against
-# ~150 MB/s of available bandwidth. Copying the files concurrently and skipping
-# metadata preservation recovers most of that gap.
+# A zarr episode here is ~18 files: one ~37 MB image shard plus a handful of
+# 0.15-1.5 MB pose/keypoint arrays and their metadata. Measured on the volume:
+# the image shard alone streams at 100-280 MB/s, the mid-sized arrays manage
+# only 21-29 MB/s and do NOT improve with more threads (flat from 32 to 1024),
+# and whole episodes land at 40-55 MB/s. shutil.copytree is sequential and adds
+# a stat+copystat per file; copying concurrently and skipping metadata
+# preservation recovers most of the gap that is recoverable here.
 _COPY_THREADS = int(os.environ.get("ZARR_STAGE_COPY_THREADS", "64"))
 
 
 def _copy_one(args: tuple[Path, Path]) -> None:
     src, dst = args
     with open(src, "rb") as fi, open(dst, "wb") as fo:
-        shutil.copyfileobj(fi, fo, length=1024 * 1024)
+        # 8 MiB: the image shard is ~37 MB, so larger reads mean far fewer
+        # round trips on the file that carries ~90% of the episode's bytes.
+        shutil.copyfileobj(fi, fo, length=8 * 1024 * 1024)
 
 
 def _copy_tree_parallel(source: Path, dest: Path) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
-    jobs: list[tuple[Path, Path]] = []
-    for src in source.rglob("*"):
-        rel = src.relative_to(source)
-        dst = dest / rel
-        if src.is_dir():
-            dst.mkdir(parents=True, exist_ok=True)
-        else:
+    with ThreadPoolExecutor(max_workers=_COPY_THREADS) as ex:
+        # Discover the tree with the directory reads fanned out. Path.rglob is
+        # a single sequential stream of FUSE round trips, which measured ~1.0s
+        # per episode against ~0.01s for the same walk issued concurrently --
+        # most of a stage was spent listing the directory, not copying it.
+        files: list[Path] = []
+        level = [source]
+        while level:
+            results = list(ex.map(lambda d: list(os.scandir(d)), level))
+            level = []
+            for entries in results:
+                for e in entries:
+                    (level if e.is_dir() else files).append(Path(e.path))
+
+        jobs: list[tuple[Path, Path]] = []
+        for src in files:
+            dst = dest / src.relative_to(source)
             dst.parent.mkdir(parents=True, exist_ok=True)
             jobs.append((src, dst))
-    if not jobs:
-        return
-    with ThreadPoolExecutor(max_workers=_COPY_THREADS) as ex:
+        if not jobs:
+            return
         list(ex.map(_copy_one, jobs))
 
 
