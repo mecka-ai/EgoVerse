@@ -273,38 +273,53 @@ class ModelWrapper(LightningModule):
             flush=True,
         )
 
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """Strip generators so ``torch.save`` can pickle the checkpoint.
+    # Tensor payloads; always picklable and far too big to probe by trial.
+    _CKPT_SKIP_PROBE = ("state_dict", "optimizer_states", "lr_schedulers")
 
-        A single generator anywhere in the checkpoint dict aborts the whole
-        save with ``TypeError: cannot pickle 'generator' object`` -- after a
-        full epoch of training has already been paid for. A generator carries
-        no restorable state, so replacing it with None loses nothing, and the
-        warning names the exact path so the real source can be fixed.
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Drop unpicklable values so ``torch.save`` can write the checkpoint.
+
+        A single unpicklable object anywhere in the checkpoint aborts the whole
+        save with e.g. ``TypeError: cannot pickle 'generator' object`` -- after
+        a full epoch of training has already been paid for. Which object it is
+        cannot be found by walking containers, because it is typically held as
+        an attribute of one, so probe with real ``pickle.dumps`` calls and
+        descend only into the branches that actually fail.
+
+        Anything dropped is reported by path so the true source can be fixed;
+        none of it is restorable state, so losing it costs nothing.
         """
-        import types
+        import pickle
 
         dropped: list[str] = []
 
-        def scrub(obj, path):
-            if isinstance(obj, types.GeneratorType):
-                dropped.append(path)
-                return None
+        def ok(obj) -> bool:
+            try:
+                pickle.dumps(obj)
+                return True
+            except Exception:
+                return False
+
+        def fix(obj, path):
+            if ok(obj):
+                return obj
             if isinstance(obj, dict):
-                return {k: scrub(v, f"{path}[{k!r}]") for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [scrub(v, f"{path}[{i}]") for i, v in enumerate(obj)]
-            if isinstance(obj, tuple):
-                return tuple(scrub(v, f"{path}[{i}]") for i, v in enumerate(obj))
-            return obj
+                return {k: fix(v, f"{path}[{k!r}]") for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                rebuilt = [fix(v, f"{path}[{i}]") for i, v in enumerate(obj)]
+                return type(obj)(rebuilt) if isinstance(obj, list) else tuple(rebuilt)
+            dropped.append(f"{path} ({type(obj).__name__})")
+            return None
 
         for key in list(checkpoint.keys()):
-            checkpoint[key] = scrub(checkpoint[key], f"checkpoint[{key!r}]")
+            if key in self._CKPT_SKIP_PROBE:
+                continue
+            checkpoint[key] = fix(checkpoint[key], f"checkpoint[{key!r}]")
 
         if dropped:
             print(
-                f"[checkpoint] dropped {len(dropped)} unpicklable generator(s): "
-                + ", ".join(dropped[:10])
+                f"[checkpoint] dropped {len(dropped)} unpicklable value(s): "
+                + "; ".join(dropped[:10])
             )
 
     def configure_optimizers(self) -> Dict[str, Any]:
