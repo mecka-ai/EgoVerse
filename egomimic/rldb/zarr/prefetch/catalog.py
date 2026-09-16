@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -203,7 +205,7 @@ class ZarrDirEpisodeResolver(ZipEpisodeResolver):
             # assume a depth. Deeper than this would mean rglob, which is far
             # too slow over a FUSE mount with tens of thousands of entries.
             seen: set[str] = set()
-            raw = []
+            eps: list[Path] = []
             for pattern in ("*/*.zarr", "*/*/*.zarr"):
                 for ep in sorted(self.zip_dir.glob(pattern)):
                     if ep.parts[len(self.zip_dir.parts)].startswith("_"):
@@ -213,12 +215,24 @@ class ZarrDirEpisodeResolver(ZipEpisodeResolver):
                     # be sampled twice within an epoch.
                     if ep.stem in seen:
                         continue
-                    n = self._n_frames(ep)
-                    if n:
-                        seen.add(ep.stem)
-                        raw.append({"path": str(ep), "episode_hash": ep.stem,
-                                    "n_frames": n,
-                                    "group": "/".join(ep.parts[len(self.zip_dir.parts):-1])})
+                    seen.add(ep.stem)
+                    eps.append(ep)
+
+            # One small FUSE read per episode, and there can be tens of
+            # thousands. Sequentially that is latency-bound and takes tens of
+            # minutes -- on a training box that is idle GPU time, so fan the
+            # reads out. The result is cached, so only a cold volume pays it.
+            n_threads = int(os.environ.get("ZARR_CATALOG_SCAN_THREADS", "64"))
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                counts = list(ex.map(self._n_frames, eps))
+
+            raw = [
+                {"path": str(ep), "episode_hash": ep.stem, "n_frames": n,
+                 "group": "/".join(ep.parts[len(self.zip_dir.parts):-1])}
+                for ep, n in zip(eps, counts) if n
+            ]
+            logger.info("ZarrDirEpisodeResolver: scanned %d episodes (%d threads)",
+                        len(raw), n_threads)
             try:
                 cache.write_text(json.dumps(raw))
                 logger.info("ZarrDirEpisodeResolver: wrote catalog cache %s", cache)
