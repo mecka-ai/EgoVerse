@@ -443,9 +443,29 @@ class PI(Algo):
         image_resolution = getattr(self, "image_resolution", (224, 224))
         required_cam_keys = getattr(self, "pi_cam_keys", cam_keys)
 
+        # The zarr keymap names the head view `observations.images.front_img_1`
+        # (Embodiment.VIZ_IMAGE_KEY), while OpenPI's camera tuple is fixed at
+        # base_0_rgb / left_wrist_0_rgb / right_wrist_0_rgb. When the batch
+        # carries none of the pi slot names, alias the dataset's own camera keys
+        # onto them in order so the fill below has a real view to seed from --
+        # otherwise every Mecka batch raises "no valid image tensor found".
+        # present_flags is computed from the aliased view, so the real camera
+        # stays unmasked and only the synthesized wrist slots are masked out.
+        cam_source = batch
+        if not any(k in batch for k in required_cam_keys):
+            aliased = {
+                dst: batch[src]
+                for dst, src in zip(required_cam_keys, cam_keys or [])
+                if src in batch
+            }
+            if aliased:
+                cam_source = aliased
+
         present_flags = {
             k: (
-                k in batch and isinstance(batch[k], torch.Tensor) and batch[k].ndim == 4
+                k in cam_source
+                and isinstance(cam_source[k], torch.Tensor)
+                and cam_source[k].ndim == 4
             )
             for k in required_cam_keys
         }
@@ -457,7 +477,7 @@ class PI(Algo):
         # OpenPI expects a fixed camera tuple. Human datasets only provide
         # `base_0_rgb`, so duplicate that view into the missing wrist slots and
         # mark those synthesized views as masked out below.
-        raw_images = _fill_missing_images(batch, required_cam_keys, device)
+        raw_images = _fill_missing_images(cam_source, required_cam_keys, device)
 
         # ---- Images (dict[str, Tensor]) ----
         images = {}
