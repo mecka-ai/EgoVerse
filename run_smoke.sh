@@ -32,7 +32,8 @@ python egomimic/modal/trainModal.py \
   trainer.limit_train_batches=5 \
   trainer.limit_val_batches=2 \
   trainer.max_epochs=1 \
-  norm_stats.sample_frac=0.05 \
+  norm_stats.sample_frac=0.005 \
+  model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \
   +modal_gpu=H200:1 \
   +modal_cpu=16 \
   +modal_memory_gb=64 \
