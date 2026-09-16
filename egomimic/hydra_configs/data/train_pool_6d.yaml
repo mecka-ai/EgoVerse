@@ -1,0 +1,115 @@
+# Best-2.6k-hours vs best-6k-hours pool — one training run per pool.
+#
+# Same staged zarr path as qaexp_arm_6d, but it CANNOT use that config's
+# "stage the whole thing once" shape. A pool is 20,000 episodes ~= 820 GB,
+# which exceeds pool_size_gb and would be hours of idle GPU before step 1.
+#
+# So this streams instead: each epoch stages a window of episodes_per_epoch
+# while the previous window trains (lookahead_epochs: 1.0). The requirement is
+# simply
+#
+#     epoch compute time  >=  window stage time
+#
+# Window stage time is episodes_per_epoch / (staging rate). Measured staging is
+# ~0.38 episodes/s with several runs sharing the volume and ~0.7 episodes/s with
+# it uncontended, so a 800-episode window is ~20-35 min. Epoch compute time is
+# trainer.limit_train_batches * batch_size / (samples/s), so limit_train_batches
+# has to be raised well above its default of 100 (which would be a ~2 min epoch
+# and would stall the GPU waiting for every window).
+#
+# Set limit_train_batches from the measured H200:4 step rate, erring HIGH: if
+# staging outruns compute the filler simply idles, whereas if compute outruns
+# staging the dataloader stalls and logs "Dataloader stalled ... pool sizing may
+# be too small". Watch for that line on the first run.
+#
+# Only the first window is idle time (~20-35 min); after that staging and
+# training overlap. pool_size_gb holds several windows so episodes already
+# staged are reused rather than re-copied.
+#
+# Both pools are 20,000 episodes, so passing the same settings to each keeps the
+# comparison fair — the only difference is which quality tier the episodes are
+# drawn from.
+#
+# Launch (one run per pool):
+#   python egomimic/modal/trainModal.py \
+#     data=train_pool_6d trainer=ddp_modal logger=wandb model=pi0.5_bc_mecka \
+#     name=pool-2600h description=pool-best-2600h \
+#     '+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_manifest/train_pool_2600h.json' \
+#     '+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_manifest/train_pool_2600h.json' \
+#     model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \
+#     trainer.limit_train_batches=<from measured step rate> \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_volume=mecka_zarr_train +modal_ephemeral_disk_gb=900
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZarrDirEpisodeResolver
+      zarr_dir: /mnt/zarr-data
+      catalog_cache: /mnt/zarr-data/_catalog_cache.json
+      eps_to_use: null          # set per run on the CLI (which pool)
+      valid_ratio: 0.1
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: train
+    # A window, NOT the whole pool: 800 episodes ~= 33 GB ~= 20-35 min to stage,
+    # which is the only idle the run pays. Raising this makes the first wait
+    # longer; lowering it risks the next window not being ready in time.
+    episodes_per_epoch: 800
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    # ~20 windows resident, so episodes staged once are reused across epochs
+    # instead of being evicted and re-copied off the volume.
+    pool_size_gb: 700
+    lookahead_epochs: 1.0
+    n_copy_threads: 48
+    prepare_timeout_s: 21600
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZarrDirEpisodeResolver
+      zarr_dir: /mnt/zarr-data
+      catalog_cache: /mnt/zarr-data/_catalog_cache.json
+      eps_to_use: null
+      valid_ratio: 0.1
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: valid
+    episodes_per_epoch: 260
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 60
+    lookahead_epochs: 1.0
+    n_copy_threads: 16
+
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 12
+    persistent_workers: true
+    prefetch_factor: 6
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false
