@@ -2101,13 +2101,18 @@ class ZarrDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _decode_jpeg_to_chw(jpeg_bytes: object) -> np.ndarray:
-        """Decode one JPEG payload to float32 CHW in [0, 1]."""
+        """Decode one JPEG payload to uint8 CHW in [0, 255].
+
+        Stays uint8 so the sample crosses the worker->main shm IPC and the H2D
+        copy at a quarter the bytes of float32. PI._to_minus1_1 already accepts
+        uint8 and applies /255 on device, so the numerics are unchanged.
+        """
         if isinstance(jpeg_bytes, np.ndarray):
             if jpeg_bytes.dtype == np.uint8 and jpeg_bytes.ndim >= 2:
-                return np.transpose(jpeg_bytes, (2, 0, 1)).astype(np.float32) / 255.0
+                return np.ascontiguousarray(np.transpose(jpeg_bytes, (2, 0, 1)))
             jpeg_bytes = jpeg_bytes.item() if jpeg_bytes.ndim == 0 else jpeg_bytes[0]
         decoded = simplejpeg.decode_jpeg(jpeg_bytes, colorspace="RGB")
-        return np.transpose(decoded, (2, 0, 1)).astype(np.float32) / 255.0
+        return np.ascontiguousarray(np.transpose(decoded, (2, 0, 1)))
 
     def collect_curation_episode(
         self,
@@ -2329,7 +2334,15 @@ class ZarrDataset(torch.utils.data.Dataset):
 
         for k, v in data.items():
             if isinstance(v, np.ndarray):
-                data[k] = torch.from_numpy(v).to(torch.float32)
+                # Decoded images stay uint8 -- casting here would undo the 4x IPC
+                # saving, since this runs in the worker immediately before the
+                # sample is pickled to the main process. Keyed on dtype rather
+                # than key name because `data` uses mapped keys while
+                # `_image_keys` holds raw zarr keys.
+                if v.dtype == np.uint8 and v.ndim >= 3:
+                    data[k] = torch.from_numpy(v)
+                else:
+                    data[k] = torch.from_numpy(v).to(torch.float32)
 
         data["metadata.robot_name"] = get_embodiment_id(self.embodiment)
         data["embodiment"] = get_embodiment_id(self.embodiment)

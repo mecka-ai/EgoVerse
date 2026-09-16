@@ -419,10 +419,14 @@ class PI(Algo):
         Returns:
             loss_log (dict): name -> summary statistic
         """
+        # Return detached tensors, not floats. `.item()` blocks the CPU until the
+        # forward finishes, once per loss per step, which stalls the next batch's
+        # H2D copy. Both callers hand these straight to LightningModule.log,
+        # which accepts tensors and reduces at epoch end.
         log = OrderedDict()
-        log["Loss"] = info["losses"]["action_loss"].item()
+        log["Loss"] = info["losses"]["action_loss"]
         for loss_key, loss in info["losses"].items():
-            log[loss_key] = loss.item()
+            log[loss_key] = loss
         if "policy_grad_norms" in info:
             log["Policy_Grad_Norms"] = info["policy_grad_norms"]
         return log
