@@ -37,5 +37,4 @@ python egomimic/modal/trainModal.py \
   +modal_cpu=16 \
   +modal_memory_gb=64 \
   +modal_volume=mecka_zarr_qaexp \
-  +modal_ephemeral_disk_gb=512 \
-  init_submodules=false
+  +modal_ephemeral_disk_gb=512
