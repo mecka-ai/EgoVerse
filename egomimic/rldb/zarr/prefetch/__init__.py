@@ -47,7 +47,11 @@ DDP correctness
 """
 
 from egomimic.rldb.zarr.prefetch.bounds import _BoundsCheckMixin
-from egomimic.rldb.zarr.prefetch.catalog import EpisodeCatalogEntry, ZipEpisodeResolver
+from egomimic.rldb.zarr.prefetch.catalog import (
+    EpisodeCatalogEntry,
+    ZarrDirEpisodeResolver,
+    ZipEpisodeResolver,
+)
 from egomimic.rldb.zarr.prefetch.dataset import (
     PrefetchedIterableDataset,
     PrefetchedMapDataset,
@@ -59,6 +63,7 @@ from egomimic.rldb.zarr.prefetch.pool import EpisodePool
 __all__ = [
     "EpisodeCatalogEntry",
     "ZipEpisodeResolver",
+    "ZarrDirEpisodeResolver",
     "EpisodePlan",
     "EpisodePool",
     "PoolFillerThread",

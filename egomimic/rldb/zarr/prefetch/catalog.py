@@ -135,3 +135,121 @@ class ZipEpisodeResolver(EpisodeResolver):
         )
 
 
+class ZarrDirEpisodeResolver(ZipEpisodeResolver):
+    """Stage plain ``.zarr`` directories instead of tar archives.
+
+    Same prefetch machinery as ZipEpisodeResolver -- the pool, filler and
+    dataset are unchanged, because ``_extract_tar_to_dir`` copies a directory
+    source rather than untarring it. What differs is where the catalog comes
+    from: a zarr volume has no ``catalog.json``, so entries are discovered by
+    walking ``<root>/<group>/<episode>.zarr`` and reading ``n_frames`` from
+    each store's ``.zattrs``.
+
+    Reading zattrs for every episode is one small read each and is done once at
+    startup, but at ~150 MB/s per container that is still minutes for tens of
+    thousands of episodes -- so the result is cached to ``catalog_cache`` (on
+    the volume, next to the data) and reused on subsequent runs and restarts.
+
+    ``eps_to_use`` takes a JSON list of episode hashes, which is how a curated
+    subset (e.g. a quality-ranked selection) is pinned for a run.
+    """
+
+    CATALOG_FILENAME = "zarr_catalog.json"
+
+    def __init__(self, zarr_dir, eps_to_use: str | None = None,
+                 catalog_cache: str | None = None, **kwargs):
+        super().__init__(zarr_dir, **kwargs)
+        self.eps_to_use = eps_to_use
+        self.catalog_cache = catalog_cache
+
+    def _n_frames(self, ep: Path) -> int | None:
+        try:
+            attrs = json.loads((ep / "zarr.json").read_text()).get("attributes", {})
+        except Exception:
+            return None
+        n = attrs.get("total_frames") or attrs.get("n_frames")
+        if n:
+            return int(n)
+        feats = attrs.get("features") or {}
+        for k, v in feats.items():
+            if v.get("dtype") == "jpeg":
+                try:
+                    meta = json.loads((ep / k / "zarr.json").read_text())
+                    return int(meta["shape"][0])
+                except Exception:
+                    return None
+        return None
+
+    def load_catalog(self) -> list[EpisodeCatalogEntry]:
+        if self._catalog is not None:
+            return self._catalog
+
+        cache = Path(self.catalog_cache) if self.catalog_cache else (
+            self.zip_dir / self.CATALOG_FILENAME
+        )
+        raw: list[dict] | None = None
+        if cache.exists():
+            try:
+                raw = json.loads(cache.read_text())
+                logger.info("ZarrDirEpisodeResolver: catalog cache hit (%d entries) %s",
+                            len(raw), cache)
+            except Exception:
+                raw = None
+
+        if raw is None:
+            logger.info("ZarrDirEpisodeResolver: scanning %s (no cache)", self.zip_dir)
+            # Layouts vary: the 6k corpus is <group>/<ep>.zarr, the QA_exp
+            # volume is <domain>/<split>/<ep>.zarr. Cover both rather than
+            # assume a depth. Deeper than this would mean rglob, which is far
+            # too slow over a FUSE mount with tens of thousands of entries.
+            seen: set[str] = set()
+            raw = []
+            for pattern in ("*/*.zarr", "*/*/*.zarr"):
+                for ep in sorted(self.zip_dir.glob(pattern)):
+                    if ep.parts[len(self.zip_dir.parts)].startswith("_"):
+                        continue
+                    # An episode can be materialised under more than one split
+                    # directory; keep the first and skip the copies, or it would
+                    # be sampled twice within an epoch.
+                    if ep.stem in seen:
+                        continue
+                    n = self._n_frames(ep)
+                    if n:
+                        seen.add(ep.stem)
+                        raw.append({"path": str(ep), "episode_hash": ep.stem,
+                                    "n_frames": n,
+                                    "group": "/".join(ep.parts[len(self.zip_dir.parts):-1])})
+            try:
+                cache.write_text(json.dumps(raw))
+                logger.info("ZarrDirEpisodeResolver: wrote catalog cache %s", cache)
+            except Exception as e:  # read-only mount is not fatal
+                logger.warning("could not write catalog cache: %s", e)
+
+        keep: set[str] | None = None
+        if self.eps_to_use:
+            with open(self.eps_to_use) as f:
+                keep = set(json.load(f))
+            logger.info("ZarrDirEpisodeResolver: eps_to_use — %d hashes from %s",
+                        len(keep), self.eps_to_use)
+
+        entries = [
+            EpisodeCatalogEntry(
+                tar_path=Path(e["path"]),      # a directory here, copied not untarred
+                episode_hash=e["episode_hash"],
+                n_frames=int(e["n_frames"]),
+            )
+            for e in raw
+            if keep is None or e["episode_hash"] in keep
+        ]
+
+        if self.debug:
+            entries = entries[: int(self.debug)]
+        if self.min_frames:
+            entries = [e for e in entries if e.n_frames >= self.min_frames]
+
+        logger.info("ZarrDirEpisodeResolver: %d episodes, %d total frames",
+                    len(entries), sum(e.n_frames for e in entries))
+        self._catalog = entries
+        return self._catalog
+
+

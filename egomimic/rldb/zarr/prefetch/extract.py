@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tarfile
 import threading
 from pathlib import Path
@@ -18,16 +19,57 @@ if TYPE_CHECKING:  # forward-ref only — importing filler here would cycle
 
 logger = logging.getLogger(__name__)
 
-def _extract_tar_to_dir(tar_path: Path, dest: Path) -> int:
-    """Extract ``tar_path`` into ``dest`` and return total bytes written.
+def _extract_tar_to_dir(source: Path, dest: Path) -> int:
+    """Materialise ``source`` into ``dest`` and return total bytes written.
+
+    ``source`` is either a tar archive (zip volume) or an already-unpacked
+    ``.zarr`` directory (zarr volume). The directory case is a straight copy,
+    which skips tar decompression entirely -- staging off a volume is bandwidth
+    bound at ~150 MB/s per container, so avoiding the extra CPU pass keeps the
+    filler from competing with the dataloader workers for cores.
 
     Caller is responsible for creating/cleaning ``dest``, touching ``.done``,
     and registering the size with the pool.  Raises ``OSError`` (including
     ENOSPC, errno 28) on failure.
     """
-    with tarfile.open(tar_path, "r") as tf:
-        tf.extractall(path=dest)
+    if source.is_dir():
+        _copy_tree_parallel(source, dest)
+    else:
+        with tarfile.open(source, "r") as tf:
+            tf.extractall(path=dest)
     return sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
+
+
+# A zarr episode is thousands of tiny chunk files, and on a FUSE volume the
+# per-file round trip -- not bandwidth -- dominates. shutil.copytree is
+# sequential and adds a stat+copystat per file, which measured 6 MB/s against
+# ~150 MB/s of available bandwidth. Copying the files concurrently and skipping
+# metadata preservation recovers most of that gap.
+_COPY_THREADS = int(os.environ.get("ZARR_STAGE_COPY_THREADS", "64"))
+
+
+def _copy_one(args: tuple[Path, Path]) -> None:
+    src, dst = args
+    with open(src, "rb") as fi, open(dst, "wb") as fo:
+        shutil.copyfileobj(fi, fo, length=1024 * 1024)
+
+
+def _copy_tree_parallel(source: Path, dest: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs: list[tuple[Path, Path]] = []
+    for src in source.rglob("*"):
+        rel = src.relative_to(source)
+        dst = dest / rel
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            jobs.append((src, dst))
+    if not jobs:
+        return
+    with ThreadPoolExecutor(max_workers=_COPY_THREADS) as ex:
+        list(ex.map(_copy_one, jobs))
 
 
 def _acquire_extract_lock(pool_dir: Path, ep_hash: str) -> int | None:

@@ -16,6 +16,7 @@ from egomimic.rldb.zarr.prefetch import (  # noqa: F401
     PoolFillerThread,
     PrefetchedIterableDataset,
     PrefetchedMapDataset,
+    ZarrDirEpisodeResolver,
     ZipEpisodeResolver,
     _BoundsCheckMixin,
 )
@@ -23,6 +24,7 @@ from egomimic.rldb.zarr.prefetch import (  # noqa: F401
 __all__ = [
     "EpisodeCatalogEntry",
     "ZipEpisodeResolver",
+    "ZarrDirEpisodeResolver",
     "EpisodePlan",
     "EpisodePool",
     "PoolFillerThread",
