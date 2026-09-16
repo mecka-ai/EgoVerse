@@ -6,6 +6,7 @@ compatible with the ZarrEpisode reader.
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,6 +14,36 @@ import numpy as np
 import simplejpeg
 import zarr
 from zarr.core.dtype import VariableLengthBytes
+
+# Optional store-time downscale. Set ZARR_IMAGE_TARGET_HW="224x224" to store
+# frames at the size the policy actually consumes.
+#
+# pi0.5 calls openpi's resize_with_pad_torch(img, H, W), which scales by
+# ratio = max(w/W, h/H) and then centre-pads. Storing the *pre-pad* size makes
+# that resize an identity -- the model still applies its own padding, so the
+# tensor it sees is unchanged -- while dropping the pixels it would discard
+# anyway. For 480x640 -> 224x224 that is 168x224, ~2.5x less data on disk, in
+# the staging copy, and across the worker->GPU hop.
+_TARGET_HW = os.environ.get("ZARR_IMAGE_TARGET_HW", "").strip()
+
+
+def _pre_pad_dims(h: int, w: int, target_h: int, target_w: int) -> tuple[int, int]:
+    """The resized (pre-padding) size openpi's resize_with_pad would produce."""
+    ratio = max(w / target_w, h / target_h)
+    return int(h / ratio), int(w / ratio)
+
+
+def _maybe_downscale(img: np.ndarray) -> np.ndarray:
+    if not _TARGET_HW:
+        return img
+    import cv2
+
+    th, tw = (int(x) for x in _TARGET_HW.lower().split("x"))
+    h, w = img.shape[:2]
+    rh, rw = _pre_pad_dims(h, w, th, tw)
+    if (rh, rw) == (h, w):
+        return img
+    return np.ascontiguousarray(cv2.resize(img, (rw, rh), interpolation=cv2.INTER_AREA))
 
 
 class _IncrementalHandle:
@@ -108,6 +139,10 @@ class _IncrementalHandle:
                 raise ValueError(
                     f"Image '{key}' must have shape (H, W, 3), got {img.shape}"
                 )
+            # Record the shape actually stored, not the source shape -- readers
+            # take the frame geometry from these features, and with a store-time
+            # downscale the two differ.
+            img = _maybe_downscale(img)
             self._image_info[key] = {"shape": img.shape}
 
             shape = (padded,)
@@ -185,7 +220,7 @@ class _IncrementalHandle:
 
         for key, img in images.items():
             jpeg_bytes = simplejpeg.encode_jpeg(
-                img, quality=ZarrWriter.JPEG_QUALITY, colorspace="RGB"
+                _maybe_downscale(img), quality=ZarrWriter.JPEG_QUALITY, colorspace="RGB"
             )
             self._store[key][self._cursor] = jpeg_bytes
 
@@ -231,7 +266,9 @@ class _IncrementalHandle:
             encoded = np.empty((batch_size,), dtype=object)
             for i in range(batch_size):
                 encoded[i] = simplejpeg.encode_jpeg(
-                    img_batch[i], quality=ZarrWriter.JPEG_QUALITY, colorspace="RGB"
+                    _maybe_downscale(img_batch[i]),
+                    quality=ZarrWriter.JPEG_QUALITY,
+                    colorspace="RGB",
                 )
             self._store[key][self._cursor : end] = encoded
 
@@ -517,7 +554,7 @@ class ZarrWriter:
             frame_idx = min(i, num_frames - 1)
             img = image_arr[frame_idx]
             jpeg_bytes = simplejpeg.encode_jpeg(
-                img, quality=self.JPEG_QUALITY, colorspace="RGB"
+                _maybe_downscale(img), quality=self.JPEG_QUALITY, colorspace="RGB"
             )
             encoded[i] = jpeg_bytes
 
@@ -535,10 +572,12 @@ class ZarrWriter:
         # Assign data after creation (required for VariableLengthBytes)
         store[key][:] = encoded
 
-        # Track shape for metadata
+        # Track shape for metadata -- the shape actually stored, which differs
+        # from the source when a store-time downscale is active.
+        stored_shape = list(_maybe_downscale(image_arr[0]).shape)  # [H, W, 3]
         self._features[key] = {
             "dtype": "jpeg",
-            "shape": list(image_arr.shape[1:]),  # [H, W, 3]
+            "shape": stored_shape,
             "names": ["height", "width", "channel"],
         }
 

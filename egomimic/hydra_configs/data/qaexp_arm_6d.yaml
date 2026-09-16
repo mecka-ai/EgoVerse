@@ -1,0 +1,98 @@
+# QA_exp quality-score arm — one training run per (task_domain, arm).
+#
+# Stages plain .zarr directories to local NVMe before training. Reading zarr
+# straight off the Modal volume is latency bound (~0.55s per cold random frame,
+# ~2 samples/s/worker against the ~1500/s four H200s consume), so the working
+# set has to be local first; after staging the same read is ~2ms.
+#
+# Unlike the zip staged configs this copies directories rather than untarring,
+# and unlike them it uses the 6D keymap that pi0.5_bc_mecka requires (18-dim,
+# not the 12-dim ypr the zip configs use).
+#
+# Which arm runs is chosen entirely by eps_to_use — the episode sets are equal
+# in count and hours, so the only difference between runs is where on the
+# quality ranking the episodes came from.
+#
+# Launch (one run per arm):
+#   python egomimic/modal/trainModal.py \
+#     data=qaexp_arm_6d trainer=ddp_modal logger=wandb model=pi0.5_bc_mecka \
+#     name=<domain>-<arm> description=<desc> \
+#     '+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/<domain>__<arm>.json' \
+#     '+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/<domain>__<arm>.json' \
+#     +modal_gpu=H200:4 +modal_cpu=64 +modal_memory_gb=200 \
+#     +modal_volume=mecka_zarr_qaexp +modal_ephemeral_disk_gb=600 \
+#     init_submodules=false
+
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZarrDirEpisodeResolver
+      zarr_dir: /mnt/zarr-data
+      catalog_cache: /mnt/zarr-data/_catalog_cache.json
+      eps_to_use: null          # set per run on the CLI
+      valid_ratio: 0.1
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: train
+    # An arm is ~2,300 episodes, so the whole arm stages before step 1 and the
+    # filler then idles — no train-vs-filler CPU contention for the rest of the
+    # run. At ~48MB/episode that is ~110GB and roughly 30 minutes.
+    episodes_per_epoch: 2400
+    epoch_frames: ${multiply:${trainer.limit_train_batches},${data.train_dataloader_params.mecka_bimanual.batch_size}}
+    cache_dir: /cache/zarr_cache
+    pool_size_gb: 400
+    lookahead_epochs: 1.0
+    n_copy_threads: 48
+    prepare_timeout_s: 7200
+
+valid_datasets:
+  mecka_bimanual:
+    _target_: egomimic.rldb.zarr.prefetch_dataset.PrefetchedMapDataset
+    resolver:
+      _target_: egomimic.rldb.zarr.prefetch_dataset.ZarrDirEpisodeResolver
+      zarr_dir: /mnt/zarr-data
+      catalog_cache: /mnt/zarr-data/_catalog_cache.json
+      eps_to_use: null
+      valid_ratio: 0.1
+      min_frames: null
+      key_map:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_keymap
+        mode: cartesian
+      transform_list:
+        _target_: egomimic.rldb.embodiment.human.Mecka.get_transform_list
+        mode: cartesian_6d
+    mode: valid
+    episodes_per_epoch: 260
+    cache_dir: /cache/zarr_cache_valid
+    pool_size_gb: 60
+    lookahead_epochs: 1.0
+    n_copy_threads: 16
+
+# persistent_workers because trainer.limit_train_batches makes an "epoch" short:
+# without it the whole worker pool is re-forked every few hundred steps and the
+# GPUs idle through each respawn. pin_memory lets the H2D copy overlap compute.
+train_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 12
+    persistent_workers: true
+    prefetch_factor: 6
+    pin_memory: true
+    shuffle: true
+
+valid_dataloader_params:
+  mecka_bimanual:
+    batch_size: 128
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    pin_memory: true
+    shuffle: false

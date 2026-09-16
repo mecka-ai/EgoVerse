@@ -286,12 +286,20 @@ zip_fold_clothes_volume = modal.Volume.from_name(
 )
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
+# Plain-zarr volumes written at 126x224 with interpolated hands, staged via
+# ZarrDirEpisodeResolver (directory copy, no tar). qaexp holds the quality-score
+# arms; train holds the two selection pools for the pi0.5 comparison.
+qaexp_volume = modal.Volume.from_name("mecka-zarr-qaexp", create_if_missing=True, version=2)
+train_volume = modal.Volume.from_name("mecka-zarr-train", create_if_missing=True, version=2)
+
 # Map volume name → (Modal Volume object, container mount path)
 VOLUME_MAP: dict[str, tuple] = {
     "mecka_data_v2": (zarr_volume, "/mnt/zarr-data"),
     "mecka_data_zip": (zip_volume, "/mnt/zarr-zip"),
     # Standalone single-task zip volume (folding_clothes); same /mnt/zarr-zip mount.
     "mecka_data_zip_fold_clothes": (zip_fold_clothes_volume, "/mnt/zarr-zip"),
+    "mecka_zarr_qaexp": (qaexp_volume, "/mnt/zarr-data"),
+    "mecka_zarr_train": (train_volume, "/mnt/zarr-data"),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
