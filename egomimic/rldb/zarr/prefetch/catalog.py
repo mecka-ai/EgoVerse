@@ -226,8 +226,13 @@ class ZarrDirEpisodeResolver(ZipEpisodeResolver):
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
                 counts = list(ex.map(self._n_frames, eps))
 
+            # Store the path RELATIVE to the volume root. The same volume gets
+            # mounted at different points by different jobs (/vol/zarr_output
+            # when the catalog is pre-built, /mnt/zarr-data during training), so
+            # an absolute path here resolves to nothing in the other container.
             raw = [
-                {"path": str(ep), "episode_hash": ep.stem, "n_frames": n,
+                {"rel_path": str(ep.relative_to(self.zip_dir)),
+                 "episode_hash": ep.stem, "n_frames": n,
                  "group": "/".join(ep.parts[len(self.zip_dir.parts):-1])}
                 for ep, n in zip(eps, counts) if n
             ]
@@ -246,15 +251,25 @@ class ZarrDirEpisodeResolver(ZipEpisodeResolver):
             logger.info("ZarrDirEpisodeResolver: eps_to_use — %d hashes from %s",
                         len(keep), self.eps_to_use)
 
+        # rel_path is resolved against this reader's own mount point; `path` is
+        # the older absolute form, tolerated so a stale cache still loads.
         entries = [
             EpisodeCatalogEntry(
-                tar_path=Path(e["path"]),      # a directory here, copied not untarred
+                tar_path=(self.zip_dir / e["rel_path"] if "rel_path" in e
+                          else Path(e["path"])),   # a directory, copied not untarred
                 episode_hash=e["episode_hash"],
                 n_frames=int(e["n_frames"]),
             )
             for e in raw
             if keep is None or e["episode_hash"] in keep
         ]
+        missing = sum(1 for e in entries[:200] if not e.tar_path.exists())
+        if missing:
+            raise RuntimeError(
+                f"ZarrDirEpisodeResolver: {missing}/200 sampled catalog paths do not "
+                f"exist under {self.zip_dir}. The cache at {cache} was most likely "
+                f"built against a different mount point — delete it and let it rebuild."
+            )
 
         if self.debug:
             entries = entries[: int(self.debug)]

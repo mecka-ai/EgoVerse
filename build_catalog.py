@@ -57,9 +57,12 @@ def _scan(root: Path, threads: int = 128):
     el = time.perf_counter() - t0
     print(f"  metadata read in {el:.1f}s ({len(eps)/el:.0f} eps/s, {threads} threads)")
 
+    # relative to the volume root: this container mounts at /vol/zarr_output but
+    # training mounts the same volume at /mnt/zarr-data, so absolute paths here
+    # resolve to nothing there.
     return [
-        {"path": str(ep), "episode_hash": ep.stem, "n_frames": n,
-         "group": "/".join(ep.parts[len(root.parts):-1])}
+        {"rel_path": str(ep.relative_to(root)), "episode_hash": ep.stem,
+         "n_frames": n, "group": "/".join(ep.parts[len(root.parts):-1])}
         for ep, n in zip(eps, counts) if n
     ]
 
