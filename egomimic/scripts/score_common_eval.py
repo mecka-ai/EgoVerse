@@ -34,6 +34,7 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=12)
     ap.add_argument("--cache-dir", default="/cache/eval_cache")
     ap.add_argument("--out", default="")
+    ap.add_argument("--embodiment", default="mecka_bimanual")
     args = ap.parse_args()
 
     import torch
@@ -56,6 +57,7 @@ def main() -> None:
         ZarrDirEpisodeResolver,
     )
 
+    embodiment = args.embodiment
     n_eval = len(json.load(open(args.eval_manifest)))
     print(f"shared eval set: {n_eval} episodes from {args.eval_manifest}",
           flush=True)
@@ -98,7 +100,12 @@ def main() -> None:
             for i, batch in enumerate(loader):
                 if i >= args.n_batches:
                     break
-                batch = model.model.process_batch_for_training(batch)
+                # process_batch_for_training expects {embodiment_name: batch},
+                # which the training datamodule builds. A plain DataLoader
+                # yields the flat tensor dict, so keying it by embodiment name
+                # is what stops get_embodiment_id being handed 'OBSERVATIONS...'.
+                batch = model.model.process_batch_for_training(
+                    {embodiment: batch})
                 pred = model.model.forward_training(batch)
                 losses = model.model.compute_losses(pred, batch)
                 tot += float(losses["action_loss"])
