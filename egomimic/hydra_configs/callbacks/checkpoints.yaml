@@ -9,3 +9,10 @@ model_checkpoint:
   save_last: true
   save_top_k: -1
   every_n_epochs: 100
+  # Save at the end of a TRAIN epoch, not a validation one. Lightning ties
+  # every_n_epochs to the validation loop by default, and
+  # check_val_every_n_epoch is 200, so the first checkpoint was scheduled for
+  # the same moment validation first ran -- when that crashed, five hours of
+  # training across nine runs produced no artifact at all. Checkpointing must
+  # not depend on validation succeeding.
+  save_on_train_epoch_end: true
