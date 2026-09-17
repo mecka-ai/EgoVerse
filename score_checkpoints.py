@@ -115,7 +115,11 @@ def score(domain: str, run_globs: list[str]) -> dict:
 
 
 @app.local_entrypoint()
-def main(domain: str = "cleaning-sanitation"):
-    globs = [f"qaexp-{domain}-{arm}/*/checkpoints/*.ckpt"
-             for arm in ("top", "bottom", "random")]
+def main(domain: str = "cleaning-sanitation", glob: str = ""):
+    # glob= lets the scorer be exercised against any checkpoint (e.g. the
+    # cadence smoke's) rather than only the arm runs, so it can be validated
+    # before there is anything real to score.
+    globs = ([glob] if glob else
+             [f"qaexp-{domain}-{arm}/*/checkpoints/*.ckpt"
+              for arm in ("top", "bottom", "random")])
     print(json.dumps(score.remote(domain, globs), indent=2))
