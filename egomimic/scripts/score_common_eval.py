@@ -24,6 +24,20 @@ import json
 from pathlib import Path
 
 
+def _to_cuda(obj):
+    """Recursively move tensors to CUDA, leaving non-tensors untouched."""
+    import torch
+
+    if torch.is_tensor(obj):
+        return obj.cuda(non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _to_cuda(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        moved = [_to_cuda(v) for v in obj]
+        return type(obj)(moved) if isinstance(obj, list) else tuple(moved)
+    return obj
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", action="append", required=True)
@@ -100,6 +114,10 @@ def main() -> None:
             for i, batch in enumerate(loader):
                 if i >= args.n_batches:
                     break
+                # Lightning moves batches to the accelerator during training;
+                # a raw DataLoader loop does not, so the model would see CPU
+                # tensors against CUDA weights.
+                batch = _to_cuda(batch)
                 # process_batch_for_training expects {embodiment_name: batch},
                 # which the training datamodule builds. A plain DataLoader
                 # yields the flat tensor dict, so keying it by embodiment name
