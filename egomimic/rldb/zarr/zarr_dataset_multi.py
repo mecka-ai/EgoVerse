@@ -220,6 +220,16 @@ def _normalize_filter_row(
     return normalized
 
 
+# Each resample retry is a recursive __getitem__ call, so max_attempts is also a
+# recursion depth. Passing the episode's frame count (~3,900) meant a handful of
+# undecodable frames blew Python's 1000-frame stack limit, and the resulting
+# RecursionError condemned the WHOLE episode ("maximum recursion depth exceeded
+# ... marking .bad") along with its thousands of good frames. A frame that
+# cannot find a readable neighbour in this many tries is a genuinely bad
+# episode, so cap well below the stack limit.
+_MAX_RESAMPLE_ATTEMPTS = 50
+
+
 def get_fallback_idx(
     idx: int,
     candidates: Iterable[int],
@@ -1510,7 +1520,7 @@ class MultiDataset(torch.utils.data.Dataset):
                 idx=idx,
                 candidates=self._global_indices_by_dataset[dataset_name],
                 _attempts=_attempts,
-                max_attempts=len(self._global_indices_by_dataset[dataset_name]),
+                max_attempts=min(len(self._global_indices_by_dataset[dataset_name]), _MAX_RESAMPLE_ATTEMPTS),
                 exhausted_error=(
                     f"Entire dataset bad (no valid indices): dataset={dataset_name}"
                 ),
@@ -2264,7 +2274,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                     idx=idx,
                     candidates=range(self.total_frames),
                     _attempts=_attempts,
-                    max_attempts=self.total_frames,
+                    max_attempts=min(self.total_frames, _MAX_RESAMPLE_ATTEMPTS),
                     exhausted_error=(
                         f"Entire episode bad (no valid indices): ep={Path(self.episode_path).name}"
                     ),
@@ -2289,7 +2299,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                         idx=idx,
                         candidates=range(len(self)),
                         _attempts=_attempts,
-                        max_attempts=len(self),
+                        max_attempts=min(len(self), _MAX_RESAMPLE_ATTEMPTS),
                         exhausted_error=(
                             f"Entire episode bad (no valid indices): ep={Path(self.episode_path).name}"
                         ),
@@ -2318,7 +2328,7 @@ class ZarrDataset(torch.utils.data.Dataset):
                         idx=idx,
                         candidates=range(len(self)),
                         _attempts=_attempts,
-                        max_attempts=len(self),
+                        max_attempts=min(len(self), _MAX_RESAMPLE_ATTEMPTS),
                         exhausted_error=(
                             f"Entire episode bad (no valid indices): ep={Path(self.episode_path).name}"
                         ),

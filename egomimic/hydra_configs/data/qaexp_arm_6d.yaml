@@ -83,9 +83,14 @@ valid_datasets:
 # persistent_workers because trainer.limit_train_batches makes an "epoch" short:
 # without it the whole worker pool is re-forked every few hundred steps and the
 # GPUs idle through each respawn. pin_memory lets the H2D copy overlap compute.
+# batch_size 48, not 128: at 128 pi0.5's 3.6B params filled an H200 to
+# 135.2 of 139.8 GiB and every rank died with torch.OutOfMemoryError at the
+# first step. Static state (bf16 weights + fp32 master + AdamW moments +
+# grads) is ~58 GB, leaving ~0.6 GB of activations per sample, so 48 lands
+# near 87 GB and keeps real headroom. Global batch is 48 x 4 ranks = 192.
 train_dataloader_params:
   mecka_bimanual:
-    batch_size: 128
+    batch_size: 48
     num_workers: 12
     persistent_workers: true
     prefetch_factor: 6
@@ -94,7 +99,7 @@ train_dataloader_params:
 
 valid_dataloader_params:
   mecka_bimanual:
-    batch_size: 128
+    batch_size: 48
     num_workers: 4
     persistent_workers: true
     prefetch_factor: 2
