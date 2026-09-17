@@ -83,6 +83,11 @@ def main() -> None:
 
         model = ModelWrapper.load_from_checkpoint(ckpt, map_location="cuda")
         model.eval().cuda()
+        # pl_model.on_validation_start() does this during training. Without it
+        # the algo's own .device stays CPU, so _empty_lang_placeholders builds
+        # the language tensors on CPU against CUDA weights:
+        #   RuntimeError: Expected all tensors to be on the same device
+        model.model.device = torch.device("cuda")
 
         resolver = ZarrDirEpisodeResolver(
             args.zarr_dir,
