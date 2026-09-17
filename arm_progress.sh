@@ -10,8 +10,8 @@ APPS="ap-MbEu0J2GYJrkwI8gmqsQh0:clean-top
 ap-wXxZj4SIyb9cEBxdl5NKsi:clean-bottom
 ap-vD0zUakn1BkH9WLbAU9akV:clean-random
 ap-s2CzLUjKco0UjOyDSOXQyc:org-top
-ap-xGBIUCn8Byd28IS9mVEjQy:org-bottom
-ap-OZBwUtbkyogeU0AqerC9fO:org-random
+ap-cjiIf26fPI551EE5EiYHDe:org-bottom
+ap-KVFCjiAggiT0GvELzdsKmH:org-random
 ap-FlIe485FUJM9ci0FY0NMEM:dish-top
 ap-n8wuoEELnYfxR0ea9AcHjb:dish-bottom
 ap-uYC7kV4DUsAvjI2Sd57kkw:dish-random"
