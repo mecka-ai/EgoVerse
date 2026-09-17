@@ -6,15 +6,15 @@
 # more episodes than high-quality ones, that confounds the exact comparison
 # these runs exist to make.
 MODAL=/home/mecka/.venv-modal/bin/modal
-APPS="ap-iP3oWp6dCaBSEO6oNWqdar:clean-top
-ap-QchA9nkYbHWf7yIIugSPc4:clean-bottom
-ap-AMZCJbjDR26JB1SANGNU3y:clean-random
-ap-MpLHe8Wq2cY15got58pzUV:org-top
-ap-vb9BrpxLx1IshdkvHXGFq2:org-bottom
-ap-Oktxk0qydANIhs6gjvzQ2c:org-random
-ap-XOzyPTtv11JEBJE3IvvQ0W:dish-top
-ap-S7kN8yeITm4EzSmcjx2eyi:dish-bottom
-ap-2TCOC2DBTjWgfEQ6SKy4Q6:dish-random"
+APPS="ap-N7emVJHDpRharURX0JB43B:clean-top
+ap-FNlpNuPQMzYkjuw1mBEKrD:clean-bottom
+ap-640FSeblWE61nfsJDXOEk0:clean-random
+ap-zpqIXUoX4UNWZWuEXIZ7K4:org-top
+ap-yVOGjcUta6ZNm4CkE7HDpN:org-bottom
+ap-NfaPJWaxpgqAithu35Wftd:org-random
+ap-q6Ip0ZteZo1sEflqqgkSbS:dish-top
+ap-JTarb0KKpSNJ6DNYXfG59X:dish-bottom
+ap-p14wtVksyM6eagpgVHOWzF:dish-random"
 
 for row in $APPS; do
   app="${row%%:*}"; name="${row##*:}"
