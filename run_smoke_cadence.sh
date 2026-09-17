@@ -18,6 +18,7 @@ cd /home/mecka/EgoVerse/.claude/worktrees/fix-frame-count-offbyone
 python egomimic/modal/trainModal.py \
   data=qaexp_arm_6d \
   debug=fast \
+  norm_stats.sample_frac=0.005 \
   trainer=ddp_modal \
   logger=wandb \
   model=pi0.5_bc_mecka \

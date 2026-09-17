@@ -36,5 +36,7 @@ callbacks:
   model_checkpoint:
     every_n_epochs: 1
 
-norm_stats:
-  sample_frac: 0.005
+# NOTE: norm_stats is deliberately NOT set here. The primary config sets it in
+# its own body, which composes after this group (_self_ is last), so a value
+# here would be silently overridden. Pass it on the CLI instead:
+#   norm_stats.sample_frac=0.005

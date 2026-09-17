@@ -15,10 +15,11 @@ defaults:
   # cfg.train_viz_evaluator. Pair with a data config that defines
   # `train_viz_datasets`.
   - evaluator@train_viz_evaluator: train_viz_hpt
+  # After trainer/callbacks/evaluator so `debug=fast` beats their cadences,
+  # and before the override below, which Hydra requires to come last.
+  - debug: null
   - override hydra/launcher: submitit
   - _self_
-  # last, so `debug=fast` overrides the body above rather than losing to it
-  - debug: null
 
 name: test
 description: test
