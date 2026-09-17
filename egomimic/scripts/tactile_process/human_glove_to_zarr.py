@@ -125,13 +125,25 @@ def convert_episode(r2_client, mongo_doc: dict, out_dir: Path, bucket: str) -> P
         shutil.rmtree(dest)
     root = zarr.open_group(str(dest), mode="w")
 
-    root.create_array("tactile_left", data=np.ascontiguousarray(left[:, 2:], dtype=np.float32))
-    root.create_array("tactile_left_frame_index", data=left[:, 0].astype(np.int64))
-    root.create_array("tactile_left_time_ns", data=left[:, 1].astype(np.int64))
+    # chunks=<full shape> => one chunk file per array (Modal Volumes have a hard
+    # 500K-inode cap; see modal_trex_robot_to_zarr.py for where this bit us).
+    tleft = np.ascontiguousarray(left[:, 2:], dtype=np.float32)
+    tright = np.ascontiguousarray(right[:, 2:], dtype=np.float32)
+    root.create_array("tactile_left", data=tleft, chunks=tleft.shape)
+    root.create_array(
+        "tactile_left_frame_index", data=left[:, 0].astype(np.int64), chunks=(left.shape[0],)
+    )
+    root.create_array(
+        "tactile_left_time_ns", data=left[:, 1].astype(np.int64), chunks=(left.shape[0],)
+    )
 
-    root.create_array("tactile_right", data=np.ascontiguousarray(right[:, 2:], dtype=np.float32))
-    root.create_array("tactile_right_frame_index", data=right[:, 0].astype(np.int64))
-    root.create_array("tactile_right_time_ns", data=right[:, 1].astype(np.int64))
+    root.create_array("tactile_right", data=tright, chunks=tright.shape)
+    root.create_array(
+        "tactile_right_frame_index", data=right[:, 0].astype(np.int64), chunks=(right.shape[0],)
+    )
+    root.create_array(
+        "tactile_right_time_ns", data=right[:, 1].astype(np.int64), chunks=(right.shape[0],)
+    )
 
     root.attrs["episode_id"] = episode_id
     root.attrs["task"] = mongo_doc.get("task_desc", "")

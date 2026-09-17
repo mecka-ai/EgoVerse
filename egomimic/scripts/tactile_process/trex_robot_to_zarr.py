@@ -156,11 +156,15 @@ def main() -> None:
         if dest.exists():
             shutil.rmtree(dest)
         root = zarr.open_group(str(dest), mode="w")
-        root.create_array("tactile_raw", data=np.ascontiguousarray(tactile_raw, dtype=np.uint8))
-        root.create_array("tactile_force", data=tactile_force[:t_min])
-        root.create_array("state", data=state[:t_min])
-        root.create_array("action", data=action[:t_min])
-        root.create_array("timestamp", data=timestamp[:t_min])
+        # chunks=<full shape> => one chunk file per array (see modal_trex_robot_to_zarr.py
+        # for why: zarr's default auto-chunking multiplies file count fast on 4D arrays).
+        tactile_raw = np.ascontiguousarray(tactile_raw, dtype=np.uint8)
+        force, st, act, ts = tactile_force[:t_min], state[:t_min], action[:t_min], timestamp[:t_min]
+        root.create_array("tactile_raw", data=tactile_raw, chunks=tactile_raw.shape)
+        root.create_array("tactile_force", data=force, chunks=force.shape)
+        root.create_array("state", data=st, chunks=st.shape)
+        root.create_array("action", data=act, chunks=act.shape)
+        root.create_array("timestamp", data=ts, chunks=ts.shape)
 
         root.attrs["episode_index"] = ep_idx
         root.attrs["tasks"] = list(ep["tasks"]) if ep["tasks"] is not None else []
