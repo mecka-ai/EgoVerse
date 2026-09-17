@@ -20,7 +20,12 @@ from pathlib import Path
 
 import modal
 
-from egomimic.modal.modal_setup import CFG, image as train_image  # noqa: F401
+from egomimic.modal.modal_setup import (
+    CFG,
+    _prepare_repo,
+    _resolve_git_state,
+    image as train_image,
+)
 
 ZARR_MOUNT = "/mnt/zarr-data"
 OUT_MOUNT = "/root/EgoVerse/logs"
@@ -40,9 +45,20 @@ BATCH_SIZE = 48
     memory=131072,
     timeout=14400,
     ephemeral_disk=600 * 1024,
+    secrets=[modal.Secret.from_name(n) for n in CFG.secret_names],
     volumes={ZARR_MOUNT: zarr_vol, OUT_MOUNT: out_vol},
 )
-def score(domain: str, run_globs: list[str]) -> dict:
+def score(domain: str, run_globs: list[str],
+          git_remote: str = "", git_commit: str = "") -> dict:
+    # The training image does not contain egomimic; trainModal clones the
+    # repo into the container at run time. Do the same before importing
+    # anything from it, with submodules so openpi (pi0.5) is present.
+    import sys
+    _prepare_repo(git_remote=git_remote, git_commit=git_commit,
+                  init_submodules=True)
+    if CFG.remote_repo_dir not in sys.path:
+        sys.path.insert(0, CFG.remote_repo_dir)
+
     import torch
     from egomimic.pl_utils.pl_model import ModelWrapper
     from egomimic.rldb.zarr.prefetch_dataset import (
@@ -122,4 +138,6 @@ def main(domain: str = "cleaning-sanitation", glob: str = ""):
     globs = ([glob] if glob else
              [f"qaexp-{domain}-{arm}/*/checkpoints/*.ckpt"
               for arm in ("top", "bottom", "random")])
-    print(json.dumps(score.remote(domain, globs), indent=2))
+    git_remote, git_commit, _ = _resolve_git_state()
+    print(json.dumps(
+        score.remote(domain, globs, git_remote, git_commit), indent=2))

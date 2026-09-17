@@ -1,15 +1,15 @@
 #!/bin/bash
 # One line per arm run: staging progress, and whether anything has failed.
 MODAL=/home/mecka/.venv-modal/bin/modal
-APPS="ap-MbEu0J2GYJrkwI8gmqsQh0:clean-top
-ap-wXxZj4SIyb9cEBxdl5NKsi:clean-bottom
-ap-vD0zUakn1BkH9WLbAU9akV:clean-random
-ap-s2CzLUjKco0UjOyDSOXQyc:org-top
-ap-cjiIf26fPI551EE5EiYHDe:org-bottom
-ap-KVFCjiAggiT0GvELzdsKmH:org-random
-ap-FlIe485FUJM9ci0FY0NMEM:dish-top
-ap-n8wuoEELnYfxR0ea9AcHjb:dish-bottom
-ap-uYC7kV4DUsAvjI2Sd57kkw:dish-random"
+APPS="ap-iP3oWp6dCaBSEO6oNWqdar:clean-top
+ap-QchA9nkYbHWf7yIIugSPc4:clean-bottom
+ap-AMZCJbjDR26JB1SANGNU3y:clean-random
+ap-MpLHe8Wq2cY15got58pzUV:org-top
+ap-vb9BrpxLx1IshdkvHXGFq2:org-bottom
+ap-Oktxk0qydANIhs6gjvzQ2c:org-random
+ap-XOzyPTtv11JEBJE3IvvQ0W:dish-top
+ap-S7kN8yeITm4EzSmcjx2eyi:dish-bottom
+ap-2TCOC2DBTjWgfEQ6SKy4Q6:dish-random"
 
 for row in $APPS; do
   app="${row%%:*}"

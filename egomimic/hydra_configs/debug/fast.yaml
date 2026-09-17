@@ -1,0 +1,40 @@
+# @package _global_
+
+# Fast end-to-end check: exercises TRAINING, VALIDATION and CHECKPOINTING in a
+# few minutes, at the real batch size, model and GPU count.
+#
+#   python egomimic/modal/trainModal.py ... debug=fast
+#
+# Deliberately NOT Lightning's fast_dev_run. That flag disables checkpointing
+# and loggers, and "the checkpoint never saved" is exactly the failure this is
+# meant to catch: nine runs once reached epoch 198 and produced no artifact at
+# all, because ModelCheckpoint was hooked to a validation loop that crashed the
+# first time it ran.
+#
+# The cadences are turned DOWN until they fire, not turned off:
+#   - validation every epoch (normally every 200) so the val path executes
+#   - checkpoint every epoch (normally every 100) so a file actually lands
+#   - 3 epochs, so epoch 2 proves the cadence repeats rather than fires once
+#
+# What is NOT reduced: batch_size, GPU count, model, precision, strategy. A
+# smoke may only differ from the real run on axes that provably cannot cause the
+# failures it screens for -- shrinking batch size is what let a CUDA OOM through
+# to nine H200:4 containers.
+#
+# Episode counts are data-config specific, so keep them on the CLI, e.g.
+#   data.train_datasets.mecka_bimanual.episodes_per_epoch=32
+# otherwise staging the full set dwarfs the few minutes of actual checking.
+
+trainer:
+  max_epochs: 3
+  min_epochs: 1
+  limit_train_batches: 4
+  limit_val_batches: 2
+  check_val_every_n_epoch: 1
+
+callbacks:
+  model_checkpoint:
+    every_n_epochs: 1
+
+norm_stats:
+  sample_frac: 0.005

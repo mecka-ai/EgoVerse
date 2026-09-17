@@ -17,6 +17,7 @@ cd /home/mecka/EgoVerse/.claude/worktrees/fix-frame-count-offbyone
 
 python egomimic/modal/trainModal.py \
   data=qaexp_arm_6d \
+  debug=fast \
   trainer=ddp_modal \
   logger=wandb \
   model=pi0.5_bc_mecka \
@@ -28,13 +29,6 @@ python egomimic/modal/trainModal.py \
   '+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/dish-handling__random.json' \
   data.train_datasets.mecka_bimanual.episodes_per_epoch=32 \
   data.valid_datasets.mecka_bimanual.episodes_per_epoch=8 \
-  trainer.limit_train_batches=4 \
-  trainer.limit_val_batches=2 \
-  trainer.max_epochs=3 \
-  trainer.min_epochs=1 \
-  trainer.check_val_every_n_epoch=2 \
-  callbacks.model_checkpoint.every_n_epochs=1 \
-  norm_stats.sample_frac=0.005 \
   model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \
   +modal_gpu=H200:4 \
   +modal_cpu=64 \

@@ -3,7 +3,6 @@ defaults:
   - visualization: cartesian
   - paths: default
   - trainer: ddp
-  - debug: null
   - logger: wandb
   - data: mecka_all_zarr
   - callbacks: checkpoints
@@ -18,6 +17,8 @@ defaults:
   - evaluator@train_viz_evaluator: train_viz_hpt
   - override hydra/launcher: submitit
   - _self_
+  # last, so `debug=fast` overrides the body above rather than losing to it
+  - debug: null
 
 name: test
 description: test
