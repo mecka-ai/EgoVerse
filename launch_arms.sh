@@ -21,6 +21,7 @@ for domain in cleaning-sanitation organization-stocking dish-handling; do
       name="qaexp-${domain}-${arm}" \
       description="qaexp-scoring-${domain}-${arm}" \
       '~evaluator@train_viz_evaluator' \
+      evaluator=eval_pi \
       "+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/${domain}__${arm}.json" \
       "+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/${domain}__${arm}.json" \
       model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \

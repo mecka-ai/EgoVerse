@@ -17,6 +17,7 @@ for arm in bottom random; do
     name="qaexp-organization-stocking-${arm}" \
     description="qaexp-scoring-organization-stocking-${arm}" \
     '~evaluator@train_viz_evaluator' \
+    evaluator=eval_pi \
     "+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/organization-stocking__${arm}.json" \
     "+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/organization-stocking__${arm}.json" \
     model.robomimic_model.config.pytorch_weight_path=pi_checkpoints/pi05_base_pytorch \

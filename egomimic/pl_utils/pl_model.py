@@ -222,8 +222,9 @@ class ModelWrapper(LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         evaluator = self._evaluator_for(dataloader_idx)
-        if evaluator is None:
-            return
+        # Validation loss does NOT depend on the evaluator. Returning early when
+        # there is no evaluator used to skip the loss too, which made disabling a
+        # mismatched evaluator equivalent to disabling validation entirely.
         # When val_dataloader returns a list of CombinedLoaders (train_viz
         # eval pass), Lightning's fetcher wraps each inner CombinedLoader
         # batch as (batch_dict, batch_idx, sub_loader_idx).  Unwrap so
@@ -248,6 +249,9 @@ class ModelWrapper(LightningModule):
                     sync_dist=True,
                     add_dataloader_idx=False,
                 )
+
+        if evaluator is None:
+            return
 
         print(
             f"[VAL_STEP] rank={self.global_rank}, batch_idx={batch_idx}, "

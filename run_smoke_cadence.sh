@@ -23,6 +23,7 @@ python egomimic/modal/trainModal.py \
   name=smoke-cadence \
   description=smoke-validation-and-checkpoint-cadence \
   '~evaluator@train_viz_evaluator' \
+  evaluator=eval_pi \
   '+data.train_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/dish-handling__random.json' \
   '+data.valid_datasets.mecka_bimanual.resolver.eps_to_use=/mnt/zarr-data/_arms/dish-handling__random.json' \
   data.train_datasets.mecka_bimanual.episodes_per_epoch=32 \
