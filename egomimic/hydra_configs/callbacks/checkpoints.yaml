@@ -8,7 +8,9 @@ model_checkpoint:
   filename: "epoch_{epoch}"
   save_last: true
   save_top_k: -1
-  every_n_epochs: 100
+  # 25, matching check_val_every_n_epoch, so a scoreable checkpoint exists
+  # at the same cadence as the validation curve rather than 4x later.
+  every_n_epochs: 25
   # Save at the end of a TRAIN epoch, not a validation one. Lightning ties
   # every_n_epochs to the validation loop by default, and
   # check_val_every_n_epoch is 200, so the first checkpoint was scheduled for

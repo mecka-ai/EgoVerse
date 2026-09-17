@@ -12,7 +12,10 @@ accelerator: gpu
 devices: ${launch_params.gpus_per_node}
 num_nodes: 1
 sync_batchnorm: True
-check_val_every_n_epoch: 200
+# 25, not 200: at ~4 min/epoch, 200 meant the first validation point landed
+# ~13h in -- and when it crashed there, it took the first checkpoint with it.
+# 25 gives a usable curve (~100 min per point) and fails fast if val breaks.
+check_val_every_n_epoch: 25
 num_sanity_val_steps: 0
 
 # Sentinel: trainHydra.py detects this and auto-submits to Modal instead of
