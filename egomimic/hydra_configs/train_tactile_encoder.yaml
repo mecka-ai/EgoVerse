@@ -42,6 +42,15 @@ skip_data_schematic: true
 reject_outliers: false
 visualization: {}
 
+# During Stage 1 (warmup_steps), forward_training computes the projector's
+# output (z_proj) every step but discards it in favor of a disconnected
+# zero tensor for ot_loss/ot_raw -- so the projector's parameters get no
+# gradient at all until Stage 2 begins. Strict DDP treats that as an error
+# ("parameters ... not used in producing the loss"); the plain (non-modal)
+# `debug` trainer already works around this the same way.
+trainer:
+  strategy: ddp_find_unused_parameters_true
+
 hydra:
   run:
     dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
