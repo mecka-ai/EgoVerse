@@ -43,18 +43,31 @@ valid_datasets:
     valid_frac: 0.05
     seed: 0
 
+# num_workers is high relative to batch_size because each __getitem__ opens
+# a fresh zarr.open_group() against a network-mounted Modal Volume -- the
+# per-sample latency is dominated by that round trip (observed: GPU idle
+# 16-26s between most batches with num_workers=2), not by local CPU work,
+# so more worker PROCESSES doing their own I/O in parallel hides most of
+# it. persistent_workers avoids re-paying worker startup every epoch given
+# trainer default.yaml's limit_train_batches=100 makes epochs short.
 train_dataloader_params:
   human:
     batch_size: 8
-    num_workers: 2
+    num_workers: 8
+    persistent_workers: true
+    prefetch_factor: 4
   robot:
     batch_size: 8
-    num_workers: 2
+    num_workers: 8
+    persistent_workers: true
+    prefetch_factor: 4
 
 valid_dataloader_params:
   human:
     batch_size: 8
-    num_workers: 1
+    num_workers: 4
+    persistent_workers: true
   robot:
     batch_size: 8
-    num_workers: 1
+    num_workers: 4
+    persistent_workers: true
