@@ -1,0 +1,59 @@
+# Human glove + T-Rex robot tactile data for egomimic.algo.tactile_encoder.
+# root_dir defaults point at the small local pilot conversions (a handful of
+# episodes each) for fast local smoke tests (`trainer=debug logger=debug`).
+# For a real run against the full converted corpora on Modal, override:
+#   data.train_datasets.human.root_dir=/mnt/zarr-data/tactile_human
+#   data.train_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot
+#   data.valid_datasets.human.root_dir=/mnt/zarr-data/tactile_human
+#   data.valid_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot
+# (`/mnt/zarr-data` matches trainModal.py's zarr_volume mount point when
+# launched with `+modal_volume=tactile-zarr-data`.)
+_target_: egomimic.pl_utils.pl_data_utils.MultiDataModuleWrapper
+
+train_datasets:
+  human:
+    _target_: egomimic.rldb.zarr.tactile_dataset.HumanGloveTactileDataset
+    root_dir: /home/mecka/EgoVerse/zarr/tactile_human
+    window: 16
+    split: train
+    valid_frac: 0.05
+    seed: 0
+  robot:
+    _target_: egomimic.rldb.zarr.tactile_dataset.RobotTrexTactileDataset
+    root_dir: /home/mecka/EgoVerse/zarr/tactile_robot
+    window: 16
+    split: train
+    valid_frac: 0.05
+    seed: 0
+
+valid_datasets:
+  human:
+    _target_: egomimic.rldb.zarr.tactile_dataset.HumanGloveTactileDataset
+    root_dir: /home/mecka/EgoVerse/zarr/tactile_human
+    window: 16
+    split: valid
+    valid_frac: 0.05
+    seed: 0
+  robot:
+    _target_: egomimic.rldb.zarr.tactile_dataset.RobotTrexTactileDataset
+    root_dir: /home/mecka/EgoVerse/zarr/tactile_robot
+    window: 16
+    split: valid
+    valid_frac: 0.05
+    seed: 0
+
+train_dataloader_params:
+  human:
+    batch_size: 8
+    num_workers: 2
+  robot:
+    batch_size: 8
+    num_workers: 2
+
+valid_dataloader_params:
+  human:
+    batch_size: 8
+    num_workers: 1
+  robot:
+    batch_size: 8
+    num_workers: 1

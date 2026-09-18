@@ -114,9 +114,28 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         raise ValueError("Seed must be provided in cfg for reproducibility!")
 
     load_env()
-    # log.info(f"Instantiating data schematic <{cfg.data_schematic._target_}>")
 
-    data_schematic: DataSchematic = hydra.utils.instantiate(cfg.data_schematic)
+    # Self-supervised / non-schema models (e.g. TactileEncoder) have no
+    # camera/proprio/action schema to speak of, and their datasets are plain
+    # torch Datasets rather than MultiDataset (no `.resolver.key_map` /
+    # `.set_data_schematic()`). `skip_data_schematic: true` skips the
+    # shape/norm-stat inference and outlier-rejection blocks below for them.
+    # A minimal placeholder DataSchematic is still built (rather than None)
+    # because `ModelWrapper._instantiate_model` calls `DataSchematic.from_state`,
+    # which rejects None outright -- the model never reads it either way.
+    skip_data_schematic = bool(OmegaConf.select(cfg, "skip_data_schematic", default=False))
+    if skip_data_schematic:
+        # Embodiment name must be a real EMBODIMENT enum member (validated by
+        # DataSchematic.__init__ via get_embodiment_id) -- the choice is
+        # otherwise arbitrary since this schematic is never actually read.
+        data_schematic = DataSchematic(
+            schematic_dict={
+                "MECKA_BIMANUAL": {"_unused": {"key_type": "proprio_keys", "zarr_key": "_unused"}}
+            }
+        )
+    else:
+        # log.info(f"Instantiating data schematic <{cfg.data_schematic._target_}>")
+        data_schematic: DataSchematic = hydra.utils.instantiate(cfg.data_schematic)
 
     # Modify dataset configs to include `data_schematic` dynamically at runtime
     train_datasets = {}
@@ -152,6 +171,8 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     )
 
     for dataset_name, dataset in datamodule.train_datasets.items():
+        if skip_data_schematic:
+            continue
         log.info(f"Inferring shapes for dataset <{dataset_name}>")
         t_shape = time.perf_counter()
         data_schematic.infer_shapes_from_batch(dataset[0])
@@ -185,7 +206,7 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if save_cache_dir:
             data_schematic.cache_stats(save_cache_dir=save_cache_dir)
 
-    if cfg.reject_outliers:
+    if cfg.reject_outliers and not skip_data_schematic:
         # Propagate the shared data schematic to top-level MultiDatasets for bounds checks.
         # Use datamodule.train_datasets (null entries already filtered by the wrapper).
         bounds_slack = float(OmegaConf.select(cfg, "reject_outliers_slack", default=0.0))

@@ -1,0 +1,53 @@
+# Top-level config for training egomimic.algo.tactile_encoder.TactileEncoder
+# (cross-embodiment human-glove / robot-fingertip tactile alignment).
+#
+# Unlike train_zarr_cartesian.yaml, this does NOT go through DataSchematic's
+# camera/proprio/action-key machinery (there is no such schema here) --
+# `skip_data_schematic: true` tells trainHydra.py to skip shape/norm-stat
+# inference and outlier rejection for this run (see trainHydra.py's
+# `skip_data_schematic` branch). No `evaluator`/`visualization` config
+# either: this is self-supervised pretraining, not a rollout policy.
+#
+# Local smoke test (small pilot zarr data, no GPU needed):
+#   python egomimic/trainHydra.py --config-name=train_tactile_encoder \
+#       trainer=debug logger=debug
+#
+# Real run on Modal (full converted corpora, GPU, auto-restart + wandb
+# resume on container preemption -- see egomimic/modal/trainModal.py):
+#   python egomimic/modal/trainModal.py --config-name=train_tactile_encoder \
+#       trainer=ddp_modal +modal_volume=tactile-zarr-data \
+#       data.train_datasets.human.root_dir=/mnt/zarr-data/tactile_human \
+#       data.train_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot \
+#       data.valid_datasets.human.root_dir=/mnt/zarr-data/tactile_human \
+#       data.valid_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot \
+#       name=tactile_encoder description=human_robot_align
+defaults:
+  - model: tactile_encoder
+  - data: tactile_human_robot
+  - paths: default
+  - trainer: default
+  - debug: null
+  - logger: wandb
+  - callbacks: tactile_smoke
+  - _self_
+
+name: tactile_encoder
+description: human_robot_align
+ckpt_path: null
+wandb_run_id: null # set to resume an existing W&B run (auto-set on Modal auto-restart)
+mode: train
+seed: 42
+
+skip_data_schematic: true
+reject_outliers: false
+visualization: {}
+
+hydra:
+  run:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ./logs/${name}/${description}_${now:%Y-%m-%d_%H-%M-%S}
+
+launch_params:
+  gpus_per_node: 1
+  nodes: 1

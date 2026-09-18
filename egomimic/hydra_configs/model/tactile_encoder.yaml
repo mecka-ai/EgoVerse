@@ -1,0 +1,92 @@
+# Cross-embodiment tactile encoder: masked tactile autoencoding (MTAE) +
+# margin-gated Sinkhorn OT alignment between a human tactile-glove stream and
+# a robot tactile-sensor stream (egomimic.algo.tactile_encoder.TactileEncoder).
+#
+# This is a self-supervised *pretraining* stage, not a policy: it does not
+# predict actions, so it does not go through DataSchematic's camera/proprio/
+# action-key machinery the way act.yaml / hpt_*.yaml do. It expects batches
+# already shaped as:
+#   {"human": {"tactile": Tensor[B, T, C, H, W]},
+#    "robot": {"tactile": Tensor[B, T, C, H, W]}}
+# i.e. a `data:` config supplying paired-or-unpaired human/robot tactile
+# streams in that shape -- see `hydra_configs/data/tactile_human_robot.yaml`
+# (backed by `egomimic.rldb.zarr.tactile_dataset.{HumanGloveTactileDataset,
+# RobotTrexTactileDataset}`, reading the zarr episodes converted by
+# `egomimic/scripts/tactile_process/{human_glove,trex_robot}_to_zarr.py`).
+#
+# `input_shape: [T, C, H, W]` and `patch_size: [patch_t, patch_h, patch_w]`
+# must match whatever those streams actually look like for each platform's
+# sensor (T divisible by patch_t, H by patch_h, W by patch_w). Concretely:
+#   human: glove_left/glove_right stacked as 2 channels of 460 raw taxel
+#     readings each. H=1 because the physical taxel->pixel layout of this
+#     glove is unknown (see zarr/tactile_human/*.zarr attrs["note"]) --
+#     treated as a 1x460 "flat image" rather than fabricating a 2D grid.
+#   robot: 10 per-fingertip (5 fingers x 2 hands) raw grayscale tactile
+#     images at native 240x320 from the T-Rex dataset, used as 10 channels.
+# `window` below (16 frames) must match `data.train_datasets.*.window`.
+#
+# After Stage 2 finishes, use `TactileEncoder.export_policy_backbone()` to get
+# a frozen adapters+encoder module (decoders/projector discarded) whose
+# latent `z` feeds a downstream policy's cross-attention (e.g. pi_0.5) -- see
+# `pi0.5_base.yaml` for where that cross-attention is wired for the policy
+# side.
+_target_: egomimic.pl_utils.pl_model.ModelWrapper
+robomimic_model:
+  _target_: egomimic.algo.tactile_encoder.TactileEncoder
+  data_schematic: null
+
+  platforms:
+    human:
+      input_shape: [16, 2, 1, 460] # [T, C, H, W] -- left/right glove taxels, no spatial grid
+      patch_size: [4, 1, 20] # -> 4 x 1 x 23 = 92 patches
+    robot:
+      input_shape: [16, 10, 240, 320] # 10 fingertip raw tactile images
+      patch_size: [4, 60, 80] # -> 4 x 4 x 4 = 64 patches
+
+  # ---------------------------
+  # Shared backbone / projector dims (Phase 1)
+  # ---------------------------
+  d_model: 256
+  d_latent: 128
+  d_proj: 64
+  proj_hidden_dim: 128
+  num_encoder_layers: 6
+  num_encoder_heads: 8
+  encoder_dim_feedforward: 1024
+  decoder_num_layers: 2
+  decoder_num_heads: 4
+  dropout: 0.1
+
+  # ---------------------------
+  # Masked Tactile Autoencoding (Phase 2)
+  # ---------------------------
+  mask_ratio: 0.75
+
+  # ---------------------------
+  # Proxy-guided, margin-gated Sinkhorn OT (Phase 2)
+  # ---------------------------
+  alpha: 1.0 # proxy-feature weight in the cost matrix C_ij
+  margin: 0.05 # margin m
+  contact_threshold: 0.0
+  sinkhorn_blur: 0.05
+  sinkhorn_scaling: 0.9
+
+  # ---------------------------
+  # Two-stage schedule (Phase 3): warmup (MTAE-only) -> sigmoid-annealed OT
+  # ---------------------------
+  warmup_steps: 10000 # K1
+  alignment_end_steps: 40000 # K2
+  lambda_max: 1.0
+  sigmoid_steepness: 10.0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  _partial_: true
+  lr: 1e-4
+  weight_decay: 0.0001
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.LinearLR
+  _partial_: true
+  start_factor: 1
+  end_factor: 1

@@ -1,0 +1,9 @@
+defaults:
+  - checkpoints
+  - _self_
+
+tsne_viz:
+  _target_: egomimic.eval.tactile_tsne_callback.TactileEmbeddingTSNECallback
+  every_n_epochs: 5
+  num_samples: 128
+  seed: 0

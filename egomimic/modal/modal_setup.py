@@ -228,6 +228,7 @@ image = (
         "geomloss",
         "tslearn",
         "scipy",
+        "scikit-learn",  # sklearn.manifold.TSNE, for tactile_tsne_callback.py
         "hydra-submitit-launcher==1.2.0",
         "submitit",
         "opencv-python-headless",
