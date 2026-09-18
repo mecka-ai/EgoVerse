@@ -16,6 +16,7 @@ name automatically.
 
 from __future__ import annotations
 
+import logging
 import random
 from pathlib import Path
 
@@ -23,6 +24,18 @@ import numpy as np
 import torch
 import zarr
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
+
+# Out of 13,197 converted episodes, at least one (tactile_human/
+# 6a4b8bdb4fa21115522b9374.zarr) turned out to be an empty/corrupted zarr
+# store -- zarr.open_group raised GroupNotFoundError deep in a DataLoader
+# worker and killed an otherwise-healthy multi-hour training run. Rather
+# than pre-validate all episodes up front (13,197 extra network-mount
+# opens just at dataset construction), __getitem__ retries a different
+# random episode on failure -- a bad sample should be rare enough that
+# this never meaningfully biases what gets seen.
+_MAX_LOAD_RETRIES = 5
 
 
 def _list_episode_dirs(root_dir: str) -> list[Path]:
@@ -88,7 +101,7 @@ class HumanGloveTactileDataset(Dataset):
     def __len__(self) -> int:
         return len(self.episode_paths)
 
-    def __getitem__(self, idx: int) -> dict:
+    def _load(self, idx: int) -> dict:
         path = self.episode_paths[idx]
         z = zarr.open_group(str(path), mode="r")
         left, right = z["tactile_left"], z["tactile_right"]
@@ -103,6 +116,21 @@ class HumanGloveTactileDataset(Dataset):
         tactile = tactile[:, :, None, :]  # [w, 2, 1, 460]
         tensor = torch.from_numpy(np.ascontiguousarray(tactile, dtype=np.float32)) * self.scale
         return {"tactile": tensor}
+
+    def __getitem__(self, idx: int) -> dict:
+        for attempt in range(_MAX_LOAD_RETRIES):
+            try:
+                return self._load(idx)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"HumanGloveTactileDataset: failed to load "
+                    f"{self.episode_paths[idx]} ({type(e).__name__}: {e}); "
+                    f"retrying with a different episode ({attempt + 1}/{_MAX_LOAD_RETRIES})"
+                )
+                idx = self._rng.randrange(len(self.episode_paths))
+        raise RuntimeError(
+            f"HumanGloveTactileDataset: {_MAX_LOAD_RETRIES} consecutive episode loads failed"
+        )
 
 
 class RobotTrexTactileDataset(Dataset):
@@ -129,7 +157,7 @@ class RobotTrexTactileDataset(Dataset):
     def __len__(self) -> int:
         return len(self.episode_paths)
 
-    def __getitem__(self, idx: int) -> dict:
+    def _load(self, idx: int) -> dict:
         path = self.episode_paths[idx]
         z = zarr.open_group(str(path), mode="r")
         raw = z["tactile_raw"]
@@ -138,3 +166,18 @@ class RobotTrexTactileDataset(Dataset):
         arr = _slice_window(raw, t, self.window, start)
         tensor = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)) / 255.0
         return {"tactile": tensor}
+
+    def __getitem__(self, idx: int) -> dict:
+        for attempt in range(_MAX_LOAD_RETRIES):
+            try:
+                return self._load(idx)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"RobotTrexTactileDataset: failed to load "
+                    f"{self.episode_paths[idx]} ({type(e).__name__}: {e}); "
+                    f"retrying with a different episode ({attempt + 1}/{_MAX_LOAD_RETRIES})"
+                )
+                idx = self._rng.randrange(len(self.episode_paths))
+        raise RuntimeError(
+            f"RobotTrexTactileDataset: {_MAX_LOAD_RETRIES} consecutive episode loads failed"
+        )
