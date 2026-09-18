@@ -16,10 +16,10 @@
 # resume on container preemption -- see egomimic/modal/trainModal.py):
 #   python egomimic/modal/trainModal.py --config-name=train_tactile_encoder \
 #       trainer=ddp_modal +modal_volume=tactile-zarr-data \
-#       data.train_datasets.human.root_dir=/mnt/zarr-data/tactile_human \
-#       data.train_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot \
-#       data.valid_datasets.human.root_dir=/mnt/zarr-data/tactile_human \
-#       data.valid_datasets.robot.root_dir=/mnt/zarr-data/tactile_robot \
+#       data.train_datasets.human.root_dir=/mnt/tactile-zarr-data/tactile_human \
+#       data.train_datasets.robot.root_dir=/mnt/tactile-zarr-data/tactile_robot \
+#       data.valid_datasets.human.root_dir=/mnt/tactile-zarr-data/tactile_human \
+#       data.valid_datasets.robot.root_dir=/mnt/tactile-zarr-data/tactile_robot \
 #       name=tactile_encoder description=human_robot_align
 defaults:
   - model: tactile_encoder

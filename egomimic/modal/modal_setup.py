@@ -285,6 +285,8 @@ zip_volume = modal.Volume.from_name("mecka_data_zip", create_if_missing=True, ve
 zip_fold_clothes_volume = modal.Volume.from_name(
     "mecka_data_zip_fold_clothes", create_if_missing=True, version=2
 )
+# Human-glove + T-Rex robot tactile zarr corpora (egomimic/scripts/tactile_process/).
+tactile_zarr_volume = modal.Volume.from_name("tactile-zarr-data")
 WDS_MOUNT_PATH = "/mnt/zarr-wds"
 
 # Map volume name → (Modal Volume object, container mount path)
@@ -293,6 +295,10 @@ VOLUME_MAP: dict[str, tuple] = {
     "mecka_data_zip": (zip_volume, "/mnt/zarr-zip"),
     # Standalone single-task zip volume (folding_clothes); same /mnt/zarr-zip mount.
     "mecka_data_zip_fold_clothes": (zip_fold_clothes_volume, "/mnt/zarr-zip"),
+    # tactile_human/, tactile_robot/ at the volume root -- see
+    # hydra_configs/data/tactile_human_robot.yaml for the root_dir overrides
+    # that expect this exact mount path.
+    "tactile-zarr-data": (tactile_zarr_volume, "/mnt/tactile-zarr-data"),
 }
 training_outputs_volume = modal.Volume.from_name(
     "egoverse-training-outputs", create_if_missing=True
