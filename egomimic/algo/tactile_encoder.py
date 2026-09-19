@@ -42,6 +42,7 @@ from egomimic.models.tactile_nets import (
     compute_proxy_features,
     make_proxy_guided_cost_fn,
     random_masking,
+    unpatchify,
 )
 
 
@@ -253,7 +254,7 @@ class TactileEncoder(Algo):
         return processed
 
     @override
-    def forward_training(self, batch):
+    def forward_training(self, batch, increment_step: bool = True):
         """
         One iteration of training: adapters -> random masking -> shared
         encoder -> per-platform decoder (MTAE) and projector (OT). Also
@@ -261,11 +262,17 @@ class TactileEncoder(Algo):
 
         Args:
             batch (dict): output of `process_batch_for_training`.
+            increment_step (bool): advance the step counter driving the
+                warmup/alignment schedule. Set False when calling this from
+                validation/diagnostics (e.g. a periodic validation-loss
+                callback) so those calls don't skew the Stage 1->2 boundary
+                ahead of the actual training step count.
         Returns:
             predictions (dict): per-platform MTAE losses/latents, the
                 current lambda_OT, and the raw/gated OT distance.
         """
-        self.training_step += 1
+        if increment_step:
+            self.training_step += 1
         model = self.nets["policy"]
         adapters, encoder = model["adapters"], model["encoder"]
         decoders, projector = model["decoders"], model["projector"]
@@ -388,10 +395,18 @@ class TactileEncoder(Algo):
         losses["ot_raw"] = predictions["ot_raw"]
         losses["ot_loss"] = ot_loss
         losses["lambda_ot"] = lambda_ot
+        # The actual contribution of OT alignment to the backpropagated total,
+        # as opposed to `ot_loss` (unweighted) or `lambda_ot` (the weight
+        # alone) -- logged separately so a scale mismatch against mtae_loss
+        # (e.g. weighted_ot_loss staying two orders of magnitude below
+        # mtae_loss even at lambda_ot==1) is visible directly in a chart,
+        # rather than something you have to compute by eye from two others.
+        weighted_ot_loss = lambda_ot * ot_loss
+        losses["weighted_ot_loss"] = weighted_ot_loss
         # Required key: `pl_utils.pl_model.ModelWrapper.training_step` reads
         # `losses["action_loss"]` as the scalar to backpropagate, regardless
         # of algo -- ACT and HPT repurpose the same key for their own totals.
-        losses["action_loss"] = mtae_total + lambda_ot * ot_loss
+        losses["action_loss"] = mtae_total + weighted_ot_loss
         return losses
 
     @override
@@ -411,6 +426,46 @@ class TactileEncoder(Algo):
             log[key] = value.item() if torch.is_tensor(value) else value
         log["stage"] = 2.0 if self.training_step > self.warmup_steps else 1.0
         return log
+
+    # ------------------------------------------------------------------
+    # Diagnostics: qualitative reconstruction (input vs. MTAE output)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def reconstruct(self, batch: Dict) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Run the same adapter -> random-masking -> encoder -> decoder path as
+        `forward_training`, but unpatchify both the reconstruction and the
+        target back into the original [B, T, C, H, W] tactile-image space
+        instead of returning a scalar loss -- for visually inspecting what
+        MTAE is actually reconstructing, not just its aggregate loss value.
+
+        Args:
+            batch (dict): output of `process_batch_for_training`.
+        Returns:
+            {platform_name: {"input": Tensor[B,T,C,H,W], "recon": same shape,
+                "mask_ratio": float}}. `recon` covers every patch (visible
+            and masked) -- only masked patches are penalized in the MTAE
+            loss, but the decoder predicts the full sequence either way.
+        """
+        model = self.nets["policy"]
+        adapters, encoder, decoders = model["adapters"], model["encoder"], model["decoders"]
+
+        out = {}
+        for name in self.platform_names:
+            x = batch[name]["tactile"]
+            adapter = adapters[name]
+            tokens, _target_patches, grid = adapter(x)
+            visible_tokens, _mask, _ids_restore, _ids_keep = random_masking(
+                tokens, self.mask_ratio
+            )
+            z, _tokens_out = encoder(visible_tokens)
+            recon = decoders[name](z)
+            recon_img = unpatchify(
+                recon, grid, adapter.patch_t, adapter.patch_h, adapter.patch_w, adapter.in_channels
+            )
+            out[name] = {"input": x, "recon": recon_img, "mask_ratio": self.mask_ratio}
+        return out
 
     # ------------------------------------------------------------------
     # Phase 4: deployment hand-off

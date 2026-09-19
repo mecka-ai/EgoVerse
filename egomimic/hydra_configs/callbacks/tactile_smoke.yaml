@@ -7,3 +7,18 @@ tsne_viz:
   every_n_epochs: 5
   num_samples: 128
   seed: 0
+
+# ModelWrapper.validation_step (pl_utils/pl_model.py) only computes/logs
+# anything when a rollout `evaluator` is configured -- this run has none
+# (self-supervised pretraining, not a policy), so without this callback
+# Valid/* is never logged even though the validation loop still runs.
+val_loss:
+  _target_: egomimic.eval.tactile_tsne_callback.TactileValidationLossCallback
+  num_samples: 64
+  seed: 1
+
+recon_viz:
+  _target_: egomimic.eval.tactile_tsne_callback.TactileReconstructionVizCallback
+  every_n_epochs: 5
+  num_examples: 2
+  seed: 2

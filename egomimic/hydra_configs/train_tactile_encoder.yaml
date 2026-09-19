@@ -50,6 +50,10 @@ visualization: {}
 # `debug` trainer already works around this the same way.
 trainer:
   strategy: ddp_find_unused_parameters_true
+  # One Train/* flush per epoch, matching other runs' convention, rather
+  # than Lightning's framework default (every 50 steps) -- interpolated off
+  # limit_train_batches so it stays in sync if that's ever overridden.
+  log_every_n_steps: ${trainer.limit_train_batches}
 
 hydra:
   run:
